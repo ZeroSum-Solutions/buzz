@@ -4,16 +4,21 @@ import test from "node:test";
 import { mapMentionCandidateToSuggestion } from "./mentionSuggestionMapping.ts";
 
 const OWNER = "a".repeat(64);
+const AGENT_PUBKEY = "b".repeat(64);
 
 function candidate(overrides = {}) {
   return {
     kind: "identity",
-    pubkey: "b".repeat(64),
+    pubkey: AGENT_PUBKEY,
     isAgent: true,
     isMember: true,
     ownerPubkey: OWNER,
     ...overrides,
   };
+}
+
+function agentCandidate(overrides = {}) {
+  return candidate(overrides);
 }
 
 function suggestion(overrides = {}, agentProvenanceReady = true) {
@@ -23,6 +28,18 @@ function suggestion(overrides = {}, agentProvenanceReady = true) {
     currentPubkey: OWNER,
     label: "Carl",
   });
+}
+
+function profileSummary(about) {
+  return {
+    displayName: "Bumble",
+    name: null,
+    avatarUrl: null,
+    about,
+    nip05Handle: null,
+    ownerPubkey: null,
+    isAgent: true,
+  };
 }
 
 test("labels Desktop-managed agent identities as managed here", () => {
@@ -57,4 +74,70 @@ test("does not attribute people or personas to a device", () => {
     suggestion({ kind: "persona", pubkey: undefined }).agentProvenance,
     undefined,
   );
+});
+
+test("agent description comes from the candidate when resolved at build time", () => {
+  const result = mapMentionCandidateToSuggestion({
+    agentProvenanceReady: true,
+    candidate: agentCandidate({ description: "Researcher — deep dives" }),
+    label: "Bumble",
+    profiles: { [AGENT_PUBKEY]: profileSummary("stale profile about") },
+  });
+
+  assert.equal(result.description, "Researcher — deep dives");
+});
+
+test("agent description falls back to the profile lookup's about", () => {
+  const result = mapMentionCandidateToSuggestion({
+    agentProvenanceReady: true,
+    candidate: agentCandidate(),
+    label: "Bumble",
+    profiles: { [AGENT_PUBKEY]: profileSummary("Researcher — deep dives") },
+  });
+
+  assert.equal(result.description, "Researcher — deep dives");
+});
+
+test("agent description is null when about is missing everywhere", () => {
+  const result = mapMentionCandidateToSuggestion({
+    agentProvenanceReady: true,
+    candidate: agentCandidate(),
+    label: "Bumble",
+    profiles: { [AGENT_PUBKEY]: profileSummary(null) },
+  });
+
+  assert.equal(result.description, null);
+});
+
+test("non-agent suggestions never carry a description", () => {
+  const result = mapMentionCandidateToSuggestion({
+    agentProvenanceReady: true,
+    candidate: agentCandidate({ isAgent: false }),
+    label: "Alice",
+    profiles: { [AGENT_PUBKEY]: profileSummary("A human bio") },
+  });
+
+  assert.equal(result.description, null);
+});
+
+test("multi-line about collapses to a single trimmed line", () => {
+  const result = mapMentionCandidateToSuggestion({
+    agentProvenanceReady: true,
+    candidate: agentCandidate({
+      description: "  Writer bee.\nDrafts docs\n\tand posts.  ",
+    }),
+    label: "Honey",
+  });
+
+  assert.equal(result.description, "Writer bee. Drafts docs and posts.");
+});
+
+test("whitespace-only about degrades to null (name-only row)", () => {
+  const result = mapMentionCandidateToSuggestion({
+    agentProvenanceReady: true,
+    candidate: agentCandidate({ description: "   \n  " }),
+    label: "Fizz",
+  });
+
+  assert.equal(result.description, null);
 });

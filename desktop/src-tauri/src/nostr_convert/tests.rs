@@ -279,6 +279,28 @@ fn users_batch_marks_valid_nip_oa_profiles_as_agents() {
 }
 
 #[test]
+fn users_batch_carries_about_when_present() {
+    let with_about = ev(
+        0,
+        r#"{"display_name":"Bumble","about":"Researcher — deep dives & sourcing"}"#,
+        vec![],
+    );
+    let without_about = ev(0, r#"{"display_name":"Fizz"}"#, vec![]);
+    let pk_with = with_about.pubkey.to_hex();
+    let pk_without = without_about.pubkey.to_hex();
+
+    let resp = users_batch_from_events(
+        &[with_about, without_about],
+        &[pk_with.clone(), pk_without.clone()],
+    );
+    assert_eq!(
+        resp.profiles[&pk_with].about.as_deref(),
+        Some("Researcher — deep dives & sourcing")
+    );
+    assert_eq!(resp.profiles[&pk_without].about, None);
+}
+
+#[test]
 fn user_notes_builds_cursor_from_last() {
     let e1 = ev(1, "first", vec![]);
     let e2 = ev(1, "second", vec![]);

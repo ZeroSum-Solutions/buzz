@@ -320,6 +320,39 @@ export function useMentions(
   const ownerProfilesQuery = useUsersBatchQuery(ownerPubkeys, {
     enabled: ownerPubkeys.length > 0,
   });
+  // Agent candidates whose kind-0 `about` is not already known — neither
+  // resolved at candidate-build time (search results) nor present in the
+  // caller's profile lookup. Batch-resolve them so the selector can show a
+  // role line even for agents who haven't authored anything in the loaded
+  // timeline. The per-pubkey entry cache behind useUsersBatchQuery keeps
+  // repeat lookups off the network.
+  const agentProfilePubkeys = React.useMemo(
+    () => [
+      ...new Set(
+        mentionCandidates
+          .filter(
+            (candidate) =>
+              candidate.isAgent &&
+              candidate.pubkey &&
+              candidate.description === undefined &&
+              !profiles?.[candidate.pubkey],
+          )
+          .map((candidate) => candidate.pubkey as string),
+      ),
+    ],
+    [mentionCandidates, profiles],
+  );
+  const agentProfilesQuery = useUsersBatchQuery(agentProfilePubkeys, {
+    enabled: agentProfilePubkeys.length > 0,
+  });
+  const mentionProfiles = React.useMemo<UserProfileLookup | undefined>(() => {
+    const agentProfiles = agentProfilesQuery.data?.profiles;
+    if (!agentProfiles || Object.keys(agentProfiles).length === 0) {
+      return profiles;
+    }
+    // Caller-provided profiles win on conflict.
+    return { ...agentProfiles, ...profiles };
+  }, [agentProfilesQuery.data?.profiles, profiles]);
   const searchableNames = React.useMemo(
     () => uniqueAutocompleteLabels(mentionCandidatesWithTeams),
     [mentionCandidatesWithTeams],
@@ -386,7 +419,7 @@ export function useMentions(
           channelType: options?.channelType,
           currentPubkey,
           ownerProfiles: ownerProfilesQuery.data?.profiles,
-          profiles,
+          profiles: mentionProfiles,
         }),
       );
   }, [
@@ -394,10 +427,10 @@ export function useMentions(
     agentDirectoriesReady,
     currentPubkey,
     mentionCandidatesWithTeams,
+    mentionProfiles,
     mentionQuery,
     options?.channelType,
     ownerProfilesQuery.data?.profiles,
-    profiles,
   ]);
   const getDefaultAgentSuggestion = useDefaultAgentSuggestion({
     activePersonaIds,
@@ -846,7 +879,7 @@ export function useMentions(
             channelType: options?.channelType,
             currentPubkey,
             ownerProfiles: ownerProfilesQuery.data?.profiles,
-            profiles,
+            profiles: mentionProfiles,
             requireExact: exactMentionSpace,
           });
           if (exactMentionSpace && flushed?.type !== "match")
@@ -880,10 +913,10 @@ export function useMentions(
       currentPubkey,
       isMentionOpen,
       mentionCandidatesWithTeams,
+      mentionProfiles,
       mentionSelectedIndex,
       options?.channelType,
       ownerProfilesQuery.data?.profiles,
-      profiles,
       setSelected,
       suggestions,
     ],

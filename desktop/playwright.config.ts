@@ -79,6 +79,7 @@ export default defineConfig({
         "**/mentions.spec.ts",
         "**/mention-spacing.spec.ts",
         "**/mention-clipboard.spec.ts",
+        "**/mention-descriptions-screenshots.spec.ts",
         "**/cloud-provenance.spec.ts",
         "**/team-mentions.spec.ts",
         "**/persistent-agent-audience.spec.ts",
