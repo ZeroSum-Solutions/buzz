@@ -85,8 +85,15 @@ import { useChannelRouteTarget } from "./useChannelRouteTarget";
 import { useChannelOpenReadState } from "./useChannelOpenReadState";
 import { useChannelUnreadState } from "./useChannelUnreadState";
 import type { ChannelScreenProps } from "./ChannelScreen.types";
-import { GuardedChannelPane } from "./GuardedChannelPane"; import { useNavigationGuard } from "./useNavigationGuard"; import * as searchForwarding from "./searchTargetForwarding";
-const EMPTY_RELAY_EVENTS: RelayEvent[] = [];
+import { GuardedChannelPane } from "./GuardedChannelPane";
+import { useNavigationGuard } from "./useNavigationGuard";
+import * as searchForwarding from "./searchTargetForwarding";
+import { ChannelFilesTab } from "@/features/channel-files/ChannelFilesTab";
+import { useChannelFiles } from "@/features/channel-files/useChannelFiles";
+import { useFileFolders } from "@/features/channel-files/useFileFolders";
+const CHANNEL_TAB_CHAT = "chat",
+  CHANNEL_TAB_FILES = "files",
+  EMPTY_RELAY_EVENTS: RelayEvent[] = [];
 export function ChannelScreen({
   activeChannel,
   autoSendDraftKey,
@@ -102,7 +109,7 @@ export function ChannelScreen({
   ...searchTarget
 }: ChannelScreenProps) {
   const queryClient = useQueryClient();
-  const { goHome } = useAppNavigation();
+  const { goHome, goChannel } = useAppNavigation();
   const { activeCommunity } = useCommunities();
   const {
     clearChannelUnreadSource,
@@ -152,6 +159,7 @@ export function ChannelScreen({
   } = useThreadPanelWidth(channelContentWidthPx || undefined);
   const [isMembersSidebarOpen, setIsMembersSidebarOpen] = React.useState(false);
   const [isAddBotOpen, setIsAddBotOpen] = React.useState(false);
+  const [activeTab, setActiveTab] = React.useState<string>(CHANNEL_TAB_CHAT);
   const [expandedThreadReplyIds, setExpandedThreadReplyIds] = React.useState(
     () => new Set<string>(),
   );
@@ -208,6 +216,13 @@ export function ChannelScreen({
     threadScrollTargetId,
   );
   useChannelSubscription(activeChannel);
+  const channelFiles = useChannelFiles(activeChannel);
+  const fileFoldersHook = useFileFolders(activeChannelId, currentPubkey);
+  // Reset to chat tab when switching channels
+  // biome-ignore lint/correctness/useExhaustiveDependencies: activeChannelId is the intentional reset trigger
+  React.useEffect(() => {
+    setActiveTab(CHANNEL_TAB_CHAT);
+  }, [activeChannelId]);
   const { fetchOlder, hasOlderMessages, historyExhausted, isFetchingOlder } =
     useFetchOlderMessages(activeChannel);
   const latestActiveMessage = React.useMemo(() => {
@@ -375,6 +390,42 @@ export function ChannelScreen({
     relayAgents,
   });
   const messageOwnerProfiles = useMessageOwnerProfiles(messageProfiles);
+  // Build a pubkey -> display name map for the Files tab attribution
+  const fileSenderNames = React.useMemo(() => {
+    const map = new Map<string, string>();
+    for (const file of channelFiles.files) {
+      if (map.has(file.pubkey)) continue;
+      const profile = messageProfiles[file.pubkey];
+      if (profile) {
+        map.set(
+          file.pubkey,
+          profile.displayName ?? profile.name ?? profile.nip05Handle ?? "",
+        );
+      }
+    }
+    return map;
+  }, [channelFiles.files, messageProfiles]);
+
+  // Build a pubkey -> avatar URL map for the Files tab
+  const fileSenderAvatarUrls = React.useMemo(() => {
+    const map = new Map<string, string | null>();
+    for (const file of channelFiles.files) {
+      if (map.has(file.pubkey)) continue;
+      const profile = messageProfiles[file.pubkey];
+      map.set(file.pubkey, profile?.avatarUrl ?? null);
+    }
+    return map;
+  }, [channelFiles.files, messageProfiles]);
+
+  const handleJumpToMessage = React.useCallback(
+    (eventId: string) => {
+      if (activeChannelId) {
+        void goChannel(activeChannelId, { messageId: eventId });
+        setActiveTab(CHANNEL_TAB_CHAT);
+      }
+    },
+    [activeChannelId, goChannel],
+  );
   const communityAgentPubkeys = useKnownAgentPubkeys();
   const agentPubkeys = React.useMemo(() => {
     const pubkeys = new Set([...communityAgentPubkeys, ...knownAgentPubkeys]);
@@ -780,6 +831,7 @@ export function ChannelScreen({
       isHuddleTranscript,
     ],
   );
+
   return (
     <AgentSessionProvider onOpenAgentSession={handleOpenAgentSession}>
       <ProfilePanelProvider onOpenProfilePanel={handleOpenProfilePanel}>
@@ -834,6 +886,41 @@ export function ChannelScreen({
                 searchTarget,
               )
             ) : (
+              <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+                <div
+                  className="shrink-0 border-b border-border bg-background px-4"
+                  role="tablist"
+                >
+                  <div className="flex gap-0">
+                    <button
+                      aria-selected={activeTab === CHANNEL_TAB_CHAT}
+                      className={`px-4 py-2.5 text-sm font-medium transition-colors border-b-2 -mb-px ${
+                        activeTab === CHANNEL_TAB_CHAT
+                          ? "border-foreground text-foreground"
+                          : "border-transparent text-muted-foreground hover:text-foreground"
+                      }`}
+                      onClick={() => setActiveTab(CHANNEL_TAB_CHAT)}
+                      role="tab"
+                      type="button"
+                    >
+                      Chat
+                    </button>
+                    <button
+                      aria-selected={activeTab === CHANNEL_TAB_FILES}
+                      className={`px-4 py-2.5 text-sm font-medium transition-colors border-b-2 -mb-px ${
+                        activeTab === CHANNEL_TAB_FILES
+                          ? "border-foreground text-foreground"
+                          : "border-transparent text-muted-foreground hover:text-foreground"
+                      }`}
+                      onClick={() => setActiveTab(CHANNEL_TAB_FILES)}
+                      role="tab"
+                      type="button"
+                    >
+                      Files
+                    </button>
+                  </div>
+                </div>
+                {activeTab === CHANNEL_TAB_CHAT ? (
               <React.Suspense
                 fallback={<ChannelScreenLoadingFallback {...{ isHuddleTranscript }} />}
               >
@@ -977,6 +1064,26 @@ export function ChannelScreen({
                   searchTarget,
                 )}
               </React.Suspense>
+                ) : (
+                  <ChannelFilesTab
+                    fileFolderMap={fileFoldersHook.fileFolderMap}
+                    files={channelFiles.files}
+                    folders={fileFoldersHook.folders}
+                    foldersLoading={fileFoldersHook.isLoading}
+                    isLoading={channelFiles.isLoading}
+                    onAddFileToFolder={fileFoldersHook.addFileToFolder}
+                    onAddFilesToFolder={fileFoldersHook.addFilesToFolder}
+                    onCreateFolder={fileFoldersHook.createFolder}
+                    onDeleteFolder={fileFoldersHook.deleteFolder}
+                    onJumpToMessage={handleJumpToMessage}
+                    onRemoveFileFromFolder={fileFoldersHook.removeFileFromFolder}
+                    onRenameFolder={fileFoldersHook.renameFolder}
+                    onSetFolderParent={fileFoldersHook.setFolderParent}
+                    senderAvatarUrls={fileSenderAvatarUrls}
+                    senderNames={fileSenderNames}
+                  />
+                )}
+              </div>
             )
           ) : (
             <ChannelScreenEmptyState />
