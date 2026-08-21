@@ -29,6 +29,7 @@ import { UserProfilePanel } from "@/features/profile/ui/UserProfilePanel";
 import { AgentSessionThreadPanel } from "@/features/channels/ui/AgentSessionThreadPanel";
 import { ChannelManagementAuxiliaryPanel } from "@/features/channels/ui/ChannelManagementAuxiliaryPanel";
 import { IdleAuxiliaryPanel } from "@/features/channels/ui/IdleAuxiliaryPanel";
+import { MarkdownDocPanel } from "@/features/channels/ui/MarkdownDocPanel";
 import { RightAuxiliaryPane } from "@/features/channels/ui/RightAuxiliaryPane";
 import {
   ThreadPanelSurface,
@@ -165,6 +166,9 @@ export const ChannelPane = React.memo(function ChannelPane({
   openAgentSessionPubkey,
   onProfilePanelViewChange,
   onProfilePanelTabChange,
+  markdownDocName,
+  markdownDocUrl,
+  onCloseMarkdownDoc,
   profilePanelPubkey,
   profilePanelTab,
   profilePanelView,
@@ -494,13 +498,18 @@ export const ChannelPane = React.memo(function ChannelPane({
     threadMessages: threadMessages.map((entry) => entry.message),
     useFocusThreadDrawer,
   });
+  const openMarkdownDoc =
+    markdownDocUrl && markdownDocName
+      ? { filename: markdownDocName, url: markdownDocUrl }
+      : null;
   const hasSplitAuxiliaryPane =
     useSplitAuxiliaryPane &&
     (channelManagementOpen ||
       Boolean(threadHeadMessage) ||
       shouldShowThreadSkeleton ||
       Boolean(activeChannel && selectedAgent) ||
-      Boolean(profilePanelPubkey));
+      Boolean(profilePanelPubkey) ||
+      Boolean(openMarkdownDoc));
   const wrapAux = (
     panel: React.ReactNode,
     testId: string,
@@ -985,6 +994,28 @@ export const ChannelPane = React.memo(function ChannelPane({
               />
             );
             return wrapAux(panel, "user-profile-panel");
+          })()
+        ) : openMarkdownDoc && onCloseMarkdownDoc ? (
+          (() => {
+            // Lowest-priority pane before the idle auxiliary surface: a
+            // higher-priority pane opened afterwards (thread, activity,
+            // profile) shows immediately, and the document reappears when it
+            // closes. Opening a document clears competitors in the
+            // screen-level handler, so it is never dead on arrival.
+            const panel = (
+              <MarkdownDocPanel
+                filename={openMarkdownDoc.filename}
+                isSinglePanelView={
+                  useSplitAuxiliaryPane ? false : isSinglePanelView
+                }
+                layout={useSplitAuxiliaryPane ? "split" : "standalone"}
+                onClose={onCloseMarkdownDoc}
+                transparentChrome={useSplitAuxiliaryPane}
+                url={openMarkdownDoc.url}
+                widthPx={threadPanelWidthPx}
+              />
+            );
+            return wrapAux(panel, "markdown-doc-panel");
           })()
         ) : (
           idleAuxiliarySurface
