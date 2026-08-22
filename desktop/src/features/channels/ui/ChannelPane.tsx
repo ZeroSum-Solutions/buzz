@@ -1003,7 +1003,10 @@ export const ChannelPane = React.memo(function ChannelPane({
             // closes. Opening a document clears competitors in the
             // screen-level handler, so it is never dead on arrival.
             const panel = (
+              // Keyed by URL so opening a different document resets the
+              // Preview/Code toggle instead of inheriting the previous doc's.
               <MarkdownDocPanel
+                key={openMarkdownDoc.url}
                 filename={openMarkdownDoc.filename}
                 isSinglePanelView={
                   useSplitAuxiliaryPane ? false : isSinglePanelView

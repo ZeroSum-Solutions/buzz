@@ -165,6 +165,8 @@ export function MarkdownDocPanel({
               className="overflow-x-auto pt-3 text-xs leading-relaxed"
               data-testid="markdown-doc-code"
             >
+              {/* Shiki's synchronous-tokenization guard caps highlighting at
+                  150 lines; longer documents render as plain text here. */}
               <SyntaxHighlightedCode code={decoded.text} language="markdown" />
             </pre>
           )

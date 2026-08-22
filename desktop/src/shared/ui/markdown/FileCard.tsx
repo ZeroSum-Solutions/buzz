@@ -6,7 +6,10 @@ import { invokeTauri } from "@/shared/api/tauri";
 import { useSmoothCorners } from "@/shared/ui/smoothCorners";
 
 import { isRelayDownloadable } from "./mediaEntry";
-import { isMarkdownDocFilename } from "./markdownDocFile";
+import {
+  isMarkdownDocFilename,
+  MAX_MARKDOWN_DOC_BYTES,
+} from "./markdownDocFile";
 import { useMarkdownDocViewer } from "./markdownDocViewerContext";
 import { useMarkdownRuntime } from "./runtimeContext";
 
@@ -56,6 +59,9 @@ export function FileCard({
   const opensInViewer =
     openMarkdownDoc !== null &&
     isMarkdownDocFilename(filename) &&
+    // Advertised-size pre-gate: skip fetching a doc the viewer would refuse
+    // anyway. The imeta size is untrusted, so the decoder re-checks post-fetch.
+    (size == null || size <= MAX_MARKDOWN_DOC_BYTES) &&
     isRelayDownloadable(href, relayOrigin ?? undefined);
 
   return (

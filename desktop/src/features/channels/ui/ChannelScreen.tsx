@@ -68,10 +68,8 @@ import { useHuddleReadMarker } from "@/features/channels/ui/useHuddleReadMarker"
 import { useHuddleThreadIsolation } from "@/features/channels/ui/useHuddleThreadIsolation";
 import { AgentSessionProvider } from "@/shared/context/AgentSessionContext";
 import { ProfilePanelProvider } from "@/shared/context/ProfilePanelContext";
-import {
-  type MarkdownDocTarget,
-  MarkdownDocViewerProvider,
-} from "@/shared/ui/markdown/markdownDocViewerContext";
+import { useChannelPaneOpeners } from "@/features/channels/ui/useChannelPaneOpeners";
+import { MarkdownDocViewerProvider } from "@/shared/ui/markdown/markdownDocViewerContext";
 import { useMainInsetRef } from "@/shared/layout/MainInsetContext";
 import { channelContentTopPaddingMeasurement } from "@/shared/layout/chromeLayout";
 import { useMeasuredCssVariable } from "@/shared/layout/useMeasuredCssVariable";
@@ -686,7 +684,8 @@ export function ChannelScreen({
     effectiveOpenThreadHeadId ||
       openAgentSessionPubkey ||
       profilePanelPubkey ||
-      channelManagementOpen,
+      channelManagementOpen ||
+      (markdownDocUrl && markdownDocName),
   );
   const displayedThreadHeadMessage = threadPanelData.threadHead;
   const displayedThreadAllMessages = threadPanelData.messages;
@@ -715,58 +714,23 @@ export function ChannelScreen({
     resetKey: activeChannelId,
     enabled: !isSinglePanelView,
   });
-  const handleManageChannel = React.useCallback(() => {
-    if (!requireThreadEditResolution()) return;
-    if (activeChannel?.channelType === "forum") {
-      openGlobalChannelManagement();
-      return;
-    }
-    if (channelManagementOpen) {
-      setChannelManagementOpen(false);
-      return;
-    }
-    setOpenThreadHeadId(null);
-    setExpandedThreadReplyIds(new Set());
-    setThreadScrollTargetId(null);
-    setThreadReplyTargetId(null);
-    handleCloseAgentSession();
-    setProfilePanelPubkey(null);
-    setChannelManagementOpen(true);
-  }, [
-    activeChannel?.channelType,
+  const { handleManageChannel, handleOpenMarkdownDoc } = useChannelPaneOpeners({
+    channelType: activeChannel?.channelType,
     channelManagementOpen,
+    closeAgentSession: handleCloseAgentSession,
     openGlobalChannelManagement,
+    openMarkdownDoc,
     requireThreadEditResolution,
     setChannelManagementOpen,
+    setExpandedThreadReplyIds,
     setOpenThreadHeadId,
-    handleCloseAgentSession,
     setProfilePanelPubkey,
-  ]);
+    setThreadReplyTargetId,
+    setThreadScrollTargetId,
+  });
   const handleToggleMembers = React.useCallback(
     () => setIsMembersSidebarOpen((prev) => !prev),
     [],
-  );
-  // Opening a document clears competing panes (mirrors handleManageChannel /
-  // useChannelProfilePanel) so the doc panel — lowest in ChannelPane's pane
-  // priority chain — is never opened dead behind another pane.
-  const handleOpenMarkdownDoc = React.useCallback(
-    (doc: MarkdownDocTarget) => {
-      setOpenThreadHeadId(null);
-      setExpandedThreadReplyIds(new Set());
-      setThreadScrollTargetId(null);
-      setThreadReplyTargetId(null);
-      handleCloseAgentSession();
-      setChannelManagementOpen(false);
-      setProfilePanelPubkey(null);
-      openMarkdownDoc(doc.url, doc.filename);
-    },
-    [
-      handleCloseAgentSession,
-      openMarkdownDoc,
-      setChannelManagementOpen,
-      setOpenThreadHeadId,
-      setProfilePanelPubkey,
-    ],
   );
   const channelHeader = React.useMemo(
     () => (
