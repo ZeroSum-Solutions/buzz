@@ -8,6 +8,10 @@ import {
   fetchMarkdownDocBytes,
   isMediaTooLargeError,
 } from "@/shared/api/tauriMedia";
+import {
+  focusMarkdownDocPanelClose,
+  restoreFocusToMarkdownDocOpener,
+} from "@/features/channels/ui/markdownDocFocus";
 import { useEscapeKey } from "@/shared/hooks/useEscapeKey";
 import { useIsThreadPanelOverlay } from "@/shared/hooks/use-mobile";
 import {
@@ -74,6 +78,18 @@ export function MarkdownDocPanel({
   useEscapeKey(onClose, isOverlay || isSinglePanelView);
   const [view, setView] = React.useState<MarkdownDocView>("preview");
 
+  // Opening can unmount the section holding the focused attachment card
+  // (narrow layout swaps the whole channel out), and closing unmounts this
+  // panel — move focus in on mount and hand it back to the opener card on
+  // unmount so keyboard users never fall to <body>.
+  React.useEffect(() => {
+    const cancel = focusMarkdownDocPanelClose();
+    return () => {
+      cancel();
+      restoreFocusToMarkdownDocOpener(url);
+    };
+  }, [url]);
+
   // Blob URLs are content-addressed (`/media/{sha256}.{ext}`), so a fetched
   // document never changes under its URL — cache it for the session.
   const docQuery = useQuery<MarkdownDocDecodeResult>({
@@ -126,17 +142,6 @@ export function MarkdownDocPanel({
             <AuxiliaryPanelHeaderTitleBlock title={filename} />
           </AuxiliaryPanelHeaderGroup>
           <AuxiliaryPanelHeaderActions includeCloseAction>
-            {decoded?.kind === "ok" ? (
-              <SegmentedControl
-                legend="Document view"
-                onValueChange={setView}
-                optionTestIdPrefix="markdown-doc-view"
-                options={VIEW_OPTIONS}
-                size="compact"
-                testId="markdown-doc-view-toggle"
-                value={view}
-              />
-            ) : null}
             <Button
               aria-label={`Download ${filename}`}
               data-testid="markdown-doc-download"
@@ -150,41 +155,63 @@ export function MarkdownDocPanel({
         </AuxiliaryPanelHeader>
       }
     >
-      <AuxiliaryPanelBody className="overflow-y-auto px-4 pb-6" panelPadding>
-        {docQuery.isPending ? (
-          <div
-            className="flex items-center justify-center py-12"
-            data-testid="markdown-doc-loading"
-          >
-            <Loader2 className="h-5 w-5 animate-spin text-muted-foreground/70" />
-          </div>
-        ) : errorMessage !== null ? (
-          <div className="flex flex-col items-center gap-3 py-12 text-center">
-            <p className="text-sm text-muted-foreground">{errorMessage}</p>
-            <Button onClick={handleDownload} size="sm" variant="secondary">
-              <Download className="mr-1.5 h-4 w-4" />
-              Download file
-            </Button>
-          </div>
-        ) : decoded?.kind === "ok" ? (
-          view === "preview" ? (
-            <Markdown
-              blockCode
-              className="pt-3 text-sm"
-              content={decoded.text}
-              hardLineBreaks={false}
+      <AuxiliaryPanelBody className="flex min-h-0 flex-col" panelPadding>
+        {/* The view picker gets its own pinned row below the title: sharing
+            the title row squeezed the filename out, and the header chrome
+            band overlays anything placed directly after it in the header
+            slot — so the row lives inside the chrome-padded body instead. */}
+        {decoded?.kind === "ok" ? (
+          <div className="flex shrink-0 items-center px-4 pb-2">
+            <SegmentedControl
+              legend="Document view"
+              onValueChange={setView}
+              optionTestIdPrefix="markdown-doc-view"
+              options={VIEW_OPTIONS}
+              size="compact"
+              testId="markdown-doc-view-toggle"
+              value={view}
             />
-          ) : (
-            <pre
-              className="overflow-x-auto pt-3 text-xs leading-relaxed"
-              data-testid="markdown-doc-code"
-            >
-              {/* Shiki's synchronous-tokenization guard caps highlighting at
-                  150 lines; longer documents render as plain text here. */}
-              <SyntaxHighlightedCode code={decoded.text} language="markdown" />
-            </pre>
-          )
+          </div>
         ) : null}
+        <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-6">
+          {docQuery.isPending ? (
+            <div
+              className="flex items-center justify-center py-12"
+              data-testid="markdown-doc-loading"
+            >
+              <Loader2 className="h-5 w-5 animate-spin text-muted-foreground/70" />
+            </div>
+          ) : errorMessage !== null ? (
+            <div className="flex flex-col items-center gap-3 py-12 text-center">
+              <p className="text-sm text-muted-foreground">{errorMessage}</p>
+              <Button onClick={handleDownload} size="sm" variant="secondary">
+                <Download className="mr-1.5 h-4 w-4" />
+                Download file
+              </Button>
+            </div>
+          ) : decoded?.kind === "ok" ? (
+            view === "preview" ? (
+              <Markdown
+                blockCode
+                className="pt-3 text-sm"
+                content={decoded.text}
+                hardLineBreaks={false}
+              />
+            ) : (
+              <pre
+                className="overflow-x-auto pt-3 text-xs leading-relaxed"
+                data-testid="markdown-doc-code"
+              >
+                {/* Shiki's synchronous-tokenization guard caps highlighting at
+                  150 lines; longer documents render as plain text here. */}
+                <SyntaxHighlightedCode
+                  code={decoded.text}
+                  language="markdown"
+                />
+              </pre>
+            )
+          ) : null}
+        </div>
       </AuxiliaryPanelBody>
     </AuxiliaryPanel>
   );

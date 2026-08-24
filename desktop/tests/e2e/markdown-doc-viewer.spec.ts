@@ -126,6 +126,32 @@ test("markdown attachment opens the in-app viewer with Preview/Code toggle", asy
   await expect(page.getByTestId("markdown-doc-panel")).toHaveCount(0);
 });
 
+test("narrow layout moves focus into the panel and returns it to the card", async ({
+  page,
+}) => {
+  await sendMarkdownAttachment(page);
+
+  // Below the split-pane threshold the panel replaces the channel section,
+  // unmounting the focused attachment card — the focus contract under test.
+  await page.setViewportSize({ width: 560, height: 720 });
+
+  const card = page.getByTestId("file-card").last();
+  await card.focus();
+  await expect(card).toBeFocused();
+  await page.keyboard.press("Enter");
+
+  // Focus lands on the panel's close control, not <body>.
+  const panel = page.getByTestId("markdown-doc-panel");
+  await expect(panel).toBeVisible();
+  await expect(page.getByTestId("auxiliary-panel-close")).toBeFocused();
+
+  // Escape closes the panel and hands focus back to the invoking card —
+  // overriding the remounted channel's composer autofocus.
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("markdown-doc-panel")).toHaveCount(0);
+  await expect(page.getByTestId("file-card").last()).toBeFocused();
+});
+
 test("open document survives reload and back/forward navigation", async ({
   page,
 }) => {

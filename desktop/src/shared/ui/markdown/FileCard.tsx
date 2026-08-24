@@ -82,6 +82,10 @@ export function FileCard({
         );
       }}
       aria-label={opensInViewer ? `Open ${filename}` : `Download ${filename}`}
+      // Focus-return anchor: when the viewer panel closes, focus comes back
+      // to the card that opened this URL (the element itself may have been
+      // unmounted and remounted in the narrow layout meanwhile).
+      data-doc-url={opensInViewer ? href : undefined}
       data-testid="file-card"
       className="my-1 inline-flex max-w-sm items-center gap-3 rounded-2xl border border-border/70 bg-muted/40 px-3 py-2 text-left no-underline transition-colors hover:bg-muted/70"
       style={{ borderRadius: "1rem" }}
