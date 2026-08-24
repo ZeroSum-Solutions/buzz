@@ -4,7 +4,10 @@ import { Download, FileText, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { invokeTauri } from "@/shared/api/tauri";
-import { fetchMediaBytes } from "@/shared/api/tauriMedia";
+import {
+  fetchMarkdownDocBytes,
+  isMediaTooLargeError,
+} from "@/shared/api/tauriMedia";
 import { useEscapeKey } from "@/shared/hooks/useEscapeKey";
 import { useIsThreadPanelOverlay } from "@/shared/hooks/use-mobile";
 import {
@@ -52,8 +55,9 @@ function decodeErrorMessage(kind: "too-large" | "binary"): string {
  * Right auxiliary panel rendering a shared markdown attachment in-app.
  *
  * Relay media URLs require relay auth (plain browser requests 401), so the
- * content is fetched through the authenticated `fetch_media_bytes` Tauri
- * command and rendered with the same markdown pipeline chat messages use.
+ * content is fetched through the authenticated `fetch_markdown_doc_bytes`
+ * Tauri command — which enforces the viewer's 2 MiB cap natively during the
+ * fetch — and rendered with the same markdown pipeline chat messages use.
  * The Preview/Code toggle switches between rendered markdown and the
  * syntax-highlighted source.
  */
@@ -74,7 +78,17 @@ export function MarkdownDocPanel({
   // document never changes under its URL — cache it for the session.
   const docQuery = useQuery<MarkdownDocDecodeResult>({
     queryKey: ["markdown-doc", url],
-    queryFn: async () => decodeMarkdownDocBytes(await fetchMediaBytes(url)),
+    queryFn: async () => {
+      try {
+        return decodeMarkdownDocBytes(await fetchMarkdownDocBytes(url));
+      } catch (err) {
+        // The native 2 MiB cap refuses oversized documents during the fetch
+        // (the in-frontend decode check never sees their bytes). Surface it
+        // as the too-large fallback rather than a generic fetch failure.
+        if (isMediaTooLargeError(err)) return { kind: "too-large" };
+        throw err;
+      }
+    },
     staleTime: Number.POSITIVE_INFINITY,
     retry: 1,
   });

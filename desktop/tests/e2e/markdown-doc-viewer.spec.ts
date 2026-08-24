@@ -126,6 +126,63 @@ test("markdown attachment opens the in-app viewer with Preview/Code toggle", asy
   await expect(page.getByTestId("markdown-doc-panel")).toHaveCount(0);
 });
 
+test("open document survives reload and back/forward navigation", async ({
+  page,
+}) => {
+  await sendMarkdownAttachment(page);
+  await page.getByTestId("file-card").last().click();
+
+  const panel = () => page.getByTestId("markdown-doc-panel");
+  await expect(
+    panel().getByRole("heading", { name: "Release Notes" }),
+  ).toBeVisible();
+
+  // The document lives in the URL (`doc`/`docName` params), so a reload
+  // must restore the open panel with its content.
+  await page.reload();
+  await expect(
+    panel().getByRole("heading", { name: "Release Notes" }),
+  ).toBeVisible();
+
+  // Opening the panel pushed a history entry: back closes it, forward
+  // restores it — the advertised back/forward contract.
+  await page.goBack();
+  await expect(page.getByTestId("markdown-doc-panel")).toHaveCount(0);
+  await page.goForward();
+  await expect(
+    panel().getByRole("heading", { name: "Release Notes" }),
+  ).toBeVisible();
+});
+
+test("a document over the native 2 MiB cap falls back to download", async ({
+  page,
+}) => {
+  // The imeta `size` is untrusted and here it lies small — the card offers
+  // the viewer. The served body is over the cap, so the (mocked) native
+  // fetch refuses it mid-transfer and the panel must show the too-large
+  // fallback instead of rendering, proving enforcement does not rest on
+  // the advertised size.
+  await page.unroute(`**/media/${DOC_SHA}.bin`);
+  await page.route(`**/media/${DOC_SHA}.bin`, (route) =>
+    route.fulfill({
+      body: Buffer.alloc(2 * 1024 * 1024 + 1, 0x61),
+      contentType: "application/octet-stream",
+    }),
+  );
+  await sendMarkdownAttachment(page);
+
+  const card = page.getByTestId("file-card").last();
+  await expect(card).toHaveAttribute("aria-label", "Open release-notes.md");
+  await card.click();
+
+  const panel = page.getByTestId("markdown-doc-panel");
+  await expect(panel).toBeVisible();
+  await expect(panel).toContainText("This file is too large to preview.");
+  await expect(
+    panel.getByRole("button", { name: "Download file" }),
+  ).toBeVisible();
+});
+
 test("non-markdown attachments keep the download-card behavior", async ({
   page,
 }) => {

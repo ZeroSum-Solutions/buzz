@@ -40,7 +40,8 @@ function formatFileSize(bytes: number): string {
  * Markdown attachments (`.md`/`.markdown`/`.mdx` by imeta filename) open the
  * in-app markdown viewer panel instead when a hosting surface provides one —
  * relay-hosted only, because the viewer fetches through the authenticated
- * `fetch_media_bytes` command, which accepts relay `/media/` origins alone.
+ * `fetch_markdown_doc_bytes` command (native 2 MiB cap), which accepts
+ * relay `/media/` origins alone.
  */
 export function FileCard({
   href,

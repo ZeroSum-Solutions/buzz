@@ -17,8 +17,13 @@ const MARKDOWN_DOC_EXTENSIONS = [".md", ".markdown", ".mdx"] as const;
 
 /**
  * Maximum attachment size the viewer will render. Larger files fall back
- * to the download card path. Matches the ceiling proven workable by other
- * in-app text viewers; well under the 50 MiB `fetch_media_bytes` cap.
+ * to the download card path.
+ *
+ * This constant powers the untrusted-imeta pre-gate (UX only) and the
+ * defense-in-depth decode check. The *enforcement* boundary is the native
+ * `fetch_markdown_doc_bytes` command's matching `MAX_MARKDOWN_DOC_BYTES`
+ * cap in `media_download.rs`, which refuses oversized documents during the
+ * streamed fetch — keep the two in sync.
  */
 export const MAX_MARKDOWN_DOC_BYTES = 2 * 1024 * 1024;
 
