@@ -828,9 +828,7 @@ export function ChannelScreen({
                 searchTarget,
               )
             ) : (
-              // Scoped to the pane that hosts the markdown-doc auxiliary
-              // panel — the forum branch has no host, so its FileCards keep
-              // download behavior instead of a dead open-in-viewer click.
+              // Forum has no doc-panel host; its FileCards keep downloading.
               <MarkdownDocViewerProvider value={handleOpenMarkdownDoc}>
                 <React.Suspense
                   fallback={
