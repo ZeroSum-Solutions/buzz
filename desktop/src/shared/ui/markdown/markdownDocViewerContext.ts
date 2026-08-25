@@ -6,6 +6,12 @@ export type MarkdownDocTarget = {
   url: string;
   /** Human-readable filename from the message's imeta `filename` field. */
   filename: string;
+  /**
+   * The card element that invoked the open, for focus restoration when the
+   * panel closes. The URL alone cannot identify the opener: the same
+   * attachment can appear in several messages, giving several cards one URL.
+   */
+  opener?: HTMLElement | null;
 };
 
 /**

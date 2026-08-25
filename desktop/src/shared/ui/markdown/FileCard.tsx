@@ -71,7 +71,7 @@ export function FileCard({
       type="button"
       onClick={() => {
         if (opensInViewer) {
-          openMarkdownDoc({ url: href, filename });
+          openMarkdownDoc({ url: href, filename, opener: cardRef.current });
           return;
         }
         invokeTauri("download_file", { url: href, filename }).catch(

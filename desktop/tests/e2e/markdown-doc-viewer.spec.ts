@@ -62,7 +62,12 @@ async function sendMarkdownAttachment(page: Page) {
   await page.goto("/");
   await page.getByTestId("channel-general").click();
   await expect(page.getByTestId("chat-title")).toHaveText("general");
+  await attachAndSendMarkdown(page);
+}
 
+/** Attach + send in the already-open channel (mock re-serves one descriptor,
+ * so every send yields a card with the same document URL). */
+async function attachAndSendMarkdown(page: Page) {
   const [chooser] = await Promise.all([
     page.waitForEvent("filechooser"),
     page.getByRole("button", { name: "Attach file" }).click(),
@@ -150,6 +155,34 @@ test("narrow layout moves focus into the panel and returns it to the card", asyn
   await page.keyboard.press("Escape");
   await expect(page.getByTestId("markdown-doc-panel")).toHaveCount(0);
   await expect(page.getByTestId("file-card").last()).toBeFocused();
+});
+
+test("close restores focus to the invoking card when the document appears twice", async ({
+  page,
+}) => {
+  // The same attachment in two messages gives two cards with one URL, so a
+  // URL-only anchor would always restore the first DOM match. The invoking
+  // card's recorded identity must win.
+  await sendMarkdownAttachment(page);
+  await attachAndSendMarkdown(page);
+
+  await page.setViewportSize({ width: 560, height: 720 });
+
+  const docCards = page.locator(
+    `[data-testid="file-card"][data-doc-url="${DOC_URL}"]`,
+  );
+  await expect(docCards).toHaveCount(2);
+
+  // Open from the SECOND card.
+  await docCards.nth(1).focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("auxiliary-panel-close")).toBeFocused();
+
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("markdown-doc-panel")).toHaveCount(0);
+  await expect(docCards).toHaveCount(2);
+  await expect(docCards.nth(1)).toBeFocused();
+  await expect(docCards.nth(0)).not.toBeFocused();
 });
 
 test("open document survives reload and back/forward navigation", async ({

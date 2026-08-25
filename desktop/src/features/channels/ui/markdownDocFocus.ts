@@ -6,12 +6,46 @@
  * panel that held focus — in both directions focus falls to `<body>` and
  * keyboard/screen-reader users lose their place. On open, focus moves to the
  * panel's close control; on close, it returns to the attachment card that
- * opened the document (matched by URL, since the original element was
- * unmounted meanwhile).
+ * opened the document (by recorded identity, since the original element was
+ * unmounted meanwhile and the URL alone can match several cards).
  */
 
 const PANEL_CLOSE_SELECTOR =
   '[data-testid="markdown-doc-panel"] [data-testid="auxiliary-panel-close"]';
+
+/**
+ * Identity of the card that invoked the current open, captured while it was
+ * still mounted. The same attachment can appear in several messages — several
+ * cards, one URL — so the opener is remembered as its DOM-order index among
+ * the cards sharing that URL. The index survives the narrow-layout swap (the
+ * message list remounts in the same order) where an element reference or a
+ * URL-only selector cannot single out the invoking card.
+ */
+type OpenerRecord = { index: number; url: string };
+
+let lastOpenerRecord: OpenerRecord | null = null;
+
+function findOpenerCards(url: string): HTMLElement[] {
+  return Array.from(
+    document.querySelectorAll<HTMLElement>(
+      `[data-testid="file-card"][data-doc-url="${CSS.escape(url)}"]`,
+    ),
+  );
+}
+
+/**
+ * Remember which card invoked the open for `url`. Call at open time, while
+ * the clicked element is still in the document; a null/detached opener (e.g.
+ * a deep-link restore with no invoking card) clears the record and the
+ * eventual restore falls back to the first matching card.
+ */
+export function recordMarkdownDocOpener(
+  url: string,
+  opener: HTMLElement | null,
+): void {
+  const index = opener ? findOpenerCards(url).indexOf(opener) : -1;
+  lastOpenerRecord = index >= 0 ? { index, url } : null;
+}
 
 /** Frames to wait for the target to (re)mount before giving up. */
 const FOCUS_SEARCH_FRAMES = 12;
@@ -63,16 +97,22 @@ export function focusMarkdownDocPanelClose(): () => void {
 
 /**
  * After the panel closes, return focus to the attachment card that opened
- * `url` once the channel section has remounted. Aborts if focus has already
+ * `url` once the channel section has remounted — the recorded invoking card
+ * when one exists, the first URL match otherwise. Aborts if focus has already
  * landed on a real control (e.g. a different panel claimed it), and gives up
- * quietly when the card no longer exists.
+ * quietly when no card exists anymore.
  */
 export function restoreFocusToMarkdownDocOpener(url: string): void {
   scheduleFocusSearch(
-    () =>
-      document.querySelector<HTMLElement>(
-        `[data-testid="file-card"][data-doc-url="${CSS.escape(url)}"]`,
-      ),
+    () => {
+      const cards = findOpenerCards(url);
+      if (cards.length === 0) return null;
+      const record = lastOpenerRecord?.url === url ? lastOpenerRecord : null;
+      // One record per invocation: consume it so a later open without a
+      // recorded card (deep link, reload) does not inherit a stale index.
+      if (record) lastOpenerRecord = null;
+      return cards[Math.min(record?.index ?? 0, cards.length - 1)] ?? null;
+    },
     () => !focusIsFree(),
   );
 }

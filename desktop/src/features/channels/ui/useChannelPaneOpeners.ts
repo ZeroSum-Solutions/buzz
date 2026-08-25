@@ -2,6 +2,8 @@ import * as React from "react";
 
 import type { MarkdownDocTarget } from "@/shared/ui/markdown/markdownDocViewerContext";
 
+import { recordMarkdownDocOpener } from "./markdownDocFocus";
+
 type UseChannelPaneOpenersOptions = {
   channelType: string | undefined;
   channelManagementOpen: boolean;
@@ -81,6 +83,10 @@ export function useChannelPaneOpeners({
       // Opening a doc closes the thread pane, so an in-progress thread edit
       // must be resolved first — same contract as the sibling pane openers.
       if (!requireThreadEditResolution()) return;
+      // Capture the invoking card's identity before the panel swap unmounts
+      // it, so close can restore focus to this card and not merely the first
+      // card sharing the document URL.
+      recordMarkdownDocOpener(doc.url, doc.opener ?? null);
       clearCompetingPanes();
       setChannelManagementOpen(false);
       openMarkdownDoc(doc.url, doc.filename);
