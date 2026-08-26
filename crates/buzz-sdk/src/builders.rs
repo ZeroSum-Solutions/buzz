@@ -641,6 +641,13 @@ pub fn canvas_write_created_at(head_created_at: u64) -> Result<u64, SdkError> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    canvas_write_created_at_at(head_created_at, now)
+}
+
+/// Pure core of [`canvas_write_created_at`] with `now` injected — the clock
+/// seam. The public wrapper reads the real clock; tests drive the exact
+/// `now + 900` / `now + 901` boundaries against a fixed `now`.
+fn canvas_write_created_at_at(head_created_at: u64, now: u64) -> Result<u64, SdkError> {
     if head_created_at > now.saturating_add(CANVAS_MAX_FUTURE_SKEW_SECS) {
         return Err(SdkError::InvalidInput(
             "canvas head is timestamped too far in the future; refusing to extend it — \
@@ -3190,24 +3197,20 @@ mod tests {
 
     #[test]
     fn canvas_write_created_at_skew_boundary() {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        // A head exactly at the ceiling is accepted and ratchets the write ahead
-        // of it; one second past the ceiling is rejected as poisoned. Comparing
-        // against `now` captured just before the call is safe: the guard's own
-        // `now` is >= ours, so the accepted case stays <= its ceiling and the
-        // rejected case stays > it even if a second ticks over between reads.
+        // Fixed clock: the injected-`now` core removes the second-rollover seam
+        // that a real-clock read introduces. A head exactly at the ceiling
+        // (`now + 900`) is accepted and stamped strictly ahead; one second past
+        // it is rejected as poisoned.
+        let now = 1_700_000_000u64;
         let at_ceiling = now + CANVAS_MAX_FUTURE_SKEW_SECS;
         assert_eq!(
-            canvas_write_created_at(at_ceiling).unwrap(),
+            canvas_write_created_at_at(at_ceiling, now).unwrap(),
             at_ceiling + 1,
             "a head at now+900 is accepted and stamped strictly ahead"
         );
         assert!(
             matches!(
-                canvas_write_created_at(at_ceiling + 1),
+                canvas_write_created_at_at(at_ceiling + 1, now),
                 Err(SdkError::InvalidInput(_))
             ),
             "a head at now+901 is poisoned and rejected"

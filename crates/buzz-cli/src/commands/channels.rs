@@ -3532,14 +3532,22 @@ mod restore_canvas_tests {
             matches!(err, CliError::Conflict(_)),
             "expected Conflict (exit 5), got {err:?}"
         );
+        let our_id = submitted
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|e| e.get("id"))
+            .and_then(|v| v.as_str())
+            .expect("the restore did publish before it was superseded")
+            .to_string();
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("superseded")
-                && err.to_string().contains("preserved in history"),
-            "conflict must name the persisted revision: {err}"
+            msg.contains("superseded") && msg.contains("preserved in history"),
+            "conflict must describe the supersession: {msg}"
         );
         assert!(
-            submitted.lock().unwrap().is_some(),
-            "the restore did publish before it was superseded"
+            msg.contains(&our_id),
+            "conflict must name the persisted revision id {our_id}: {msg}"
         );
     }
 }
