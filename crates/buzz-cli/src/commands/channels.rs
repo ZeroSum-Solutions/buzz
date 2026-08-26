@@ -384,6 +384,13 @@ pub async fn cmd_canvas_history(
 /// (`created_at = max(now, head.created_at + 1)`) so the restore sorts strictly
 /// ahead of the head it read; the `expected-revision` tag it carries is
 /// advisory (no relay enforcement).
+///
+/// After publishing, a single post-write re-read classifies whether the restore
+/// still holds the visible head (or a later write legitimately built on it). If
+/// a concurrent write has become current, this returns [`CliError::Conflict`]
+/// (exit 5) naming the persisted revision — the restore is not lost, it survives
+/// in history. Detection is bounded to competitors visible by verification time;
+/// preventing the race entirely requires relay-side linearization (phase 2).
 pub async fn cmd_restore_canvas(
     client: &BuzzClient,
     channel_id: &str,
@@ -425,9 +432,50 @@ pub async fn cmd_restore_canvas(
         buzz_sdk::build_set_canvas_after_head(channel_uuid, &content, head_id, head_created_at)
             .map_err(|e| CliError::Other(format!("build_set_canvas failed: {e}")))?;
     let event = client.sign_event(builder)?;
+    let our_id = event.id.to_hex();
     let resp = client.submit_event(event).await?;
+
+    // Post-write supersession check. Re-read the head once and classify via the
+    // SDK's shared predicate: our event is the head, or a later write built on
+    // it → the restore is live; anything else (including no head) → a concurrent
+    // write won the visible head. The restored revision is preserved in history,
+    // so surface a conflict naming it rather than reporting a hollow success.
+    // This only catches a competitor visible by now; the residual race past this
+    // read needs relay linearization (phase 2).
+    let live_head = fetch_canvas_head(client, channel_id).await?;
+    let live_head_id = live_head
+        .as_ref()
+        .and_then(|h| h.get("id"))
+        .and_then(|v| v.as_str());
+    let live_expected_revision = live_head.as_ref().and_then(extract_head_expected_revision);
+    if !buzz_sdk::canvas_write_survived(&our_id, live_head_id, live_expected_revision.as_deref()) {
+        return Err(CliError::Conflict(format!(
+            "canvas restore {our_id} was superseded by a concurrent write; it is preserved in history — re-run restore against the current head if you still want it"
+        )));
+    }
+
     println!("{}", normalize_write_response(&resp));
     Ok(())
+}
+
+/// The head's own `["expected-revision", …]` tag value (the id it built on), or
+/// `None` when absent — used by the post-write supersession check to recognize
+/// a later write that legitimately layered on top of ours.
+fn extract_head_expected_revision(head: &serde_json::Value) -> Option<String> {
+    head.get("tags")
+        .and_then(|t| t.as_array())
+        .and_then(|tags| {
+            tags.iter().find(|t| {
+                t.as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|v| v.as_str())
+                    == Some("expected-revision")
+            })
+        })
+        .and_then(|t| t.as_array())
+        .and_then(|a| a.get(1))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 pub async fn cmd_create_channel(
@@ -1607,11 +1655,16 @@ pub async fn cmd_set_canvas(
     let channel_uuid = parse_uuid(channel_id)?;
 
     // `set` is an unconditional replace — a moved head is not an error, so it
-    // never returns the restore path's conflict/exit-5. It does apply the same
-    // writer discipline: read the head and stamp `created_at = max(now, head + 1)`
-    // so the write sorts strictly ahead of a newer or future-dated head under
-    // `created_at DESC, id ASC` instead of reporting success behind it. With no
-    // head yet, `Some("none")` records the create-assertion at the default `now`.
+    // never returns the restore path's conflict/exit-5, and it takes no
+    // post-write supersession check (it asserts no loaded revision to survive).
+    // It does apply the same writer discipline: read the head and stamp
+    // `created_at = max(now, head + 1)` so the write sorts strictly ahead of a
+    // newer or future-dated head under `created_at DESC, id ASC` instead of
+    // reporting success behind it. That stamping runs through
+    // `build_set_canvas_after_head`, so `set` also inherits its skew guard: a
+    // head timestamped more than 15 minutes in the future is refused with a
+    // clear error rather than extending a poisoned timeline. With no head yet,
+    // `Some("none")` records the create-assertion at the default `now`.
     let builder = match fetch_canvas_head(client, channel_id).await? {
         Some(head) => {
             let head_id = head.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
@@ -3183,14 +3236,22 @@ mod set_canvas_tests {
             .map(str::to_string)
     }
 
-    /// A future-dated head forces the `max(now, head + 1)` bump to resolve to
-    /// `head + 1` deterministically (no clock dependence, no sleeps), so the
-    /// submitted revision sorts strictly ahead of the head under
-    /// `created_at DESC, id ASC` and carries the head id as `expected-revision`.
+    /// A future-dated head (within the skew ceiling) forces the
+    /// `max(now, head + 1)` bump to resolve to `head + 1` deterministically (no
+    /// clock dependence, no sleeps), so the submitted revision sorts strictly
+    /// ahead of the head under `created_at DESC, id ASC` and carries the head id
+    /// as `expected-revision`.
     #[tokio::test]
     async fn set_stamps_ahead_of_future_head_and_asserts_it() {
         let head_id = "a".repeat(64);
-        let future: u64 = 4_102_444_800; // 2100-01-01Z — always ahead of `now`
+        // A head ahead of `now` but inside the 15-minute ceiling: `head + 1`
+        // deterministically wins the `max`, and the guard accepts it. Computed
+        // from `now` so it tracks the wall clock without a hardcoded date.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let future = now + 600;
         let head = json!([{
             "id": head_id,
             "pubkey": "b".repeat(64),
@@ -3217,6 +3278,35 @@ mod set_canvas_tests {
             "must assert the head id it read"
         );
         assert_eq!(event.get("kind").and_then(|v| v.as_u64()), Some(40100));
+    }
+
+    /// `set` inherits the SDK skew guard via `build_set_canvas_after_head`: a
+    /// head timestamped far beyond the future ceiling is refused with a clear
+    /// error and nothing is published, rather than extending a poisoned timeline.
+    #[tokio::test]
+    async fn set_refuses_a_poisoned_future_head() {
+        let head = json!([{
+            "id": "a".repeat(64),
+            "pubkey": "b".repeat(64),
+            "kind": 40100,
+            "content": "old",
+            "created_at": 4_102_444_800u64, // 2100-01-01Z — far past the ceiling
+            "tags": [["h", CHANNEL]],
+        }]);
+        let (url, submitted) = relay(&head.to_string()).await;
+
+        let err = cmd_set_canvas(&client(&url), CHANNEL, "new content")
+            .await
+            .expect_err("a poisoned future head must be refused");
+
+        assert!(
+            err.to_string().contains("too far in the future"),
+            "unexpected message: {err}"
+        );
+        assert!(
+            submitted.lock().unwrap().is_none(),
+            "no event may be published against a poisoned head"
+        );
     }
 
     /// No head yet: `set` still submits (create is not an error) and records the
@@ -3265,6 +3355,191 @@ mod set_canvas_tests {
         assert!(
             submitted.lock().unwrap().is_none(),
             "no event may be published when the head is malformed"
+        );
+    }
+}
+
+/// Command-level coverage for `cmd_restore_canvas`'s post-write supersession
+/// check. After publishing the restored revision, the command re-reads the head
+/// once and classifies the outcome via the SDK's `canvas_write_survived`
+/// predicate. These pin all three post-write outcomes deterministically —
+/// controlled relay responses, no timing, no sleeps — so a revert of the
+/// verification hunk fails a test rather than silently reporting hollow success.
+///
+/// The relay dispatches by filter shape: an `ids` query returns the target
+/// revision's content; the first plain head query returns the pre-write head,
+/// and the post-write head query is synthesized from the captured submission per
+/// a per-test [`PostHead`] mode — so the head can echo our own event id (which
+/// we cannot predict before signing under a random key).
+#[cfg(test)]
+mod restore_canvas_tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::body::Bytes;
+    use axum::extract::State;
+    use axum::routing::post;
+    use axum::Router;
+    use nostr::Keys;
+    use serde_json::{json, Value};
+    use tokio::net::TcpListener;
+
+    use super::cmd_restore_canvas;
+    use crate::client::BuzzClient;
+    use crate::CliError;
+
+    const CHANNEL: &str = "326d56bc-c96c-4af0-86a1-5e804cd1b467";
+    const REVISION: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const HEAD: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const STRANGER: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+
+    /// How the relay synthesizes the post-write head from the submitted event.
+    #[derive(Clone, Copy)]
+    enum PostHead {
+        /// The head is our own submitted event → survived.
+        OurEvent,
+        /// The head is a stranger whose `expected-revision` names our submitted
+        /// event → a later write legitimately built on us → survived.
+        StrangerBuildsOnUs,
+        /// The head is an unrelated stranger → our restore was superseded.
+        Stranger,
+    }
+
+    #[derive(Clone)]
+    struct RelayState {
+        revision_response: Arc<String>,
+        pre_head: Arc<String>,
+        post_head: PostHead,
+        /// Head queries seen so far: read 0 is pre-write, read 1 is post-write.
+        head_reads: Arc<Mutex<u32>>,
+        submitted: Arc<Mutex<Option<Value>>>,
+    }
+
+    async fn relay(post_head: PostHead) -> (String, Arc<Mutex<Option<Value>>>) {
+        let submitted: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let state = RelayState {
+            revision_response: Arc::new(json!([canvas_event(REVISION, 1_000, None)]).to_string()),
+            pre_head: Arc::new(json!([canvas_event(HEAD, 2_000, None)]).to_string()),
+            post_head,
+            head_reads: Arc::new(Mutex::new(0)),
+            submitted: submitted.clone(),
+        };
+        let app = Router::new()
+            .route(
+                "/query",
+                post(|State(s): State<RelayState>, body: Bytes| async move {
+                    let is_ids_query = std::str::from_utf8(&body)
+                        .map(|b| b.contains("\"ids\""))
+                        .unwrap_or(false);
+                    if is_ids_query {
+                        return (*s.revision_response).clone();
+                    }
+                    let mut reads = s.head_reads.lock().unwrap();
+                    let read = *reads;
+                    *reads += 1;
+                    if read == 0 {
+                        return (*s.pre_head).clone();
+                    }
+                    // Post-write head: synthesize from the captured submission.
+                    let our_id = s
+                        .submitted
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .and_then(|e| e.get("id"))
+                        .and_then(|v| v.as_str())
+                        .expect("post-write head read must follow a submit")
+                        .to_string();
+                    match s.post_head {
+                        PostHead::OurEvent => {
+                            json!([canvas_event(&our_id, 2_001, Some(HEAD))]).to_string()
+                        }
+                        PostHead::StrangerBuildsOnUs => {
+                            json!([canvas_event(STRANGER, 2_002, Some(&our_id))]).to_string()
+                        }
+                        PostHead::Stranger => {
+                            json!([canvas_event(STRANGER, 2_002, Some(HEAD))]).to_string()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/events",
+                post(|State(s): State<RelayState>, body: Bytes| async move {
+                    let event: Value = serde_json::from_slice(&body).expect("event json");
+                    *s.submitted.lock().unwrap() = Some(event);
+                    r#"{"event_id":"deadbeef","accepted":true,"message":""}"#.to_string()
+                }),
+            )
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), submitted)
+    }
+
+    fn client(base_url: &str) -> BuzzClient {
+        BuzzClient::new(base_url.to_string(), Keys::generate(), None, None).unwrap()
+    }
+
+    /// A canvas event JSON with the given id/created_at and optional
+    /// `expected-revision` ancestry tag.
+    fn canvas_event(id: &str, created_at: u64, expected_revision: Option<&str>) -> Value {
+        let mut tags = vec![json!(["h", CHANNEL])];
+        if let Some(rev) = expected_revision {
+            tags.push(json!(["expected-revision", rev]));
+        }
+        json!({
+            "id": id,
+            "pubkey": "c".repeat(64),
+            "kind": 40100,
+            "content": "target content",
+            "created_at": created_at,
+            "tags": tags,
+        })
+    }
+
+    /// The post-write head is our own event → restore holds the head → success.
+    #[tokio::test]
+    async fn restore_survives_when_head_is_our_event() {
+        let (url, submitted) = relay(PostHead::OurEvent).await;
+        cmd_restore_canvas(&client(&url), CHANNEL, REVISION)
+            .await
+            .expect("restore that holds the head succeeds");
+        assert!(submitted.lock().unwrap().is_some(), "restore must publish");
+    }
+
+    /// A later write built on our restore (its `expected-revision` names us):
+    /// the restore is still in the accepted chain → success.
+    #[tokio::test]
+    async fn restore_survives_when_head_builds_on_it() {
+        let (url, submitted) = relay(PostHead::StrangerBuildsOnUs).await;
+        cmd_restore_canvas(&client(&url), CHANNEL, REVISION)
+            .await
+            .expect("restore a later write built on succeeds");
+        assert!(submitted.lock().unwrap().is_some(), "restore must publish");
+    }
+
+    /// A concurrent stranger won the visible head (no ancestry to our restore):
+    /// the command returns `CliError::Conflict` naming the persisted revision.
+    #[tokio::test]
+    async fn restore_conflicts_when_head_is_a_stranger() {
+        let (url, submitted) = relay(PostHead::Stranger).await;
+        let err = cmd_restore_canvas(&client(&url), CHANNEL, REVISION)
+            .await
+            .expect_err("a stranger head must be a supersession conflict");
+
+        assert!(
+            matches!(err, CliError::Conflict(_)),
+            "expected Conflict (exit 5), got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("superseded")
+                && err.to_string().contains("preserved in history"),
+            "conflict must name the persisted revision: {err}"
+        );
+        assert!(
+            submitted.lock().unwrap().is_some(),
+            "the restore did publish before it was superseded"
         );
     }
 }

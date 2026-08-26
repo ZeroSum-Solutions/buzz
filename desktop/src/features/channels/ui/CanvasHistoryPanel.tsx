@@ -15,9 +15,8 @@ import {
   RELAY_UNREACHABLE_SHORT,
 } from "@/shared/lib/relayError";
 import {
-  CANVAS_CONFLICT_MESSAGE,
   CANVAS_EXPECTED_REVISION_NONE,
-  isCanvasConflictError,
+  canvasConflictMessage,
 } from "@/features/channels/canvasConflict";
 import { Button } from "@/shared/ui/button";
 
@@ -158,9 +157,8 @@ export function CanvasHistoryPanel({
                   ) : null}
                   {restoreMutation.error instanceof Error ? (
                     <p className="text-sm text-destructive">
-                      {isCanvasConflictError(restoreMutation.error)
-                        ? CANVAS_CONFLICT_MESSAGE
-                        : restoreMutation.error.message}
+                      {canvasConflictMessage(restoreMutation.error) ??
+                        restoreMutation.error.message}
                     </p>
                   ) : null}
                 </div>

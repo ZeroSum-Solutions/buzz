@@ -14,9 +14,8 @@ import {
   RELAY_UNREACHABLE_SHORT,
 } from "@/shared/lib/relayError";
 import {
-  CANVAS_CONFLICT_MESSAGE,
   CANVAS_EXPECTED_REVISION_NONE,
-  isCanvasConflictError,
+  canvasConflictMessage,
 } from "@/features/channels/canvasConflict";
 import { CanvasHistoryPanel } from "./CanvasHistoryPanel";
 
@@ -138,9 +137,8 @@ export function ChannelCanvas({
         </div>
         {setCanvasMutation.error instanceof Error ? (
           <p className="text-sm text-destructive">
-            {isCanvasConflictError(setCanvasMutation.error)
-              ? CANVAS_CONFLICT_MESSAGE
-              : setCanvasMutation.error.message}
+            {canvasConflictMessage(setCanvasMutation.error) ??
+              setCanvasMutation.error.message}
           </p>
         ) : null}
       </div>

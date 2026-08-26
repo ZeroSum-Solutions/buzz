@@ -559,11 +559,14 @@ pub fn build_custom_emoji_set(emojis: &[CustomEmoji]) -> Result<EventBuilder, Sd
 /// When `expected_revision` is set, an `["expected-revision", …]` tag is
 /// attached documenting the head the write was composed against: a 64-hex
 /// event ID names the head it expects, and the literal `none` asserts no head
-/// exists yet. Concurrency enforcement is **client-side** (the CLI/Desktop
-/// compare against a freshly read head before publishing); the relay does not
-/// interpret this tag today, so it is advisory/documentary and preserves the
-/// option to add relay enforcement later with zero client change. Omit it for
-/// an unconditional append (backward compatible).
+/// exists yet. Concurrency enforcement is **client-side** and best-effort: the
+/// CLI/Desktop compare against a freshly read head before publishing and
+/// re-read once after (see `canvas_write_survived`) to detect a competitor
+/// visible by then. The relay does not interpret this tag today, so it is
+/// advisory/documentary — detection only, not prevention; closing the race
+/// entirely needs relay enforcement, which this design leaves room to add with
+/// zero client change. Omit the tag for an unconditional append (backward
+/// compatible).
 pub fn build_set_canvas(
     channel_id: Uuid,
     content: &str,
@@ -607,16 +610,19 @@ pub fn build_set_canvas_after_head(
     head_id: &str,
     head_created_at: u64,
 ) -> Result<EventBuilder, SdkError> {
-    if head_created_at == u64::MAX {
-        return Err(SdkError::InvalidInput(
-            "head_created_at must be below u64::MAX so the write can stamp strictly ahead of it"
-                .into(),
-        ));
-    }
-    let created_at = canvas_write_created_at(head_created_at);
+    let created_at = canvas_write_created_at(head_created_at)?;
     Ok(build_set_canvas(channel_id, content, Some(head_id))?
         .custom_created_at(nostr::Timestamp::from(created_at)))
 }
+
+/// Maximum future skew a canvas head may carry before a first-party client
+/// refuses to ratchet past it (seconds). A head timestamped beyond `now +
+/// CANVAS_MAX_FUTURE_SKEW_SECS` is treated as poisoned: stamping
+/// `max(now, head + 1)` against it would silently extend a bogus timeline
+/// arbitrarily far ahead, and every later legitimate write would inherit that
+/// floor. Relay-side ingestion bounds are follow-up work; this stops
+/// first-party clients from propagating the poison in the meantime.
+pub const CANVAS_MAX_FUTURE_SKEW_SECS: u64 = 900;
 
 /// Contract-v3 writer-discipline timestamp for a canvas write asserting a head
 /// at `head_created_at`: `max(now, head_created_at + 1)` (Unix seconds).
@@ -625,12 +631,53 @@ pub fn build_set_canvas_after_head(
 /// stamps CLI restore/`set` writes with this, and Desktop's `set_canvas` calls
 /// it directly for the same reason, so the `max(now, head + 1)` rule is never
 /// re-derived per surface.
-pub fn canvas_write_created_at(head_created_at: u64) -> u64 {
+///
+/// Rejects a head timestamped more than [`CANVAS_MAX_FUTURE_SKEW_SECS`] beyond
+/// `now` rather than ratcheting past it: extending a poisoned future timeline
+/// would strand every later write behind a floor arbitrarily far ahead.
+/// `u64::MAX` is covered by the same ceiling.
+pub fn canvas_write_created_at(head_created_at: u64) -> Result<u64, SdkError> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    now.max(head_created_at.saturating_add(1))
+    if head_created_at > now.saturating_add(CANVAS_MAX_FUTURE_SKEW_SECS) {
+        return Err(SdkError::InvalidInput(
+            "canvas head is timestamped too far in the future; refusing to extend it — \
+             relay-side bounds are follow-up work"
+                .into(),
+        ));
+    }
+    Ok(now.max(head_created_at.saturating_add(1)))
+}
+
+/// Whether a just-published canvas write still survives as (or under) the live
+/// head read back after submit — the post-write supersession check.
+///
+/// A conflict-checked write (Desktop save/restore, CLI `restore`) re-reads the
+/// head once after publishing and classifies:
+/// - the head **is** our event → survived;
+/// - the head **builds on** our event (its `expected-revision` names us) → a
+///   later write legitimately layered on top, so our revision is still in the
+///   accepted chain → survived;
+/// - anything else, including **no head at all** → not survived: a concurrent
+///   write won the visible head and ours is superseded (preserved in history,
+///   not lost).
+///
+/// Both comparisons are case-insensitive, matching the precondition check's
+/// `eq_ignore_ascii_case` convention. This only detects a competitor already
+/// visible at verification time; a competitor that lands *after* this read is
+/// still missed — closing that window needs relay-side linearization (phase 2).
+pub fn canvas_write_survived(
+    our_id: &str,
+    head_id: Option<&str>,
+    head_expected_revision: Option<&str>,
+) -> bool {
+    match head_id {
+        None => false,
+        Some(head_id) if head_id.eq_ignore_ascii_case(our_id) => true,
+        Some(_) => head_expected_revision.is_some_and(|rev| rev.eq_ignore_ascii_case(our_id)),
+    }
 }
 
 /// Build a NIP-01 profile metadata event (kind 0).
@@ -3089,10 +3136,14 @@ mod tests {
     fn set_canvas_after_head_pins_revision_and_bumps_timestamp() {
         let cid = uuid();
         let head = event_id().to_hex();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
 
-        // Head created far in the future relative to the signer's clock: the
-        // discipline must still stamp strictly ahead of the asserted head.
-        let future_head = 4_000_000_000_u64;
+        // Head created ahead of the signer's clock but within the future-skew
+        // ceiling: the discipline must still stamp strictly ahead of it.
+        let future_head = now + CANVAS_MAX_FUTURE_SKEW_SECS;
         let ev = sign(build_set_canvas_after_head(cid, "# Restored", &head, future_head).unwrap());
         assert!(has_tag(&ev, "expected-revision", &head));
         assert!(
@@ -3129,12 +3180,65 @@ mod tests {
     fn set_canvas_after_head_rejects_max_head_created_at() {
         let cid = uuid();
         let head = event_id().to_hex();
-        // u64::MAX cannot be stamped strictly ahead of: reject instead of
+        // u64::MAX is far beyond the future-skew ceiling: reject instead of
         // silently saturating and breaking the head-advancement guarantee.
         assert!(matches!(
             build_set_canvas_after_head(cid, "# Restored", &head, u64::MAX),
             Err(SdkError::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn canvas_write_created_at_skew_boundary() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // A head exactly at the ceiling is accepted and ratchets the write ahead
+        // of it; one second past the ceiling is rejected as poisoned. Comparing
+        // against `now` captured just before the call is safe: the guard's own
+        // `now` is >= ours, so the accepted case stays <= its ceiling and the
+        // rejected case stays > it even if a second ticks over between reads.
+        let at_ceiling = now + CANVAS_MAX_FUTURE_SKEW_SECS;
+        assert_eq!(
+            canvas_write_created_at(at_ceiling).unwrap(),
+            at_ceiling + 1,
+            "a head at now+900 is accepted and stamped strictly ahead"
+        );
+        assert!(
+            matches!(
+                canvas_write_created_at(at_ceiling + 1),
+                Err(SdkError::InvalidInput(_))
+            ),
+            "a head at now+901 is poisoned and rejected"
+        );
+    }
+
+    #[test]
+    fn canvas_write_survived_classifies_head_ancestry() {
+        let ours = "a".repeat(64);
+        let other = "b".repeat(64);
+        // Head is our own event → survived.
+        assert!(canvas_write_survived(&ours, Some(&ours), None));
+        // Head is case-insensitively our event → survived.
+        assert!(canvas_write_survived(
+            &ours,
+            Some(&ours.to_uppercase()),
+            None
+        ));
+        // Head is a stranger that builds on us (case-insensitively) → survived.
+        assert!(canvas_write_survived(
+            &ours,
+            Some(&other),
+            Some(&ours.to_uppercase())
+        ));
+        // Head is a stranger that builds on someone else → superseded.
+        assert!(!canvas_write_survived(&ours, Some(&other), Some(&other)));
+        // Head is a stranger with no ancestry tag → superseded.
+        assert!(!canvas_write_survived(&ours, Some(&other), None));
+        // No head at all after an accepted write → superseded, never silent
+        // success (shouldn't happen, classified conservatively).
+        assert!(!canvas_write_survived(&ours, None, None));
     }
 
     #[test]

@@ -52,19 +52,25 @@ pub async fn set_canvas(
     let uuid = uuid::Uuid::parse_str(&channel_id)
         .map_err(|_| format!("invalid channel UUID: {channel_id}"))?;
 
-    // Advisory optimistic-concurrency check (client-side). A conflict-checked
-    // save asserts the revision the editor loaded; we read the live head once
-    // and compare locally, returning one of the frozen conflict markers so
-    // `canvasConflict.ts` renders the reload state. This catches the realistic
-    // stale-edit case (head moved minutes ago). It cannot close the
-    // millisecond race between this read and the write — that would need relay
-    // enforcement — but the day-to-day protection and conflict UX are intact.
+    // Advisory optimistic-concurrency check (client-side, two-stage). A
+    // conflict-checked save asserts the revision the editor loaded. Stage one:
+    // read the live head once before publishing and compare locally, returning
+    // a frozen pre-write conflict marker if it already moved — this catches the
+    // realistic stale-edit case (head moved minutes ago). Stage two, after
+    // publishing (below): re-read the head once and confirm our write is (or is
+    // built upon by) the visible head, surfacing a distinct post-write
+    // supersession marker otherwise. Detection is bounded to a competitor
+    // visible at check time; preventing the race entirely — a competitor that
+    // lands between our read and write, or after the post-write read — needs
+    // relay-side linearization (phase 2).
     //
     // `head` is `None` when the channel has no canvas yet. A matched head's
     // `created_at` is the floor for writer discipline: an accepted save stamps
     // `created_at = max(now, head + 1)` via the SDK's `canvas_write_created_at`
     // — the one home for canvas timestamp discipline — so it sorts strictly
-    // ahead of the head it read under `created_at DESC, id ASC`. The no-head /
+    // ahead of the head it read under `created_at DESC, id ASC`. That helper
+    // also refuses a head timestamped far in the future, so a poisoned timeline
+    // fails loudly here rather than being silently extended. The no-head /
     // unconditional-append case has no floor and keeps the default `now`.
     let head = current_canvas_head(&state, &channel_id).await?;
     let prior_head_created_at = check_canvas_precondition(expected_revision.as_deref(), head)?;
@@ -72,10 +78,30 @@ pub async fn set_canvas(
     let mut builder = events::build_set_canvas(uuid, &content, expected_revision.as_deref())?;
     if let Some(floor) = prior_head_created_at {
         builder = builder.custom_created_at(nostr::Timestamp::from(
-            buzz_sdk_pkg::canvas_write_created_at(floor as u64),
+            buzz_sdk_pkg::canvas_write_created_at(floor as u64).map_err(|e| e.to_string())?,
         ));
     }
     let result = submit_event(builder, &state).await?;
+
+    // Post-write supersession detection (only for conflict-checked writes). The
+    // precondition above closes the stale-edit case; this closes the narrower
+    // window where a concurrent write we could not see at precondition time has
+    // become visible by now. Re-read the head once and classify: our event is
+    // the head, or a later write legitimately built on it → success; anything
+    // else → our revision was superseded (it is preserved in history, not
+    // lost). An unconditional append (`None`) has nothing to assert, so it stays
+    // fire-and-forget. This cannot close the residual race where the competitor
+    // lands *after* this read — that needs relay linearization (phase 2).
+    if expected_revision.is_some() {
+        let head = current_canvas_head_ancestry(&state, &channel_id).await?;
+        let (head_id, head_expected_revision) = match &head {
+            Some((id, rev)) => (Some(id.as_str()), rev.as_deref()),
+            None => (None, None),
+        };
+        if !buzz_sdk_pkg::canvas_write_survived(&result.event_id, head_id, head_expected_revision) {
+            return Err(CANVAS_SUPERSEDED.to_string());
+        }
+    }
 
     Ok(serde_json::json!({
         "ok": true,
@@ -89,6 +115,12 @@ pub async fn set_canvas(
 /// `CANVAS_CONFLICT_MARKERS` list on the TS side.
 const CANVAS_CHANGED: &str = "conflict: canvas changed since it was loaded";
 const CANVAS_REVISION_MISSING: &str = "conflict: canvas revision does not exist";
+/// Post-write marker: the save published successfully but a concurrent write is
+/// now the visible head. The user's revision is **not** lost — it is preserved
+/// in history — so the TS surface renders a distinct "reload, then restore it
+/// if needed" message rather than the pre-write "reapply your edit" message.
+/// Keep byte-identical to `CANVAS_SUPERSEDED_MARKER` on the TS side.
+const CANVAS_SUPERSEDED: &str = "conflict: canvas save was superseded by a concurrent write";
 
 /// Pure advisory precondition: compare the revision the editor asserts against
 /// the live `head` (`(event_id, created_at)` or `None` when no canvas exists),
@@ -142,6 +174,37 @@ async fn current_canvas_head(
     Ok(events
         .first()
         .map(|event| (event.id.to_hex(), event.created_at.as_secs() as i64)))
+}
+
+/// Read the live canvas head as `(event_id, expected-revision tag)` for the
+/// post-write supersession check. The second element is the head's own
+/// `["expected-revision", …]` tag value (the id it built on), or `None` when
+/// the head carries no such tag. Returns `None` when the channel has no canvas.
+async fn current_canvas_head_ancestry(
+    state: &AppState,
+    channel_id: &str,
+) -> Result<Option<(String, Option<String>)>, String> {
+    let events = query_relay(
+        state,
+        &[serde_json::json!({
+            "kinds": [40100],
+            "#h": [channel_id],
+            "limit": 1
+        })],
+    )
+    .await?;
+    Ok(events.first().map(|event| {
+        let expected_revision = event
+            .tags
+            .iter()
+            .find(|t| {
+                t.as_slice()
+                    .first()
+                    .is_some_and(|k| k == "expected-revision")
+            })
+            .and_then(|t| t.as_slice().get(1).cloned());
+        (event.id.to_hex(), expected_revision)
+    }))
 }
 
 /// One page of a channel canvas's revision stream (kind:40100), newest first.
