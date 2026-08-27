@@ -76,6 +76,8 @@ export type AutocompleteEdit = {
   preserveSelection?: boolean;
   /** Skip asynchronous DOM caret reassertion when focus may move elsewhere. */
   reassertMentionCaret?: boolean;
+  /** Suppress authored-update observers for automatic composer restoration. */
+  preventUpdate?: boolean;
   /**
    * When set, the replaced range becomes a CustomEmojiNode for this
    * shortcode (followed by `insertText`, which carries the trailing space)
@@ -802,6 +804,7 @@ export function useRichTextEditor({
       customEmojiShortcode?: string,
       preserveSelection = false,
       reassertMentionCaret = !preserveSelection,
+      preventUpdate = false,
     ) => {
       if (!editor) return;
       const projection = buildPlainTextProjection(editor.state.doc);
@@ -824,6 +827,7 @@ export function useRichTextEditor({
           // after it.
           const afterNode = tr.mapping.map(toPM);
           if (text) tr = tr.insertText(text, afterNode);
+          if (preventUpdate) tr.setMeta("preventUpdate", true);
           const cursorPM = afterNode + (text ? text.length : 0);
           tr = tr.setSelection(TextSelection.create(tr.doc, cursorPM));
           editor.view.dispatch(tr);
@@ -834,6 +838,7 @@ export function useRichTextEditor({
       }
 
       const tr = editor.state.tr.insertText(text, fromPM, toPM);
+      if (preventUpdate) tr.setMeta("preventUpdate", true);
       if (preserveSelection) {
         tr.setSelection(editor.state.selection.map(tr.doc, tr.mapping));
       } else {

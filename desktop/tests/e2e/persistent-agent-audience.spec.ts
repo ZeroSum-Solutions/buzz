@@ -169,6 +169,28 @@ async function readOutgoingMentionPubkeys(page: Page, content: string) {
   }, content);
 }
 
+async function readStoredDraftEntryKind(page: Page, channelId: string) {
+  return page.evaluate((targetChannelId) => {
+    for (let index = 0; index < window.localStorage.length; index += 1) {
+      const key = window.localStorage.key(index);
+      if (!key?.startsWith("buzz-drafts.")) continue;
+      const raw = window.localStorage.getItem(key);
+      if (!raw) continue;
+      try {
+        const drafts = JSON.parse(raw) as Record<
+          string,
+          { channelId?: string; entryKind?: string }
+        >;
+        const draft = Object.values(drafts).find(
+          (candidate) => candidate.channelId === targetChannelId,
+        );
+        if (draft) return draft.entryKind ?? null;
+      } catch {}
+    }
+    return null;
+  }, channelId);
+}
+
 async function emitMockMessage(
   page: Page,
   content: string,
@@ -379,6 +401,76 @@ test("keeps the composer and global automatic mention settings synchronized", as
       name: "Automatically mention Morgarita",
     }),
   ).toHaveAttribute("aria-pressed", "false");
+});
+
+test("automatic agent prefill survives navigation and reload without becoming an Inbox draft", async ({
+  page,
+}) => {
+  await installAudienceFixtures(page);
+  await openGeneral(page);
+
+  const composer = channelComposer(page);
+  await automaticallyMention(composer, "Morgarita");
+  await expect(composer.getByTestId("message-input")).toHaveText("@Morgarita ");
+  await expect
+    .poll(() => readStoredDraftEntryKind(page, CHANNEL_ID))
+    .toBe("agent-prefill");
+
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+  await expect(page.getByTestId("home-inbox")).toBeVisible();
+  expect(await readStoredDraftEntryKind(page, CHANNEL_ID)).toBe(
+    "agent-prefill",
+  );
+  await page.getByTestId("inbox-filter-trigger").click();
+  await page.getByRole("menuitemradio", { name: "Drafts" }).click();
+  await expect(page.getByTestId("home-inbox-drafts")).toBeVisible();
+  await expect(page.locator("[data-testid^='home-draft-item-']")).toHaveCount(
+    0,
+  );
+  await expect(page.getByTestId("inbox-draft-badge-option")).toHaveCount(0);
+
+  await openGeneral(page);
+  await expect(channelComposer(page).getByTestId("message-input")).toHaveText(
+    "@Morgarita ",
+  );
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+  await expect(channelComposer(page).getByTestId("message-input")).toHaveText(
+    "@Morgarita ",
+  );
+});
+
+test("cancelling a message edit restores the automatic prefill classification", async ({
+  page,
+}) => {
+  await installAudienceFixtures(page);
+  await openGeneral(page);
+
+  const composer = channelComposer(page);
+  const input = composer.getByTestId("message-input");
+  await automaticallyMention(composer, "Morgarita");
+  await expect
+    .poll(() => readStoredDraftEntryKind(page, CHANNEL_ID))
+    .toBe("agent-prefill");
+
+  const editableRow = page.locator(`[data-message-id="${THREAD_ROOT_ID}"]`);
+  await editableRow.hover();
+  await editableRow.getByRole("button", { name: "More actions" }).click();
+  await page.getByTestId(`edit-message-${THREAD_ROOT_ID}`).click();
+  await expect(composer.getByTestId("edit-target")).toBeVisible();
+
+  await composer.getByRole("button", { name: "Cancel edit" }).click();
+  await expect(input).toHaveText("@Morgarita ");
+  await expect
+    .poll(() => readStoredDraftEntryKind(page, CHANNEL_ID))
+    .toBe("agent-prefill");
+
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+  await page.getByTestId("inbox-filter-trigger").click();
+  await page.getByRole("menuitemradio", { name: "Drafts" }).click();
+  await expect(page.locator("[data-testid^='home-draft-item-']")).toHaveCount(
+    0,
+  );
 });
 
 test("the disabled root composer preserves its explicit draft without audience controls", async ({
