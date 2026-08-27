@@ -31,6 +31,7 @@ import { ChannelManagementAuxiliaryPanel } from "@/features/channels/ui/ChannelM
 import { IdleAuxiliaryPanel } from "@/features/channels/ui/IdleAuxiliaryPanel";
 import { MarkdownDocAuxiliaryPanel } from "@/features/channels/ui/MarkdownDocAuxiliaryPanel";
 import { RightAuxiliaryPane } from "@/features/channels/ui/RightAuxiliaryPane";
+import { createChannelPaneAuxiliaryLayout } from "@/features/channels/ui/channelPaneAuxiliaryLayout";
 import {
   ThreadPanelSurface,
   useThreadPanelSurface,
@@ -54,8 +55,6 @@ import { useWelcomeComposerBanner } from "@/features/channels/ui/useWelcomeCompo
 import {
   mentionsKnownAgent,
   selectThreadComposerBotTypingPubkeys,
-  shouldPrioritizeIdleAuxiliary,
-  shouldUseFocusIdleDrawer,
 } from "@/features/channels/ui/ChannelPane.helpers";
 import { HuddleStartingView, HuddleTranscriptIntro } from "@/features/huddle";
 import { ChannelGlyph } from "@/features/channels/ui/ChannelGlyph";
@@ -424,12 +423,7 @@ export const ChannelPane = React.memo(function ChannelPane({
     threadHeadMessage,
   ]);
   const isOverlay = useIsThreadPanelOverlay();
-  const useSplitAuxiliaryPane = !isSinglePanelView && !isOverlay;
   const threadViewMode = useThreadViewMode();
-  const hasThreadSurface =
-    Boolean(threadHeadMessage) || shouldShowThreadSkeleton;
-  const useFocusThreadDrawer =
-    threadViewMode === "focus" && useSplitAuxiliaryPane && hasThreadSurface;
   const selectedAgent = React.useMemo(
     () =>
       agentSessionSelection.resolveSelectedAgentSession({
@@ -440,28 +434,29 @@ export const ChannelPane = React.memo(function ChannelPane({
       }),
     [agentSessionAgents, openAgentSessionPubkey, profilePanelPubkey, profiles],
   );
-  const hasIdleAuxiliary =
-    Boolean(idleAuxiliaryPanel) && Boolean(onCloseIdleAuxiliaryPanel);
-  const priorityIdleAuxiliary = shouldPrioritizeIdleAuxiliary(
-    idleAuxiliaryOverridesThread,
-    hasIdleAuxiliary,
-  );
-  const overlayIdleAuxiliaryOverThread =
-    priorityIdleAuxiliary && hasThreadSurface && !isOverlay;
-  const replaceThreadWithIdleAuxiliary =
-    priorityIdleAuxiliary && hasThreadSurface && isOverlay;
-  const useFocusIdleDrawer = shouldUseFocusIdleDrawer({
+  const {
+    hasSplitAuxiliaryPane,
+    openMarkdownDoc,
+    priorityIdleAuxiliary,
+    replaceThreadWithIdleAuxiliary,
+    showIdleAuxiliaryOverThread,
+    useFocusIdleDrawer,
+    useFocusThreadDrawer,
+    useSplitAuxiliaryPane,
+  } = createChannelPaneAuxiliaryLayout({
     channelManagementOpen,
     hasAgentSession: Boolean(activeChannel && selectedAgent),
     hasIdleAuxiliaryPanel: Boolean(idleAuxiliaryPanel),
     hasIdlePanelCloseHandler: Boolean(onCloseIdleAuxiliaryPanel),
     hasProfilePanel: Boolean(profilePanelPubkey),
-    hasThreadSurface,
-    overrideThread: overlayIdleAuxiliaryOverThread,
-    useSplitAuxiliaryPane,
+    hasThreadSurface: Boolean(threadHeadMessage) || shouldShowThreadSkeleton,
+    idleAuxiliaryOverridesThread,
+    isOverlay,
+    isSinglePanelView,
+    markdownDocName,
+    markdownDocUrl,
+    threadViewMode,
   });
-  const showIdleAuxiliaryOverThread =
-    overlayIdleAuxiliaryOverThread && useFocusIdleDrawer;
   const { channelIsCovered, markExitComplete } = useFocusDrawerPresence(
     useFocusThreadDrawer || useFocusIdleDrawer,
     priorityIdleAuxiliary
@@ -498,18 +493,6 @@ export const ChannelPane = React.memo(function ChannelPane({
     threadMessages: threadMessages.map((entry) => entry.message),
     useFocusThreadDrawer,
   });
-  const openMarkdownDoc =
-    markdownDocUrl && markdownDocName
-      ? { filename: markdownDocName, url: markdownDocUrl }
-      : null;
-  const hasSplitAuxiliaryPane =
-    useSplitAuxiliaryPane &&
-    (channelManagementOpen ||
-      Boolean(threadHeadMessage) ||
-      shouldShowThreadSkeleton ||
-      Boolean(activeChannel && selectedAgent) ||
-      Boolean(profilePanelPubkey) ||
-      Boolean(openMarkdownDoc));
   const wrapAux = (
     panel: React.ReactNode,
     testId: string,
@@ -825,7 +808,6 @@ export const ChannelPane = React.memo(function ChannelPane({
           </div>
         </section>
       ) : null}
-      {/* Serialize replacements so focus drawers keep one travel direction. */}
       <AnimatePresence mode="wait" onExitComplete={markExitComplete}>
         {channelManagementOpen && activeChannel ? (
           <ChannelManagementAuxiliaryPanel
