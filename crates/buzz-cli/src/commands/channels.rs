@@ -438,12 +438,14 @@ pub async fn cmd_restore_canvas(
     let our_id = event.id.to_hex();
     let resp = client.submit_event(event).await?;
 
-    // Post-write supersession check. Re-read the head once and classify via the
-    // SDK's shared predicate: our event is the head, or a later write built on
-    // it → the restore is live; anything else (including no head) → a concurrent
-    // write won the visible head. The restored revision is preserved in history,
-    // so surface a conflict naming it rather than reporting a hollow success.
-    // This only catches a competitor visible by now; the residual race past this
+    // Post-write supersession check. Re-read a recent slice of the revision
+    // stream and classify via the SDK's shared predicate: our event is the
+    // head, or reachable through the head's `expected-revision` ancestry chain
+    // (a later write legitimately built on ours, possibly transitively) → the
+    // restore is live; anything else (including no head) → a concurrent write
+    // won the visible head. The restored revision is preserved in history, so
+    // surface a conflict naming it rather than reporting a hollow success. This
+    // only catches a competitor visible by now; the residual race past this
     // read needs relay linearization (phase 2).
     //
     // The submit above was accepted, so the restore is durable. Only this
@@ -451,8 +453,8 @@ pub async fn cmd_restore_canvas(
     // accepted publish as a failed restore. Print the normal success response
     // naming `our_id`, warn on stderr that verification was unavailable, and
     // exit 0 — a failed read is not a conflict.
-    let live_head = match fetch_canvas_head(client, channel_id).await {
-        Ok(head) => head,
+    let live_stream = match fetch_canvas_ancestry(client, channel_id).await {
+        Ok(stream) => stream,
         Err(_) => {
             eprintln!(
                 "warning: canvas restore {our_id} was published but its post-write verification read failed; the restore is preserved in history — check `buzz canvas history` if a concurrent edit may have landed"
@@ -461,12 +463,7 @@ pub async fn cmd_restore_canvas(
             return Ok(());
         }
     };
-    let live_head_id = live_head
-        .as_ref()
-        .and_then(|h| h.get("id"))
-        .and_then(|v| v.as_str());
-    let live_expected_revision = live_head.as_ref().and_then(extract_head_expected_revision);
-    if !buzz_sdk::canvas_write_survived(&our_id, live_head_id, live_expected_revision.as_deref()) {
+    if !buzz_sdk::canvas_write_survived(&our_id, &live_stream) {
         return Err(CliError::Conflict(format!(
             "canvas restore {our_id} was superseded by a concurrent write; it is preserved in history — re-run restore against the current head if you still want it"
         )));
@@ -474,6 +471,36 @@ pub async fn cmd_restore_canvas(
 
     println!("{}", normalize_write_response(&resp));
     Ok(())
+}
+
+/// Read a recent slice of the canvas revision stream as `(event_id,
+/// expected-revision tag)` pairs, newest first, for the post-write supersession
+/// check. The head is the first element; the rest let
+/// [`buzz_sdk::canvas_write_survived`] walk `expected-revision` links back
+/// through a descendant chain (A→B→C) so a legitimate later write layered on
+/// ours is not misread as a supersession. An empty vec means no canvas exists.
+async fn fetch_canvas_ancestry(
+    client: &BuzzClient,
+    channel_id: &str,
+) -> Result<Vec<(String, Option<String>)>, CliError> {
+    let filter = serde_json::json!({
+        "kinds": [40100],
+        "#h": [channel_id],
+        "limit": buzz_sdk::CANVAS_ANCESTRY_WALK_MAX,
+    });
+    let resp = client.query(&filter).await?;
+    let events: Vec<serde_json::Value> = serde_json::from_str(&resp).map_err(|e| {
+        CliError::Other(format!(
+            "malformed relay response querying canvas head: {e}"
+        ))
+    })?;
+    Ok(events
+        .iter()
+        .filter_map(|event| {
+            let id = event.get("id").and_then(|v| v.as_str())?.to_string();
+            Some((id, extract_head_expected_revision(event)))
+        })
+        .collect())
 }
 
 /// The head's own `["expected-revision", …]` tag value (the id it built on), or
@@ -3409,6 +3436,7 @@ mod restore_canvas_tests {
     const REVISION: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const HEAD: &str = "2222222222222222222222222222222222222222222222222222222222222222";
     const STRANGER: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+    const THIRD: &str = "4444444444444444444444444444444444444444444444444444444444444444";
 
     /// How the relay synthesizes the post-write head from the submitted event.
     #[derive(Clone, Copy)]
@@ -3418,6 +3446,9 @@ mod restore_canvas_tests {
         /// The head is a stranger whose `expected-revision` names our submitted
         /// event → a later write legitimately built on us → survived.
         StrangerBuildsOnUs,
+        /// The head is a stranger two links above ours: C(exp=B)→B(exp=ours)→
+        /// ours, all present in the stream → survived by ancestry walk.
+        StrangerBuildsOnUsTransitively,
         /// The head is an unrelated stranger → our restore was superseded.
         Stranger,
         /// The post-write verification read fails (HTTP 500). The submit was
@@ -3483,6 +3514,17 @@ mod restore_canvas_tests {
                         PostHead::StrangerBuildsOnUs => {
                             json!([canvas_event(STRANGER, 2_002, Some(&our_id))]).to_string()
                         }
+                        PostHead::StrangerBuildsOnUsTransitively => {
+                            // C(head, exp=STRANGER) → B(STRANGER, exp=ours) →
+                            // ours: the whole chain is in the returned stream so
+                            // the ancestry walk reaches ours. Newest first.
+                            json!([
+                                canvas_event(THIRD, 2_003, Some(STRANGER)),
+                                canvas_event(STRANGER, 2_002, Some(&our_id)),
+                                canvas_event(&our_id, 2_001, Some(HEAD)),
+                            ])
+                            .to_string()
+                        }
                         PostHead::Stranger => {
                             json!([canvas_event(STRANGER, 2_002, Some(HEAD))]).to_string()
                         }
@@ -3545,6 +3587,17 @@ mod restore_canvas_tests {
         cmd_restore_canvas(&client(&url), CHANNEL, REVISION)
             .await
             .expect("restore a later write built on succeeds");
+        assert!(submitted.lock().unwrap().is_some(), "restore must publish");
+    }
+
+    /// A later write two links above our restore (C→B→ours, whole chain in the
+    /// stream): the ancestry walk reaches ours → success, not a supersession.
+    #[tokio::test]
+    async fn restore_survives_when_head_builds_on_it_transitively() {
+        let (url, submitted) = relay(PostHead::StrangerBuildsOnUsTransitively).await;
+        cmd_restore_canvas(&client(&url), CHANNEL, REVISION)
+            .await
+            .expect("a transitive descendant of our restore succeeds");
         assert!(submitted.lock().unwrap().is_some(), "restore must publish");
     }
 

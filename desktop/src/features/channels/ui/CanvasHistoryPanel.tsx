@@ -47,6 +47,27 @@ export function CanvasHistoryPanel({
   const historyQuery = useCanvasHistoryQuery(channelId, true);
   const restoreMutation = useSetCanvasMutation(channelId);
   const [selectedId, setSelectedId] = React.useState<string | null>(null);
+  // Non-destructive notice shown after a restore the relay accepted but could
+  // not verify (the post-write supersession read failed). The restore is
+  // durable; the note tells the user to check the current canvas if a
+  // concurrent edit later appears. Cleared whenever the selection changes.
+  const [unverifiedRestoreNotice, setUnverifiedRestoreNotice] =
+    React.useState(false);
+  // After a restore the selection collapses and the focused Restore button
+  // unmounts. Move focus to the most informative surviving destination: the
+  // unverified notice when it renders, otherwise the toggle of the row that was
+  // just restored. `pendingRestoreFocus` arms the move; the effect runs it once
+  // the collapsed tree paints.
+  const noticeRef = React.useRef<HTMLParagraphElement | null>(null);
+  const restoredRowRef = React.useRef<HTMLButtonElement | null>(null);
+  const [restoredId, setRestoredId] = React.useState<string | null>(null);
+  const [pendingRestoreFocus, setPendingRestoreFocus] = React.useState(false);
+  React.useEffect(() => {
+    if (pendingRestoreFocus && selectedId === null) {
+      (noticeRef.current ?? restoredRowRef.current)?.focus();
+      setPendingRestoreFocus(false);
+    }
+  }, [pendingRestoreFocus, selectedId]);
 
   const revisions = React.useMemo(
     () => historyQuery.data?.pages.flatMap((page) => page.revisions) ?? [],
@@ -69,20 +90,35 @@ export function CanvasHistoryPanel({
     // Restore is a conflict-checked publish against the live head: if the
     // canvas moved since this panel loaded, the save command's advisory check
     // fails and we surface the same reload state as a normal save.
-    await restoreMutation.mutateAsync({
+    const result = await restoreMutation.mutateAsync({
       content: revision.content,
       expectedRevision: currentRevision ?? CANVAS_EXPECTED_REVISION_NONE,
     });
+    // The restore was accepted. `verified: false` means the post-write
+    // supersession read failed, not that the restore failed — collapse the
+    // selection and surface the same non-destructive note as an unverified
+    // save. A detected supersession rejects the promise (handled by the catch
+    // in the click wiring), so it never reaches here.
+    setUnverifiedRestoreNotice(!result.verified);
+    setRestoredId(revision.eventId);
     setSelectedId(null);
+    setPendingRestoreFocus(true);
   }
 
   if (historyQuery.isLoading) {
-    return <p className="text-sm text-muted-foreground">Loading history...</p>;
+    return (
+      <p className="text-sm text-muted-foreground" role="status">
+        Loading history...
+      </p>
+    );
   }
 
   if (historyQuery.error instanceof Error) {
     return (
-      <p className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+      <p
+        className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+        role="alert"
+      >
         {isRelayUnreachableError(historyQuery.error)
           ? RELAY_UNREACHABLE_SHORT
           : historyQuery.error.message}
@@ -91,11 +127,28 @@ export function CanvasHistoryPanel({
   }
 
   if (revisions.length === 0) {
-    return <p className="text-sm text-muted-foreground">No revisions yet.</p>;
+    return (
+      <p className="text-sm text-muted-foreground" role="status">
+        No revisions yet.
+      </p>
+    );
   }
 
   return (
     <div className="space-y-2" data-testid="channel-canvas-history">
+      {unverifiedRestoreNotice ? (
+        <p
+          aria-live="polite"
+          className="rounded-xl border border-border/70 bg-muted/20 px-3 py-2 text-sm text-muted-foreground"
+          data-testid="channel-canvas-restore-unverified-notice"
+          ref={noticeRef}
+          role="status"
+          tabIndex={-1}
+        >
+          Restored. We couldn't verify against the latest revision just now —
+          check the canvas if a concurrent edit appears.
+        </p>
+      ) : null}
       <ul className="space-y-2">
         {revisions.map((revision) => {
           const isCurrent = revision.eventId === currentRevision;
@@ -109,11 +162,13 @@ export function CanvasHistoryPanel({
               <button
                 aria-expanded={isSelected}
                 className="flex w-full items-baseline justify-between gap-2 px-3 py-2 text-left"
+                ref={revision.eventId === restoredId ? restoredRowRef : null}
                 onClick={() => {
                   // Clear any prior restore error so it can't render under a
                   // different row once the selection moves — the mutation state
                   // is shared across every row.
                   restoreMutation.reset();
+                  setUnverifiedRestoreNotice(false);
                   setSelectedId(isSelected ? null : revision.eventId);
                 }}
                 type="button"
@@ -156,7 +211,7 @@ export function CanvasHistoryPanel({
                     </Button>
                   ) : null}
                   {restoreMutation.error instanceof Error ? (
-                    <p className="text-sm text-destructive">
+                    <p className="text-sm text-destructive" role="alert">
                       {canvasConflictMessage(restoreMutation.error) ??
                         restoreMutation.error.message}
                     </p>

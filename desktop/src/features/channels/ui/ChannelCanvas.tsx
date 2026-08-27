@@ -52,6 +52,20 @@ export function ChannelCanvas({
   const [editBaseRevision, setEditBaseRevision] = React.useState<string | null>(
     null,
   );
+  // After a save settles the focused Save button unmounts with the editor. To
+  // keep keyboard focus from falling back to the document body, we move it to
+  // the most informative surviving destination: the unverified notice when it
+  // renders, otherwise the Edit button next to the canvas. `pendingSaveFocus`
+  // arms the move; the effect below runs it once the non-editing tree paints.
+  const noticeRef = React.useRef<HTMLParagraphElement | null>(null);
+  const editButtonRef = React.useRef<HTMLButtonElement | null>(null);
+  const [pendingSaveFocus, setPendingSaveFocus] = React.useState(false);
+  React.useEffect(() => {
+    if (pendingSaveFocus && !isEditing) {
+      (noticeRef.current ?? editButtonRef.current)?.focus();
+      setPendingSaveFocus(false);
+    }
+  }, [pendingSaveFocus, isEditing]);
 
   const canvasContent = canvasQuery.data?.content ?? null;
   const canvasRevision = canvasQuery.data?.eventId ?? null;
@@ -92,15 +106,23 @@ export function ChannelCanvas({
     // wiring below, so it never reaches here.
     setUnverifiedSaveNotice(!result.verified);
     setIsEditing(false);
+    setPendingSaveFocus(true);
   }
 
   if (canvasQuery.isLoading) {
-    return <p className="text-sm text-muted-foreground">Loading canvas...</p>;
+    return (
+      <p className="text-sm text-muted-foreground" role="status">
+        Loading canvas...
+      </p>
+    );
   }
 
   if (canvasQuery.error instanceof Error) {
     return (
-      <p className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+      <p
+        className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+        role="alert"
+      >
         {isRelayUnreachableError(canvasQuery.error)
           ? RELAY_UNREACHABLE_SHORT
           : canvasQuery.error.message}
@@ -148,7 +170,7 @@ export function ChannelCanvas({
           </Button>
         </div>
         {setCanvasMutation.error instanceof Error ? (
-          <p className="text-sm text-destructive">
+          <p className="text-sm text-destructive" role="alert">
             {canvasConflictMessage(setCanvasMutation.error) ??
               setCanvasMutation.error.message}
           </p>
@@ -161,8 +183,12 @@ export function ChannelCanvas({
     <div className="space-y-3">
       {unverifiedSaveNotice ? (
         <p
+          aria-live="polite"
           className="rounded-xl border border-border/70 bg-muted/20 px-3 py-2 text-sm text-muted-foreground"
           data-testid="channel-canvas-unverified-notice"
+          role="status"
+          ref={noticeRef}
+          tabIndex={-1}
         >
           Saved. We couldn't verify against the latest revision just now — check
           History if a concurrent edit appears.
@@ -187,6 +213,7 @@ export function ChannelCanvas({
         <Button
           data-testid="channel-canvas-edit"
           onClick={handleStartEditing}
+          ref={editButtonRef}
           size="sm"
           type="button"
           variant="outline"

@@ -107,14 +107,16 @@ pub async fn set_canvas(
 }
 
 /// Classify a conflict-checked write's post-submit outcome from the ancestry
-/// read (`(head_id, head's expected-revision)` or `None` for no canvas). The
-/// submit was already accepted, so the write is durable — this only decides how
-/// to report it:
+/// read (a recent slice of the canvas revision stream, newest first, each
+/// entry `(event_id, the expected-revision it built on)`, or an empty slice for
+/// no canvas). The submit was already accepted, so the write is durable — this
+/// only decides how to report it:
 ///
 /// - read error → `Ok(false)`: accepted but unverified. A failed verification
 ///   read must never masquerade as a failed save; the caller reports success
 ///   with `verified: false`.
-/// - our event is the head, or a later write legitimately built on it → `Ok(true)`.
+/// - our event is the head, or reachable through the head's ancestry chain →
+///   `Ok(true)`.
 /// - any other head → `Err(CANVAS_SUPERSEDED)`: a concurrent write won the
 ///   visible head; our revision is preserved in history, not lost.
 ///
@@ -122,16 +124,12 @@ pub async fn set_canvas(
 /// read — that needs relay linearization (phase 2).
 fn classify_post_write(
     our_id: &str,
-    ancestry: Result<Option<(String, Option<String>)>, String>,
+    ancestry: Result<Vec<(String, Option<String>)>, String>,
 ) -> Result<bool, String> {
     match ancestry {
         Err(_) => Ok(false),
-        Ok(head) => {
-            let (head_id, head_expected_revision) = match &head {
-                Some((id, rev)) => (Some(id.as_str()), rev.as_deref()),
-                None => (None, None),
-            };
-            if buzz_sdk_pkg::canvas_write_survived(our_id, head_id, head_expected_revision) {
+        Ok(revisions) => {
+            if buzz_sdk_pkg::canvas_write_survived(our_id, &revisions) {
                 Ok(true)
             } else {
                 Err(CANVAS_SUPERSEDED.to_string())
@@ -207,35 +205,42 @@ async fn current_canvas_head(
         .map(|event| (event.id.to_hex(), event.created_at.as_secs() as i64)))
 }
 
-/// Read the live canvas head as `(event_id, expected-revision tag)` for the
-/// post-write supersession check. The second element is the head's own
-/// `["expected-revision", …]` tag value (the id it built on), or `None` when
-/// the head carries no such tag. Returns `None` when the channel has no canvas.
+/// Read a recent slice of the canvas revision stream as `(event_id,
+/// expected-revision tag)` pairs, newest first, for the post-write supersession
+/// check. The head is the first element; the rest let `canvas_write_survived`
+/// walk `expected-revision` links back through a descendant chain (A→B→C) so a
+/// legitimate later write layered on ours is not misread as a supersession. The
+/// second element of each pair is that revision's own `["expected-revision", …]`
+/// tag value (the id it built on), or `None` when absent. An empty vec means the
+/// channel has no canvas.
 async fn current_canvas_head_ancestry(
     state: &AppState,
     channel_id: &str,
-) -> Result<Option<(String, Option<String>)>, String> {
+) -> Result<Vec<(String, Option<String>)>, String> {
     let events = query_relay(
         state,
         &[serde_json::json!({
             "kinds": [40100],
             "#h": [channel_id],
-            "limit": 1
+            "limit": buzz_sdk_pkg::CANVAS_ANCESTRY_WALK_MAX,
         })],
     )
     .await?;
-    Ok(events.first().map(|event| {
-        let expected_revision = event
-            .tags
-            .iter()
-            .find(|t| {
-                t.as_slice()
-                    .first()
-                    .is_some_and(|k| k == "expected-revision")
-            })
-            .and_then(|t| t.as_slice().get(1).cloned());
-        (event.id.to_hex(), expected_revision)
-    }))
+    Ok(events
+        .iter()
+        .map(|event| {
+            let expected_revision = event
+                .tags
+                .iter()
+                .find(|t| {
+                    t.as_slice()
+                        .first()
+                        .is_some_and(|k| k == "expected-revision")
+                })
+                .and_then(|t| t.as_slice().get(1).cloned());
+            (event.id.to_hex(), expected_revision)
+        })
+        .collect())
 }
 
 /// One page of a channel canvas's revision stream (kind:40100), newest first.
@@ -330,6 +335,7 @@ mod tests {
     const HEAD_ID: &str = "aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44";
     const OUR_ID: &str = "bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55";
     const STRANGER_ID: &str = "cc33dd44ee55ff66aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55ff66";
+    const THIRD_ID: &str = "dd44ee55ff66aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55ff66aa11";
 
     #[test]
     fn post_write_read_error_is_durable_but_unverified() {
@@ -345,14 +351,28 @@ mod tests {
     fn post_write_our_head_or_descendant_is_verified() {
         // Our own event is the head → verified.
         assert_eq!(
-            classify_post_write(OUR_ID, Ok(Some((OUR_ID.to_string(), None)))),
+            classify_post_write(OUR_ID, Ok(vec![(OUR_ID.to_string(), None)])),
             Ok(true)
         );
-        // A later write built on ours (its expected-revision names us) → verified.
+        // A later write directly built on ours (its expected-revision names us)
+        // → verified.
         assert_eq!(
             classify_post_write(
                 OUR_ID,
-                Ok(Some((STRANGER_ID.to_string(), Some(OUR_ID.to_string()))))
+                Ok(vec![(STRANGER_ID.to_string(), Some(OUR_ID.to_string()))])
+            ),
+            Ok(true)
+        );
+        // Transitive descendant A(ours) → B(exp=A) → C(exp=B, head): ours is
+        // reached by walking the head's ancestry, so it is not a supersession.
+        assert_eq!(
+            classify_post_write(
+                OUR_ID,
+                Ok(vec![
+                    (THIRD_ID.to_string(), Some(STRANGER_ID.to_string())),
+                    (STRANGER_ID.to_string(), Some(OUR_ID.to_string())),
+                    (OUR_ID.to_string(), None),
+                ])
             ),
             Ok(true)
         );
@@ -366,13 +386,13 @@ mod tests {
         assert_eq!(
             classify_post_write(
                 OUR_ID,
-                Ok(Some((STRANGER_ID.to_string(), Some(HEAD_ID.to_string()))))
+                Ok(vec![(STRANGER_ID.to_string(), Some(HEAD_ID.to_string()))])
             ),
             Err(super::CANVAS_SUPERSEDED.to_string())
         );
         // No head at all is likewise a supersession, not verified.
         assert_eq!(
-            classify_post_write(OUR_ID, Ok(None)),
+            classify_post_write(OUR_ID, Ok(vec![])),
             Err(super::CANVAS_SUPERSEDED.to_string())
         );
     }

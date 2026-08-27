@@ -658,33 +658,63 @@ fn canvas_write_created_at_at(head_created_at: u64, now: u64) -> Result<u64, Sdk
     Ok(now.max(head_created_at.saturating_add(1)))
 }
 
-/// Whether a just-published canvas write still survives as (or under) the live
-/// head read back after submit — the post-write supersession check.
+/// Maximum ancestry links the post-write supersession walk follows before
+/// failing safe (reporting superseded). A legitimate descendant chain visible
+/// in one history page is far shorter; the bound only caps a pathological or
+/// adversarial revision stream so the walk can never loop or run unbounded.
+pub const CANVAS_ANCESTRY_WALK_MAX: usize = 256;
+
+/// Whether a just-published canvas write still survives as — or anywhere in the
+/// accepted ancestry of — the live head read back after submit. The post-write
+/// supersession check.
 ///
-/// A conflict-checked write (Desktop save/restore, CLI `restore`) re-reads the
-/// head once after publishing and classifies:
+/// `revisions` is a recent slice of the channel's canvas stream ordered newest
+/// first, each entry `(event_id, the expected-revision it built on)`;
+/// `revisions[0]` is the live head. A conflict-checked write (Desktop
+/// save/restore, CLI `restore`) re-reads this stream after publishing and the
+/// walk starts at the head, following `expected-revision` links backward:
 /// - the head **is** our event → survived;
-/// - the head **builds on** our event (its `expected-revision` names us) → a
-///   later write legitimately layered on top, so our revision is still in the
-///   accepted chain → survived;
-/// - anything else, including **no head at all** → not survived: a concurrent
-///   write won the visible head and ours is superseded (preserved in history,
-///   not lost).
+/// - our event is reached anywhere in the head's ancestry chain (e.g. A→B→C
+///   with C the head and A ours, each linked by `expected-revision`) → a later
+///   write legitimately layered on top of ours → survived;
+/// - the chain ends, reaches a link outside `revisions`, cycles, exceeds
+///   [`CANVAS_ANCESTRY_WALK_MAX`], or there is no head at all → not survived: a
+///   concurrent write won the visible head and ours is superseded (preserved in
+///   history, not lost). Every non-survival outcome, including a truncated or
+///   adversarial stream, fails safe as superseded and never hangs.
 ///
-/// Both comparisons are case-insensitive, matching the precondition check's
+/// All id comparisons are case-insensitive, matching the precondition check's
 /// `eq_ignore_ascii_case` convention. This only detects a competitor already
 /// visible at verification time; a competitor that lands *after* this read is
 /// still missed — closing that window needs relay-side linearization (phase 2).
-pub fn canvas_write_survived(
-    our_id: &str,
-    head_id: Option<&str>,
-    head_expected_revision: Option<&str>,
-) -> bool {
-    match head_id {
-        None => false,
-        Some(head_id) if head_id.eq_ignore_ascii_case(our_id) => true,
-        Some(_) => head_expected_revision.is_some_and(|rev| rev.eq_ignore_ascii_case(our_id)),
+pub fn canvas_write_survived(our_id: &str, revisions: &[(String, Option<String>)]) -> bool {
+    let Some((head_id, _)) = revisions.first() else {
+        return false; // no head after an accepted write → conservatively superseded
+    };
+    if head_id.eq_ignore_ascii_case(our_id) {
+        return true;
     }
+    // Lowercased id → its expected-revision, for walking the chain backward.
+    let by_id: std::collections::HashMap<String, Option<&str>> = revisions
+        .iter()
+        .map(|(id, expected)| (id.to_ascii_lowercase(), expected.as_deref()))
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut cursor = head_id.to_ascii_lowercase();
+    for _ in 0..CANVAS_ANCESTRY_WALK_MAX {
+        if !seen.insert(cursor.clone()) {
+            return false; // cycle guard
+        }
+        // The link out of `cursor`; absent id or missing tag ends the walk.
+        let Some(expected) = by_id.get(&cursor).copied().flatten() else {
+            return false;
+        };
+        if expected.eq_ignore_ascii_case(our_id) {
+            return true;
+        }
+        cursor = expected.to_ascii_lowercase();
+    }
+    false // depth exhausted → fail safe (superseded)
 }
 
 /// Build a NIP-01 profile metadata event (kind 0).
@@ -3221,27 +3251,74 @@ mod tests {
     fn canvas_write_survived_classifies_head_ancestry() {
         let ours = "a".repeat(64);
         let other = "b".repeat(64);
+        let third = "c".repeat(64);
         // Head is our own event → survived.
-        assert!(canvas_write_survived(&ours, Some(&ours), None));
+        assert!(canvas_write_survived(&ours, &[(ours.clone(), None)]));
         // Head is case-insensitively our event → survived.
+        assert!(canvas_write_survived(&ours, &[(ours.to_uppercase(), None)]));
+        // Head is a stranger that builds directly on us (case-insensitively) →
+        // survived.
         assert!(canvas_write_survived(
             &ours,
-            Some(&ours.to_uppercase()),
-            None
+            &[(other.clone(), Some(ours.to_uppercase()))]
         ));
-        // Head is a stranger that builds on us (case-insensitively) → survived.
+        // Transitive descendant: A(ours) → B(exp=A) → C(exp=B, the head). Ours
+        // is reached by walking the chain, so the write survived.
         assert!(canvas_write_survived(
             &ours,
-            Some(&other),
-            Some(&ours.to_uppercase())
+            &[
+                (third.clone(), Some(other.clone())),
+                (other.clone(), Some(ours.clone())),
+                (ours.clone(), None),
+            ]
         ));
-        // Head is a stranger that builds on someone else → superseded.
-        assert!(!canvas_write_survived(&ours, Some(&other), Some(&other)));
+        // Head is a stranger that builds on someone else, and that ancestor is
+        // not ours and not in the stream → superseded.
+        assert!(!canvas_write_survived(
+            &ours,
+            &[(other.clone(), Some(third.clone()))]
+        ));
         // Head is a stranger with no ancestry tag → superseded.
-        assert!(!canvas_write_survived(&ours, Some(&other), None));
+        assert!(!canvas_write_survived(&ours, &[(other.clone(), None)]));
         // No head at all after an accepted write → superseded, never silent
         // success (shouldn't happen, classified conservatively).
-        assert!(!canvas_write_survived(&ours, None, None));
+        assert!(!canvas_write_survived(&ours, &[]));
+        // A descendant chain that never reaches ours before the stream ends →
+        // superseded (fails safe rather than assuming survival).
+        assert!(!canvas_write_survived(
+            &ours,
+            &[
+                (third.clone(), Some(other.clone())),
+                (other.clone(), Some("d".repeat(64))),
+            ]
+        ));
+    }
+
+    #[test]
+    fn canvas_write_survived_fails_safe_on_cycles_and_depth() {
+        let ours = "a".repeat(64);
+        let x = "b".repeat(64);
+        let y = "c".repeat(64);
+        // A cycle in the stream (x→y→x) that never touches ours must terminate
+        // as superseded, not loop forever.
+        assert!(!canvas_write_survived(
+            &ours,
+            &[(x.clone(), Some(y.clone())), (y.clone(), Some(x.clone()))]
+        ));
+        // A chain longer than the walk bound that never reaches ours fails safe
+        // as superseded. Each link i points to link i+1; ours is never in it.
+        let mut revisions: Vec<(String, Option<String>)> = (0..(CANVAS_ANCESTRY_WALK_MAX + 10))
+            .map(|i| {
+                let id = format!("{i:064x}");
+                let next = format!("{:064x}", i + 1);
+                (id, Some(next))
+            })
+            .collect();
+        // Terminate the last link at ours so only the depth bound (not a missing
+        // link) can stop the walk — proving the bound itself is the guard.
+        let last = revisions.len() - 1;
+        revisions[last].1 = Some(ours.clone());
+        assert!(!canvas_write_survived(&ours, &revisions));
     }
 
     #[test]
