@@ -56,7 +56,7 @@ import {
   PANEL_ENTER_MOTION_CLASS,
   PANEL_OVERLAY_CLASS,
 } from "@/shared/ui/OverlayPanelBackdrop";
-import { ChannelCanvas } from "./ChannelCanvas";
+import { KeyedChannelCanvas } from "./KeyedChannelCanvas";
 import { ChannelWorkflowsSection } from "./ChannelWorkflowsSection";
 import {
   CHANNEL_FORM_FIELD_CONTROL_CLASS,
@@ -972,8 +972,7 @@ function ChannelManagementPanelContent({
           </div>
         ) : activeView === "canvas" ? (
           <div data-testid="channel-canvas-section">
-            <ChannelCanvas
-              key={channelId ?? "none"}
+            <KeyedChannelCanvas
               canEdit={canEditNarrative}
               channelId={channelId}
               isArchived={isArchived}

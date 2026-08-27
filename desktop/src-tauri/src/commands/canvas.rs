@@ -86,37 +86,17 @@ pub async fn set_canvas(
     // Post-write supersession detection (only for conflict-checked writes). The
     // precondition above closes the stale-edit case; this closes the narrower
     // window where a concurrent write we could not see at precondition time has
-    // become visible by now. Re-read the head once and classify: our event is
-    // the head, or a later write legitimately built on it → success; anything
-    // else → our revision was superseded (it is preserved in history, not
-    // lost). An unconditional append (`None`) has nothing to assert, so it stays
-    // fire-and-forget. This cannot close the residual race where the competitor
-    // lands *after* this read — that needs relay linearization (phase 2).
+    // become visible by now. An unconditional append (`None`) has nothing to
+    // assert, so it stays fire-and-forget.
     //
-    // The submit above was accepted, so the write is durable. Only the
-    // *verification read* can still fail here; when it does we must not present
-    // an accepted publish as a failed save. Report success with `verified:
-    // false` so the caller can invalidate and refetch, distinguishing an
-    // unverified-but-accepted write from a detected supersession (which keeps
-    // its frozen conflict marker). Supersession detection itself is unchanged.
+    // The submit above was accepted, so the write is durable. `classify_post_write`
+    // maps the ancestry read to a report: a failed read is durable-but-unverified
+    // (`verified: false`), not a failed save; a stranger head is a supersession
+    // (frozen conflict marker); our head or a descendant is verified success.
     let mut verified = true;
     if expected_revision.is_some() {
-        match current_canvas_head_ancestry(&state, &channel_id).await {
-            Ok(head) => {
-                let (head_id, head_expected_revision) = match &head {
-                    Some((id, rev)) => (Some(id.as_str()), rev.as_deref()),
-                    None => (None, None),
-                };
-                if !buzz_sdk_pkg::canvas_write_survived(
-                    &result.event_id,
-                    head_id,
-                    head_expected_revision,
-                ) {
-                    return Err(CANVAS_SUPERSEDED.to_string());
-                }
-            }
-            Err(_) => verified = false,
-        }
+        let ancestry = current_canvas_head_ancestry(&state, &channel_id).await;
+        verified = classify_post_write(&result.event_id, ancestry)?;
     }
 
     Ok(serde_json::json!({
@@ -124,6 +104,40 @@ pub async fn set_canvas(
         "event_id": result.event_id,
         "verified": verified,
     }))
+}
+
+/// Classify a conflict-checked write's post-submit outcome from the ancestry
+/// read (`(head_id, head's expected-revision)` or `None` for no canvas). The
+/// submit was already accepted, so the write is durable — this only decides how
+/// to report it:
+///
+/// - read error → `Ok(false)`: accepted but unverified. A failed verification
+///   read must never masquerade as a failed save; the caller reports success
+///   with `verified: false`.
+/// - our event is the head, or a later write legitimately built on it → `Ok(true)`.
+/// - any other head → `Err(CANVAS_SUPERSEDED)`: a concurrent write won the
+///   visible head; our revision is preserved in history, not lost.
+///
+/// This cannot close the residual race where a competitor lands *after* this
+/// read — that needs relay linearization (phase 2).
+fn classify_post_write(
+    our_id: &str,
+    ancestry: Result<Option<(String, Option<String>)>, String>,
+) -> Result<bool, String> {
+    match ancestry {
+        Err(_) => Ok(false),
+        Ok(head) => {
+            let (head_id, head_expected_revision) = match &head {
+                Some((id, rev)) => (Some(id.as_str()), rev.as_deref()),
+                None => (None, None),
+            };
+            if buzz_sdk_pkg::canvas_write_survived(our_id, head_id, head_expected_revision) {
+                Ok(true)
+            } else {
+                Err(CANVAS_SUPERSEDED.to_string())
+            }
+        }
+    }
 }
 
 /// Frozen conflict markers the desktop TypeScript layer (`canvasConflict.ts`)
@@ -311,9 +325,57 @@ fn resolve_history_page_size(limit: Option<usize>) -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_canvas_precondition, resolve_history_page_size};
+    use super::{check_canvas_precondition, classify_post_write, resolve_history_page_size};
 
     const HEAD_ID: &str = "aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44";
+    const OUR_ID: &str = "bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55";
+    const STRANGER_ID: &str = "cc33dd44ee55ff66aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55ff66";
+
+    #[test]
+    fn post_write_read_error_is_durable_but_unverified() {
+        // The submit was accepted; a failed verification read is durable
+        // success with verified=false, never a failed save.
+        assert_eq!(
+            classify_post_write(OUR_ID, Err("relay unreachable".to_string())),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn post_write_our_head_or_descendant_is_verified() {
+        // Our own event is the head → verified.
+        assert_eq!(
+            classify_post_write(OUR_ID, Ok(Some((OUR_ID.to_string(), None)))),
+            Ok(true)
+        );
+        // A later write built on ours (its expected-revision names us) → verified.
+        assert_eq!(
+            classify_post_write(
+                OUR_ID,
+                Ok(Some((STRANGER_ID.to_string(), Some(OUR_ID.to_string()))))
+            ),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn post_write_stranger_head_is_superseded() {
+        // A stranger won the visible head with no ancestry to ours → frozen
+        // supersession marker (the read succeeded, so this is detection, not an
+        // unverified read).
+        assert_eq!(
+            classify_post_write(
+                OUR_ID,
+                Ok(Some((STRANGER_ID.to_string(), Some(HEAD_ID.to_string()))))
+            ),
+            Err(super::CANVAS_SUPERSEDED.to_string())
+        );
+        // No head at all is likewise a supersession, not verified.
+        assert_eq!(
+            classify_post_write(OUR_ID, Ok(None)),
+            Err(super::CANVAS_SUPERSEDED.to_string())
+        );
+    }
 
     #[test]
     fn precondition_none_assertion_is_unconditional_append() {

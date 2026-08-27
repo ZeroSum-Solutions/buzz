@@ -1,14 +1,16 @@
 /**
- * Channel-switch reset regression: ChannelManagementSheet renders ChannelCanvas
- * keyed by channelId, so a channel change remounts the subtree and drops all
- * edit state (isEditing, draft, editBaseRevision, history selection, mutation
- * instance). Without the key the sheet stays mounted and a draft typed against
- * canvas-less channel A would publish as channel B's canvas under A's retained
- * `none` precondition.
+ * Channel-switch reset regression: ChannelManagementSheet renders
+ * KeyedChannelCanvas, the production wrapper that owns
+ * `key={channelId ?? "none"}`, so a channel change remounts the ChannelCanvas
+ * subtree and drops all edit state (isEditing, draft, editBaseRevision,
+ * showHistory, unverifiedSaveNotice, the set-canvas mutation instance). Without
+ * the key the sheet stays mounted and a draft typed against canvas-less channel
+ * A would publish as channel B's canvas under A's retained `none` precondition.
  *
- * Mirrors the parent's `<ChannelCanvas key={channelId ?? "none"} …>` wiring:
- * starts creating on canvas-less A, types a draft, switches to canvas-less B,
- * and asserts the editor is gone (state reset) and nothing was submitted.
+ * Mounts the production KeyedChannelCanvas directly (the same seam the sheet
+ * consumes): starts creating on canvas-less A, types a draft, switches to
+ * canvas-less B, and asserts the editor is gone (state reset) and nothing was
+ * submitted. Deleting the wrapper's key turns this RED.
  */
 
 import assert from "node:assert/strict";
@@ -46,7 +48,7 @@ let createRoot;
 let QueryClient;
 let QueryClientProvider;
 let ChannelNavigationProvider;
-let ChannelCanvas;
+let KeyedChannelCanvas;
 
 const setCanvasCalls = [];
 
@@ -90,7 +92,7 @@ before(async () => {
   ({ ChannelNavigationProvider } = await import(
     "@/shared/context/ChannelNavigationContext"
   ));
-  ({ ChannelCanvas } = await import("./ChannelCanvas.tsx"));
+  ({ KeyedChannelCanvas } = await import("./KeyedChannelCanvas.tsx"));
 });
 
 after(() => dom.window.close());
@@ -109,11 +111,11 @@ async function settle(iterations = 6) {
   }
 }
 
-// Renders ChannelCanvas keyed by channelId exactly as ChannelManagementSheet
-// does, so re-rendering with a new channelId remounts the subtree.
+// Renders the production KeyedChannelCanvas wrapper, which owns the
+// channelId-derived key — the exact seam ChannelManagementSheet consumes. A
+// re-render with a new channelId remounts the ChannelCanvas subtree.
 function Harness({ channelId }) {
-  return React.createElement(ChannelCanvas, {
-    key: channelId ?? "none",
+  return React.createElement(KeyedChannelCanvas, {
     channelId,
     canEdit: true,
     isArchived: false,
@@ -148,65 +150,77 @@ test("switching channels mid-create resets edit state and submits nothing", asyn
   }
 
   // Load canvas-less channel A and start creating.
-  await render("channel-a");
-  await act(async () => {
-    await queryClient.refetchQueries({ queryKey: ["channel-canvas"] });
-  });
-  await settle();
-  const createButton = container.querySelector(
-    "[data-testid='channel-canvas-edit']",
-  );
-  assert.ok(createButton, "create button renders for canvas-less channel A");
-  await act(async () => click(createButton));
-  const editor = container.querySelector(
-    "[data-testid='channel-canvas-editor']",
-  );
-  assert.ok(editor, "editor opens on channel A");
+  let observed;
+  try {
+    await render("channel-a");
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: ["channel-canvas"] });
+    });
+    await settle();
+    const createButton = container.querySelector(
+      "[data-testid='channel-canvas-edit']",
+    );
+    assert.ok(createButton, "create button renders for canvas-less channel A");
+    await act(async () => click(createButton));
+    const editor = container.querySelector(
+      "[data-testid='channel-canvas-editor']",
+    );
+    assert.ok(editor, "editor opens on channel A");
 
-  // Type a draft against A.
-  await act(async () => {
-    const setter = Object.getOwnPropertyDescriptor(
-      dom.window.HTMLTextAreaElement.prototype,
-      "value",
-    ).set;
-    setter.call(editor, "draft written for channel A");
-    editor.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
-  });
-  await settle();
+    // Type a draft against A.
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(
+        dom.window.HTMLTextAreaElement.prototype,
+        "value",
+      ).set;
+      setter.call(editor, "draft written for channel A");
+      editor.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+    });
+    await settle();
 
-  // Switch to canvas-less channel B — the key change remounts ChannelCanvas.
-  await render("channel-b");
-  await act(async () => {
-    await queryClient.refetchQueries({ queryKey: ["channel-canvas"] });
-  });
-  await settle();
+    // Switch to canvas-less channel B — the key change remounts ChannelCanvas.
+    await render("channel-b");
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: ["channel-canvas"] });
+    });
+    await settle();
 
-  // Edit state must not survive the switch: the editor is gone and B shows its
-  // own fresh Create action.
+    // Snapshot what the switch produced before tearing down. Capturing here and
+    // asserting after teardown keeps a failing run (e.g. the production key
+    // deleted) from leaving a live editing tree mounted, which would hang the
+    // process instead of reporting a clean failure.
+    observed = {
+      editorStillOpen: container.querySelector(
+        "[data-testid='channel-canvas-editor']",
+      ),
+      editButtonLabel: container
+        .querySelector("[data-testid='channel-canvas-edit']")
+        ?.textContent.trim(),
+      submitCount: setCanvasCalls.length,
+    };
+  } finally {
+    // Always tear down so the process exits whether or not the assertions hold.
+    await settle(12);
+    await act(async () => root.unmount());
+    queryClient.clear();
+    container.remove();
+  }
+
+  // Edit state must not survive the switch: the editor is gone, B shows its own
+  // fresh Create action, and A's draft never published against B.
   assert.equal(
-    container.querySelector("[data-testid='channel-canvas-editor']"),
+    observed.editorStillOpen,
     null,
     "editor does not carry across the channel switch",
   );
-  const bCreate = container.querySelector(
-    "[data-testid='channel-canvas-edit']",
-  );
-  assert.ok(bCreate, "channel B shows its own fresh Create action");
   assert.equal(
-    bCreate.textContent.trim(),
+    observed.editButtonLabel,
     "Create canvas",
     "channel B is treated as canvas-less, not carrying A's edit session",
   );
-
-  // Nothing was ever submitted — A's draft never published against B.
   assert.equal(
-    setCanvasCalls.length,
+    observed.submitCount,
     0,
     "no canvas save fired across the channel switch",
   );
-
-  await settle(12);
-  await act(async () => root.unmount());
-  queryClient.clear();
-  container.remove();
 });
