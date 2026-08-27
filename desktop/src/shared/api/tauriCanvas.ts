@@ -27,6 +27,7 @@ type RawCanvasHistoryResponse = {
 type RawSetCanvasResult = {
   ok: boolean;
   event_id: string;
+  verified: boolean;
 };
 
 export async function getCanvas(channelId: string): Promise<CanvasResponse> {
@@ -55,6 +56,7 @@ export async function setCanvas(
   return {
     ok: response.ok,
     eventId: response.event_id,
+    verified: response.verified,
   };
 }
 

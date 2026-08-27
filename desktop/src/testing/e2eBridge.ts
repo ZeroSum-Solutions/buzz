@@ -14737,7 +14737,7 @@ export function maybeInstallE2eTauriMocks() {
           author: DEFAULT_MOCK_IDENTITY.pubkey,
         };
         mockCanvasRevisions.set(req.channelId, [revision, ...stream]);
-        return { ok: true, event_id: revision.eventId };
+        return { ok: true, event_id: revision.eventId, verified: true };
       }
       case "get_canvas": {
         const canvasReadError = activeConfig?.mock?.canvasReadError;

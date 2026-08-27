@@ -40,6 +40,11 @@ export function ChannelCanvas({
   const [isEditing, setIsEditing] = React.useState(false);
   const [showHistory, setShowHistory] = React.useState(false);
   const [draft, setDraft] = React.useState("");
+  // Non-destructive notice shown after a save the relay accepted but could not
+  // verify (the post-write supersession read failed). The write is durable; the
+  // note tells the user to check History if a concurrent edit later appears.
+  // Cleared whenever a new edit session starts.
+  const [unverifiedSaveNotice, setUnverifiedSaveNotice] = React.useState(false);
   // Head event id captured at edit-start. A background canvas refetch can move
   // the live head mid-edit; the save must assert against what the editor
   // actually loaded, not the latest head. `null` means "no canvas existed when
@@ -62,6 +67,7 @@ export function ChannelCanvas({
   function handleStartEditing() {
     setDraft(canvasContent ?? "");
     setEditBaseRevision(canvasRevision);
+    setUnverifiedSaveNotice(false);
     setIsEditing(true);
   }
 
@@ -75,10 +81,16 @@ export function ChannelCanvas({
     // a refetch may have moved `canvasRevision` while the editor was open.
     // A null snapshot means no canvas existed then, so send the `none`
     // sentinel to close the concurrent-first-creation race.
-    await setCanvasMutation.mutateAsync({
+    const result = await setCanvasMutation.mutateAsync({
       content: draft,
       expectedRevision: editBaseRevision ?? CANVAS_EXPECTED_REVISION_NONE,
     });
+    // The write was accepted. `verified: false` means the post-write
+    // supersession read failed, not that the save failed — close the editor and
+    // surface a non-destructive note rather than a conflict. A detected
+    // supersession is a rejected promise handled by the catch in the click
+    // wiring below, so it never reaches here.
+    setUnverifiedSaveNotice(!result.verified);
     setIsEditing(false);
   }
 
@@ -147,6 +159,15 @@ export function ChannelCanvas({
 
   return (
     <div className="space-y-3">
+      {unverifiedSaveNotice ? (
+        <p
+          className="rounded-xl border border-border/70 bg-muted/20 px-3 py-2 text-sm text-muted-foreground"
+          data-testid="channel-canvas-unverified-notice"
+        >
+          Saved. We couldn't verify against the latest revision just now — check
+          History if a concurrent edit appears.
+        </p>
+      ) : null}
       {canvasExists ? (
         <div
           className="rounded-2xl border border-border/70 bg-muted/20 px-4 py-3"

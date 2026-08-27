@@ -389,7 +389,10 @@ pub async fn cmd_canvas_history(
 /// still holds the visible head (or a later write legitimately built on it). If
 /// a concurrent write has become current, this returns [`CliError::Conflict`]
 /// (exit 5) naming the persisted revision — the restore is not lost, it survives
-/// in history. Detection is bounded to competitors visible by verification time;
+/// in history. If the verification read itself fails, the accepted restore is
+/// reported as success (exit 0) with a stderr warning that verification was
+/// unavailable — a failed read must never masquerade as a failed restore.
+/// Detection is bounded to competitors visible by verification time;
 /// preventing the race entirely requires relay-side linearization (phase 2).
 pub async fn cmd_restore_canvas(
     client: &BuzzClient,
@@ -442,7 +445,22 @@ pub async fn cmd_restore_canvas(
     // so surface a conflict naming it rather than reporting a hollow success.
     // This only catches a competitor visible by now; the residual race past this
     // read needs relay linearization (phase 2).
-    let live_head = fetch_canvas_head(client, channel_id).await?;
+    //
+    // The submit above was accepted, so the restore is durable. Only this
+    // verification read can still fail; when it does we must not present an
+    // accepted publish as a failed restore. Print the normal success response
+    // naming `our_id`, warn on stderr that verification was unavailable, and
+    // exit 0 — a failed read is not a conflict.
+    let live_head = match fetch_canvas_head(client, channel_id).await {
+        Ok(head) => head,
+        Err(_) => {
+            eprintln!(
+                "warning: canvas restore {our_id} was published but its post-write verification read failed; the restore is preserved in history — check `buzz canvas history` if a concurrent edit may have landed"
+            );
+            println!("{}", normalize_write_response(&resp));
+            return Ok(());
+        }
+    };
     let live_head_id = live_head
         .as_ref()
         .and_then(|h| h.get("id"))
@@ -3402,6 +3420,9 @@ mod restore_canvas_tests {
         StrangerBuildsOnUs,
         /// The head is an unrelated stranger → our restore was superseded.
         Stranger,
+        /// The post-write verification read fails (HTTP 500). The submit was
+        /// accepted, so the restore must still report success (exit 0).
+        ReadFails,
     }
 
     #[derive(Clone)]
@@ -3427,17 +3448,23 @@ mod restore_canvas_tests {
             .route(
                 "/query",
                 post(|State(s): State<RelayState>, body: Bytes| async move {
+                    use axum::http::StatusCode;
                     let is_ids_query = std::str::from_utf8(&body)
                         .map(|b| b.contains("\"ids\""))
                         .unwrap_or(false);
                     if is_ids_query {
-                        return (*s.revision_response).clone();
+                        return (StatusCode::OK, (*s.revision_response).clone());
                     }
                     let mut reads = s.head_reads.lock().unwrap();
                     let read = *reads;
                     *reads += 1;
                     if read == 0 {
-                        return (*s.pre_head).clone();
+                        return (StatusCode::OK, (*s.pre_head).clone());
+                    }
+                    // Post-write verification read that fails: the submit was
+                    // accepted, so the command reports success despite this 500.
+                    if matches!(s.post_head, PostHead::ReadFails) {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, String::new());
                     }
                     // Post-write head: synthesize from the captured submission.
                     let our_id = s
@@ -3449,7 +3476,7 @@ mod restore_canvas_tests {
                         .and_then(|v| v.as_str())
                         .expect("post-write head read must follow a submit")
                         .to_string();
-                    match s.post_head {
+                    let body = match s.post_head {
                         PostHead::OurEvent => {
                             json!([canvas_event(&our_id, 2_001, Some(HEAD))]).to_string()
                         }
@@ -3459,7 +3486,9 @@ mod restore_canvas_tests {
                         PostHead::Stranger => {
                             json!([canvas_event(STRANGER, 2_002, Some(HEAD))]).to_string()
                         }
-                    }
+                        PostHead::ReadFails => unreachable!("handled above"),
+                    };
+                    (StatusCode::OK, body)
                 }),
             )
             .route(
@@ -3548,6 +3577,22 @@ mod restore_canvas_tests {
         assert!(
             msg.contains(&our_id),
             "conflict must name the persisted revision id {our_id}: {msg}"
+        );
+    }
+
+    /// The post-write verification read fails after an accepted submit: the
+    /// restore is durable, so the command reports success (exit 0), not a
+    /// conflict or error — a failed read must never masquerade as a failed
+    /// restore.
+    #[tokio::test]
+    async fn restore_succeeds_when_verification_read_fails() {
+        let (url, submitted) = relay(PostHead::ReadFails).await;
+        cmd_restore_canvas(&client(&url), CHANNEL, REVISION)
+            .await
+            .expect("an accepted restore whose verification read fails still succeeds");
+        assert!(
+            submitted.lock().unwrap().is_some(),
+            "the restore did publish before the verification read failed"
         );
     }
 }

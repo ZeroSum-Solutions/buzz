@@ -973,6 +973,7 @@ function ChannelManagementPanelContent({
         ) : activeView === "canvas" ? (
           <div data-testid="channel-canvas-section">
             <ChannelCanvas
+              key={channelId ?? "none"}
               canEdit={canEditNarrative}
               channelId={channelId}
               isArchived={isArchived}

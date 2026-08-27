@@ -92,20 +92,37 @@ pub async fn set_canvas(
     // lost). An unconditional append (`None`) has nothing to assert, so it stays
     // fire-and-forget. This cannot close the residual race where the competitor
     // lands *after* this read — that needs relay linearization (phase 2).
+    //
+    // The submit above was accepted, so the write is durable. Only the
+    // *verification read* can still fail here; when it does we must not present
+    // an accepted publish as a failed save. Report success with `verified:
+    // false` so the caller can invalidate and refetch, distinguishing an
+    // unverified-but-accepted write from a detected supersession (which keeps
+    // its frozen conflict marker). Supersession detection itself is unchanged.
+    let mut verified = true;
     if expected_revision.is_some() {
-        let head = current_canvas_head_ancestry(&state, &channel_id).await?;
-        let (head_id, head_expected_revision) = match &head {
-            Some((id, rev)) => (Some(id.as_str()), rev.as_deref()),
-            None => (None, None),
-        };
-        if !buzz_sdk_pkg::canvas_write_survived(&result.event_id, head_id, head_expected_revision) {
-            return Err(CANVAS_SUPERSEDED.to_string());
+        match current_canvas_head_ancestry(&state, &channel_id).await {
+            Ok(head) => {
+                let (head_id, head_expected_revision) = match &head {
+                    Some((id, rev)) => (Some(id.as_str()), rev.as_deref()),
+                    None => (None, None),
+                };
+                if !buzz_sdk_pkg::canvas_write_survived(
+                    &result.event_id,
+                    head_id,
+                    head_expected_revision,
+                ) {
+                    return Err(CANVAS_SUPERSEDED.to_string());
+                }
+            }
+            Err(_) => verified = false,
         }
     }
 
     Ok(serde_json::json!({
         "ok": true,
         "event_id": result.event_id,
+        "verified": verified,
     }))
 }
 

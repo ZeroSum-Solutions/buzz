@@ -1,12 +1,13 @@
 /**
- * Edit-session snapshot regression: ChannelCanvas must assert the save against
- * the head that existed when editing started, not the live head. A background
- * canvas refetch can move the head mid-edit; without the snapshot the save
- * would silently overwrite the newer revision instead of surfacing a conflict.
+ * Unverified-save regression: when set_canvas returns `verified: false` (the
+ * relay accepted the write but the post-write verification read failed), the
+ * save is durable — ChannelCanvas must close the editor and show a
+ * non-destructive informational note, not a conflict or error. A `verified:
+ * true` save shows no such note.
  *
- * Mounts the shipping ChannelCanvas, opens the editor at head A, moves the live
- * head to B via a refetch, then saves and asserts the submitted
- * `expectedRevision` is still A.
+ * Mounts the shipping ChannelCanvas, edits an existing canvas, and drives
+ * set_canvas to return `verified: false`, then asserts the editor closes and
+ * the unverified note renders.
  */
 
 import assert from "node:assert/strict";
@@ -15,9 +16,6 @@ import { after, before, test } from "node:test";
 
 import { JSDOM } from "jsdom";
 
-// The real Markdown component pulls in the remark/rehype/emoji stack, which
-// never releases its jsdom handles and hangs the node:test process. This test
-// only exercises the save-snapshot wiring, so serve an inert stub.
 registerHooks({
   resolve(specifier, context, nextResolve) {
     if (specifier === "@/shared/ui/markdown") {
@@ -41,8 +39,7 @@ const dom = new JSDOM("<!doctype html><html><body></body></html>", {
   url: "http://localhost",
 });
 
-const HEAD_A = "a".repeat(64);
-const HEAD_B = "b".repeat(64);
+const HEAD = "a".repeat(64);
 
 let React;
 let act;
@@ -52,9 +49,8 @@ let QueryClientProvider;
 let ChannelNavigationProvider;
 let ChannelCanvas;
 
-// Mutable relay-head mock the Tauri bridge reads on each get_canvas.
-let currentHead = { content: "original", eventId: HEAD_A };
-const setCanvasCalls = [];
+// Controls the `verified` flag the mocked set_canvas returns.
+let nextVerified = false;
 
 before(async () => {
   Object.assign(globalThis, {
@@ -74,20 +70,16 @@ before(async () => {
     removeEventListener() {},
   });
 
-  // Stub the Tauri IPC bridge invokeTauri ultimately calls.
   dom.window.__TAURI_INTERNALS__ = {
-    invoke: async (cmd, args) => {
+    invoke: async (cmd) => {
       if (cmd === "get_canvas") {
-        return {
-          content: currentHead.content,
-          event_id: currentHead.eventId,
-          updated_at: 1,
-          author: HEAD_A,
-        };
+        return { content: "hi", event_id: HEAD, updated_at: 1, author: HEAD };
       }
       if (cmd === "set_canvas") {
-        setCanvasCalls.push(args);
-        return { ok: true, event_id: HEAD_B, verified: true };
+        return { ok: true, event_id: "e".repeat(64), verified: nextVerified };
+      }
+      if (cmd === "get_canvas_history") {
+        return { revisions: [], next_cursor: null };
       }
       throw new Error(`unexpected command: ${cmd}`);
     },
@@ -112,9 +104,6 @@ function click(element) {
   );
 }
 
-// Flush microtasks, pending query promises, and React's scheduler (the
-// deferred canvas render is posted on a MessageChannel) so nothing is left
-// pending at teardown.
 async function settle(iterations = 6) {
   for (let i = 0; i < iterations; i++) {
     await act(async () => {
@@ -123,19 +112,10 @@ async function settle(iterations = 6) {
   }
 }
 
-test("head moves mid-edit — save still asserts the head snapshotted at edit-start", async () => {
-  const queryClient = new QueryClient({
-    defaultOptions: {
-      queries: { gcTime: Number.POSITIVE_INFINITY, retry: false },
-      // gcTime: 0 lets the settled mutation drop from cache immediately so no
-      // mutation promise is left pending when the node:test process tears down.
-      mutations: { gcTime: 0 },
-    },
-  });
+async function mount(queryClient) {
   const container = dom.window.document.createElement("div");
   dom.window.document.body.appendChild(container);
   const root = createRoot(container);
-
   await act(async () => {
     root.render(
       React.createElement(
@@ -153,36 +133,78 @@ test("head moves mid-edit — save still asserts the head snapshotted at edit-st
       ),
     );
   });
-
-  // Canvas at head A has loaded; open the editor.
   await act(async () => {
     await queryClient.refetchQueries({ queryKey: ["channel-canvas"] });
   });
   await settle();
-  const editButton = container.querySelector(
-    "[data-testid='channel-canvas-edit']",
+  return { container, root };
+}
+
+test("verified:false save closes the editor and shows the non-destructive note", async () => {
+  nextVerified = false;
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { gcTime: Number.POSITIVE_INFINITY, retry: false },
+      mutations: { gcTime: 0 },
+    },
+  });
+  const { container, root } = await mount(queryClient);
+
+  await act(async () =>
+    click(container.querySelector("[data-testid='channel-canvas-edit']")),
   );
-  assert.ok(editButton, "edit button renders after head A loads");
-  await act(async () => click(editButton));
   assert.ok(container.querySelector("[data-testid='channel-canvas-editor']"));
 
-  // Head moves to B under the open editor via a background refetch.
-  currentHead = { content: "moved", eventId: HEAD_B };
-  await act(async () => {
-    await queryClient.refetchQueries({ queryKey: ["channel-canvas"] });
-  });
-  await settle();
-
-  // Save — the submitted expected revision must be the snapshot (A), not B.
   await act(async () => {
     click(container.querySelector("[data-testid='channel-canvas-save']"));
   });
+  await settle(12);
 
-  assert.equal(setCanvasCalls.length, 1);
-  assert.equal(setCanvasCalls[0].expectedRevision, HEAD_A);
+  assert.equal(
+    container.querySelector("[data-testid='channel-canvas-editor']"),
+    null,
+    "editor closes after an accepted-but-unverified save",
+  );
+  assert.ok(
+    container.querySelector("[data-testid='channel-canvas-unverified-notice']"),
+    "the non-destructive unverified-save note renders",
+  );
 
-  // Drain the refetch the save's onSuccess invalidation triggers, plus any
-  // deferred render still scheduled, so no work is pending at teardown.
+  await settle(12);
+  await act(async () => root.unmount());
+  queryClient.clear();
+  container.remove();
+});
+
+test("verified:true save closes the editor with no unverified note", async () => {
+  nextVerified = true;
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { gcTime: Number.POSITIVE_INFINITY, retry: false },
+      mutations: { gcTime: 0 },
+    },
+  });
+  const { container, root } = await mount(queryClient);
+
+  await act(async () =>
+    click(container.querySelector("[data-testid='channel-canvas-edit']")),
+  );
+  await act(async () => {
+    click(container.querySelector("[data-testid='channel-canvas-save']"));
+  });
+  await settle(12);
+
+  assert.equal(
+    container.querySelector("[data-testid='channel-canvas-editor']"),
+    null,
+    "editor closes after a verified save",
+  );
+  assert.equal(
+    container.querySelector("[data-testid='channel-canvas-unverified-notice']"),
+    null,
+    "a verified save shows no unverified note",
+  );
+
   await settle(12);
   await act(async () => root.unmount());
   queryClient.clear();

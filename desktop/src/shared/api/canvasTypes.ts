@@ -14,6 +14,13 @@ export type SetCanvasInput = {
 export type SetCanvasResult = {
   ok: boolean;
   eventId: string;
+  /**
+   * `false` when the write was accepted by the relay but the post-write
+   * verification read failed, so supersession could not be checked. The save is
+   * durable; the caller shows a non-destructive "saved, verification
+   * unavailable" note rather than a failure. `true` on the normal verified path.
+   */
+  verified: boolean;
 };
 
 export type CanvasRevision = {
