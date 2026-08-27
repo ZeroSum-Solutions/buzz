@@ -61,7 +61,14 @@ export function useSetCanvasMutation(channelId: string | null) {
         expectedRevision: input.expectedRevision ?? null,
       });
     },
-    onSuccess: () => {
+    // Invalidate on every settled outcome, not just success: an accepted
+    // write reported as CANVAS_SUPERSEDED is durable and in history, yet it
+    // rejects the mutation — the UI tells the user to reload and restore the
+    // retained revision, so the stale current/history caches must refetch on
+    // that rejection too. The pre-publish conflict paths and plain network
+    // failures also mean the canvas may have moved, so a refetch is correct
+    // there as well.
+    onSettled: () => {
       if (channelId) {
         void queryClient.invalidateQueries({
           queryKey: ["channel-canvas", channelId],
