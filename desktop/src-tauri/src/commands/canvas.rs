@@ -12,15 +12,7 @@ pub async fn get_canvas(
     channel_id: String,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
-    let events = query_relay(
-        &state,
-        &[serde_json::json!({
-            "kinds": [40100],
-            "#h": [channel_id],
-            "limit": 1
-        })],
-    )
-    .await?;
+    let events = query_relay(&state, &[get_canvas_filter(&channel_id)]).await?;
 
     let Some(event) = events.first() else {
         // Explicit nulls: the TS caller distinguishes "no canvas yet" from
@@ -184,6 +176,34 @@ fn check_canvas_precondition(
     }
 }
 
+/// Build the filter for [`get_canvas`] (display read).
+///
+/// Display reads must NOT carry `"consistency"` — they are replica-eligible
+/// reads that do not gate writes. Exposed for unit tests so asserting the
+/// field is absent is causal: adding `"consistency"` to this function turns
+/// the inverse-guard test red.
+fn get_canvas_filter(channel_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kinds": [40100],
+        "#h": [channel_id],
+        "limit": 1,
+    })
+}
+
+/// Build the base filter for [`get_canvas_history`] (display read).
+///
+/// Like [`get_canvas_filter`], this must NOT carry `"consistency"` — history
+/// pagination is a display read, never write-gating. Exposed for unit tests
+/// for the same causal reason. The caller layers optional `until`/`before_id`
+/// pagination fields on top.
+fn get_canvas_history_base_filter(channel_id: &str, page_size: usize) -> serde_json::Value {
+    serde_json::json!({
+        "kinds": [40100],
+        "#h": [channel_id],
+        "limit": page_size,
+    })
+}
+
 /// Build the filter for [`current_canvas_head`].
 ///
 /// The filter carries `"consistency": "strong"` because this read gates a
@@ -285,11 +305,7 @@ pub async fn get_canvas_history(
     // stranding them behind an unreachable page.
     let page_size = resolve_history_page_size(limit)?;
 
-    let mut filter = serde_json::json!({
-        "kinds": [40100],
-        "#h": [channel_id],
-        "limit": page_size,
-    });
+    let mut filter = get_canvas_history_base_filter(&channel_id, page_size);
     if let Some(value) = until {
         filter["until"] = serde_json::json!(value);
     }
@@ -486,19 +502,21 @@ mod tests {
     //
     // `canvas_head_filter` and `canvas_ancestry_filter` build the JSON that
     // `current_canvas_head` and `current_canvas_head_ancestry` pass to
-    // `query_relay`. These tests assert the `"consistency"` field is
-    // present/absent in the produced filter, and that the async functions
-    // delegate to those helpers (the helpers ARE the production code path —
-    // there is no copy).
+    // `query_relay`. `get_canvas_filter` and `get_canvas_history_base_filter`
+    // build the corresponding display filters. These tests assert the
+    // `"consistency"` field is present/absent in the produced filter, and that
+    // each command delegates to its helper (the helpers ARE the production code
+    // path — there is no copy).
     //
     // Mutation oracle:
     //   * Removing `"consistency"` from `canvas_head_filter` → the
     //     `head_filter_carries_strong_consistency` test fails.
     //   * Removing `"consistency"` from `canvas_ancestry_filter` → the
     //     `ancestry_filter_carries_strong_consistency` test fails.
-    //   * `get_canvas` builds its filter inline without `"consistency"` → the
-    //     `get_canvas_filter_does_not_carry_consistency` test stays green (it
-    //     asserts absence), serving as the inverse guard.
+    //   * Adding `"consistency"` to `get_canvas_filter` → the
+    //     `get_canvas_filter_does_not_carry_consistency` test fails.
+    //   * Adding `"consistency"` to `get_canvas_history_base_filter` → the
+    //     `get_canvas_history_base_filter_does_not_carry_consistency` test fails.
 
     #[test]
     fn head_filter_carries_strong_consistency() {
@@ -541,23 +559,32 @@ mod tests {
         );
     }
 
-    /// `get_canvas` is a display read: it must NOT carry `"consistency"`. This
-    /// is the inverse guard — if `consistency` were accidentally injected into
-    /// the display filter, this test would catch it.
+    /// `get_canvas` and `get_canvas_history` are display reads: they must NOT
+    /// carry `"consistency"`. These inverse guards call the actual production
+    /// filter builders — adding `"consistency"` to either builder turns the
+    /// relevant test red immediately (unlike a copied literal, which would
+    /// silently stay green while production drifted).
     #[test]
     fn get_canvas_filter_does_not_carry_consistency() {
-        // The `get_canvas` filter is built inline in the handler; replicate it
-        // here so any future addition of `consistency` to that literal fails
-        // this test. Note: this is intentionally a copy so it catches divergence
-        // from the production literal — the mutation oracle is the comparison.
-        let f = serde_json::json!({
-            "kinds": [40100],
-            "#h": ["326d56bc-c96c-4af0-86a1-5e804cd1b467"],
-            "limit": 1
-        });
+        let f = super::get_canvas_filter("326d56bc-c96c-4af0-86a1-5e804cd1b467");
         assert!(
             f.get("consistency").is_none(),
             "display (get_canvas) filter must NOT carry consistency: {f}"
         );
+        // Structural sanity.
+        assert_eq!(f["kinds"], serde_json::json!([40100]));
+        assert_eq!(f.get("limit").and_then(|v| v.as_u64()), Some(1));
+    }
+
+    #[test]
+    fn get_canvas_history_base_filter_does_not_carry_consistency() {
+        let f = super::get_canvas_history_base_filter("326d56bc-c96c-4af0-86a1-5e804cd1b467", 50);
+        assert!(
+            f.get("consistency").is_none(),
+            "display (get_canvas_history) filter must NOT carry consistency: {f}"
+        );
+        // Structural sanity.
+        assert_eq!(f["kinds"], serde_json::json!([40100]));
+        assert_eq!(f.get("limit").and_then(|v| v.as_u64()), Some(50));
     }
 }

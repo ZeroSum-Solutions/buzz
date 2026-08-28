@@ -532,6 +532,25 @@ jobs:
             --run-ignored ignored-only
         env:
           RELAY_URL: ws://localhost:3000
+      - name: Canvas writer-pin dispatch test
+        # The only causal proof that `consistency: "strong"` routes to the
+        # writer pool at the real /query bridge: a canvas event present only on
+        # the writer is visible with the pin, absent without it, and an unknown
+        # consistency value is rejected 400. Two scratch Postgres databases are
+        # created and migrated inside the test; the test tears them down on exit.
+        # Mutation oracle: routing the Writer arm through query_events_routed
+        # makes the strong-read assertion fail with `left: 0, right: 1`.
+        # #[ignore]d in the default suite — see
+        # api::bridge::tests::strong_consistency_dispatches_to_writer_pool_not_replica.
+        run: |
+          cargo nextest run \
+            --archive-file target/ci/backend-integration-tests.tar.zst \
+            -E 'package(buzz-relay) and test(=api::bridge::tests::strong_consistency_dispatches_to_writer_pool_not_replica)' \
+            --run-ignored ignored-only
+        env:
+          DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+          TEST_DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+          REDIS_URL: redis://localhost:6379
       - name: Upload relay log
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
