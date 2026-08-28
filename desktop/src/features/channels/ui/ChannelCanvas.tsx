@@ -79,6 +79,10 @@ export function ChannelCanvas({
   const deferredCanvasContent = React.useDeferredValue(canvasContent);
 
   function handleStartEditing() {
+    // Clear any prior rejected-save error so it can't render in the fresh
+    // editor session — the mutation state persists across edit sessions and
+    // the editor renders `setCanvasMutation.error` whenever it opens.
+    setCanvasMutation.reset();
     setDraft(canvasContent ?? "");
     setEditBaseRevision(canvasRevision);
     setUnverifiedSaveNotice(false);
