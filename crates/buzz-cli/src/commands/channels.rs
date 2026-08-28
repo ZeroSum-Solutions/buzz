@@ -272,15 +272,25 @@ pub async fn cmd_list_channel_members(
 /// The relay orders results `created_at DESC, id ASC`, so a `limit: 1` query
 /// returns exactly the head every surface agrees on — no full-stream scan, no
 /// silent page clamp.
+///
+/// `writer_pinned` opts into read-your-writes: when the head read gates a write
+/// (the restore precondition, or `set`'s writer-discipline stamping) it must
+/// observe the caller's own recent writes, so it sets `consistency: strong` to
+/// pin the relay read to the writer pool. The display path (`get`) leaves it
+/// `false` and stays replica-eligible.
 async fn fetch_canvas_head(
     client: &BuzzClient,
     channel_id: &str,
+    writer_pinned: bool,
 ) -> Result<Option<serde_json::Value>, CliError> {
-    let filter = serde_json::json!({
+    let mut filter = serde_json::json!({
         "kinds": [40100],
         "#h": [channel_id],
         "limit": 1,
     });
+    if writer_pinned {
+        filter["consistency"] = serde_json::json!("strong");
+    }
     let resp = client.query(&filter).await?;
     let events: Vec<serde_json::Value> = serde_json::from_str(&resp).map_err(|e| {
         CliError::Other(format!(
@@ -325,7 +335,7 @@ pub async fn cmd_get_canvas(
             validate_hex64(revision)?;
             fetch_canvas_revision(client, channel_id, revision).await?
         }
-        None => fetch_canvas_head(client, channel_id).await?,
+        None => fetch_canvas_head(client, channel_id, false).await?,
     };
     if let Some(content) = selected
         .as_ref()
@@ -414,7 +424,7 @@ pub async fn cmd_restore_canvas(
         })?
         .to_string();
 
-    let head = fetch_canvas_head(client, channel_id)
+    let head = fetch_canvas_head(client, channel_id, true)
         .await?
         .ok_or_else(|| CliError::Other(format!("no canvas head found for channel {channel_id}")))?;
     let head_id = head
@@ -487,6 +497,9 @@ async fn fetch_canvas_ancestry(
         "kinds": [40100],
         "#h": [channel_id],
         "limit": buzz_sdk::CANVAS_ANCESTRY_WALK_MAX,
+        // Read-your-writes: this post-write verification read must observe the
+        // restore we just published, so it pins to the writer pool.
+        "consistency": "strong",
     });
     let resp = client.query(&filter).await?;
     let events: Vec<serde_json::Value> = serde_json::from_str(&resp).map_err(|e| {
@@ -1710,7 +1723,7 @@ pub async fn cmd_set_canvas(
     // head timestamped more than 15 minutes in the future is refused with a
     // clear error rather than extending a poisoned timeline. With no head yet,
     // `Some("none")` records the create-assertion at the default `now`.
-    let builder = match fetch_canvas_head(client, channel_id).await? {
+    let builder = match fetch_canvas_head(client, channel_id, true).await? {
         Some(head) => {
             let head_id = head.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
                 CliError::Other(format!("no canvas head id found for channel {channel_id}"))

@@ -293,6 +293,60 @@ fn extract_before_id(raw: &Value) -> BeforeId {
     }
 }
 
+/// The `consistency` extension field: a read-your-writes opt-in. A
+/// write-influencing read (a canvas save's head precondition or its post-write
+/// ancestry verification) sets `"consistency": "strong"` so the relay serves it
+/// from the writer pool, never a replica that may lag behind the caller's own
+/// just-accepted write. Absent = the default routed path (replica-eligible when
+/// `BUZZ_REPLICA_READ_MAX_AGE_MS` is set).
+///
+/// This only ever forces the *writer*, which is always the sound direction (a
+/// replica can be stale, the writer never is), so it cannot be abused to skip
+/// data — there is deliberately no inverse "force replica" value. Any value
+/// other than the single accepted `"strong"` is rejected, so a typo fails loud
+/// rather than silently degrading to routed.
+enum Consistency {
+    /// Absent: route normally (replica-eligible under the read budget).
+    Default,
+    /// `"strong"`: pin this filter's read to the writer pool.
+    Strong,
+    /// Present but not `"strong"`: reject the request.
+    Malformed,
+}
+
+fn extract_consistency(raw: &Value) -> Consistency {
+    let Some(value) = raw.get("consistency") else {
+        return Consistency::Default;
+    };
+    match value.as_str() {
+        Some("strong") => Consistency::Strong,
+        _ => Consistency::Malformed,
+    }
+}
+
+/// Which pool a catchall filter's read is dispatched to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadRoute {
+    /// The default replica-eligible path (`query_events_routed`).
+    Routed,
+    /// The writer pool (`query_events`), pinned by `"consistency": "strong"`.
+    Writer,
+}
+
+/// Resolve the pool a filter reads from, folding the `consistency` extension
+/// into a routing direction. `"strong"` pins the writer; absent routes
+/// normally; any other value is a client error (`Err`), rejected before any DB
+/// work. This is the single seam that maps client-carried intent to a pool, so
+/// a refactor that drops the field flips the mapping this function returns and
+/// its tests fail.
+fn resolve_read_route(raw: &Value) -> Result<ReadRoute, ()> {
+    match extract_consistency(raw) {
+        Consistency::Default => Ok(ReadRoute::Routed),
+        Consistency::Strong => Ok(ReadRoute::Writer),
+        Consistency::Malformed => Err(()),
+    }
+}
+
 fn extract_buzz_channel(raw: &Value) -> Option<&str> {
     raw.get("#buzz-channel")
         .and_then(Value::as_array)
@@ -1401,7 +1455,7 @@ async fn query_events_authed(
     // skips and the `before_id` BAD_REQUEST are decided here, before any DB
     // work is issued (validation errors are deterministic client mistakes, so
     // surfacing them ahead of transient DB errors is strictly more predictable).
-    let mut catchall_queries: Vec<(usize, buzz_db::EventQuery)> = Vec::new();
+    let mut catchall_queries: Vec<(usize, buzz_db::EventQuery, ReadRoute)> = Vec::new();
     for (idx, (raw, filter)) in raw_filters.iter().zip(filters.iter()).enumerate() {
         if handled.contains(&idx) {
             continue;
@@ -1412,6 +1466,17 @@ async fn query_events_authed(
                 continue;
             }
         }
+
+        // Read-your-writes opt-in: a write-influencing read pins to the writer
+        // pool so a lagging replica cannot hide the caller's own just-accepted
+        // write. Rejected before any DB work, like the `before_id` grammar
+        // error below — a malformed value is a deterministic client mistake.
+        let read_route = resolve_read_route(raw).map_err(|()| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "consistency must be \"strong\" when present",
+            )
+        })?;
 
         let mut query = crate::handlers::req::build_event_query_from_filter(
             filter,
@@ -1466,7 +1531,7 @@ async fn query_events_authed(
             query.offset = Some(offset);
         }
 
-        catchall_queries.push((idx, query));
+        catchall_queries.push((idx, query, read_route));
     }
 
     // Phase 2 — DB reads, bounded-concurrent, order-preserving (`buffered`).
@@ -1474,10 +1539,23 @@ async fn query_events_authed(
     // and error semantics match the previous serial loop.
     use futures_util::stream::{self, StreamExt};
     let db = state.db.clone();
-    let mut catchall_results = stream::iter(catchall_queries.into_iter().map(|(idx, query)| {
-        let db = db.clone();
-        async move { (idx, db.query_events_routed("bridge_query", &query).await) }
-    }))
+    let mut catchall_results = stream::iter(catchall_queries.into_iter().map(
+        |(idx, query, read_route)| {
+            let db = db.clone();
+            async move {
+                // The route was resolved from client-carried `consistency`
+                // intent in phase 1 (`resolve_read_route`). `Writer` pins the
+                // read to the writer pool (`query_events`); `Routed` takes the
+                // replica-eligible path. Only these two directions exist — the
+                // inverse "force replica" is deliberately unrepresentable.
+                let result = match read_route {
+                    ReadRoute::Writer => db.query_events(&query).await,
+                    ReadRoute::Routed => db.query_events_routed("bridge_query", &query).await,
+                };
+                (idx, result)
+            }
+        },
+    ))
     .buffered(crate::handlers::req::FILTER_QUERY_CONCURRENCY);
 
     // Phase 3 — post-processing, strictly in filter order.
@@ -3460,6 +3538,76 @@ mod postgres_tests {
     fn extract_before_id_non_string() {
         let raw = serde_json::json!({ "before_id": 12345 });
         assert!(matches!(extract_before_id(&raw), BeforeId::Malformed));
+    }
+
+    #[test]
+    fn extract_consistency_strong_pins_to_writer() {
+        let raw = serde_json::json!({ "consistency": "strong" });
+        assert!(matches!(extract_consistency(&raw), Consistency::Strong));
+    }
+
+    #[test]
+    fn extract_consistency_absent_is_default_routed() {
+        let raw = serde_json::json!({ "kinds": [40100] });
+        assert!(matches!(extract_consistency(&raw), Consistency::Default));
+    }
+
+    #[test]
+    fn extract_consistency_unknown_value_is_malformed() {
+        // A typo or an attempt to name the inverse "force replica" direction
+        // must reject the request, never silently degrade to routed.
+        for bad in [
+            serde_json::json!({ "consistency": "weak" }),
+            serde_json::json!({ "consistency": "replica" }),
+            serde_json::json!({ "consistency": "eventual" }),
+            serde_json::json!({ "consistency": "STRONG" }),
+            serde_json::json!({ "consistency": true }),
+            serde_json::json!({ "consistency": 1 }),
+        ] {
+            assert!(
+                matches!(extract_consistency(&bad), Consistency::Malformed),
+                "{bad} must be rejected as malformed"
+            );
+        }
+    }
+
+    /// The routing direction the catchall loop dispatches on. A filter carrying
+    /// `"consistency": "strong"` MUST resolve to the writer pool
+    /// (`ReadRoute::Writer` → `query_events`); one without MUST resolve to the
+    /// replica-eligible path (`ReadRoute::Routed` → `query_events_routed`).
+    /// Both directions are pinned here so a refactor that drops the field on
+    /// the floor — reading every filter from one pool — flips one of these and
+    /// fails. The writer-vs-replica pool divergence itself is exercised by the
+    /// two-pool `routed_reads_are_confined_to_the_requested_community` test in
+    /// buzz-db (`#[ignore]`, requires Postgres).
+    #[test]
+    fn resolve_read_route_pins_strong_to_writer() {
+        let strong = serde_json::json!({ "consistency": "strong" });
+        assert_eq!(resolve_read_route(&strong), Ok(ReadRoute::Writer));
+    }
+
+    #[test]
+    fn resolve_read_route_defaults_to_routed_replica() {
+        let absent = serde_json::json!({ "kinds": [40100], "limit": 1 });
+        assert_eq!(resolve_read_route(&absent), Ok(ReadRoute::Routed));
+    }
+
+    #[test]
+    fn resolve_read_route_rejects_unknown_values() {
+        // Malformed never degrades to a pool — it is a client error, so the
+        // catchall loop turns this `Err` into a BAD_REQUEST before any DB work.
+        for bad in [
+            serde_json::json!({ "consistency": "weak" }),
+            serde_json::json!({ "consistency": "replica" }),
+            serde_json::json!({ "consistency": "STRONG" }),
+            serde_json::json!({ "consistency": true }),
+        ] {
+            assert_eq!(
+                resolve_read_route(&bad),
+                Err(()),
+                "{bad} must be a client error, never a pool"
+            );
+        }
     }
 
     /// Extension flags opt in only on a literal JSON `true` — absent,

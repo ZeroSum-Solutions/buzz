@@ -18,6 +18,16 @@ import {
   CANVAS_EXPECTED_REVISION_NONE,
   canvasConflictMessage,
 } from "@/features/channels/canvasConflict";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/shared/ui/alert-dialog";
 import { Button } from "@/shared/ui/button";
 
 type CanvasHistoryPanelProps = {
@@ -47,6 +57,12 @@ export function CanvasHistoryPanel({
   const historyQuery = useCanvasHistoryQuery(channelId, true);
   const restoreMutation = useSetCanvasMutation(channelId);
   const [selectedId, setSelectedId] = React.useState<string | null>(null);
+  // Restore rewrites the shared channel canvas for everyone, so it is gated
+  // behind an explicit confirmation identifying the target revision. Holds the
+  // revision awaiting confirmation; `null` means no dialog is open. Nothing
+  // mutates until the user confirms.
+  const [confirmRevision, setConfirmRevision] =
+    React.useState<CanvasRevision | null>(null);
   // Non-destructive notice shown after a restore the relay accepted but could
   // not verify (the post-write supersession read failed). The restore is
   // durable; the note tells the user to check the current canvas if a
@@ -195,11 +211,7 @@ export function CanvasHistoryPanel({
                     <Button
                       data-testid="channel-canvas-restore"
                       disabled={restoreMutation.isPending}
-                      onClick={() => {
-                        void handleRestore(revision).catch(() => {
-                          // Surfaced below via restoreMutation.error.
-                        });
-                      }}
+                      onClick={() => setConfirmRevision(revision)}
                       size="sm"
                       type="button"
                       variant="outline"
@@ -234,6 +246,50 @@ export function CanvasHistoryPanel({
           {historyQuery.isFetchingNextPage ? "Loading..." : "Load older"}
         </Button>
       ) : null}
+      <AlertDialog
+        onOpenChange={(open) => {
+          if (!open) setConfirmRevision(null);
+        }}
+        open={confirmRevision !== null}
+      >
+        <AlertDialogContent data-testid="channel-canvas-restore-confirm">
+          <AlertDialogHeader>
+            <AlertDialogTitle>Restore this revision?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This publishes{" "}
+              {confirmRevision
+                ? `${authorLabel(confirmRevision.author)}'s revision from ${formatItemTimestamp(confirmRevision.createdAt, { withTime: true })}`
+                : "the selected revision"}{" "}
+              as the current canvas for everyone in this channel. History is
+              preserved.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel asChild>
+              <Button type="button" variant="outline">
+                Cancel
+              </Button>
+            </AlertDialogCancel>
+            <AlertDialogAction asChild>
+              <Button
+                data-testid="channel-canvas-restore-confirm-action"
+                onClick={() => {
+                  const revision = confirmRevision;
+                  setConfirmRevision(null);
+                  if (revision) {
+                    void handleRestore(revision).catch(() => {
+                      // Surfaced below via restoreMutation.error.
+                    });
+                  }
+                }}
+                type="button"
+              >
+                Restore
+              </Button>
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

@@ -3194,6 +3194,9 @@ test("canvas history, save-conflict, and restore journey", async ({ page }) => {
   await expect(items).toHaveCount(3);
   await items.last().getByRole("button").first().click();
   await section.getByTestId("channel-canvas-restore").click();
+  // Restore now requires explicit confirmation before it mutates the shared
+  // canvas; the dialog identifies the target revision.
+  await page.getByTestId("channel-canvas-restore-confirm-action").click();
   await expect(section.getByTestId("channel-canvas-content")).toContainText(
     "first draft",
   );

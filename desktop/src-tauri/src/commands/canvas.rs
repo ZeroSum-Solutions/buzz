@@ -196,7 +196,10 @@ async fn current_canvas_head(
         &[serde_json::json!({
             "kinds": [40100],
             "#h": [channel_id],
-            "limit": 1
+            "limit": 1,
+            // Read-your-writes: this head read gates a write (the save's
+            // precondition), so it must never route to a lagging replica.
+            "consistency": "strong",
         })],
     )
     .await?;
@@ -223,6 +226,9 @@ async fn current_canvas_head_ancestry(
             "kinds": [40100],
             "#h": [channel_id],
             "limit": buzz_sdk_pkg::CANVAS_ANCESTRY_WALK_MAX,
+            // Read-your-writes: this post-write verification read must observe
+            // the caller's own just-accepted save, so it pins to the writer.
+            "consistency": "strong",
         })],
     )
     .await?;
