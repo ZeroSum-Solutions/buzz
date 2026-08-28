@@ -19,6 +19,8 @@ import { after, before, test } from "node:test";
 
 import { JSDOM } from "jsdom";
 
+import { installRadixDialogGlobals } from "./canvasDialogTestEnv.mjs";
+
 registerHooks({
   resolve(specifier, context, nextResolve) {
     if (specifier === "@/shared/ui/markdown") {
@@ -82,49 +84,7 @@ before(async () => {
     addEventListener() {},
     removeEventListener() {},
   });
-  dom.window.requestAnimationFrame = (callback) => setTimeout(callback, 0);
-  globalThis.requestAnimationFrame = dom.window.requestAnimationFrame;
-  dom.window.ResizeObserver = globalThis.ResizeObserver;
-  // Copy the DOM-level globals Radix AlertDialog's focus/dismiss machinery
-  // references without a `window.` prefix (getComputedStyle, NodeFilter, the
-  // HTML*/SVG* constructors, ...). Bulk copy avoids per-internal whack-a-mole.
-  for (const key of Object.getOwnPropertyNames(dom.window)) {
-    if (
-      !(key in globalThis) &&
-      (key.startsWith("HTML") ||
-        key.startsWith("SVG") ||
-        [
-          "Node",
-          "NodeFilter",
-          "NodeList",
-          "Event",
-          "CustomEvent",
-          "MouseEvent",
-          "KeyboardEvent",
-          "FocusEvent",
-          "PointerEvent",
-          "EventTarget",
-          "DocumentFragment",
-          "getComputedStyle",
-        ].includes(key))
-    ) {
-      const val = dom.window[key];
-      if (val !== undefined) globalThis[key] = val;
-    }
-  }
-  // getComputedStyle must stay bound to dom.window or it throws "Illegal
-  // invocation" when Radix calls it.
-  globalThis.getComputedStyle = dom.window.getComputedStyle.bind(dom.window);
-  // Radix DismissableLayer/FocusScope dispatch plain objects through
-  // dispatchEvent for layer coordination; JSDOM's strict Event validation
-  // throws on those. Drop non-Event objects so the dialog's effects settle
-  // without affecting real Event delivery.
-  const origDispatch = dom.window.EventTarget.prototype.dispatchEvent;
-  dom.window.EventTarget.prototype.dispatchEvent = function (event) {
-    if (!(event instanceof dom.window.Event)) return false;
-    return origDispatch.call(this, event);
-  };
-  globalThis.EventTarget = dom.window.EventTarget;
+  installRadixDialogGlobals(dom);
 
   dom.window.__TAURI_INTERNALS__ = {
     invoke: async (cmd) => {

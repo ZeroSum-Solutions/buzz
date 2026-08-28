@@ -21,6 +21,8 @@ import { after, before, test } from "node:test";
 
 import { JSDOM } from "jsdom";
 
+import { installRadixDialogGlobals } from "./canvasDialogTestEnv.mjs";
+
 registerHooks({
   resolve(specifier, context, nextResolve) {
     if (specifier === "@/shared/ui/markdown") {
@@ -81,6 +83,7 @@ before(async () => {
     addEventListener() {},
     removeEventListener() {},
   });
+  installRadixDialogGlobals(dom);
 
   dom.window.__TAURI_INTERNALS__ = {
     invoke: async (cmd) => {
@@ -249,6 +252,18 @@ test("restore path: supersession rejection invalidates both canvas caches", asyn
   invalidated.length = 0; // Ignore history/profile fetches settling.
   await act(async () => {
     click(container.querySelector("[data-testid='channel-canvas-restore']"));
+  });
+  await settle();
+
+  // Restore opens a confirmation dialog before mutating the shared canvas;
+  // confirm to fire the (rejecting) set_canvas. The dialog portals into
+  // document.body.
+  await act(async () => {
+    click(
+      dom.window.document.querySelector(
+        "[data-testid='channel-canvas-restore-confirm-action']",
+      ),
+    );
   });
   await settle();
 
