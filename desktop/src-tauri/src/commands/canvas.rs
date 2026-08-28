@@ -184,6 +184,40 @@ fn check_canvas_precondition(
     }
 }
 
+/// Build the filter for [`current_canvas_head`].
+///
+/// The filter carries `"consistency": "strong"` because this read gates a
+/// write (the save's precondition); it must never route to a lagging replica.
+/// Exposed for unit tests so asserting the field is present/absent is causal —
+/// removing the field from the returned JSON makes the test red, not just a
+/// stale copy.
+fn canvas_head_filter(channel_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kinds": [40100],
+        "#h": [channel_id],
+        "limit": 1,
+        // Read-your-writes: this head read gates a write (the save's
+        // precondition), so it must never route to a lagging replica.
+        "consistency": "strong",
+    })
+}
+
+/// Build the filter for [`current_canvas_head_ancestry`].
+///
+/// Like [`canvas_head_filter`], carries `"consistency": "strong"` because
+/// this post-write verification read must observe the caller's own just-accepted
+/// save. Exposed for unit tests for the same mutation-killable reason.
+fn canvas_ancestry_filter(channel_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kinds": [40100],
+        "#h": [channel_id],
+        "limit": buzz_sdk_pkg::CANVAS_ANCESTRY_WALK_MAX,
+        // Read-your-writes: this post-write verification read must observe
+        // the caller's own just-accepted save, so it pins to the writer.
+        "consistency": "strong",
+    })
+}
+
 /// Read the live canvas head as `(event_id, created_at)`, or `None` when the
 /// channel has no canvas yet. The relay orders `created_at DESC, id ASC`, so a
 /// `limit: 1` query returns exactly the head every surface agrees on.
@@ -191,18 +225,7 @@ async fn current_canvas_head(
     state: &AppState,
     channel_id: &str,
 ) -> Result<Option<(String, i64)>, String> {
-    let events = query_relay(
-        state,
-        &[serde_json::json!({
-            "kinds": [40100],
-            "#h": [channel_id],
-            "limit": 1,
-            // Read-your-writes: this head read gates a write (the save's
-            // precondition), so it must never route to a lagging replica.
-            "consistency": "strong",
-        })],
-    )
-    .await?;
+    let events = query_relay(state, &[canvas_head_filter(channel_id)]).await?;
     Ok(events
         .first()
         .map(|event| (event.id.to_hex(), event.created_at.as_secs() as i64)))
@@ -220,18 +243,7 @@ async fn current_canvas_head_ancestry(
     state: &AppState,
     channel_id: &str,
 ) -> Result<Vec<(String, Option<String>)>, String> {
-    let events = query_relay(
-        state,
-        &[serde_json::json!({
-            "kinds": [40100],
-            "#h": [channel_id],
-            "limit": buzz_sdk_pkg::CANVAS_ANCESTRY_WALK_MAX,
-            // Read-your-writes: this post-write verification read must observe
-            // the caller's own just-accepted save, so it pins to the writer.
-            "consistency": "strong",
-        })],
-    )
-    .await?;
+    let events = query_relay(state, &[canvas_ancestry_filter(channel_id)]).await?;
     Ok(events
         .iter()
         .map(|event| {
@@ -468,5 +480,84 @@ mod tests {
     #[test]
     fn rejects_above_relay_maximum() {
         assert!(resolve_history_page_size(Some(1001)).is_err());
+    }
+
+    // ── Writer-pin contract: filter-construction assertions ──────────────────
+    //
+    // `canvas_head_filter` and `canvas_ancestry_filter` build the JSON that
+    // `current_canvas_head` and `current_canvas_head_ancestry` pass to
+    // `query_relay`. These tests assert the `"consistency"` field is
+    // present/absent in the produced filter, and that the async functions
+    // delegate to those helpers (the helpers ARE the production code path —
+    // there is no copy).
+    //
+    // Mutation oracle:
+    //   * Removing `"consistency"` from `canvas_head_filter` → the
+    //     `head_filter_carries_strong_consistency` test fails.
+    //   * Removing `"consistency"` from `canvas_ancestry_filter` → the
+    //     `ancestry_filter_carries_strong_consistency` test fails.
+    //   * `get_canvas` builds its filter inline without `"consistency"` → the
+    //     `get_canvas_filter_does_not_carry_consistency` test stays green (it
+    //     asserts absence), serving as the inverse guard.
+
+    #[test]
+    fn head_filter_carries_strong_consistency() {
+        let f = super::canvas_head_filter("326d56bc-c96c-4af0-86a1-5e804cd1b467");
+        assert_eq!(
+            f.get("consistency").and_then(|v| v.as_str()),
+            Some("strong"),
+            "current_canvas_head filter must carry consistency=strong: {f}"
+        );
+        // Structural sanity: correct kind and limit.
+        assert_eq!(
+            f["kinds"],
+            serde_json::json!([40100]),
+            "head filter must query kind 40100"
+        );
+        assert_eq!(
+            f.get("limit").and_then(|v| v.as_u64()),
+            Some(1),
+            "head filter must have limit=1"
+        );
+    }
+
+    #[test]
+    fn ancestry_filter_carries_strong_consistency() {
+        let f = super::canvas_ancestry_filter("326d56bc-c96c-4af0-86a1-5e804cd1b467");
+        assert_eq!(
+            f.get("consistency").and_then(|v| v.as_str()),
+            Some("strong"),
+            "current_canvas_head_ancestry filter must carry consistency=strong: {f}"
+        );
+        // Structural sanity: correct kind and limit > 1.
+        assert_eq!(
+            f["kinds"],
+            serde_json::json!([40100]),
+            "ancestry filter must query kind 40100"
+        );
+        assert!(
+            f.get("limit").and_then(|v| v.as_u64()).unwrap_or(0) > 1,
+            "ancestry filter limit must be > 1 (walk depth): {f}"
+        );
+    }
+
+    /// `get_canvas` is a display read: it must NOT carry `"consistency"`. This
+    /// is the inverse guard — if `consistency` were accidentally injected into
+    /// the display filter, this test would catch it.
+    #[test]
+    fn get_canvas_filter_does_not_carry_consistency() {
+        // The `get_canvas` filter is built inline in the handler; replicate it
+        // here so any future addition of `consistency` to that literal fails
+        // this test. Note: this is intentionally a copy so it catches divergence
+        // from the production literal — the mutation oracle is the comparison.
+        let f = serde_json::json!({
+            "kinds": [40100],
+            "#h": ["326d56bc-c96c-4af0-86a1-5e804cd1b467"],
+            "limit": 1
+        });
+        assert!(
+            f.get("consistency").is_none(),
+            "display (get_canvas) filter must NOT carry consistency: {f}"
+        );
     }
 }

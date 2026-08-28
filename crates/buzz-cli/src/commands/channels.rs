@@ -3240,21 +3240,35 @@ mod set_canvas_tests {
     struct RelayState {
         query_response: Arc<String>,
         submitted: Arc<Mutex<Option<Value>>>,
+        /// All filter arrays sent to POST /query, in call order.
+        query_bodies: Arc<Mutex<Vec<Vec<Value>>>>,
     }
 
     /// Spawn a relay that returns `query_response` from `POST /query` and records
     /// the event posted to `POST /events`. `submitted` stays `None` until (and
     /// unless) `set` actually publishes.
-    async fn relay(query_response: &str) -> (String, Arc<Mutex<Option<Value>>>) {
+    ///
+    /// Returns `(url, submitted_event, query_bodies)`.
+    async fn relay(
+        query_response: &str,
+    ) -> (
+        String,
+        Arc<Mutex<Option<Value>>>,
+        Arc<Mutex<Vec<Vec<Value>>>>,
+    ) {
         let submitted: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let query_bodies: Arc<Mutex<Vec<Vec<Value>>>> = Arc::new(Mutex::new(Vec::new()));
         let state = RelayState {
             query_response: Arc::new(query_response.to_string()),
             submitted: submitted.clone(),
+            query_bodies: query_bodies.clone(),
         };
         let app = Router::new()
             .route(
                 "/query",
-                post(|State(s): State<RelayState>, _body: Bytes| async move {
+                post(|State(s): State<RelayState>, body: Bytes| async move {
+                    let filters: Vec<Value> = serde_json::from_slice(&body).unwrap_or_default();
+                    s.query_bodies.lock().unwrap().push(filters);
                     (*s.query_response).clone()
                 }),
             )
@@ -3270,7 +3284,17 @@ mod set_canvas_tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (format!("http://{addr}"), submitted)
+        (format!("http://{addr}"), submitted, query_bodies)
+    }
+
+    /// Return all filter objects from all /query calls flattened into one vec.
+    fn all_filters(query_bodies: &Arc<Mutex<Vec<Vec<Value>>>>) -> Vec<Value> {
+        query_bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|batch| batch.clone())
+            .collect()
     }
 
     fn client(base_url: &str) -> BuzzClient {
@@ -3318,7 +3342,7 @@ mod set_canvas_tests {
             "created_at": future,
             "tags": [["h", CHANNEL]],
         }]);
-        let (url, submitted) = relay(&head.to_string()).await;
+        let (url, submitted, _) = relay(&head.to_string()).await;
 
         cmd_set_canvas(&client(&url), CHANNEL, "new content")
             .await
@@ -3351,7 +3375,7 @@ mod set_canvas_tests {
             "created_at": 4_102_444_800u64, // 2100-01-01Z — far past the ceiling
             "tags": [["h", CHANNEL]],
         }]);
-        let (url, submitted) = relay(&head.to_string()).await;
+        let (url, submitted, _) = relay(&head.to_string()).await;
 
         let err = cmd_set_canvas(&client(&url), CHANNEL, "new content")
             .await
@@ -3371,7 +3395,7 @@ mod set_canvas_tests {
     /// create-assertion `expected-revision: none`.
     #[tokio::test]
     async fn set_with_no_head_creates_with_expected_revision_none() {
-        let (url, submitted) = relay("[]").await;
+        let (url, submitted, _) = relay("[]").await;
 
         cmd_set_canvas(&client(&url), CHANNEL, "first content")
             .await
@@ -3396,7 +3420,7 @@ mod set_canvas_tests {
             "created_at": 1_700_000_000u64,
             "tags": [["h", CHANNEL]],
         }]);
-        let (url, submitted) = relay(&head.to_string()).await;
+        let (url, submitted, _) = relay(&head.to_string()).await;
 
         let err = cmd_set_canvas(&client(&url), CHANNEL, "new content")
             .await
@@ -3414,6 +3438,102 @@ mod set_canvas_tests {
             submitted.lock().unwrap().is_none(),
             "no event may be published when the head is malformed"
         );
+    }
+
+    /// `set` sends `"consistency": "strong"` on its head-read (write-influencing)
+    /// but NOT on other queries. This is the request-filter side of the writer-pin
+    /// contract: removing the injection from `fetch_canvas_head(writer_pinned=true)`
+    /// must turn this test red.
+    ///
+    /// Mutation oracle: if `filter["consistency"] = …` is deleted from the
+    /// `writer_pinned` branch of `fetch_canvas_head`, the head-read filter no
+    /// longer carries `"consistency"`, and the assertion below fails.
+    #[tokio::test]
+    async fn set_head_read_carries_strong_consistency() {
+        let head_id = "a".repeat(64);
+        let head = json!([{
+            "id": head_id,
+            "pubkey": "b".repeat(64),
+            "kind": 40100,
+            "content": "old",
+            "created_at": 1_700_000_000u64,
+            "tags": [["h", CHANNEL]],
+        }]);
+        let (url, _, query_bodies) = relay(&head.to_string()).await;
+        cmd_set_canvas(&client(&url), CHANNEL, "new content")
+            .await
+            .expect("set succeeds");
+
+        let filters = all_filters(&query_bodies);
+        // The head read is a non-`ids` filter for kind 40100 with limit 1.
+        let head_reads: Vec<_> = filters
+            .iter()
+            .filter(|f| {
+                f.get("ids").is_none()
+                    && f.get("kinds")
+                        .and_then(|k| k.as_array())
+                        .map(|a| a.iter().any(|k| k == 40100))
+                        .unwrap_or(false)
+                    && f.get("limit").and_then(|v| v.as_u64()) == Some(1)
+            })
+            .collect();
+        assert!(
+            !head_reads.is_empty(),
+            "set must issue at least one head-read filter"
+        );
+        for f in &head_reads {
+            assert_eq!(
+                f.get("consistency").and_then(|v| v.as_str()),
+                Some("strong"),
+                "set head-read must carry consistency=strong: {f}"
+            );
+        }
+    }
+
+    /// `get` (display path) does NOT send `"consistency"` — it stays
+    /// replica-eligible. This is the inverse of the writer-pin contract: a
+    /// display read that silently acquired the pin would unnecessarily load
+    /// the writer pool.
+    ///
+    /// Mutation oracle: if `fetch_canvas_head(writer_pinned=false)` were changed
+    /// to always inject `consistency`, the assertion below would fail.
+    #[tokio::test]
+    async fn get_head_read_does_not_carry_consistency() {
+        use super::cmd_get_canvas;
+
+        let head_id = "a".repeat(64);
+        let head = json!([{
+            "id": head_id,
+            "pubkey": "b".repeat(64),
+            "kind": 40100,
+            "content": "canvas content",
+            "created_at": 1_700_000_000u64,
+            "tags": [["h", CHANNEL]],
+        }]);
+        let (url, _, query_bodies) = relay(&head.to_string()).await;
+        cmd_get_canvas(&client(&url), CHANNEL, None)
+            .await
+            .expect("get succeeds");
+
+        let filters = all_filters(&query_bodies);
+        let head_reads: Vec<_> = filters
+            .iter()
+            .filter(|f| {
+                f.get("ids").is_none()
+                    && f.get("kinds")
+                        .and_then(|k| k.as_array())
+                        .map(|a| a.iter().any(|k| k == 40100))
+                        .unwrap_or(false)
+                    && f.get("limit").and_then(|v| v.as_u64()) == Some(1)
+            })
+            .collect();
+        assert!(!head_reads.is_empty(), "get must issue a head-read filter");
+        for f in &head_reads {
+            assert!(
+                f.get("consistency").is_none(),
+                "display head-read must NOT carry consistency: {f}"
+            );
+        }
     }
 }
 
@@ -3477,22 +3597,36 @@ mod restore_canvas_tests {
         /// Head queries seen so far: read 0 is pre-write, read 1 is post-write.
         head_reads: Arc<Mutex<u32>>,
         submitted: Arc<Mutex<Option<Value>>>,
+        /// All filter arrays sent to POST /query, in call order.
+        query_bodies: Arc<Mutex<Vec<Vec<Value>>>>,
     }
 
-    async fn relay(post_head: PostHead) -> (String, Arc<Mutex<Option<Value>>>) {
+    async fn relay(
+        post_head: PostHead,
+    ) -> (
+        String,
+        Arc<Mutex<Option<Value>>>,
+        Arc<Mutex<Vec<Vec<Value>>>>,
+    ) {
         let submitted: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let query_bodies: Arc<Mutex<Vec<Vec<Value>>>> = Arc::new(Mutex::new(Vec::new()));
         let state = RelayState {
             revision_response: Arc::new(json!([canvas_event(REVISION, 1_000, None)]).to_string()),
             pre_head: Arc::new(json!([canvas_event(HEAD, 2_000, None)]).to_string()),
             post_head,
             head_reads: Arc::new(Mutex::new(0)),
             submitted: submitted.clone(),
+            query_bodies: query_bodies.clone(),
         };
         let app = Router::new()
             .route(
                 "/query",
                 post(|State(s): State<RelayState>, body: Bytes| async move {
                     use axum::http::StatusCode;
+                    // Capture every request body for filter-field assertions.
+                    if let Ok(filters) = serde_json::from_slice::<Vec<Value>>(&body) {
+                        s.query_bodies.lock().unwrap().push(filters);
+                    }
                     let is_ids_query = std::str::from_utf8(&body)
                         .map(|b| b.contains("\"ids\""))
                         .unwrap_or(false);
@@ -3558,11 +3692,21 @@ mod restore_canvas_tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (format!("http://{addr}"), submitted)
+        (format!("http://{addr}"), submitted, query_bodies)
     }
 
     fn client(base_url: &str) -> BuzzClient {
         BuzzClient::new(base_url.to_string(), Keys::generate(), None, None).unwrap()
+    }
+
+    /// Return all filter objects from all /query calls flattened into one vec.
+    fn all_filters(query_bodies: &Arc<Mutex<Vec<Vec<Value>>>>) -> Vec<Value> {
+        query_bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|batch| batch.clone())
+            .collect()
     }
 
     /// A canvas event JSON with the given id/created_at and optional
@@ -3585,7 +3729,7 @@ mod restore_canvas_tests {
     /// The post-write head is our own event → restore holds the head → success.
     #[tokio::test]
     async fn restore_survives_when_head_is_our_event() {
-        let (url, submitted) = relay(PostHead::OurEvent).await;
+        let (url, submitted, _) = relay(PostHead::OurEvent).await;
         cmd_restore_canvas(&client(&url), CHANNEL, REVISION)
             .await
             .expect("restore that holds the head succeeds");
@@ -3596,7 +3740,7 @@ mod restore_canvas_tests {
     /// the restore is still in the accepted chain → success.
     #[tokio::test]
     async fn restore_survives_when_head_builds_on_it() {
-        let (url, submitted) = relay(PostHead::StrangerBuildsOnUs).await;
+        let (url, submitted, _) = relay(PostHead::StrangerBuildsOnUs).await;
         cmd_restore_canvas(&client(&url), CHANNEL, REVISION)
             .await
             .expect("restore a later write built on succeeds");
@@ -3607,7 +3751,7 @@ mod restore_canvas_tests {
     /// stream): the ancestry walk reaches ours → success, not a supersession.
     #[tokio::test]
     async fn restore_survives_when_head_builds_on_it_transitively() {
-        let (url, submitted) = relay(PostHead::StrangerBuildsOnUsTransitively).await;
+        let (url, submitted, _) = relay(PostHead::StrangerBuildsOnUsTransitively).await;
         cmd_restore_canvas(&client(&url), CHANNEL, REVISION)
             .await
             .expect("a transitive descendant of our restore succeeds");
@@ -3618,7 +3762,7 @@ mod restore_canvas_tests {
     /// the command returns `CliError::Conflict` naming the persisted revision.
     #[tokio::test]
     async fn restore_conflicts_when_head_is_a_stranger() {
-        let (url, submitted) = relay(PostHead::Stranger).await;
+        let (url, submitted, _) = relay(PostHead::Stranger).await;
         let err = cmd_restore_canvas(&client(&url), CHANNEL, REVISION)
             .await
             .expect_err("a stranger head must be a supersession conflict");
@@ -3652,7 +3796,7 @@ mod restore_canvas_tests {
     /// restore.
     #[tokio::test]
     async fn restore_succeeds_when_verification_read_fails() {
-        let (url, submitted) = relay(PostHead::ReadFails).await;
+        let (url, submitted, _) = relay(PostHead::ReadFails).await;
         cmd_restore_canvas(&client(&url), CHANNEL, REVISION)
             .await
             .expect("an accepted restore whose verification read fails still succeeds");
@@ -3660,5 +3804,61 @@ mod restore_canvas_tests {
             submitted.lock().unwrap().is_some(),
             "the restore did publish before the verification read failed"
         );
+    }
+
+    /// `restore` sends `"consistency": "strong"` on the write-influencing
+    /// head reads (pre-write precondition and post-write ancestry) and does NOT
+    /// send it on the revision-by-id lookup (display read).
+    ///
+    /// Mutation oracle — removing either `"consistency"` injection must flip the
+    /// relevant assertion:
+    ///   * `fetch_canvas_head(writer_pinned=true)` → pre-write head filter loses
+    ///     the field.
+    ///   * `fetch_canvas_ancestry` → post-write filter loses it.
+    ///   * Adding `"consistency"` to `fetch_canvas_revision` → ids filter
+    ///     incorrectly gains it.
+    #[tokio::test]
+    async fn restore_write_influencing_reads_carry_strong_consistency() {
+        let (url, _, query_bodies) = relay(PostHead::OurEvent).await;
+        cmd_restore_canvas(&client(&url), CHANNEL, REVISION)
+            .await
+            .expect("restore succeeds");
+
+        let filters = all_filters(&query_bodies);
+
+        // IDs filter (revision fetch — display read): must NOT have consistency.
+        let ids_filters: Vec<_> = filters.iter().filter(|f| f.get("ids").is_some()).collect();
+        assert!(!ids_filters.is_empty(), "restore must issue an ids filter");
+        for f in &ids_filters {
+            assert!(
+                f.get("consistency").is_none(),
+                "revision-fetch (ids) filter must NOT carry consistency: {f}"
+            );
+        }
+
+        // Non-ids kind-40100 filters (head reads — write-influencing): must all
+        // carry consistency=strong. These are the pre-write precondition head and
+        // the post-write ancestry verification read.
+        let head_filters: Vec<_> = filters
+            .iter()
+            .filter(|f| {
+                f.get("ids").is_none()
+                    && f.get("kinds")
+                        .and_then(|k| k.as_array())
+                        .map(|a| a.iter().any(|k| k == 40100))
+                        .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            !head_filters.is_empty(),
+            "restore must issue at least one head/ancestry filter"
+        );
+        for f in &head_filters {
+            assert_eq!(
+                f.get("consistency").and_then(|v| v.as_str()),
+                Some("strong"),
+                "write-influencing head/ancestry filter must carry consistency=strong: {f}"
+            );
+        }
     }
 }
