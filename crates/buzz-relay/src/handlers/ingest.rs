@@ -5652,9 +5652,15 @@ mod postgres_tests {
     /// guard in `ingest_event_inner` must be exercised through the real ingest
     /// path, not only the pure `validate_canvas_future_timestamp` helper.
     ///
-    /// A signed kind-40100 event with `created_at = relay_now + 301` is
-    /// submitted through `ingest_event_inner`. It must be rejected with the
-    /// canvas-specific error "canvas event timestamp too far in the future".
+    /// A signed kind-40100 event with `created_at = relay_now + 600` is
+    /// submitted through `ingest_event_inner`. The offset is chosen to be
+    /// well inside the guard's rejection zone (300 s ceiling) so that
+    /// scheduler latency between test setup and production's `Utc::now()`
+    /// re-sample cannot shrink the apparent offset to within 300 s and
+    /// accidentally let the event through. Exact 300/301 boundary coverage
+    /// lives in `canvas_ingest_numeric_contract` and
+    /// `canvas_ingest_future_timestamp_boundary`, which exercise the pure
+    /// `validate_canvas_future_timestamp` helper with fixed arguments.
     ///
     /// Mutation oracle: deleting the `if kind_u32 == KIND_CANVAS { … }` call
     /// site in `ingest_event_inner` changes the rejection reason to the h-tag
@@ -5751,11 +5757,16 @@ mod postgres_tests {
             .id;
         let tenant = TenantContext::resolved(community, &host);
 
-        // ── Build a kind-40100 event 301 seconds in the future ───────────────
+        // ── Build a kind-40100 event 600 seconds in the future ───────────────
+        // +600 is well inside the guard's rejection zone (>300 s), so scheduler
+        // latency between this Utc::now() call and production's independent
+        // Utc::now() re-sample inside ingest_event_inner cannot close the gap
+        // to within 300 s. Exact 300/301 boundary assertions live in the pure
+        // `validate_canvas_future_timestamp` tests which have no clock race.
         let keys = Keys::generate();
         let relay_now = chrono::Utc::now().timestamp() as u64;
         let event = nostr::EventBuilder::new(Kind::Custom(KIND_CANVAS as u16), "")
-            .custom_created_at(Timestamp::from(relay_now + 301))
+            .custom_created_at(Timestamp::from(relay_now + 600))
             .sign_with_keys(&keys)
             .expect("sign canvas event");
 
@@ -5770,22 +5781,24 @@ mod postgres_tests {
         let result = ingest_event_inner(&state, &tracer, &tenant, event, auth).await;
 
         // The canvas-specific guard must fire before the h-tag check.
-        // Fixed boundary: created_at = relay_now + 301 exceeds the 300 s canvas
-        // ceiling, so the guard rejects with this exact message.
+        // created_at = relay_now + 600 is 300 s above the canvas ceiling, so
+        // even under heavy load the guard fires and rejects with this message.
         //
         // Mutation oracle: delete `if kind_u32 == KIND_CANVAS { … }` in
         // ingest_event_inner → no canvas guard fires → the event reaches the
         // h-tag check → Rejected("invalid: channel-scoped events must include
-        // an h tag") → assert_eq! below fails.
+        // an h tag") → assert! below fails.
         let err = match result {
             Ok(_) => panic!(
-                "kind-40100 event at now+301 must be rejected, but ingest_event_inner returned Ok"
+                "kind-40100 event at now+600 must be rejected, but ingest_event_inner returned Ok"
             ),
             Err(e) => e,
         };
         assert!(
             matches!(&err, IngestError::Rejected(msg) if msg.contains("canvas event timestamp too far in the future")),
-            "rejection must be the canvas guard, not the h-tag check;              deleting the guard call site changes this error to the h-tag rejection.              Got: {err:?}",
+            "rejection must be the canvas guard, not the h-tag check; \
+             deleting the guard call site changes this error to the h-tag rejection. \
+             Got: {err:?}",
         );
     }
 }

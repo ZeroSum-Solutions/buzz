@@ -554,10 +554,13 @@ jobs:
       - name: Canvas ingest guard HTTP wiring test
         # Proves the kind-40100 future-timestamp guard is wired in the full HTTP
         # ingest path (post_events → router → ingest_event_inner). A canvas event
-        # at relay_now+300 must NOT be rejected 400; at relay_now+301 must be
-        # rejected 400 by the canvas-specific guard (not the general ±900 s bound).
+        # at relay_now+600 must be rejected 400 by the canvas-specific guard.
+        # +600 sits 300 s above the canvas ceiling (300 s) and 300 s below the
+        # general drift bound (900 s), so scheduler latency cannot erase the margin.
+        # Exact 300/301 boundary coverage is in the pure fixed-literal tests.
         # Mutation oracle: deleting `if kind_u32 == KIND_CANVAS { … }` in
-        # ingest_event_inner makes the +301 case return non-400, failing the test.
+        # ingest_event_inner makes the +600 case pass the general drift check and
+        # reach the membership check, changing the body to "not a channel member".
         # #[ignore]d in the default suite — see
         # api::bridge::tests::canvas_ingest_future_timestamp_guard_is_wired.
         run: |
@@ -571,8 +574,11 @@ jobs:
           REDIS_URL: redis://localhost:6379
       - name: Canvas ingest guard ingest_event_inner wiring test
         # Confirms the canvas future-timestamp guard fires through ingest_event_inner
-        # directly (not via the HTTP router). A kind-40100 event at relay_now+301
+        # directly (not via the HTTP router). A kind-40100 event at relay_now+600
         # must be rejected with the canvas-specific message, not the h-tag message.
+        # +600 sits 300 s above the canvas ceiling so scheduler latency cannot
+        # shrink the apparent offset to within 300 s.
+        # Exact 300/301 boundary coverage is in the pure fixed-literal tests.
         # Mutation oracle: deleting the guard call site changes the rejection reason
         # to the h-tag check, failing the message assertion.
         # #[ignore]d in the default suite — see

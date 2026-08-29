@@ -4238,18 +4238,22 @@ mod postgres_tests {
     /// guard in `ingest_event_inner` is actually wired to the shipping call path.
     ///
     /// Calls `post_events_with_body` → router → `submit_event` → `ingest_event_inner`:
-    /// - A canvas event with `created_at = relay_now + 301` is rejected 400 with
+    /// - A canvas event with `created_at = relay_now + 600` is rejected 400 with
     ///   the canvas-specific error "canvas event timestamp too far in the future".
     ///
-    /// Discriminating: deleting the `if kind_u32 == KIND_CANVAS { … }` call in
-    /// `ingest_event_inner` removes the guard. The event then reaches the channel
-    /// membership check (no h-tag channel exists → "restricted: not a channel
-    /// member"), making the message assertion below fail with a different body.
+    /// The +600 offset sits 300 s above the canvas ceiling (300 s) and 300 s
+    /// below the general drift bound (900 s). Scheduler latency between test
+    /// setup and production's independent `Utc::now()` re-sample would need to
+    /// exceed 300 s to erode the margin — not possible under any realistic load.
+    /// Exact 300/301 boundary coverage lives in the pure `validate_canvas_future_timestamp`
+    /// tests (`canvas_ingest_numeric_contract`, `canvas_ingest_future_timestamp_boundary`),
+    /// which pass fixed arguments and have no clock race.
     ///
-    /// Note: both +301 and +300 are within the general ±900 s drift window;
-    /// only the canvas-specific guard distinguishes them at 300 s. This test is
-    /// therefore exclusively sensitive to the guard being wired, not to the
-    /// general drift check.
+    /// Discriminating: deleting the `if kind_u32 == KIND_CANVAS { … }` call in
+    /// `ingest_event_inner` removes the guard. The event then passes the general
+    /// ±900 s drift check (600 s < 900 s) and reaches the channel membership
+    /// check (no h-tag channel exists → "restricted: not a channel member"),
+    /// making the message assertion below fail with a different body.
     #[test]
     #[ignore = "requires Postgres"]
     fn canvas_ingest_future_timestamp_guard_is_wired() {
@@ -4275,20 +4279,23 @@ mod postgres_tests {
         let client_keys = Keys::generate();
         let pubkey_hex = client_keys.public_key().to_hex();
 
-        // A canvas event 301 s in the future. The canvas ingest guard (300 s
-        // ceiling) fires BEFORE the channel membership check, rejecting with
-        // the canvas-specific error. The general ±900 s drift check admits this
-        // timestamp, so only the canvas guard can produce this rejection.
+        // A canvas event 600 s in the future. The +600 offset sits 300 s above
+        // the canvas ceiling and 300 s below the general ±900 s drift bound, so
+        // only the canvas guard can produce a rejection here. Scheduler latency
+        // between this Utc::now() call and production's independent re-sample
+        // would need to exceed 300 s to erode the margin — impossible in practice.
+        // Exact 300/301 boundary assertions live in the pure fixed-literal tests.
         let relay_now = chrono::Utc::now().timestamp();
         // Use a random channel UUID that does NOT exist in the DB. If the canvas
-        // guard is correctly wired, it fires first; if deleted, the event reaches
-        // the membership check and the body says "not a channel member" instead.
+        // guard is correctly wired, it fires first; if deleted, the event passes
+        // the general ±900 s check (600 < 900) and reaches the membership check,
+        // producing "not a channel member" instead of the canvas rejection.
         let channel_id = uuid::Uuid::new_v4().to_string();
         let event_past_ceiling =
             EventBuilder::new(Kind::Custom(buzz_core::kind::KIND_CANVAS as u16), "")
                 .tag(Tag::parse(["h", channel_id.as_str()]).expect("h tag"))
                 .custom_created_at(nostr::Timestamp::from(
-                    (relay_now + 301).try_into().unwrap_or(0u64),
+                    (relay_now + 600).try_into().unwrap_or(0u64),
                 ))
                 .sign_with_keys(&client_keys)
                 .expect("sign canvas event past ceiling");
@@ -4308,11 +4315,13 @@ mod postgres_tests {
         assert_eq!(
             status,
             axum::http::StatusCode::BAD_REQUEST,
-            "canvas event at relay_now+301 must be rejected 400; body: {body}",
+            "canvas event at relay_now+600 must be rejected 400; body: {body}",
         );
         assert!(
             body.contains("canvas event timestamp too far in the future"),
-            "rejection body must name the canvas guard (not the membership check).              Got: {body}; mutation oracle: delete the guard call site → body becomes              'not a channel member'",
+            "rejection body must name the canvas guard (not the membership check). \
+             Got: {body}; mutation oracle: delete the guard call site → body becomes \
+             'not a channel member'",
         );
     }
 
