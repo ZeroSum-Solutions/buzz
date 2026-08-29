@@ -4061,6 +4061,36 @@ mod postgres_tests {
             .status()
     }
 
+    /// Like `post_events` but also returns the UTF-8 response body.
+    async fn post_events_with_body(
+        state: Arc<crate::state::AppState>,
+        host: &str,
+        pubkey_hex: &str,
+        body: &[u8],
+    ) -> (axum::http::StatusCode, String) {
+        use axum::body::Body;
+        use axum::http::{header, Request};
+        use tower::ServiceExt;
+
+        let resp = crate::router::build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/events")
+                    .header(header::HOST, host)
+                    .header("x-pubkey", pubkey_hex)
+                    .body(Body::from(body.to_vec()))
+                    .expect("build request"),
+            )
+            .await
+            .expect("router oneshot");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
     /// Collect buzz_events_rejected_total with (transport, reason) labels from
     /// a DebuggingRecorder snapshot.
     fn http_reject_counts(
@@ -4201,6 +4231,88 @@ mod postgres_tests {
             counts.get(&("http".to_owned(), "invalid".to_owned())),
             Some(&1),
             "IngestError::Rejected arm must increment transport=http,reason=invalid"
+        );
+    }
+
+    /// Canvas ingest wiring regression: the kind-40100-specific future-timestamp
+    /// guard in `ingest_event_inner` is actually wired to the shipping call path.
+    ///
+    /// Calls `post_events_with_body` → router → `submit_event` → `ingest_event_inner`:
+    /// - A canvas event with `created_at = relay_now + 301` is rejected 400 with
+    ///   the canvas-specific error "canvas event timestamp too far in the future".
+    ///
+    /// Discriminating: deleting the `if kind_u32 == KIND_CANVAS { … }` call in
+    /// `ingest_event_inner` removes the guard. The event then reaches the channel
+    /// membership check (no h-tag channel exists → "restricted: not a channel
+    /// member"), making the message assertion below fail with a different body.
+    ///
+    /// Note: both +301 and +300 are within the general ±900 s drift window;
+    /// only the canvas-specific guard distinguishes them at 300 s. This test is
+    /// therefore exclusively sensitive to the guard being wired, not to the
+    /// general drift check.
+    #[test]
+    #[ignore = "requires Postgres"]
+    fn canvas_ingest_future_timestamp_guard_is_wired() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current_thread runtime");
+
+        let Some(state) = rt.block_on(bridge_handler_test_state()) else {
+            panic!("local Postgres not reachable — start Postgres on 127.0.0.1:5432 before running ignored bridge handler tests");
+        };
+
+        let host = {
+            let h = format!(
+                "canvas-ingest-wiring-{}.local",
+                uuid::Uuid::new_v4().simple()
+            );
+            rt.block_on(state.db.ensure_configured_community(&h))
+                .expect("ensure community");
+            h
+        };
+
+        let client_keys = Keys::generate();
+        let pubkey_hex = client_keys.public_key().to_hex();
+
+        // A canvas event 301 s in the future. The canvas ingest guard (300 s
+        // ceiling) fires BEFORE the channel membership check, rejecting with
+        // the canvas-specific error. The general ±900 s drift check admits this
+        // timestamp, so only the canvas guard can produce this rejection.
+        let relay_now = chrono::Utc::now().timestamp();
+        // Use a random channel UUID that does NOT exist in the DB. If the canvas
+        // guard is correctly wired, it fires first; if deleted, the event reaches
+        // the membership check and the body says "not a channel member" instead.
+        let channel_id = uuid::Uuid::new_v4().to_string();
+        let event_past_ceiling =
+            EventBuilder::new(Kind::Custom(buzz_core::kind::KIND_CANVAS as u16), "")
+                .tag(Tag::parse(["h", channel_id.as_str()]).expect("h tag"))
+                .custom_created_at(nostr::Timestamp::from(
+                    (relay_now + 301).try_into().unwrap_or(0u64),
+                ))
+                .sign_with_keys(&client_keys)
+                .expect("sign canvas event past ceiling");
+        let body_bytes =
+            serde_json::to_vec(&event_past_ceiling).expect("serialize event past ceiling");
+
+        let (status, body) = rt.block_on(post_events_with_body(
+            state.clone(),
+            &host,
+            &pubkey_hex,
+            &body_bytes,
+        ));
+
+        // Must be 400 AND the body must name the canvas guard (not the membership check).
+        // Mutation oracle: deleting the `if kind_u32 == KIND_CANVAS { … }` guard
+        // makes the body say "not a channel member" instead, failing both assertions.
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "canvas event at relay_now+301 must be rejected 400; body: {body}",
+        );
+        assert!(
+            body.contains("canvas event timestamp too far in the future"),
+            "rejection body must name the canvas guard (not the membership check).              Got: {body}; mutation oracle: delete the guard call site → body becomes              'not a channel member'",
         );
     }
 

@@ -551,6 +551,41 @@ jobs:
           DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
           TEST_DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
           REDIS_URL: redis://localhost:6379
+      - name: Canvas ingest guard HTTP wiring test
+        # Proves the kind-40100 future-timestamp guard is wired in the full HTTP
+        # ingest path (post_events → router → ingest_event_inner). A canvas event
+        # at relay_now+300 must NOT be rejected 400; at relay_now+301 must be
+        # rejected 400 by the canvas-specific guard (not the general ±900 s bound).
+        # Mutation oracle: deleting `if kind_u32 == KIND_CANVAS { … }` in
+        # ingest_event_inner makes the +301 case return non-400, failing the test.
+        # #[ignore]d in the default suite — see
+        # api::bridge::tests::canvas_ingest_future_timestamp_guard_is_wired.
+        run: |
+          cargo nextest run \
+            --archive-file target/ci/backend-integration-tests.tar.zst \
+            -E 'package(buzz-relay) and test(=api::bridge::tests::canvas_ingest_future_timestamp_guard_is_wired)' \
+            --run-ignored ignored-only
+        env:
+          DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+          TEST_DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+          REDIS_URL: redis://localhost:6379
+      - name: Canvas ingest guard ingest_event_inner wiring test
+        # Confirms the canvas future-timestamp guard fires through ingest_event_inner
+        # directly (not via the HTTP router). A kind-40100 event at relay_now+301
+        # must be rejected with the canvas-specific message, not the h-tag message.
+        # Mutation oracle: deleting the guard call site changes the rejection reason
+        # to the h-tag check, failing the message assertion.
+        # #[ignore]d in the default suite — see
+        # handlers::ingest::tests::canvas_ingest_guard_wired_through_ingest_event_inner.
+        run: |
+          cargo nextest run \
+            --archive-file target/ci/backend-integration-tests.tar.zst \
+            -E 'package(buzz-relay) and test(=handlers::ingest::tests::canvas_ingest_guard_wired_through_ingest_event_inner)' \
+            --run-ignored ignored-only
+        env:
+          DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+          TEST_DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+          REDIS_URL: redis://localhost:6379
       - name: Upload relay log
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

@@ -5570,6 +5570,12 @@ mod postgres_tests {
     /// `validate_canvas_future_timestamp` is the pure seam; mutation: changing
     /// `CANVAS_MAX_INGEST_FUTURE_SECS` to 900 or removing the guard makes the
     /// "at ceiling + 1" case pass when it must not.
+    ///
+    /// Fixed-literal contract (pinned so constant mutations go red): the relay
+    /// canvas bound IS 300 s; now+300 accepted, now+301 rejected. The relay
+    /// general bound is 900 s (a separate guard); the client ceiling is 60 s
+    /// (CANVAS_MAX_FUTURE_SKEW_SECS in buzz-sdk). Mutating the 300 s constant
+    /// back to 900 makes the numeric assertions below fail.
     #[test]
     fn canvas_ingest_future_timestamp_boundary() {
         let now = 1_700_000_000i64;
@@ -5596,6 +5602,190 @@ mod postgres_tests {
         assert!(
             validate_canvas_future_timestamp(now - 1, now).is_ok(),
             "canvas event in the past is not affected by the future-timestamp guard"
+        );
+
+        // Fixed-literal contract: relay canvas bound IS 300 s, NOT 900 s.
+        // Mutating CANVAS_MAX_INGEST_FUTURE_SECS back to 900 makes these fail.
+        assert!(
+            validate_canvas_future_timestamp(now + 300, now).is_ok(),
+            "now+300: accepted at the 300 s relay canvas ceiling"
+        );
+        assert!(
+            validate_canvas_future_timestamp(now + 301, now).is_err(),
+            "now+301: rejected one second past the 300 s relay canvas ceiling"
+        );
+        // The old 900 s value must be rejected by this guard.
+        assert!(
+            validate_canvas_future_timestamp(now + 900, now).is_err(),
+            "now+900 must be rejected by the 300 s relay canvas ceiling"
+        );
+    }
+
+    /// Standalone numeric contract for the relay-side canvas ingest guard.
+    ///
+    /// No constants used — if CANVAS_MAX_INGEST_FUTURE_SECS changes, this test
+    /// catches it regardless of whether constant-based assertions remain
+    /// self-consistent. The relay canvas ceiling IS 300 s: now+300 is the last
+    /// accepted timestamp; now+301 is the first rejected timestamp.
+    #[test]
+    fn canvas_ingest_numeric_contract() {
+        let now = 1_700_000_000i64;
+        // These assertions use only fixed numeric literals; they cannot be
+        // self-referential regardless of what CANVAS_MAX_INGEST_FUTURE_SECS holds.
+        assert!(
+            validate_canvas_future_timestamp(now + 300, now).is_ok(),
+            "now+300 must be accepted: relay canvas ceiling is 300 s",
+        );
+        assert!(
+            validate_canvas_future_timestamp(now + 301, now).is_err(),
+            "now+301 must be rejected: one second past the 300 s relay canvas ceiling",
+        );
+        // Old 900 s value must also be rejected (prevents silent reversion to
+        // the general drift bound).
+        assert!(
+            validate_canvas_future_timestamp(now + 900, now).is_err(),
+            "now+900 must be rejected: the general 900 s bound does not apply to canvas events",
+        );
+    }
+
+    /// Ingest-path wiring regression: the kind-40100 canvas future-timestamp
+    /// guard in `ingest_event_inner` must be exercised through the real ingest
+    /// path, not only the pure `validate_canvas_future_timestamp` helper.
+    ///
+    /// A signed kind-40100 event with `created_at = relay_now + 301` is
+    /// submitted through `ingest_event_inner`. It must be rejected with the
+    /// canvas-specific error "canvas event timestamp too far in the future".
+    ///
+    /// Mutation oracle: deleting the `if kind_u32 == KIND_CANVAS { … }` call
+    /// site in `ingest_event_inner` changes the rejection reason to the h-tag
+    /// check ("channel-scoped events must include an h tag"), causing this
+    /// assertion to fail.
+    ///
+    /// Infrastructure: a real Postgres is required to pass the community
+    /// deletion-fence check that precedes the canvas guard. Redis is not
+    /// needed — the canvas guard fires before any Redis-backed path.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn canvas_ingest_guard_wired_through_ingest_event_inner() {
+        use buzz_auth::Nip98ReplayGuard;
+        use nostr::{Keys, Kind, Timestamp};
+
+        const FAKE_REDIS_URL: &str = "redis://127.0.0.1:1"; // no Redis needed for this path
+
+        // ── Postgres connection ──────────────────────────────────────────────
+        let db_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()); // sadscan:disable np.postgres.1
+        let pool = sqlx::PgPool::connect(&db_url).await.expect(
+            "connect test Postgres — start local Postgres before running ignored ingest tests",
+        );
+        let db = buzz_db::Db::from_pool(pool.clone());
+        // Do not call db.migrate() here: CI migrates the schema before running
+        // integration tests; calling migrate() locally risks version conflicts
+        // if the DB was provisioned via a different path.
+
+        // ── AppState ─────────────────────────────────────────────────────────
+        // Redis is lazy and never actually contacted on this rejection path.
+        let redis_pool = deadpool_redis::Config::from_url(FAKE_REDIS_URL)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("deadpool redis pool");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(FAKE_REDIS_URL, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let mut config = crate::config::Config::from_env().expect("relay config from env");
+        config.database_url = db_url.clone();
+        config.redis_url = FAKE_REDIS_URL.to_string();
+        config.require_relay_membership = false;
+
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth_svc = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+
+        let (mut state, _audit_shutdown) = crate::state::AppState::new(
+            config,
+            db.clone(),
+            redis_pool,
+            audit,
+            pubsub,
+            auth_svc,
+            search,
+            workflow_engine,
+            Keys::generate(),
+            media_storage,
+        );
+
+        // Replace the NIP-98 replay guard so no live Redis is required.
+        struct AlwaysFreshReplayGuard;
+        impl Nip98ReplayGuard for AlwaysFreshReplayGuard {
+            fn try_mark_in_scope<'a>(
+                &'a self,
+                _scope: &'a str,
+                _event_id: &'a nostr::EventId,
+                _ttl_secs: u64,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<bool, buzz_auth::AuthError>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(true) })
+            }
+        }
+        state.nip98_replay = Arc::new(AlwaysFreshReplayGuard);
+        let state = Arc::new(state);
+
+        // ── Provision a fresh community so the deletion fence allows writes ──
+        let host = format!("canvas-ts-guard-{}.test", Uuid::new_v4().simple());
+        let community = db
+            .ensure_configured_community(&host)
+            .await
+            .expect("ensure community")
+            .id;
+        let tenant = TenantContext::resolved(community, &host);
+
+        // ── Build a kind-40100 event 301 seconds in the future ───────────────
+        let keys = Keys::generate();
+        let relay_now = chrono::Utc::now().timestamp() as u64;
+        let event = nostr::EventBuilder::new(Kind::Custom(KIND_CANVAS as u16), "")
+            .custom_created_at(Timestamp::from(relay_now + 301))
+            .sign_with_keys(&keys)
+            .expect("sign canvas event");
+
+        let auth = IngestAuth::Http {
+            pubkey: keys.public_key(),
+            scopes: vec![Scope::ChannelsWrite],
+            auth_method: HttpAuthMethod::Nip98,
+        };
+        let tracer: Arc<dyn buzz_conformance::Tracer> = Arc::new(VecTracer::default());
+
+        // ── Submit through the real ingest path ───────────────────────────────
+        let result = ingest_event_inner(&state, &tracer, &tenant, event, auth).await;
+
+        // The canvas-specific guard must fire before the h-tag check.
+        // Fixed boundary: created_at = relay_now + 301 exceeds the 300 s canvas
+        // ceiling, so the guard rejects with this exact message.
+        //
+        // Mutation oracle: delete `if kind_u32 == KIND_CANVAS { … }` in
+        // ingest_event_inner → no canvas guard fires → the event reaches the
+        // h-tag check → Rejected("invalid: channel-scoped events must include
+        // an h tag") → assert_eq! below fails.
+        let err = match result {
+            Ok(_) => panic!(
+                "kind-40100 event at now+301 must be rejected, but ingest_event_inner returned Ok"
+            ),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(&err, IngestError::Rejected(msg) if msg.contains("canvas event timestamp too far in the future")),
+            "rejection must be the canvas guard, not the h-tag check;              deleting the guard call site changes this error to the h-tag rejection.              Got: {err:?}",
         );
     }
 }

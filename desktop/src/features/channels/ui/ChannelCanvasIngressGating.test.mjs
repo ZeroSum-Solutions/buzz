@@ -10,9 +10,42 @@
  */
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 const { canvasIngressOpen } = await import("./canvasIngress.ts");
+
+// Source-wiring oracle: read ChannelManagementSheet.tsx and verify it calls
+// `canvasIngressOpen` with `eventId` as the existence signal, not with
+// `hasCanvas` (content-length truthiness). Reverting the sheet call site to
+// `hasCanvas || canEditNarrative` removes the `canvasIngressOpen` call from
+// `canOpenCanvas` and makes the match below fail.
+const sheetSource = readFileSync(
+  new URL("./ChannelManagementSheet.tsx", import.meta.url),
+  "utf8",
+).replace(/\s+/g, " ");
+
+test("ChannelManagementSheet: canOpenCanvas is wired to canvasIngressOpen with eventId", () => {
+  // The sheet must delegate existence gating to the canonical helper, passing
+  // `canvasQuery.data?.eventId` so persisted-empty canvases are not hidden from
+  // read-only members. Reverting to `hasCanvas || canEditNarrative` removes
+  // this call and the assertion below fails.
+  assert.match(
+    sheetSource,
+    /canvasIngressOpen\( canvasQuery\.data\?\.eventId,/,
+    "canOpenCanvas must call canvasIngressOpen(canvasQuery.data?.eventId, …)",
+  );
+});
+
+test("ChannelManagementSheet: hasCanvas is not used as the ingress-open predicate", () => {
+  // `hasCanvas` is a content-length check valid only for preview text. It must
+  // NOT be the existence gate for canOpenCanvas.
+  assert.doesNotMatch(
+    sheetSource,
+    /canOpenCanvas = hasCanvas/,
+    "canOpenCanvas must not be derived directly from hasCanvas",
+  );
+});
 
 const EVENT_ID = "a".repeat(64);
 

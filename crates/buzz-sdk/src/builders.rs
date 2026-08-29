@@ -3234,6 +3234,13 @@ mod tests {
         // that a real-clock read introduces. A head exactly at the ceiling
         // (`now + 60`) is accepted and stamped strictly ahead; one second past
         // it is rejected as poisoned.
+        //
+        // Invariant contract (pinned with literals, not constants, so a constant
+        // mutation also fails this test): the client ceiling is 60 s; the relay
+        // canvas ingest bound is 300 s; the relay general drift bound is 900 s.
+        // A ceiling head at now+60 produces now+61, well below both relay bounds.
+        // These numeric assertions must stay consistent with CANVAS_MAX_FUTURE_SKEW_SECS
+        // and the relay's CANVAS_MAX_INGEST_FUTURE_SECS (300) / MAX_TIMESTAMP_DRIFT_SECS (900).
         let now = 1_700_000_000u64;
         let at_ceiling = now + CANVAS_MAX_FUTURE_SKEW_SECS;
         assert_eq!(
@@ -3247,6 +3254,60 @@ mod tests {
                 Err(SdkError::InvalidInput(_))
             ),
             "a head at now+61 is poisoned and rejected"
+        );
+
+        // Fixed-literal contract: client ceiling IS 60 s, NOT the old 900 s.
+        // Mutating CANVAS_MAX_FUTURE_SKEW_SECS back to 900 makes these fail.
+        assert!(
+            canvas_write_created_at_at(now + 60, now).is_ok(),
+            "now+60 is within the 60 s client ceiling"
+        );
+        assert!(
+            matches!(
+                canvas_write_created_at_at(now + 61, now),
+                Err(SdkError::InvalidInput(_))
+            ),
+            "now+61 is one second past the 60 s client ceiling"
+        );
+        // Confirm the old 900 s ceiling is now rejected (prevents silent
+        // reversion): a head at now+900 must not be ratcheted past.
+        assert!(
+            matches!(
+                canvas_write_created_at_at(now + 900, now),
+                Err(SdkError::InvalidInput(_))
+            ),
+            "now+900 must be rejected by the 60 s client ceiling"
+        );
+    }
+
+    /// Standalone numeric contract for the client-side canvas future-skew ceiling.
+    ///
+    /// No constants used — if CANVAS_MAX_FUTURE_SKEW_SECS changes, this test
+    /// catches it regardless of whether the constant-based assertions remain
+    /// self-consistent. The client ceiling IS 60 s: now+60 is the last accepted
+    /// head; now+61 is the first rejected head.
+    ///
+    /// Cross-crate invariant: the relay canvas ingest bound is 300 s and the
+    /// relay general drift bound is 900 s. A ceiling head at now+60 is stamped
+    /// now+61, comfortably below both relay bounds.
+    #[test]
+    fn canvas_write_created_at_numeric_contract() {
+        let now = 1_700_000_000u64;
+        // The client ceiling is exactly 60 s — not 900 s (the old value).
+        // These assertions use only fixed numeric literals; they cannot be
+        // self-referential regardless of what CANVAS_MAX_FUTURE_SKEW_SECS holds.
+        assert!(
+            canvas_write_created_at_at(now + 60, now).is_ok(),
+            "now+60 must be accepted: client ceiling is 60 s",
+        );
+        assert!(
+            canvas_write_created_at_at(now + 61, now).is_err(),
+            "now+61 must be rejected: one second past the 60 s client ceiling",
+        );
+        // Old 900 s value must also be rejected (prevents silent reversion).
+        assert!(
+            canvas_write_created_at_at(now + 900, now).is_err(),
+            "now+900 must be rejected: the old 900 s ceiling is no longer valid",
         );
     }
 
