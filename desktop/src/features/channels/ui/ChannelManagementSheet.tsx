@@ -21,6 +21,7 @@ import {
   useUnarchiveChannelMutation,
   useUpdateChannelMutation,
 } from "@/features/channels/hooks";
+import { canvasIngressOpen } from "./canvasIngress";
 import { compareMembersByRole } from "@/features/channels/lib/memberUtils";
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { useChannelWorkflowsQuery } from "@/features/workflows/hooks";
@@ -309,7 +310,10 @@ export function ChannelManagementSheet({
   const canvasPreview = hasCanvas
     ? getMarkdownPreviewText(canvasContent)
     : undefined;
-  const canOpenCanvas = hasCanvas || canEditNarrative;
+  const canOpenCanvas = canvasIngressOpen(
+    canvasQuery.data?.eventId,
+    canEditNarrative,
+  );
 
   function handleEditDialogOpenChange(next: boolean) {
     if (next) {

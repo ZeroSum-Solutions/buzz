@@ -620,9 +620,14 @@ pub fn build_set_canvas_after_head(
 /// CANVAS_MAX_FUTURE_SKEW_SECS` is treated as poisoned: stamping
 /// `max(now, head + 1)` against it would silently extend a bogus timeline
 /// arbitrarily far ahead, and every later legitimate write would inherit that
-/// floor. Relay-side ingestion bounds are follow-up work; this stops
-/// first-party clients from propagating the poison in the meantime.
-pub const CANVAS_MAX_FUTURE_SKEW_SECS: u64 = 900;
+/// floor.
+///
+/// This is kept well below the relay's general ±900 s drift window. A ceiling
+/// head at `now + 60` produces a write at `now + 61`, which is within the relay's
+/// kind-40100-specific future bound (`CANVAS_MAX_INGEST_FUTURE_SECS = 300` in
+/// ingest.rs) and far inside the general ±900 s window — first-party clients
+/// can never construct an ingest-rejected event through ordinary use.
+pub const CANVAS_MAX_FUTURE_SKEW_SECS: u64 = 60;
 
 /// Contract-v3 writer-discipline timestamp for a canvas write asserting a head
 /// at `head_created_at`: `max(now, head_created_at + 1)` (Unix seconds).
@@ -646,13 +651,11 @@ pub fn canvas_write_created_at(head_created_at: u64) -> Result<u64, SdkError> {
 
 /// Pure core of [`canvas_write_created_at`] with `now` injected — the clock
 /// seam. The public wrapper reads the real clock; tests drive the exact
-/// `now + 900` / `now + 901` boundaries against a fixed `now`.
+/// `now + 60` / `now + 61` boundaries against a fixed `now`.
 fn canvas_write_created_at_at(head_created_at: u64, now: u64) -> Result<u64, SdkError> {
     if head_created_at > now.saturating_add(CANVAS_MAX_FUTURE_SKEW_SECS) {
         return Err(SdkError::InvalidInput(
-            "canvas head is timestamped too far in the future; refusing to extend it — \
-             relay-side bounds are follow-up work"
-                .into(),
+            "canvas head is timestamped too far in the future; refusing to extend it".into(),
         ));
     }
     Ok(now.max(head_created_at.saturating_add(1)))
@@ -3229,21 +3232,21 @@ mod tests {
     fn canvas_write_created_at_skew_boundary() {
         // Fixed clock: the injected-`now` core removes the second-rollover seam
         // that a real-clock read introduces. A head exactly at the ceiling
-        // (`now + 900`) is accepted and stamped strictly ahead; one second past
+        // (`now + 60`) is accepted and stamped strictly ahead; one second past
         // it is rejected as poisoned.
         let now = 1_700_000_000u64;
         let at_ceiling = now + CANVAS_MAX_FUTURE_SKEW_SECS;
         assert_eq!(
             canvas_write_created_at_at(at_ceiling, now).unwrap(),
             at_ceiling + 1,
-            "a head at now+900 is accepted and stamped strictly ahead"
+            "a head at now+60 is accepted and stamped strictly ahead"
         );
         assert!(
             matches!(
                 canvas_write_created_at_at(at_ceiling + 1, now),
                 Err(SdkError::InvalidInput(_))
             ),
-            "a head at now+901 is poisoned and rejected"
+            "a head at now+61 is poisoned and rejected"
         );
     }
 

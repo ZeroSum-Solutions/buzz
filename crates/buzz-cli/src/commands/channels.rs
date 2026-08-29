@@ -3326,14 +3326,14 @@ mod set_canvas_tests {
     #[tokio::test]
     async fn set_stamps_ahead_of_future_head_and_asserts_it() {
         let head_id = "a".repeat(64);
-        // A head ahead of `now` but inside the 15-minute ceiling: `head + 1`
+        // A head ahead of `now` but inside the 60-second ceiling: `head + 1`
         // deterministically wins the `max`, and the guard accepts it. Computed
         // from `now` so it tracks the wall clock without a hardcoded date.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let future = now + 600;
+        let future = now + 30;
         let head = json!([{
             "id": head_id,
             "pubkey": "b".repeat(64),

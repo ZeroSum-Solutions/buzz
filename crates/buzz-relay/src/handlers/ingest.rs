@@ -2167,6 +2167,26 @@ pub async fn ingest_event(
     result
 }
 
+/// Maximum seconds in the future a kind:40100 canvas event may be timestamped.
+/// Tighter than the general ±900 s drift window to prevent a ceiling-timestamped
+/// head from producing a write at `head + 1` that the relay would accept (the
+/// boundary head itself is within ±900 s) but that permanently stalls all later
+/// legitimate writes behind an inflated floor. Invariant:
+///   client ceiling (60 s, CANVAS_MAX_FUTURE_SKEW_SECS) < canvas relay bound (300 s) < relay general bound (900 s)
+const CANVAS_MAX_INGEST_FUTURE_SECS: i64 = 300;
+
+/// Returns `Ok(())` if the canvas event timestamp is within the allowed future
+/// window, or `Err` with a rejection message otherwise.
+///
+/// Extracted as a pure function so the boundary can be regression-tested without
+/// a live database or HTTP stack.
+fn validate_canvas_future_timestamp(event_ts: i64, now: i64) -> Result<(), &'static str> {
+    if event_ts - now > CANVAS_MAX_INGEST_FUTURE_SECS {
+        return Err("invalid: canvas event timestamp too far in the future");
+    }
+    Ok(())
+}
+
 async fn ingest_event_inner(
     state: &Arc<AppState>,
     tracer: &Arc<dyn buzz_conformance::Tracer>,
@@ -2238,6 +2258,14 @@ async fn ingest_event_inner(
         return Err(IngestError::Rejected(
             "invalid: event timestamp too far from server time".into(),
         ));
+    }
+
+    // kind:40100 canvas events carry a tighter future ceiling — see
+    // `validate_canvas_future_timestamp` for the rationale and invariant.
+    if kind_u32 == KIND_CANVAS {
+        if let Err(msg) = validate_canvas_future_timestamp(event_ts, now) {
+            return Err(IngestError::Rejected(msg.into()));
+        }
     }
 
     const MAX_EVENT_CONTENT_BYTES: usize = 256 * 1024; // 256 KB
@@ -5535,6 +5563,39 @@ mod postgres_tests {
         assert_eq!(
             counts.get(&("ws".to_owned(), "invalid".to_owned())),
             Some(&1)
+        );
+    }
+
+    /// Boundary regression for the canvas-specific ingest future-timestamp guard.
+    /// `validate_canvas_future_timestamp` is the pure seam; mutation: changing
+    /// `CANVAS_MAX_INGEST_FUTURE_SECS` to 900 or removing the guard makes the
+    /// "at ceiling + 1" case pass when it must not.
+    #[test]
+    fn canvas_ingest_future_timestamp_boundary() {
+        let now = 1_700_000_000i64;
+
+        // Exactly at the ceiling: accepted.
+        assert!(
+            validate_canvas_future_timestamp(now + CANVAS_MAX_INGEST_FUTURE_SECS, now).is_ok(),
+            "canvas event at now+300 is within the relay canvas future bound"
+        );
+
+        // One second past the ceiling: rejected.
+        assert!(
+            validate_canvas_future_timestamp(now + CANVAS_MAX_INGEST_FUTURE_SECS + 1, now).is_err(),
+            "canvas event at now+301 exceeds the relay canvas future bound and must be rejected"
+        );
+
+        // Past the general ±900 s window: also rejected (guard fires first).
+        assert!(
+            validate_canvas_future_timestamp(now + 901, now).is_err(),
+            "canvas event at now+901 exceeds both the canvas bound and the general drift window"
+        );
+
+        // In the past: accepted (canvas guard is future-only; general past check is separate).
+        assert!(
+            validate_canvas_future_timestamp(now - 1, now).is_ok(),
+            "canvas event in the past is not affected by the future-timestamp guard"
         );
     }
 }
