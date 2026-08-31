@@ -39,17 +39,21 @@ pub(crate) type ScopedPubkeyKey = (CommunityId, [u8; 32]);
 
 /// Why a community-bound socket is being asked to stop.
 ///
-/// Only deletion is externally attributed today. Ordinary lifecycle exits keep
-/// using cancellation alone and therefore retain the existing bare-close
-/// behavior.
+/// Ordinary lifecycle exits keep using cancellation alone and therefore retain
+/// the existing bare-close behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommunityDisconnectReason {
+    CommunityArchived,
     CommunityDeleted,
 }
 
 impl CommunityDisconnectReason {
     pub(crate) fn close_message(self) -> WsMessage {
         match self {
+            Self::CommunityArchived => WsMessage::Close(Some(axum::extract::ws::CloseFrame {
+                code: axum::extract::ws::close_code::POLICY,
+                reason: WsUtf8Bytes::from_static("community archived"),
+            })),
             Self::CommunityDeleted => WsMessage::Close(Some(axum::extract::ws::CloseFrame {
                 code: axum::extract::ws::close_code::POLICY,
                 reason: WsUtf8Bytes::from_static("community deleted"),
@@ -79,9 +83,8 @@ impl CommunityConnectionControl {
         self.reason_tx.subscribe()
     }
 
-    fn disconnect_community(&self) {
-        self.reason_tx
-            .send_replace(Some(CommunityDisconnectReason::CommunityDeleted));
+    fn disconnect_community(&self, reason: CommunityDisconnectReason) {
+        self.reason_tx.send_replace(Some(reason));
         self.cancel.cancel();
     }
 }
@@ -149,13 +152,25 @@ impl CommunityConnectionRegistry {
         }
     }
 
-    /// Disconnects every socket type currently bound to `community_id` and
-    /// attributes the close to community deletion.
-    pub fn disconnect_community(&self, community_id: CommunityId) -> usize {
+    /// Disconnects every socket type currently bound to an archived community.
+    pub fn disconnect_archived_community(&self, community_id: CommunityId) -> usize {
+        self.disconnect_community(community_id, CommunityDisconnectReason::CommunityArchived)
+    }
+
+    /// Disconnects every socket type currently bound to a permanently deleted community.
+    pub fn disconnect_deleted_community(&self, community_id: CommunityId) -> usize {
+        self.disconnect_community(community_id, CommunityDisconnectReason::CommunityDeleted)
+    }
+
+    fn disconnect_community(
+        &self,
+        community_id: CommunityId,
+        reason: CommunityDisconnectReason,
+    ) -> usize {
         let mut closed = 0;
         for entry in self.connections.iter() {
             if entry.value().0 == community_id {
-                entry.value().1.disconnect_community();
+                entry.value().1.disconnect_community(reason);
                 closed += 1;
             }
         }
@@ -1237,7 +1252,7 @@ impl AppState {
             .db
             .with_community_archive_fence(tenant.community(), archived_at, || {
                 self.community_connections
-                    .disconnect_community(tenant.community())
+                    .disconnect_archived_community(tenant.community())
             })
             .await?
             .unwrap_or(0);
@@ -1264,9 +1279,14 @@ impl AppState {
             &self.community_connections,
             |community_id| async move {
                 self.db
-                    .with_inactive_community_fence(community_id, || {
-                        self.community_connections
-                            .disconnect_community(community_id)
+                    .with_inactive_community_fence(community_id, |archived_at| {
+                        if archived_at.is_some() {
+                            self.community_connections
+                                .disconnect_archived_community(community_id)
+                        } else {
+                            self.community_connections
+                                .disconnect_deleted_community(community_id)
+                        }
                     })
                     .await
                     .map(|disconnected| disconnected.unwrap_or(0))
@@ -1943,17 +1963,17 @@ pub(crate) mod tests {
         let _audio_a_guard = registry.register(Uuid::new_v4(), community_a, audio_a_control);
         let _ordinary_b_guard = registry.register(Uuid::new_v4(), community_b, ordinary_b_control);
 
-        assert_eq!(registry.disconnect_community(community_a), 2);
+        assert_eq!(registry.disconnect_archived_community(community_a), 2);
         assert!(ordinary_a.is_cancelled());
         assert!(audio_a.is_cancelled());
         assert!(!ordinary_b.is_cancelled());
         assert_eq!(
             *ordinary_a_reason.borrow(),
-            Some(CommunityDisconnectReason::CommunityDeleted)
+            Some(CommunityDisconnectReason::CommunityArchived)
         );
         assert_eq!(
             *audio_a_reason.borrow(),
-            Some(CommunityDisconnectReason::CommunityDeleted)
+            Some(CommunityDisconnectReason::CommunityArchived)
         );
         assert_eq!(*ordinary_b_reason.borrow(), None);
     }
@@ -2007,7 +2027,7 @@ pub(crate) mod tests {
             _ = registered.notified() => {}
             _ = &mut future => panic!("revalidation should be paused"),
         }
-        assert_eq!(registry.disconnect_community(community), 1);
+        assert_eq!(registry.disconnect_archived_community(community), 1);
         resume.notify_one();
         future.await;
         assert!(cancel_during.is_cancelled());
@@ -2048,7 +2068,7 @@ pub(crate) mod tests {
                         "injected lookup failure".into(),
                     ))
                 } else {
-                    Ok(registry.disconnect_community(community))
+                    Ok(registry.disconnect_archived_community(community))
                 }
             }
         })
@@ -2086,7 +2106,7 @@ pub(crate) mod tests {
             async move {
                 entered.notify_one();
                 resume.notified().await;
-                Ok(registry.disconnect_community(community_id))
+                Ok(registry.disconnect_archived_community(community_id))
             }
         });
         tokio::pin!(future);
@@ -2121,7 +2141,7 @@ pub(crate) mod tests {
         drop(guard);
 
         assert!(registry.bound_communities().is_empty());
-        assert_eq!(registry.disconnect_community(community), 0);
+        assert_eq!(registry.disconnect_archived_community(community), 0);
         assert!(!cancel.is_cancelled());
     }
 
