@@ -12,7 +12,15 @@ import { MENTION_REFERENCE_TAG } from "@/shared/lib/resolveMentionNames";
 
 export { MENTION_REFERENCE_TAG };
 
+/** A single visit to a source draft; returning to the same key is a new owner. */
+export type ComposerDraftOwner = {
+  channelId: string | null;
+  draftKey: string | null | undefined;
+};
+
 export type PendingNonMemberMentionSend = {
+  sourceOwner: ComposerDraftOwner;
+  composerRevision: number;
   invitationSignal?: AbortSignal;
   addressedAgentPubkeys: string[];
   inlineAgentMentionPubkeys: string[];
