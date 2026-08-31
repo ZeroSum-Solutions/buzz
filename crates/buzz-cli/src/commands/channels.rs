@@ -1712,26 +1712,29 @@ pub async fn cmd_set_canvas(
     let content = read_or_stdin(content)?;
     let channel_uuid = parse_uuid(channel_id)?;
 
-    // `set` is an unconditional replace — a moved head is not an error, so it
-    // never returns the restore path's conflict/exit-5, and it takes no
-    // post-write supersession check (it asserts no loaded revision to survive).
-    // It does apply the same writer discipline: read the head and stamp
+    // `set` is an unconditional replace — no `expected-revision` tag, so the
+    // relay accepts the write regardless of the current head. A moved head is
+    // not an error; there is no post-write supersession check.
+    //
+    // Writer discipline still applies: read the head and stamp
     // `created_at = max(now, head + 1)` so the write sorts strictly ahead of a
-    // newer or future-dated head under `created_at DESC, id ASC` instead of
-    // reporting success behind it. That stamping runs through
-    // `build_set_canvas_after_head`, so `set` also inherits its skew guard: a
-    // head timestamped more than 15 minutes in the future is refused with a
-    // clear error rather than extending a poisoned timeline. With no head yet,
-    // `Some("none")` records the create-assertion at the default `now`.
+    // newer or future-dated head under `created_at DESC, id ASC`. This keeps
+    // an accepted append from landing behind the current head in read order,
+    // which would "succeed" without changing the visible canvas.
+    //
+    // The skew guard applies: a head timestamped more than CANVAS_MAX_FUTURE_SKEW_SECS
+    // in the future is refused with a clear error rather than extending a poisoned
+    // timeline. With no head yet, `build_set_canvas` with no tag stamps at `now`.
     let builder = match fetch_canvas_head(client, channel_id, true).await? {
         Some(head) => {
-            let head_id = head.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
-                CliError::Other(format!("no canvas head id found for channel {channel_id}"))
-            })?;
             let head_created_at = head.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
-            buzz_sdk::build_set_canvas_after_head(channel_uuid, &content, head_id, head_created_at)
+            buzz_sdk::build_set_canvas_unconditional_after_head(
+                channel_uuid,
+                &content,
+                head_created_at,
+            )
         }
-        None => buzz_sdk::build_set_canvas(channel_uuid, &content, Some("none")),
+        None => buzz_sdk::build_set_canvas(channel_uuid, &content, None),
     }
     .map_err(|e| CliError::Other(format!("build_set_canvas failed: {e}")))?;
 
@@ -3209,11 +3212,11 @@ mod tests {
 }
 
 /// Command-level coverage for `cmd_set_canvas`'s writer discipline: it must read
-/// the head, stamp `created_at` strictly ahead of a future-dated head, carry the
-/// head's id as the `expected-revision` tag, fall back to an `expected-revision:
-/// none` create when no head exists, and refuse to submit against a structurally
-/// malformed head. These pin the fix so a revert to `created_at = now` / no head
-/// read fails a test rather than silently recreating the false-success bug.
+/// the head, stamp `created_at` strictly ahead of a future-dated head, emit NO
+/// `expected-revision` tag (unconditional replace), fall back to stamping at `now`
+/// when no head exists, and refuse to submit against a structurally poisoned head.
+/// These pin the fix so a revert to `created_at = now` / no head read fails a test
+/// rather than silently recreating the false-success bug.
 ///
 /// Each test spins up a local axum relay that answers `POST /query` with a fixed
 /// head and captures the event submitted to `POST /events`, then inspects the
@@ -3320,11 +3323,11 @@ mod set_canvas_tests {
 
     /// A future-dated head (within the skew ceiling) forces the
     /// `max(now, head + 1)` bump to resolve to `head + 1` deterministically (no
-    /// clock dependence, no sleeps), so the submitted revision sorts strictly
-    /// ahead of the head under `created_at DESC, id ASC` and carries the head id
-    /// as `expected-revision`.
+    /// clock dependence, no sleeps), so the submitted event sorts strictly
+    /// ahead of the head under `created_at DESC, id ASC`. `set` is unconditional:
+    /// no `expected-revision` tag is emitted even though the head was read.
     #[tokio::test]
-    async fn set_stamps_ahead_of_future_head_and_asserts_it() {
+    async fn set_stamps_ahead_of_future_head_and_is_untagged() {
         let head_id = "a".repeat(64);
         // A head ahead of `now` but inside the 60-second ceiling: `head + 1`
         // deterministically wins the `max`, and the guard accepts it. Computed
@@ -3354,10 +3357,11 @@ mod set_canvas_tests {
             Some(future + 1),
             "must stamp strictly ahead of the future-dated head"
         );
+        // `set` is unconditional — no expected-revision tag regardless of head presence.
         assert_eq!(
-            tag_value(&event, "expected-revision").as_deref(),
-            Some(head_id.as_str()),
-            "must assert the head id it read"
+            tag_value(&event, "expected-revision"),
+            None,
+            "set must NOT emit expected-revision — it is an unconditional replace"
         );
         assert_eq!(event.get("kind").and_then(|v| v.as_u64()), Some(40100));
     }
@@ -3391,10 +3395,11 @@ mod set_canvas_tests {
         );
     }
 
-    /// No head yet: `set` still submits (create is not an error) and records the
-    /// create-assertion `expected-revision: none`.
+    /// No head yet: `set` still submits (create is not an error) and does NOT
+    /// emit an `expected-revision` tag — `set` is unconditional regardless of
+    /// head presence.
     #[tokio::test]
-    async fn set_with_no_head_creates_with_expected_revision_none() {
+    async fn set_with_no_head_creates_without_expected_revision() {
         let (url, submitted, _) = relay("[]").await;
 
         cmd_set_canvas(&client(&url), CHANNEL, "first content")
@@ -3403,40 +3408,9 @@ mod set_canvas_tests {
 
         let event = submitted.lock().unwrap().clone().expect("set must submit");
         assert_eq!(
-            tag_value(&event, "expected-revision").as_deref(),
-            Some("none"),
-            "no-head create must assert expected-revision: none"
-        );
-    }
-
-    /// A structurally malformed head (row without `id`) is an ordinary error, not
-    /// a conflict, and nothing is published — the exact boundary the fix added.
-    #[tokio::test]
-    async fn set_errors_on_head_without_id_and_does_not_submit() {
-        let head = json!([{
-            "pubkey": "b".repeat(64),
-            "kind": 40100,
-            "content": "old",
-            "created_at": 1_700_000_000u64,
-            "tags": [["h", CHANNEL]],
-        }]);
-        let (url, submitted, _) = relay(&head.to_string()).await;
-
-        let err = cmd_set_canvas(&client(&url), CHANNEL, "new content")
-            .await
-            .expect_err("malformed head must error");
-
-        assert!(
-            matches!(err, CliError::Other(_)),
-            "expected Other, got {err:?}"
-        );
-        assert!(
-            err.to_string().contains("no canvas head id found"),
-            "unexpected message: {err}"
-        );
-        assert!(
-            submitted.lock().unwrap().is_none(),
-            "no event may be published when the head is malformed"
+            tag_value(&event, "expected-revision"),
+            None,
+            "set must NOT emit expected-revision even on first create"
         );
     }
 

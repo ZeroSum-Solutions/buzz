@@ -615,6 +615,26 @@ pub fn build_set_canvas_after_head(
         .custom_created_at(nostr::Timestamp::from(created_at)))
 }
 
+/// Build an unconditional canvas write (kind 40100) that still applies writer
+/// discipline: stamps `created_at = max(now, head_created_at + 1)` so the
+/// event sorts strictly ahead of the current head under `created_at DESC, id ASC`.
+///
+/// Unlike [`build_set_canvas_after_head`], no `expected-revision` tag is added
+/// — the write is an unconditional append that can never conflict. Use this for
+/// `buzz canvas set`, which documents unconditional replace semantics.
+///
+/// Returns an error if `head_created_at` is more than
+/// [`CANVAS_MAX_FUTURE_SKEW_SECS`] beyond `now` (poisoned timeline guard).
+pub fn build_set_canvas_unconditional_after_head(
+    channel_id: Uuid,
+    content: &str,
+    head_created_at: u64,
+) -> Result<EventBuilder, SdkError> {
+    let created_at = canvas_write_created_at(head_created_at)?;
+    Ok(build_set_canvas(channel_id, content, None)?
+        .custom_created_at(nostr::Timestamp::from(created_at)))
+}
+
 /// Maximum future skew a canvas head may carry before a first-party client
 /// refuses to ratchet past it (seconds). A head timestamped beyond `now +
 /// CANVAS_MAX_FUTURE_SKEW_SECS` is treated as poisoned: stamping

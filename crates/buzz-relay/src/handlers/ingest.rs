@@ -191,6 +191,60 @@ fn validate_reaction_emoji(event: &Event, emoji: &str) -> Result<(), IngestError
     Ok(())
 }
 
+/// A validated canvas `expected-revision` precondition.
+///
+/// The tag value is either the literal `none` (expect no canvas head yet) or a
+/// 64-hex event ID (expect the live head to match it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CanvasRevisionSpec {
+    /// Literal `none` — the writer expects no canvas head to exist.
+    NoHead,
+    /// A 32-byte event ID the live canvas head must equal.
+    Head(Vec<u8>),
+}
+
+/// Parse the optional canvas `expected-revision` precondition from an event.
+///
+/// Returns `Ok(None)` when the tag is absent (backward-compatible unconditional
+/// append). The tag shape is exactly `["expected-revision", value]`: a
+/// one-element `["expected-revision"]` or any three-or-more-element form is
+/// malformed and rejects `invalid:` — it is never treated as absent. At most
+/// one `expected-revision` tag may be present. A single well-formed tag yields
+/// `Some(spec)`.
+pub(crate) fn parse_canvas_expected_revision(
+    event: &Event,
+) -> Result<Option<CanvasRevisionSpec>, IngestError> {
+    let mut tags = event
+        .tags
+        .iter()
+        .map(nostr::Tag::as_slice)
+        .filter(|parts| parts.first().map(String::as_str) == Some("expected-revision"));
+
+    let Some(tag) = tags.next() else {
+        return Ok(None);
+    };
+    if tags.next().is_some() {
+        return Err(IngestError::Rejected(
+            "invalid: duplicate expected-revision tag".into(),
+        ));
+    }
+    if tag.len() != 2 {
+        return Err(IngestError::Rejected(
+            "invalid: expected-revision tag must have exactly one value".into(),
+        ));
+    }
+    let value = tag[1].as_str();
+
+    if value == "none" {
+        return Ok(Some(CanvasRevisionSpec::NoHead));
+    }
+    let bytes = hex::decode(value)
+        .ok()
+        .filter(|bytes| bytes.len() == 32)
+        .ok_or_else(|| IngestError::Rejected("invalid: bad expected canvas revision".into()))?;
+    Ok(Some(CanvasRevisionSpec::Head(bytes)))
+}
+
 /// How the HTTP caller authenticated (for [`IngestAuth::Http`]).
 #[derive(Debug, Clone)]
 pub enum HttpAuthMethod {
@@ -3172,6 +3226,15 @@ async fn ingest_event_inner(
         });
     }
 
+    // Parse a canvas `expected-revision` precondition once, ahead of the write
+    // dispatch. Malformed or duplicate tags reject here (never reaching the DB);
+    // an absent tag yields `None`, routing canvas writes to the generic append.
+    let canvas_revision_spec = if kind_u32 == KIND_CANVAS {
+        parse_canvas_expected_revision(&event)?
+    } else {
+        None
+    };
+
     let (stored_event, was_inserted) = if buzz_core::kind::is_replaceable(kind_u32) {
         // NIP-16 replaceable event — atomic replace with stale-write protection.
         // channel_id is None for global kinds (0, 1, 3) due to step 5b above.
@@ -3195,6 +3258,42 @@ async fn ingest_event_inner(
             .replace_parameterized_event(tenant.community(), &event, &d_tag, channel_id)
             .await
             .map_err(|e| IngestError::Internal(format!("error: {e}")))?
+    } else if let Some(spec) = canvas_revision_spec.as_ref() {
+        // Canvas write carrying an optimistic-concurrency precondition. Plain
+        // canvas writes (no `expected-revision` tag) fall through to the generic
+        // append path below, preserving unconditional behavior. The channel is
+        // guaranteed present here: KIND_CANVAS requires an `h` tag and step 5b
+        // resolved it into `channel_id`.
+        let channel = channel_id
+            .ok_or_else(|| IngestError::Rejected("invalid: canvas event missing channel".into()))?;
+        let precondition = match spec {
+            CanvasRevisionSpec::NoHead => buzz_db::ChannelHeadPrecondition::ExpectNoHead,
+            CanvasRevisionSpec::Head(id) => buzz_db::ChannelHeadPrecondition::ExpectedHead(id),
+        };
+        let (stored_event, status) = state
+            .db
+            .insert_channel_head_checked(tenant.community(), &event, channel, precondition)
+            .await
+            .map_err(|e| IngestError::Internal(format!("error: {e}")))?;
+        match status {
+            buzz_db::ChannelHeadWriteStatus::RevisionMissing => {
+                return Err(IngestError::Rejected(
+                    "conflict: canvas revision does not exist".into(),
+                ));
+            }
+            buzz_db::ChannelHeadWriteStatus::RevisionMismatch => {
+                return Err(IngestError::Rejected(
+                    "conflict: canvas changed since it was loaded".into(),
+                ));
+            }
+            buzz_db::ChannelHeadWriteStatus::SupersedeFailed => {
+                return Err(IngestError::Rejected(
+                    "conflict: canvas write does not supersede the current head".into(),
+                ));
+            }
+            buzz_db::ChannelHeadWriteStatus::Inserted => (stored_event, true),
+            buzz_db::ChannelHeadWriteStatus::Duplicate => (stored_event, false),
+        }
     } else {
         let thread_params = thread_meta.as_ref().map(|m| m.as_params());
         match state
@@ -5799,6 +5898,148 @@ mod postgres_tests {
             "rejection must be the canvas guard, not the h-tag check; \
              deleting the guard call site changes this error to the h-tag rejection. \
              Got: {err:?}",
+        );
+    }
+
+    // ── parse_canvas_expected_revision unit tests ─────────────────────────
+    //
+    // These cover every branch in the parser without requiring Postgres or
+    // Redis.  A helper builds a signed kind-40100 event from a tag-list so the
+    // tests only state the tags they care about.
+
+    /// Build a signed kind-40100 event carrying the given tags.  The event is
+    /// fully signed so the nostr library populates `tags` correctly; content
+    /// and timestamp are irrelevant for the parser.
+    fn canvas_event_with_tags(tags: impl IntoIterator<Item = nostr::Tag>) -> nostr::Event {
+        use nostr::{EventBuilder, Keys, Kind};
+        EventBuilder::new(Kind::Custom(KIND_CANVAS as u16), "")
+            .tags(tags)
+            .sign_with_keys(&Keys::generate())
+            .expect("sign canvas event for parser test")
+    }
+
+    /// No `expected-revision` tag → `Ok(None)` (backward-compatible unconditional
+    /// append; mutation: adding a spurious tag-match makes the call return
+    /// `Some`, changing the Ok(None) assertion to fail).
+    #[test]
+    fn parse_canvas_revision_absent_returns_none() {
+        let event = canvas_event_with_tags([nostr::Tag::parse(["h", "chan-uuid"]).unwrap()]);
+        let result = parse_canvas_expected_revision(&event);
+        assert_eq!(result.unwrap(), None);
+    }
+
+    /// `expected-revision = "none"` → `Ok(Some(NoHead))` (first-create
+    /// precondition; mutation: changing `"none"` check to `"NONE"` makes the
+    /// parser fall through to the hex decoder and return `Rejected`).
+    #[test]
+    fn parse_canvas_revision_none_literal_yields_no_head() {
+        let event =
+            canvas_event_with_tags([nostr::Tag::parse(["expected-revision", "none"]).unwrap()]);
+        assert_eq!(
+            parse_canvas_expected_revision(&event).unwrap(),
+            Some(CanvasRevisionSpec::NoHead),
+        );
+    }
+
+    /// A well-formed 64-hex event ID → `Ok(Some(Head(bytes)))` where the
+    /// bytes equal the decoded hex (mutation: changing `bytes.len() == 32`
+    /// to `!= 32` makes this return `Rejected`).
+    #[test]
+    fn parse_canvas_revision_valid_hex_yields_head() {
+        let hex_id = "a".repeat(64);
+        let event =
+            canvas_event_with_tags([nostr::Tag::parse(["expected-revision", &hex_id]).unwrap()]);
+        let spec = parse_canvas_expected_revision(&event)
+            .expect("valid hex must parse")
+            .expect("must be Some");
+        assert_eq!(spec, CanvasRevisionSpec::Head(vec![0xaa; 32]));
+    }
+
+    /// Two `expected-revision` tags → `Rejected("invalid: duplicate …")`.
+    /// Mutation: removing the `tags.next().is_some()` guard makes this return
+    /// `Ok(Some(…))` instead.
+    #[test]
+    fn parse_canvas_revision_duplicate_tag_rejects() {
+        let hex_id = "b".repeat(64);
+        let event = canvas_event_with_tags([
+            nostr::Tag::parse(["expected-revision", &hex_id]).unwrap(),
+            nostr::Tag::parse(["expected-revision", &hex_id]).unwrap(),
+        ]);
+        assert!(
+            matches!(
+                parse_canvas_expected_revision(&event),
+                Err(IngestError::Rejected(msg)) if msg.contains("duplicate expected-revision tag")
+            ),
+            "duplicate tags must be rejected",
+        );
+    }
+
+    /// A one-element `["expected-revision"]` tag (no value) → `Rejected`.
+    /// Mutation: changing `tag.len() != 2` to `< 2` also catches zero-element
+    /// forms but not three-element; this case specifically exercises the
+    /// `len == 1` branch.
+    #[test]
+    fn parse_canvas_revision_missing_value_rejects() {
+        // nostr::Tag::parse requires ≥1 element; build a tag with only the key.
+        let event = canvas_event_with_tags([nostr::Tag::parse(["expected-revision"]).unwrap()]);
+        assert!(
+            matches!(
+                parse_canvas_expected_revision(&event),
+                Err(IngestError::Rejected(msg)) if msg.contains("expected-revision tag must have exactly one value")
+            ),
+            "tag with no value must be rejected",
+        );
+    }
+
+    /// A three-element `["expected-revision", value, extra]` tag → `Rejected`.
+    /// Mutation: changing `tag.len() != 2` to `tag.len() < 2` lets three-element
+    /// tags through; this test catches that.
+    #[test]
+    fn parse_canvas_revision_extra_value_rejects() {
+        let hex_id = "c".repeat(64);
+        let event =
+            canvas_event_with_tags([
+                nostr::Tag::parse(["expected-revision", &hex_id, "extra"]).unwrap()
+            ]);
+        assert!(
+            matches!(
+                parse_canvas_expected_revision(&event),
+                Err(IngestError::Rejected(msg)) if msg.contains("expected-revision tag must have exactly one value")
+            ),
+            "tag with extra value must be rejected",
+        );
+    }
+
+    /// A 62-character hex string (too short — not a 32-byte id) → `Rejected`.
+    /// Mutation: removing the `bytes.len() == 32` length check makes this return
+    /// `Ok(Some(Head(…)))` with 31 bytes instead of rejecting.
+    #[test]
+    fn parse_canvas_revision_too_short_hex_rejects() {
+        let short_hex = "d".repeat(62);
+        let event =
+            canvas_event_with_tags([nostr::Tag::parse(["expected-revision", &short_hex]).unwrap()]);
+        assert!(
+            matches!(
+                parse_canvas_expected_revision(&event),
+                Err(IngestError::Rejected(msg)) if msg.contains("bad expected canvas revision")
+            ),
+            "too-short hex must be rejected",
+        );
+    }
+
+    /// A non-hex value → `Rejected("invalid: bad expected canvas revision")`.
+    /// Mutation: removing `hex::decode(value).ok()` makes this panic instead.
+    #[test]
+    fn parse_canvas_revision_non_hex_rejects() {
+        let not_hex = "g".repeat(64); // 'g' is not a valid hex digit
+        let event =
+            canvas_event_with_tags([nostr::Tag::parse(["expected-revision", &not_hex]).unwrap()]);
+        assert!(
+            matches!(
+                parse_canvas_expected_revision(&event),
+                Err(IngestError::Rejected(msg)) if msg.contains("bad expected canvas revision")
+            ),
+            "non-hex value must be rejected",
         );
     }
 }
