@@ -4,7 +4,7 @@
 
 use buzz_datastore_tracing::datastore_span;
 use chrono::{Datelike, TimeZone, Utc};
-use sqlx::PgPool;
+use sqlx::{Connection, PgPool};
 use tracing::info;
 
 use crate::error::{DbError, Result};
@@ -16,6 +16,11 @@ const PARTITIONED_TABLES: &[&str] = &["events", "delivery_log"];
 /// Ensures monthly partition tables exist for the next `months_ahead` months.
 pub async fn ensure_future_partitions(pool: &PgPool, months_ahead: u32) -> Result<()> {
     let now = Utc::now();
+    let mut connection = crate::observability::acquire_writer(
+        pool,
+        crate::observability::WriterOperation::Bootstrap,
+    )
+    .await?;
 
     for i in 0..=(months_ahead as i32) {
         let year = now.year();
@@ -50,7 +55,7 @@ pub async fn ensure_future_partitions(pool: &PgPool, months_ahead: u32) -> Resul
         let end_str = end.format("%Y-%m-%d").to_string();
 
         for table in PARTITIONED_TABLES {
-            ensure_partition(pool, table, &start_str, &end_str, &suffix).await?;
+            ensure_partition(&mut connection, table, &start_str, &end_str, &suffix).await?;
         }
     }
 
@@ -82,7 +87,7 @@ fn validate_date_str(s: &str) -> bool {
 }
 
 async fn ensure_partition(
-    pool: &PgPool,
+    connection: &mut sqlx::PgConnection,
     table_name: &str,
     start_date_str: &str,
     end_date_str: &str,
@@ -112,7 +117,7 @@ async fn ensure_partition(
 
     let partition_name = format!("{table_name}_p{suffix}");
 
-    if partition_range_covered(pool, table_name, start_date_str, end_date_str).await? {
+    if partition_range_covered(connection, table_name, start_date_str, end_date_str).await? {
         return Ok(());
     }
 
@@ -124,7 +129,7 @@ async fn ensure_partition(
 
     // SET LOCAL applies only to this transaction, and the DDL must use the same
     // connection for the timeout to bound its parent-table lock wait.
-    let mut tx = pool.begin().await?;
+    let mut tx = connection.begin().await?;
     sqlx::query("SET LOCAL lock_timeout = '2s'")
         .execute(&mut *tx)
         .await?;
@@ -150,7 +155,8 @@ async fn ensure_partition(
             );
             tx.rollback().await?;
             if is_overlap
-                && partition_range_covered(pool, table_name, start_date_str, end_date_str).await?
+                && partition_range_covered(connection, table_name, start_date_str, end_date_str)
+                    .await?
             {
                 // A concurrent creator can cover the range between the catalog
                 // pre-check and this DDL.
@@ -167,7 +173,7 @@ async fn ensure_partition(
 }
 
 async fn partition_range_covered(
-    pool: &PgPool,
+    connection: &mut sqlx::PgConnection,
     table_name: &str,
     start_date_str: &str,
     end_date_str: &str,
@@ -235,7 +241,7 @@ async fn partition_range_covered(
     .bind(table_name)
     .bind(start_date_str)
     .bind(end_date_str)
-    .fetch_one(pool)
+    .fetch_one(&mut *connection)
     .await?;
 
     if !all_bounds_recognized {
@@ -436,6 +442,7 @@ mod tests {
             (now.year(), now.month() + 1)
         };
         let end_str = format!("{end_year:04}-{end_month:02}-01");
+        let mut connection = pool.acquire().await.expect("acquire test connection");
         for table in PARTITIONED_TABLES {
             let partition_name = format!("{table}_p{suffix}");
             let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
@@ -444,12 +451,13 @@ mod tests {
                 .await
                 .expect("check created partition");
             assert!(exists, "missing partition {partition_name}");
-            let covered = partition_range_covered(&pool, table, &start_str, &end_str)
+            let covered = partition_range_covered(&mut connection, table, &start_str, &end_str)
                 .await
                 .expect("inspect created partition bounds");
             assert!(covered, "partition {partition_name} must use UTC bounds");
         }
 
+        drop(connection);
         drop_scratch_db(&admin, pool, &name).await;
     }
 
