@@ -592,6 +592,62 @@ jobs:
           DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
           TEST_DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
           REDIS_URL: redis://localhost:6379
+      - name: Canvas CAS DB tests
+        # Transaction, advisory-lock, and precondition-evaluation coverage for the
+        # kind-40100 atomic compare-and-insert path in buzz-db. All 12 tests share
+        # the `channel_head_checked_` prefix; a typo in the filter exits with code 4
+        # (nextest --no-tests=fail default) so silent zero-test runs are impossible.
+        #
+        # Covers: first-create (ExpectNoHead → Inserted), first-create rejection
+        # when head exists (ExpectNoHead → RevisionMismatch + loser absent),
+        # head-match advance (ExpectedHead match → Inserted), head-mismatch
+        # (ExpectedHead wrong id → RevisionMismatch), missing head (ExpectedHead
+        # but no head → RevisionMissing), idempotent replay (Duplicate short-circuit
+        # pre-precondition), replay-skips-stale-precondition, same-second higher-id
+        # SupersedeFailed + loser absent, same-second lower-id Inserted, behind-clock
+        # SupersedeFailed, concurrent-authors advisory-lock serialization, and
+        # concurrent-first-create race.
+        #
+        # Mutation oracle: removing `pg_advisory_xact_lock` from
+        # `insert_channel_head_checked` causes the concurrent tests to fail under
+        # load (both writers observe the same head).
+        #
+        # --test-threads=1: the concurrent tests spawn Tokio tasks against a
+        # shared pool; running them in isolation avoids cross-test contention on
+        # the advisory lock key space.
+        run: |
+          filter='package(buzz-db) and test(/channel_head_checked_/)'
+          cargo nextest run \
+            --archive-file target/ci/backend-integration-tests.tar.zst \
+            --test-threads=1 \
+            --no-tests=fail \
+            -E "${filter}" \
+            --run-ignored ignored-only
+        env:
+          DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+          TEST_DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+      - name: Canvas CAS ingest-path wiring test
+        # End-to-end proof that the expected-revision parser → CAS dispatch →
+        # insert_channel_head_checked DB transaction round-trip is wired through
+        # ingest_event_inner. Steps: first write (ExpectNoHead → Inserted), advance
+        # (ExpectedHead match → Inserted), stale competitor (ExpectedHead mismatch
+        # → conflict: rejection), loser absent from DB, untagged write still
+        # appends unconditionally via the generic path.
+        #
+        # Mutation oracle: removing the `canvas_revision_spec` dispatch block from
+        # ingest_event_inner (the `} else if let Some(spec) = canvas_revision_spec`
+        # branch) makes the stale step return Ok instead of a conflict: rejection,
+        # failing the assert!.
+        run: |
+          cargo nextest run \
+            --archive-file target/ci/backend-integration-tests.tar.zst \
+            --no-tests=fail \
+            -E 'package(buzz-relay) and test(=handlers::ingest::tests::canvas_cas_dispatch_wired_through_ingest_event_inner)' \
+            --run-ignored ignored-only
+        env:
+          DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+          TEST_DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+          REDIS_URL: redis://localhost:6379
       - name: Upload relay log
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

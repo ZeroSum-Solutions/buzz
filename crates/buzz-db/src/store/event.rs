@@ -1528,26 +1528,20 @@ pub async fn insert_event_with_thread_metadata(
 }
 
 /// Outcome of a channel-head conditional canvas write.
-///
-/// Canvas events (kind 40100) are plain appends that accrue as version history;
-/// the "current" canvas is the live head under `created_at DESC, id ASC`. When a
-/// write carries an `expected-revision` precondition, this enum reports whether
-/// it matched.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChannelHeadWriteStatus {
     /// The event was appended as the new channel head.
     Inserted,
     /// The exact event already existed (idempotent replay of the current head).
     Duplicate,
-    /// `ExpectedHead` was required but no live head exists for the channel/kind.
+    /// `ExpectedHead` was supplied but no live head exists for the channel.
     RevisionMissing,
-    /// The live head differs from the required `ExpectedHead` (or `ExpectNoHead`
-    /// was required but a head already exists).
+    /// The live head id did not match `ExpectedHead`, or `ExpectNoHead` was
+    /// required but a head already exists.
     RevisionMismatch,
-    /// The precondition matched, but the candidate does not sort strictly ahead
-    /// of the current head under `created_at DESC, id ASC`, so accepting it
-    /// would leave the visible canvas unchanged. Rejected to preserve the
-    /// invariant that an accepted tagged write IS the new head.
+    /// Precondition matched but the candidate does not sort ahead of the head
+    /// under `created_at DESC, id ASC`; accepting it would not change the
+    /// visible canvas.
     SupersedeFailed,
 }
 
@@ -1560,13 +1554,8 @@ pub enum ChannelHeadPrecondition<'a> {
     ExpectedHead(&'a [u8]),
 }
 
-/// Whether a candidate channel-head event sorts strictly ahead of the current
-/// head under the canonical `created_at DESC, id ASC` ordering — i.e. whether
-/// accepting it actually makes it the new head.
-///
-/// The head is the row with the greatest `created_at`, ties broken by the
-/// lowest `id`. So the candidate wins iff it has a later `created_at`, or an
-/// equal `created_at` with a strictly lower `id`.
+/// Returns `true` iff a candidate canvas event sorts strictly ahead of the
+/// current head under `created_at DESC, id ASC`.
 fn candidate_supersedes_head(
     candidate: &Event,
     candidate_id: &[u8; 32],
@@ -1585,32 +1574,16 @@ fn candidate_supersedes_head(
 /// Conditionally append a channel-head event (canvas kind 40100) under an
 /// optimistic-concurrency precondition.
 ///
-/// The check and the insert share one advisory lock keyed on
-/// `(community, kind, channel)` — deliberately excluding the author, since any
-/// channel member edits the same canvas and cross-author concurrent edits must
-/// serialize on the same head. The head is read as `created_at DESC, id ASC`
-/// (matching the read path), the precondition is evaluated, and on success the
-/// event plus its mentions are inserted in the same transaction. Precondition
-/// failures mutate nothing.
+/// Acquires a per-`(community, kind, channel)` advisory lock (author excluded
+/// so cross-author concurrent edits serialize on the same head), reads the head
+/// under `created_at DESC, id ASC`, evaluates the precondition, and on success
+/// inserts the event and its mentions in the same transaction. Failures are
+/// pure reads — nothing is mutated.
 ///
-/// # Head-advancement guarantee
-///
-/// A matching `ExpectedHead` precondition additionally requires the candidate
-/// to sort strictly ahead of the current head under `created_at DESC, id ASC`.
-/// Otherwise the write would be accepted and fanned out yet leave the visible
-/// head unchanged — a same-second lower-id or behind-clock writer would
-/// "succeed" without restoring the selected content or advancing the canvas.
-/// Such writes reject as [`ChannelHeadWriteStatus::SupersedeFailed`]. First-party
-/// writers sign `created_at = max(now, head.created_at + 1)`, so this reject is
-/// practically unreachable outside clock pathology.
-///
-/// # Idempotent replay exception
-///
-/// Re-submitting the byte-identical event that already is the live head returns
-/// [`ChannelHeadWriteStatus::Duplicate`] without evaluating the supplied
-/// precondition. A duplicate insert cannot change state, so evaluating its
-/// precondition buys nothing and would turn a safe transport retry (identical
-/// bytes replayed after a lost response) into a false conflict.
+/// A matching `ExpectedHead` precondition also requires the candidate to sort
+/// strictly ahead of the head; if not, returns `SupersedeFailed`. Re-submitting
+/// the byte-identical live head short-circuits to `Duplicate` without evaluating
+/// the precondition (safe transport-retry semantics).
 pub async fn insert_channel_head_checked(
     pool: &PgPool,
     community_id: CommunityId,
@@ -1626,9 +1599,7 @@ pub async fn insert_channel_head_checked(
 
     let mut tx = pool.begin().await?;
 
-    // Serialize check+insert per (community, kind, channel). The author is
-    // intentionally excluded from the key so cross-author concurrent edits
-    // contend on the same lock.
+    // Serialize check+insert per (community, kind, channel).
     let lock_key = event_replacement_lock_key(
         community_id,
         kind_i32,
@@ -1651,9 +1622,7 @@ pub async fn insert_channel_head_checked(
     .fetch_optional(&mut *tx)
     .await?;
 
-    // Idempotent replay: the incoming event already is the live head. Returns
-    // before precondition evaluation — a duplicate insert cannot change state,
-    // so a byte-identical transport retry must never surface as a false conflict.
+    // Idempotent replay: the incoming event is already the live head.
     if head
         .as_ref()
         .is_some_and(|(id, _)| id.as_slice() == incoming_id.as_slice())
@@ -1677,9 +1646,6 @@ pub async fn insert_channel_head_checked(
             if id.as_slice() != expected {
                 Some(ChannelHeadWriteStatus::RevisionMismatch)
             } else if !candidate_supersedes_head(event, incoming_id, *head_created_at, id) {
-                // Precondition matched, but the candidate cannot become the
-                // head under `created_at DESC, id ASC`. Accepting it would leave
-                // the visible canvas unchanged.
                 Some(ChannelHeadWriteStatus::SupersedeFailed)
             } else {
                 None
@@ -3551,7 +3517,7 @@ mod postgres_tests {
                 ChannelHeadPrecondition::ExpectNoHead,
             )
             .await
-            .map(|(stored, status)| (stored.id.to_vec(), status))
+            .map(|(stored, status)| (stored.event.id.to_bytes().to_vec(), status))
         });
         let tb = tokio::spawn(async move {
             insert_channel_head_checked(
@@ -3562,7 +3528,7 @@ mod postgres_tests {
                 ChannelHeadPrecondition::ExpectNoHead,
             )
             .await
-            .map(|(stored, status)| (stored.id.to_vec(), status))
+            .map(|(stored, status)| (stored.event.id.to_bytes().to_vec(), status))
         });
 
         let (id_a, status_a) = ta.await.expect("join A").expect("call A");

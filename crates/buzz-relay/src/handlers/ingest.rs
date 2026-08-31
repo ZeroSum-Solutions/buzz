@@ -6042,4 +6042,226 @@ mod postgres_tests {
             "non-hex value must be rejected",
         );
     }
+
+    // ── CAS ingest-path wiring test ───────────────────────────────────────
+    //
+    // Proves that the `expected-revision` parser → dispatch → DB transaction
+    // round-trip is wired end-to-end through `ingest_event_inner`. Deletng or
+    // bypassing the CAS dispatch block (the `} else if let Some(spec) =
+    // canvas_revision_spec.as_ref() {` branch) must turn this test red.
+    //
+    // Mutation oracle for the dispatch:
+    //   - Removing the `canvas_revision_spec` branch makes tagged writes fall
+    //     through to the generic append; the stale-head step no longer returns
+    //     a conflict: rejection, causing the assert! below to fail.
+    //   - Replacing `insert_channel_head_checked` with `insert_event_with_thread_metadata`
+    //     has the same effect — no conflict is surfaced.
+    //
+    // Requires Postgres (and does NOT need Redis — the fake replay guard fires
+    // before any Redis-backed path, and the CAS path never touches Redis).
+
+    /// Build the minimal AppState for an ingest-path CAS test.
+    ///
+    /// Replaces the NIP-98 replay guard with an always-fresh stub so that no
+    /// live Redis is needed. The returned `AppState` is ready for
+    /// `ingest_event_inner` calls.
+    async fn build_canvas_ingest_state(
+        db_url: &str,
+        pool: &sqlx::PgPool,
+    ) -> Arc<crate::state::AppState> {
+        use buzz_auth::Nip98ReplayGuard;
+        use nostr::Keys;
+
+        const FAKE_REDIS_URL: &str = "redis://127.0.0.1:1"; // never contacted
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let redis_pool = deadpool_redis::Config::from_url(FAKE_REDIS_URL)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("deadpool redis pool");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(FAKE_REDIS_URL, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let mut config = crate::config::Config::from_env().expect("relay config from env");
+        config.database_url = db_url.to_owned();
+        config.redis_url = FAKE_REDIS_URL.to_string();
+        config.require_relay_membership = false;
+
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth_svc = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+
+        let (mut state, _audit_shutdown) = crate::state::AppState::new(
+            config,
+            db.clone(),
+            redis_pool,
+            audit,
+            pubsub,
+            auth_svc,
+            search,
+            workflow_engine,
+            Keys::generate(),
+            media_storage,
+        );
+
+        struct AlwaysFresh;
+        impl Nip98ReplayGuard for AlwaysFresh {
+            fn try_mark_in_scope<'a>(
+                &'a self,
+                _scope: &'a str,
+                _event_id: &'a nostr::EventId,
+                _ttl_secs: u64,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<bool, buzz_auth::AuthError>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(true) })
+            }
+        }
+        state.nip98_replay = Arc::new(AlwaysFresh);
+        Arc::new(state)
+    }
+
+    /// End-to-end CAS dispatch wiring: a tagged write inserts, a stale same-head
+    /// competitor returns the exact conflict: rejection, the loser is absent from
+    /// the DB, and an untagged write still appends unconditionally.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn canvas_cas_dispatch_wired_through_ingest_event_inner() {
+        use buzz_db::channel::{ChannelType, ChannelVisibility};
+        use nostr::{Keys, Kind, Tag, Timestamp};
+
+        let db_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()); // sadscan:disable np.postgres.1
+        let pool = sqlx::PgPool::connect(&db_url).await.expect(
+            "connect test Postgres — start local Postgres before running ignored ingest tests",
+        );
+        let state = build_canvas_ingest_state(&db_url, &pool).await;
+
+        // Provision a fresh community + channel so each test run is isolated.
+        let host = format!("canvas-cas-wiring-{}.test", Uuid::new_v4().simple());
+        let community = state
+            .db
+            .ensure_configured_community(&host)
+            .await
+            .expect("ensure community")
+            .id;
+        let tenant = TenantContext::resolved(community, &host);
+
+        let channel_id = Uuid::new_v4();
+        let creator_keys = Keys::generate();
+        state
+            .db
+            .create_channel_with_id(
+                community,
+                channel_id,
+                &format!("canvas-cas-wiring-{}", channel_id.simple()),
+                ChannelType::Stream,
+                ChannelVisibility::Open,
+                None,
+                creator_keys.public_key().to_bytes().as_slice(),
+                None,
+            )
+            .await
+            .expect("create test channel");
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        let channel_uuid_str = channel_id.to_string();
+        let tracer: Arc<dyn buzz_conformance::Tracer> = Arc::new(VecTracer::default());
+
+        let make_auth = |keys: &Keys| IngestAuth::Http {
+            pubkey: keys.public_key(),
+            scopes: vec![Scope::ChannelsWrite],
+            auth_method: HttpAuthMethod::Nip98,
+        };
+
+        // ── Step 1: first write with expected-revision=none → Inserted ────────
+        let author = Keys::generate();
+        let first = nostr::EventBuilder::new(Kind::Custom(KIND_CANVAS as u16), "# v1")
+            .custom_created_at(Timestamp::from(now))
+            .tags([
+                Tag::parse(["h", &channel_uuid_str]).unwrap(),
+                Tag::parse(["expected-revision", "none"]).unwrap(),
+            ])
+            .sign_with_keys(&author)
+            .expect("sign first canvas");
+        let first_id_hex = first.id.to_hex();
+
+        ingest_event_inner(&state, &tracer, &tenant, first, make_auth(&author))
+            .await
+            .expect("first canvas write must succeed");
+
+        // ── Step 2: advance with expected-revision=<first id> → Inserted ──────
+        let second = nostr::EventBuilder::new(Kind::Custom(KIND_CANVAS as u16), "# v2")
+            .custom_created_at(Timestamp::from(now + 1))
+            .tags([
+                Tag::parse(["h", &channel_uuid_str]).unwrap(),
+                Tag::parse(["expected-revision", &first_id_hex]).unwrap(),
+            ])
+            .sign_with_keys(&author)
+            .expect("sign second canvas");
+
+        ingest_event_inner(&state, &tracer, &tenant, second, make_auth(&author))
+            .await
+            .expect("second canvas write must succeed");
+
+        // ── Step 3: stale competitor — same first-id precondition → conflict ──
+        // The head is now the second event, so expected-revision=<first_id> is stale.
+        // Mutation oracle: deleting the `canvas_revision_spec` dispatch block makes
+        // this return Ok instead of the conflict: rejection below.
+        let stale = nostr::EventBuilder::new(Kind::Custom(KIND_CANVAS as u16), "# stale")
+            .custom_created_at(Timestamp::from(now + 2))
+            .tags([
+                Tag::parse(["h", &channel_uuid_str]).unwrap(),
+                Tag::parse(["expected-revision", &first_id_hex]).unwrap(),
+            ])
+            .sign_with_keys(&author)
+            .expect("sign stale canvas");
+        let stale_id_bytes = stale.id.as_bytes().to_vec();
+
+        let err =
+            match ingest_event_inner(&state, &tracer, &tenant, stale, make_auth(&author)).await {
+                Ok(_) => panic!("stale precondition must be rejected, but ingest returned Ok"),
+                Err(e) => e,
+            };
+        assert!(
+            matches!(&err, IngestError::Rejected(msg) if msg.starts_with("conflict:")),
+            "stale write must return a conflict: rejection; got {:?}",
+            err,
+        );
+
+        // The losing write must not be persisted.
+        let persisted: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM events WHERE community_id = $1 AND id = $2")
+                .bind(community.as_uuid())
+                .bind(stale_id_bytes.as_slice())
+                .fetch_one(&pool)
+                .await
+                .expect("count stale canvas row");
+        assert_eq!(persisted, 0, "losing CAS write must not be stored");
+
+        // ── Step 4: untagged write still appends unconditionally ──────────────
+        // No expected-revision tag → the event is routed through the generic
+        // append path, NOT through insert_channel_head_checked. It must succeed
+        // regardless of the current head state.
+        let untagged =
+            nostr::EventBuilder::new(Kind::Custom(KIND_CANVAS as u16), "# unconditional")
+                .custom_created_at(Timestamp::from(now + 3))
+                .tags([Tag::parse(["h", &channel_uuid_str]).unwrap()])
+                .sign_with_keys(&author)
+                .expect("sign untagged canvas");
+
+        ingest_event_inner(&state, &tracer, &tenant, untagged, make_auth(&author))
+            .await
+            .expect("untagged canvas write must append unconditionally");
+    }
 }

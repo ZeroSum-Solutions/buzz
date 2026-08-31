@@ -3235,7 +3235,6 @@ mod set_canvas_tests {
 
     use super::cmd_set_canvas;
     use crate::client::BuzzClient;
-    use crate::CliError;
 
     const CHANNEL: &str = "326d56bc-c96c-4af0-86a1-5e804cd1b467";
 
