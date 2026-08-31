@@ -36,11 +36,16 @@ after(() => dom.window.close());
 
 const DOC_URL = "http://localhost:3000/media/deadbeef.bin";
 
-function addCard(url = DOC_URL) {
+let nextMessageId = 0;
+function addCard(url = DOC_URL, messageId = `message-${nextMessageId++}`) {
+  const row = dom.window.document.createElement("article");
+  row.setAttribute("data-testid", "message-row");
+  row.setAttribute("data-message-id", messageId);
   const card = dom.window.document.createElement("button");
   card.setAttribute("data-testid", "file-card");
   card.setAttribute("data-doc-url", url);
-  dom.window.document.body.appendChild(card);
+  row.appendChild(card);
+  dom.window.document.body.appendChild(row);
   return card;
 }
 
@@ -97,7 +102,23 @@ test("consumes the record: a later restore without one takes the first match", a
   assert.equal(dom.window.document.activeElement, first);
 });
 
-test("clamps to the last remaining card when the recorded one is gone", async () => {
+test("tracks the opener by message id when a preceding same-URL card disappears", async () => {
+  const { recordMarkdownDocOpener, restoreFocusToMarkdownDocOpener } =
+    await loadModule();
+  const first = addCard(DOC_URL, "message-a");
+  const opener = addCard(DOC_URL, "message-b");
+  const following = addCard(DOC_URL, "message-c");
+
+  recordMarkdownDocOpener(DOC_URL, opener);
+  first.closest('[data-testid="message-row"]').remove();
+  restoreFocusToMarkdownDocOpener(DOC_URL);
+  await settleFrames();
+
+  assert.equal(dom.window.document.activeElement, opener);
+  assert.notEqual(dom.window.document.activeElement, following);
+});
+
+test("falls back to a surviving same-URL card when the opener is gone", async () => {
   const { recordMarkdownDocOpener, restoreFocusToMarkdownDocOpener } =
     await loadModule();
   const first = addCard();
@@ -109,6 +130,33 @@ test("clamps to the last remaining card when the recorded one is gone", async ()
   await settleFrames();
 
   assert.equal(dom.window.document.activeElement, first);
+});
+
+test("restores a thread-only opener to its surviving summary control", async () => {
+  const { recordMarkdownDocOpener, restoreFocusToMarkdownDocOpener } =
+    await loadModule();
+  const threadPanel = dom.window.document.createElement("section");
+  threadPanel.setAttribute("data-testid", "message-thread-panel");
+  dom.window.document.body.appendChild(threadPanel);
+  const head = addCard(DOC_URL, "thread-head").closest(
+    '[data-testid="message-row"]',
+  );
+  const reply = addCard(DOC_URL, "thread-reply").closest(
+    '[data-testid="message-row"]',
+  );
+  threadPanel.append(head, reply);
+  const opener = reply.querySelector('[data-testid="file-card"]');
+  const summary = dom.window.document.createElement("button");
+  summary.setAttribute("data-testid", "message-thread-summary");
+  summary.setAttribute("data-thread-head-id", "thread-head");
+  dom.window.document.body.appendChild(summary);
+
+  recordMarkdownDocOpener(DOC_URL, opener);
+  threadPanel.remove();
+  restoreFocusToMarkdownDocOpener(DOC_URL);
+  await settleFrames();
+
+  assert.equal(dom.window.document.activeElement, summary);
 });
 
 test("ignores a record made for a different document URL", async () => {

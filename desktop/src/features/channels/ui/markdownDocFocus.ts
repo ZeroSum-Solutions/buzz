@@ -14,37 +14,74 @@ const PANEL_CLOSE_SELECTOR =
   '[data-testid="markdown-doc-panel"] [data-testid="auxiliary-panel-close"]';
 
 /**
- * Identity of the card that invoked the current open, captured while it was
- * still mounted. The same attachment can appear in several messages — several
- * cards, one URL — so the opener is remembered as its DOM-order index among
- * the cards sharing that URL. The index survives the narrow-layout swap (the
- * message list remounts in the same order) where an element reference or a
- * URL-only selector cannot single out the invoking card.
+ * Identity of the surface that invoked the current open. Message ids survive
+ * timeline insertions/deletions and narrow-layout remounts; URL ordinals do
+ * not. For a thread-only card, the thread head identifies the surviving
+ * summary control used as the deliberate return target after the pane closes.
  */
-type OpenerRecord = { index: number; url: string };
+type OpenerRecord = {
+  messageId: string;
+  threadHeadId: string | null;
+  url: string;
+};
 
 let lastOpenerRecord: OpenerRecord | null = null;
 
-function findOpenerCards(url: string): HTMLElement[] {
-  return Array.from(
-    document.querySelectorAll<HTMLElement>(
+function findCard(messageId: string, url: string): HTMLElement | null {
+  const row = document.querySelector<HTMLElement>(
+    `[data-testid="message-row"][data-message-id="${CSS.escape(messageId)}"]`,
+  );
+  return (
+    row?.querySelector<HTMLElement>(
       `[data-testid="file-card"][data-doc-url="${CSS.escape(url)}"]`,
-    ),
+    ) ?? null
+  );
+}
+
+function findFallback(url: string): HTMLElement | null {
+  return document.querySelector<HTMLElement>(
+    `[data-testid="file-card"][data-doc-url="${CSS.escape(url)}"]`,
+  );
+}
+
+function findThreadSummary(threadHeadId: string): HTMLElement | null {
+  return document.querySelector<HTMLElement>(
+    `[data-testid="message-thread-summary"][data-thread-head-id="${CSS.escape(threadHeadId)}"]`,
   );
 }
 
 /**
- * Remember which card invoked the open for `url`. Call at open time, while
- * the clicked element is still in the document; a null/detached opener (e.g.
- * a deep-link restore with no invoking card) clears the record and the
- * eventual restore falls back to the first matching card.
+ * Remember the logical surface that invoked the open while its card is still
+ * mounted. A detached/null opener (for example URL history restoration) clears
+ * the record, leaving close to use the first matching card when available.
  */
 export function recordMarkdownDocOpener(
   url: string,
   opener: HTMLElement | null,
 ): void {
-  const index = opener ? findOpenerCards(url).indexOf(opener) : -1;
-  lastOpenerRecord = index >= 0 ? { index, url } : null;
+  if (!opener?.isConnected) {
+    lastOpenerRecord = null;
+    return;
+  }
+  const row = opener.closest<HTMLElement>(
+    '[data-testid="message-row"][data-message-id]',
+  );
+  const messageId = row?.dataset.messageId;
+  if (!messageId) {
+    lastOpenerRecord = null;
+    return;
+  }
+  const threadPanel = opener.closest<HTMLElement>(
+    '[data-testid="message-thread-panel"]',
+  );
+  lastOpenerRecord = {
+    messageId,
+    threadHeadId:
+      threadPanel?.querySelector<HTMLElement>(
+        '[data-testid="message-row"][data-message-id]',
+      )?.dataset.messageId ?? null,
+    url,
+  };
 }
 
 /** Frames to wait for the target to (re)mount before giving up. */
@@ -96,23 +133,19 @@ export function focusMarkdownDocPanelClose(): () => void {
 }
 
 /**
- * After the panel closes, return focus to the attachment card that opened
- * `url` once the channel section has remounted — the recorded invoking card
- * when one exists, the first URL match otherwise. Aborts if focus has already
- * landed on a real control (e.g. a different panel claimed it), and gives up
- * quietly when no card exists anymore.
+ * After the panel closes, return focus to the exact invoking message/card.
+ * If its thread surface was closed to make room for the document, focus the
+ * surviving thread-summary control. Only if the logical opener disappeared do
+ * we fall back to another card for the same immutable attachment URL.
  */
 export function restoreFocusToMarkdownDocOpener(url: string): void {
+  const record = lastOpenerRecord?.url === url ? lastOpenerRecord : null;
+  lastOpenerRecord = null;
   scheduleFocusSearch(
-    () => {
-      const cards = findOpenerCards(url);
-      if (cards.length === 0) return null;
-      const record = lastOpenerRecord?.url === url ? lastOpenerRecord : null;
-      // One record per invocation: consume it so a later open without a
-      // recorded card (deep link, reload) does not inherit a stale index.
-      if (record) lastOpenerRecord = null;
-      return cards[Math.min(record?.index ?? 0, cards.length - 1)] ?? null;
-    },
+    () =>
+      (record ? findCard(record.messageId, url) : null) ??
+      (record?.threadHeadId ? findThreadSummary(record.threadHeadId) : null) ??
+      findFallback(url),
     () => !focusIsFree(),
   );
 }
