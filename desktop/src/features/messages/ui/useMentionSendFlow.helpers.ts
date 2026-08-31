@@ -16,7 +16,7 @@ export { MENTION_REFERENCE_TAG };
 export type ComposerDraftOwner = {
   channelId: string | null;
   draftKey: string | null | undefined;
-  /** Read this source visit, never the currently visible editor visit. */
+  /** Read shared source-key intent, never another visible draft key. */
   getComposerRevision: () => number;
 };
 

@@ -1,4 +1,5 @@
 import * as React from "react";
+import { claimDraftSend } from "@/features/messages/lib/useDrafts";
 import { toast } from "sonner";
 import {
   type CreateChannelManagedAgentInput,
@@ -410,7 +411,7 @@ export function useMentionSendFlow({
         if (!composerCleared) return;
         composerCleared = false;
         // An authored edit (even edit -> clear) ends optimistic recovery's
-        // authority over this visit, including its persisted record and files.
+        // authority over this key, including its persisted record and files.
         if (draft.sourceOwner.getComposerRevision() !== clearedRevision) return;
         const persisted = persistRecoverableDraft();
         const canAnimateCurrentComposer =
@@ -448,13 +449,15 @@ export function useMentionSendFlow({
         });
       };
       if (ownsComposer() && getComposerRevision() === draft.composerRevision) {
-        runComposerUpdate(clearComposer);
-        if (draft.addressedAgentPubkeys.length > 0) {
-          optimisticComposerContent =
-            onAddressedAgentsComposerCleared?.(draft.addressedAgentPubkeys) ??
-            "";
-          contentRef.current = optimisticComposerContent;
-        }
+        runComposerUpdate(() => {
+          clearComposer();
+          if (draft.addressedAgentPubkeys.length > 0) {
+            optimisticComposerContent =
+              onAddressedAgentsComposerCleared?.(draft.addressedAgentPubkeys) ??
+              "";
+            contentRef.current = optimisticComposerContent;
+          }
+        });
         composerCleared = true;
         clearedRevision = getComposerRevision();
       }
@@ -624,7 +627,10 @@ export function useMentionSendFlow({
           const newlyPinnedPubkeys = draft.inlineAgentMentionPubkeys.filter(
             (pubkey) => sentMentionPubkeys.has(normalizePubkey(pubkey)),
           );
-          if (ownsComposer()) {
+          if (
+            ownsComposer() &&
+            getComposerRevision() === draft.composerRevision
+          ) {
             onAddressedAgentsSendSucceeded?.(
               [
                 ...new Set([
@@ -766,6 +772,7 @@ export function useMentionSendFlow({
       setIsMentionSendPending(true);
       // Capture exact selections before any async preparation can navigate the
       // reused editor to another draft (possibly with identical display text).
+      claimDraftSend(effectiveDraftKey);
       const composerRevision = getComposerRevision();
       const savedMentionRefs = mentions.getDraftMentionRefs(trimmed).slice();
       const selectedMentionPubkeys = mentions.extractMentionPubkeys(trimmed);
@@ -920,6 +927,7 @@ export function useMentionSendFlow({
     },
     [
       completeSend,
+      effectiveDraftKey,
       sourceOwner,
       getComposerRevision,
       channelType,
