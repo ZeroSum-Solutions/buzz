@@ -910,32 +910,6 @@ pub(crate) async fn count_events_on(conn: &mut sqlx::PgConnection, q: &EventQuer
     Ok(cnt)
 }
 
-/// Soft-delete an event by setting `deleted_at = NOW()`.
-///
-/// Returns `Ok(true)` if the event was deleted, `Ok(false)` if already deleted
-/// or not found. Callers are responsible for decrementing thread reply counts
-/// when the deleted event is a thread reply.
-pub async fn soft_delete_event(
-    pool: &PgPool,
-    community_id: CommunityId,
-    event_id: &[u8],
-) -> Result<bool> {
-    let mut connection = crate::observability::acquire_writer(
-        pool,
-        crate::observability::WriterOperation::EventWrite,
-    )
-    .await?;
-    let result = sqlx::query(
-        "UPDATE events SET deleted_at = NOW() WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL",
-    )
-            .bind(community_id.as_uuid())
-            .bind(event_id)
-            .execute(&mut *connection)
-            .await?;
-
-    Ok(result.rows_affected() > 0)
-}
-
 /// Soft-delete the live row for an addressable coordinate
 /// `(kind, pubkey, d_tag)` — the NIP-33 replacement key — provided it is not
 /// newer than the deletion request.
@@ -2154,16 +2128,6 @@ pub async fn insert_reaction_event_with_thread_metadata(
             crate::observability::WriterOperation::EventWrite,
         )
         .await
-    }
-
-    /// Soft-deletes an event. Returns `Ok(true)` if deleted, `Ok(false)` if already deleted.
-    #[datastore_span(name = "soft_delete_event", system = "postgresql")]
-    pub async fn soft_delete_event(
-        &self,
-        community_id: CommunityId,
-        event_id: &[u8],
-    ) -> Result<bool> {
-        crate::event::soft_delete_event(&self.pool, community_id, event_id).await
     }
 
     /// Soft-delete the live row for an addressable coordinate `(kind, pubkey, d_tag)`
@@ -3484,6 +3448,57 @@ mod postgres_tests {
         )
     }
 
+    /// Polls `pg_locks` until at least `min_waiters` sessions are queued as
+    /// ungranted waiters on the given `int8` advisory lock key, or until
+    /// `timeout` elapses.
+    ///
+    /// Returns `Ok(())` once the condition is met. Panics if the timeout
+    /// expires before the required number of waiters appear, or if any waiter
+    /// task completes (exits the lock wait) before the condition is met.
+    ///
+    /// Postgres stores `pg_advisory_xact_lock(int8)` rows in `pg_locks` as
+    /// `(locktype='advisory', classid=(key>>32)::oid, objid=(key & 0xffffffff)::oid)`.
+    /// The `classid`/`objid` columns are of type `oid` (unsigned 32-bit integer).
+    async fn wait_for_advisory_waiters(
+        pool: &PgPool,
+        lock_key: i64,
+        min_waiters: i64,
+        timeout: std::time::Duration,
+    ) {
+        let deadline = std::time::Instant::now() + timeout;
+        // Split the int8 key into its two oid halves exactly as Postgres does.
+        // Cast each half to int8 first (no overflow), then let sqlx bind them
+        // as bigint; Postgres compares oid columns via implicit cast.
+        let classid = ((lock_key as u64) >> 32) as i64;
+        let objid = ((lock_key as u64) & 0xffff_ffff) as i64;
+        loop {
+            let waiters: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks \
+                 WHERE locktype = 'advisory' \
+                   AND classid = $1::oid \
+                   AND objid = $2::oid \
+                   AND NOT granted",
+            )
+            .bind(classid)
+            .bind(objid)
+            .fetch_one(pool)
+            .await
+            .expect("pg_locks waiter query");
+
+            if waiters >= min_waiters {
+                return;
+            }
+
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {min_waiters} advisory waiters on key {lock_key:#x}; \
+                 only {waiters} appeared — the production lock was likely removed"
+            );
+
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
     /// Tombstone regression: H → A → soft-delete A → replay A-on-H must return
     /// `RevisionMismatch`. A must remain deleted and H must remain the live head.
     ///
@@ -3602,20 +3617,17 @@ mod postgres_tests {
     /// become the visible head; the loser must not appear as a live row.
     ///
     /// Causal oracle: an external connection holds the exact advisory key before
-    /// either writer starts. Both writers queue at `pg_advisory_xact_lock` and
-    /// are released together when the blocker rolls back. This guarantees both
-    /// transactions are open and competing when they unblock, making the
-    /// interleaving deterministic rather than scheduler-dependent. Without the
-    /// lock in `insert_channel_head_checked`, the tasks proceed without waiting;
-    /// `channel_head_untagged_canvas_append_serializes_on_advisory_key` proves
-    /// the key is exclusively held during an in-flight write (direct lock-contention
-    /// oracle), and this test proves the end-state invariant holds.
+    /// either writer starts. Both writers are spawned and `pg_locks` is polled
+    /// until both appear as ungranted waiters on this exact key. Only then is
+    /// the blocker released. This is a causal proof: both sessions have opened
+    /// their transactions and reached `pg_advisory_xact_lock` before the
+    /// interleaving begins — the outcome is deterministic rather than
+    /// scheduler-dependent.
     ///
     /// Mutation oracle: removing `pg_advisory_xact_lock` from
-    /// `insert_channel_head_checked` means the blocker no longer holds both writers;
-    /// they race concurrently — both can read the same head, both insert (distinct
-    /// event IDs → no PK conflict), both return `Inserted`, and `head_count`
-    /// becomes 3 instead of 2. The `assert_eq!(head_count, 2)` fails.
+    /// `insert_channel_head_checked` means neither writer queues as a waiter;
+    /// `wait_for_advisory_waiters` times out, or both writers read the same head,
+    /// both insert, and `head_count` becomes 3 instead of 2.
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn channel_head_checked_concurrent_authors_only_one_advances() {
@@ -3676,8 +3688,11 @@ mod postgres_tests {
             .map(|(stored, status)| (stored.event.id.to_bytes().to_vec(), status))
         });
 
-        // Give both tasks time to open their transactions and queue at the key.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Wait until both writers are observed as ungranted advisory-lock
+        // waiters in pg_locks. This is a causal proof that both sessions have
+        // opened their transactions and are blocked at pg_advisory_xact_lock
+        // before we release the blocker.
+        wait_for_advisory_waiters(&pool, lock_key, 2, std::time::Duration::from_secs(5)).await;
 
         // Release — both writers unblock and race for the advisory lock.
         blocker.rollback().await.expect("release blocker");
@@ -3744,13 +3759,16 @@ mod postgres_tests {
     /// simultaneously. Exactly one must be `Inserted`; the other gets
     /// `RevisionMismatch`. The loser must not be persisted.
     ///
-    /// Causal oracle: same external-blocker pattern as the same-head race test.
-    /// Both writers are queued before the blocker releases, making the outcome
-    /// deterministic regardless of scheduler ordering.
+    /// Causal oracle: an external connection holds the exact advisory key before
+    /// either writer starts. Both writers are spawned and `pg_locks` is polled
+    /// until both appear as ungranted waiters on this exact key, proving both
+    /// transactions have opened and reached `pg_advisory_xact_lock`. Only then
+    /// is the blocker released.
     ///
     /// Mutation oracle: removing `pg_advisory_xact_lock` from
-    /// `insert_channel_head_checked` lets both writers read `None` for the head,
-    /// both pass `ExpectNoHead`, both insert, and `head_count` becomes 2.
+    /// `insert_channel_head_checked` means neither writer queues as a waiter;
+    /// `wait_for_advisory_waiters` times out, or both writers read `None` for
+    /// the head, both pass `ExpectNoHead`, both insert, and `head_count` becomes 2.
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn channel_head_checked_concurrent_first_create_only_one_wins() {
@@ -3794,8 +3812,11 @@ mod postgres_tests {
             .map(|(stored, status)| (stored.event.id.to_bytes().to_vec(), status))
         });
 
-        // Give both tasks time to open their transactions and queue at the key.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Wait until both writers are observed as ungranted advisory-lock
+        // waiters in pg_locks. This is a causal proof that both sessions have
+        // opened their transactions and are blocked at pg_advisory_xact_lock
+        // before we release the blocker.
+        wait_for_advisory_waiters(&pool, lock_key, 2, std::time::Duration::from_secs(5)).await;
 
         // Release — both race for the advisory lock.
         blocker.rollback().await.expect("release blocker");
@@ -3803,13 +3824,13 @@ mod postgres_tests {
         let (id_a, status_a) = ta.await.expect("join A").expect("call A");
         let (id_b, status_b) = tb.await.expect("join B").expect("call B");
 
-        let inserted = if status_a == ChannelHeadWriteStatus::Inserted {
+        let (winner_id, loser_id) = if status_a == ChannelHeadWriteStatus::Inserted {
             assert_eq!(status_b, ChannelHeadWriteStatus::RevisionMismatch);
-            id_a
+            (id_a, id_b)
         } else {
             assert_eq!(status_a, ChannelHeadWriteStatus::RevisionMismatch);
             assert_eq!(status_b, ChannelHeadWriteStatus::Inserted);
-            id_b
+            (id_b, id_a)
         };
 
         // Exactly one canvas row exists.
@@ -3837,7 +3858,22 @@ mod postgres_tests {
         .fetch_one(&pool)
         .await
         .expect("read head");
-        assert_eq!(head_id, inserted, "stored head must be the winner");
+        assert_eq!(head_id, winner_id, "stored head must be the winner");
+
+        // The loser must not appear as a live row.
+        let loser_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events \
+             WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL",
+        )
+        .bind(community.as_uuid())
+        .bind(&loser_id)
+        .fetch_one(&pool)
+        .await
+        .expect("check loser absent");
+        assert_eq!(
+            loser_count, 0,
+            "the losing first-create writer must not be a live row"
+        );
     }
 
     /// Serialization coverage: an untagged kind-40100 unconditional append must

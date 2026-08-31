@@ -609,16 +609,18 @@ jobs:
         # SupersedeFailed + loser absent, same-second lower-id Inserted, behind-clock
         # SupersedeFailed, tombstone regression (deleted-replay → RevisionMismatch,
         # not Duplicate), concurrent-authors advisory-lock serialization with
-        # deterministic external-blocker oracle, concurrent-first-create race with
-        # external-blocker oracle, untagged canvas append serialization, and canvas
-        # soft-delete serialization.
+        # deterministic pg_locks waiter oracle, concurrent-first-create race with
+        # pg_locks waiter oracle + explicit loser-absent assertion, untagged canvas
+        # append serialization, and canvas soft-delete serialization.
         #
         # Mutation oracles:
         # - post-insert conflict returning Duplicate unconditionally fails
         #   channel_head_checked_deleted_replay_returns_revision_mismatch.
-        # - removing pg_advisory_xact_lock from insert_channel_head_checked lets
-        #   both writers read the same head simultaneously: head_count becomes 3
-        #   (same-head test) or 2 (first-create test) and both return Inserted.
+        # - removing pg_advisory_xact_lock from insert_channel_head_checked means
+        #   writers never queue as pg_locks advisory waiters; wait_for_advisory_waiters
+        #   times out (both race tests fail deterministically), or both writers read
+        #   the same head simultaneously: head_count becomes 3 (same-head test) or 2
+        #   (first-create test) and both return Inserted.
         # - removing the lock from insert_event_with_thread_metadata or
         #   soft_delete_event_and_update_thread for kind-40100 makes
         #   pg_try_advisory_xact_lock return true under the hold.
