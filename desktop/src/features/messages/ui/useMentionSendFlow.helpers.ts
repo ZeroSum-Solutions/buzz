@@ -13,6 +13,7 @@ import { MENTION_REFERENCE_TAG } from "@/shared/lib/resolveMentionNames";
 export { MENTION_REFERENCE_TAG };
 
 export type PendingNonMemberMentionSend = {
+  invitationSignal?: AbortSignal;
   addressedAgentPubkeys: string[];
   inlineAgentMentionPubkeys: string[];
   capturedChannelId: string | null;
