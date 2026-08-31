@@ -137,7 +137,7 @@ export function MarkdownDocPanel({
           backdropSurface="soft"
           inset={layout !== "split" ? "wide" : "default"}
         >
-          <AuxiliaryPanelHeaderGroup align="start">
+          <AuxiliaryPanelHeaderGroup>
             <FileText className="h-4 w-4 shrink-0 text-muted-foreground" />
             <AuxiliaryPanelHeaderTitleBlock title={filename} />
           </AuxiliaryPanelHeaderGroup>
