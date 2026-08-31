@@ -594,9 +594,11 @@ jobs:
           REDIS_URL: redis://localhost:6379
       - name: Canvas CAS DB tests
         # Transaction, advisory-lock, and precondition-evaluation coverage for the
-        # kind-40100 atomic compare-and-insert path in buzz-db. All 12 tests share
-        # the `channel_head_checked_` prefix; a typo in the filter exits with code 4
-        # (nextest --no-tests=fail default) so silent zero-test runs are impossible.
+        # kind-40100 atomic compare-and-insert path in buzz-db. 13 tests share the
+        # `channel_head_checked_` prefix; two additional serialization tests cover
+        # untagged canvas appends and canvas soft-deletions. A typo in either filter
+        # exits with code 4 (nextest --no-tests=fail default) so silent zero-test
+        # runs are impossible.
         #
         # Covers: first-create (ExpectNoHead → Inserted), first-create rejection
         # when head exists (ExpectNoHead → RevisionMismatch + loser absent),
@@ -605,23 +607,33 @@ jobs:
         # but no head → RevisionMissing), idempotent replay (Duplicate short-circuit
         # pre-precondition), replay-skips-stale-precondition, same-second higher-id
         # SupersedeFailed + loser absent, same-second lower-id Inserted, behind-clock
-        # SupersedeFailed, concurrent-authors advisory-lock serialization, and
-        # concurrent-first-create race.
+        # SupersedeFailed, tombstone regression (deleted-replay → RevisionMismatch,
+        # not Duplicate), concurrent-authors advisory-lock serialization with
+        # deterministic external-blocker oracle, concurrent-first-create race with
+        # external-blocker oracle, untagged canvas append serialization, and canvas
+        # soft-delete serialization.
         #
-        # Mutation oracle: removing `pg_advisory_xact_lock` from
-        # `insert_channel_head_checked` causes the concurrent tests to fail under
-        # load (both writers observe the same head).
+        # Mutation oracles:
+        # - post-insert conflict returning Duplicate unconditionally fails
+        #   channel_head_checked_deleted_replay_returns_revision_mismatch.
+        # - removing pg_advisory_xact_lock from insert_channel_head_checked lets
+        #   both writers read the same head simultaneously: head_count becomes 3
+        #   (same-head test) or 2 (first-create test) and both return Inserted.
+        # - removing the lock from insert_event_with_thread_metadata or
+        #   soft_delete_event_and_update_thread for kind-40100 makes
+        #   pg_try_advisory_xact_lock return true under the hold.
         #
         # --test-threads=1: the concurrent tests spawn Tokio tasks against a
         # shared pool; running them in isolation avoids cross-test contention on
         # the advisory lock key space.
         run: |
-          filter='package(buzz-db) and test(/channel_head_checked_/)'
+          filter1='package(buzz-db) and test(/channel_head_checked_/)'
+          filter2='package(buzz-db) and test(/channel_head_(untagged_canvas_append|canvas_deletion)_serializes_on_advisory_key/)'
           cargo nextest run \
             --archive-file target/ci/backend-integration-tests.tar.zst \
             --test-threads=1 \
             --no-tests=fail \
-            -E "${filter}" \
+            -E "${filter1} or ${filter2}" \
             --run-ignored ignored-only
         env:
           DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz

@@ -10,8 +10,8 @@ use sqlx::{PgConnection, PgPool, Postgres, QueryBuilder, Row, Transaction};
 use uuid::Uuid;
 
 use buzz_core::kind::{
-    event_kind_i32, is_ephemeral, is_parameterized_replaceable, KIND_AUTH, KIND_EVENT_REMINDER,
-    KIND_HUDDLE_STARTED, SHARED_GATED_KINDS,
+    event_kind_i32, is_ephemeral, is_parameterized_replaceable, KIND_AUTH, KIND_CANVAS,
+    KIND_EVENT_REMINDER, KIND_HUDDLE_STARTED, SHARED_GATED_KINDS,
 };
 use buzz_core::{CommunityId, StoredEvent};
 use buzz_datastore_tracing::datastore_span;
@@ -1001,6 +1001,14 @@ pub async fn soft_delete_by_coordinate(
 /// Wraps the delete + counter update in a single transaction so a crash between
 /// them cannot leave counters permanently inflated. Returns `Ok(true)` if the
 /// event was deleted this call.
+///
+/// When the target event is a kind-40100 (canvas) event, this function derives
+/// the target's `kind` and `channel_id` from the database inside the same
+/// transaction and acquires the same `(community, kind, channel)` advisory lock
+/// used by [`insert_channel_head_checked`] before the UPDATE. This prevents a
+/// concurrent tagged write from observing a head that is simultaneously being
+/// removed. The serialization invariant is owned entirely by this function;
+/// callers do not classify the target kind.
 pub async fn soft_delete_event_and_update_thread(
     pool: &PgPool,
     community_id: CommunityId,
@@ -1008,12 +1016,39 @@ pub async fn soft_delete_event_and_update_thread(
     parent_event_id: Option<&[u8]>,
     root_event_id: Option<&[u8]>,
 ) -> Result<bool> {
+    use crate::store::replaceable::event_replacement_lock_key;
+
     let connection = crate::observability::acquire_writer(
         pool,
         crate::observability::WriterOperation::EventWrite,
     )
     .await?;
     let mut tx = sqlx::Transaction::begin(connection, None).await?;
+    // Derive the target event's kind and channel_id inside the transaction so
+    // that the serialization decision cannot be bypassed by any caller.
+    let target: Option<(i32, Option<Uuid>)> = sqlx::query_as(
+        "SELECT kind, channel_id FROM events \
+         WHERE community_id = $1 AND id = $2",
+    )
+    .bind(community_id.as_uuid())
+    .bind(event_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if let Some((kind, Some(channel_id))) = target {
+        if kind == KIND_CANVAS as i32 {
+            let lock_key = event_replacement_lock_key(
+                community_id,
+                kind,
+                &[],
+                Some(channel_id.as_bytes().as_slice()),
+            );
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(lock_key)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
 
     let result = sqlx::query(
         "UPDATE events SET deleted_at = NOW() WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL",
@@ -1506,6 +1541,13 @@ pub(crate) async fn insert_event_with_thread_metadata_tx(
 /// inconsistent if one succeeded and the other failed. Keep this as one
 /// transaction so reply metadata and counters commit together with the event.
 ///
+/// For kind-40100 (canvas) events with a `channel_id`, acquires the same
+/// `(community, kind, channel)` advisory lock used by
+/// [`insert_channel_head_checked`] so that untagged unconditional canvas appends
+/// serialize against concurrent tagged writes on the same coordinate. Untagged
+/// writes remain unconditional — they never conflict — but must not race the
+/// head read inside a concurrent tagged transaction.
+///
 /// Returns `(StoredEvent, was_inserted)`.
 pub async fn insert_event_with_thread_metadata(
     pool: &PgPool,
@@ -1514,12 +1556,30 @@ pub async fn insert_event_with_thread_metadata(
     channel_id: Option<Uuid>,
     thread_meta: Option<ThreadMetadataParams<'_>>,
 ) -> Result<(StoredEvent, bool)> {
+    use crate::store::replaceable::event_replacement_lock_key;
+
     let connection = crate::observability::acquire_writer(
         pool,
         crate::observability::WriterOperation::EventWrite,
     )
     .await?;
     let mut tx = sqlx::Transaction::begin(connection, None).await?;
+
+    if event_kind_i32(event) == KIND_CANVAS as i32 {
+        if let Some(ch) = channel_id {
+            let lock_key = event_replacement_lock_key(
+                community_id,
+                KIND_CANVAS as i32,
+                &[],
+                Some(ch.as_bytes().as_slice()),
+            );
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(lock_key)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+
     let result =
         insert_event_with_thread_metadata_tx(&mut tx, community_id, event, channel_id, thread_meta)
             .await?;
@@ -1664,10 +1724,16 @@ pub async fn insert_channel_head_checked(
         insert_event_with_thread_metadata_tx(&mut tx, community_id, event, Some(channel_id), None)
             .await?;
     if !was_inserted {
-        // Lost an insert race after passing the precondition (another writer
-        // committed the identical id). Treat as an idempotent duplicate.
+        // The primary-key row already exists. The idempotent-replay branch above
+        // already returned `Duplicate` for the case where the incoming event is
+        // the canonical live head. Reaching here means the row exists but is NOT
+        // the live head (e.g. soft-deleted). Because every kind-40100 mutator
+        // serializes on this advisory key, no concurrent writer can have changed
+        // the live head since our read above, so the truthful result is
+        // `RevisionMismatch` — a false `Duplicate` would acknowledge a write
+        // that did not become live.
         tx.rollback().await?;
-        return Ok((stored, ChannelHeadWriteStatus::Duplicate));
+        return Ok((stored, ChannelHeadWriteStatus::RevisionMismatch));
     }
     crate::insert_mentions_in_transaction(&mut tx, community_id, event, Some(channel_id)).await?;
     tx.commit().await?;
@@ -3406,16 +3472,150 @@ mod postgres_tests {
         .expect("behind-clock edit");
         assert_eq!(status, ChannelHeadWriteStatus::SupersedeFailed);
     }
+    /// Derives the advisory-lock key for a canvas coordinate, matching the key
+    /// computed inside `insert_channel_head_checked` and
+    /// `soft_delete_event_and_update_thread`.
+    fn canvas_lock_key(community: CommunityId, channel: Uuid) -> i64 {
+        crate::store::replaceable::event_replacement_lock_key(
+            community,
+            buzz_core::kind::KIND_CANVAS as i32,
+            &[],
+            Some(channel.as_bytes().as_slice()),
+        )
+    }
+
+    /// Tombstone regression: H → A → soft-delete A → replay A-on-H must return
+    /// `RevisionMismatch`. A must remain deleted and H must remain the live head.
+    ///
+    /// Mutation oracle: the post-insert conflict branch returning `Duplicate`
+    /// unconditionally makes this test fail with status `Duplicate` instead of
+    /// `RevisionMismatch`.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn channel_head_checked_deleted_replay_returns_revision_mismatch() {
+        let pool = setup_pool().await;
+        let community = CommunityId::from_uuid(make_test_community(&pool).await);
+        let channel = make_test_channel(&pool, community.as_uuid().to_owned(), None).await;
+
+        // H: seed the initial head.
+        let head = make_canvas_event_at("# Head", 1000);
+        insert_channel_head_checked(
+            &pool,
+            community,
+            &head,
+            channel,
+            ChannelHeadPrecondition::ExpectNoHead,
+        )
+        .await
+        .expect("seed head H");
+        let head_id = head.id.to_bytes().to_vec();
+
+        // A: insert a second revision.
+        let a = make_canvas_event_at("# A", 1001);
+        insert_channel_head_checked(
+            &pool,
+            community,
+            &a,
+            channel,
+            ChannelHeadPrecondition::ExpectedHead(&head_id),
+        )
+        .await
+        .expect("insert A");
+        let a_id = a.id.to_bytes().to_vec();
+
+        // Soft-delete A so H becomes the live head again.
+        soft_delete_event_and_update_thread(&pool, community, &a_id, None, None)
+            .await
+            .expect("soft-delete A");
+
+        // Verify A is deleted and H is the live head before replay.
+        let a_deleted: Option<bool> = sqlx::query_scalar(
+            "SELECT deleted_at IS NOT NULL FROM events \
+             WHERE community_id = $1 AND id = $2",
+        )
+        .bind(community.as_uuid())
+        .bind(&a_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("check A deleted");
+        assert_eq!(
+            a_deleted,
+            Some(true),
+            "A must be soft-deleted before replay"
+        );
+
+        // Replay byte-identical A against live head H — must not return Duplicate.
+        let (_, status) = insert_channel_head_checked(
+            &pool,
+            community,
+            &a,
+            channel,
+            ChannelHeadPrecondition::ExpectedHead(&head_id),
+        )
+        .await
+        .expect("replay A");
+        assert_eq!(
+            status,
+            ChannelHeadWriteStatus::RevisionMismatch,
+            "replay of a deleted event must return RevisionMismatch, not Duplicate"
+        );
+
+        // A must still be deleted after the replay attempt.
+        let a_still_deleted: Option<bool> = sqlx::query_scalar(
+            "SELECT deleted_at IS NOT NULL FROM events \
+             WHERE community_id = $1 AND id = $2",
+        )
+        .bind(community.as_uuid())
+        .bind(&a_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("check A still deleted");
+        assert_eq!(
+            a_still_deleted,
+            Some(true),
+            "A must remain deleted after replay"
+        );
+
+        // H must remain the canonical live head.
+        let live_head: Vec<u8> = sqlx::query_scalar(
+            "SELECT id FROM events \
+             WHERE community_id = $1 AND kind = $2 AND channel_id = $3 \
+             AND deleted_at IS NULL \
+             ORDER BY created_at DESC, id ASC LIMIT 1",
+        )
+        .bind(community.as_uuid())
+        .bind(buzz_core::kind::KIND_CANVAS as i32)
+        .bind(channel)
+        .fetch_one(&pool)
+        .await
+        .expect("read live head");
+        assert_eq!(
+            live_head, head_id,
+            "H must remain the live head after failed replay"
+        );
+    }
 
     /// Race soundness: two concurrent authors both assert the same live head and
     /// both sign strictly-advancing writes. The per-(community, channel) advisory
     /// lock must serialize check+insert so exactly one wins (`Inserted`) and the
     /// other observes the moved head (`RevisionMismatch`). Exactly one write may
-    /// become the visible head.
+    /// become the visible head; the loser must not appear as a live row.
     ///
-    /// Mutation oracle: removing the `pg_advisory_xact_lock` call from
-    /// `insert_channel_head_checked` causes this test to fail under concurrent
-    /// load (both writers can observe the same head simultaneously).
+    /// Causal oracle: an external connection holds the exact advisory key before
+    /// either writer starts. Both writers queue at `pg_advisory_xact_lock` and
+    /// are released together when the blocker rolls back. This guarantees both
+    /// transactions are open and competing when they unblock, making the
+    /// interleaving deterministic rather than scheduler-dependent. Without the
+    /// lock in `insert_channel_head_checked`, the tasks proceed without waiting;
+    /// `channel_head_untagged_canvas_append_serializes_on_advisory_key` proves
+    /// the key is exclusively held during an in-flight write (direct lock-contention
+    /// oracle), and this test proves the end-state invariant holds.
+    ///
+    /// Mutation oracle: removing `pg_advisory_xact_lock` from
+    /// `insert_channel_head_checked` means the blocker no longer holds both writers;
+    /// they race concurrently — both can read the same head, both insert (distinct
+    /// event IDs → no PK conflict), both return `Inserted`, and `head_count`
+    /// becomes 3 instead of 2. The `assert_eq!(head_count, 2)` fails.
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn channel_head_checked_concurrent_authors_only_one_advances() {
@@ -3435,6 +3635,16 @@ mod postgres_tests {
         .expect("seed base head");
         let base_id = base.id.to_bytes().to_vec();
 
+        // Acquire the exact advisory key from an external connection so both
+        // writers block immediately at pg_advisory_xact_lock.
+        let lock_key = canvas_lock_key(community, channel);
+        let mut blocker = pool.begin().await.expect("blocker tx");
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(lock_key)
+            .execute(&mut *blocker)
+            .await
+            .expect("blocker acquires key");
+
         // Both edits assert `base` as their head and are timestamped strictly
         // ahead of it (writer discipline), so neither trips SupersedeFailed —
         // only the advisory-lock serialization decides the winner.
@@ -3452,7 +3662,7 @@ mod postgres_tests {
                 ChannelHeadPrecondition::ExpectedHead(&id_a),
             )
             .await
-            .map(|(_, status)| status)
+            .map(|(stored, status)| (stored.event.id.to_bytes().to_vec(), status))
         });
         let tb = tokio::spawn(async move {
             insert_channel_head_checked(
@@ -3463,22 +3673,26 @@ mod postgres_tests {
                 ChannelHeadPrecondition::ExpectedHead(&id_b),
             )
             .await
-            .map(|(_, status)| status)
+            .map(|(stored, status)| (stored.event.id.to_bytes().to_vec(), status))
         });
 
-        let status_a = ta.await.expect("join A").expect("insert A");
-        let status_b = tb.await.expect("join B").expect("insert B");
+        // Give both tasks time to open their transactions and queue at the key.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let mut statuses = [status_a, status_b];
-        statuses.sort_by_key(|s| format!("{s:?}"));
-        assert_eq!(
-            statuses,
-            [
-                ChannelHeadWriteStatus::Inserted,
-                ChannelHeadWriteStatus::RevisionMismatch
-            ],
-            "exactly one concurrent write advances the head; got {statuses:?}"
-        );
+        // Release — both writers unblock and race for the advisory lock.
+        blocker.rollback().await.expect("release blocker");
+
+        let (id_a, status_a) = ta.await.expect("join A").expect("call A");
+        let (id_b, status_b) = tb.await.expect("join B").expect("call B");
+
+        let (winner_id, loser_id) = if status_a == ChannelHeadWriteStatus::Inserted {
+            assert_eq!(status_b, ChannelHeadWriteStatus::RevisionMismatch);
+            (id_a, id_b)
+        } else {
+            assert_eq!(status_a, ChannelHeadWriteStatus::RevisionMismatch);
+            assert_eq!(status_b, ChannelHeadWriteStatus::Inserted);
+            (id_b, id_a)
+        };
 
         // Exactly one new canvas row (beyond the base) was committed.
         let head_count: i64 = sqlx::query_scalar(
@@ -3492,17 +3706,66 @@ mod postgres_tests {
         .await
         .expect("count committed canvas rows");
         assert_eq!(head_count, 2, "base plus exactly one winning edit");
+
+        // The canonical live head must be the winner's event.
+        let live_head: Vec<u8> = sqlx::query_scalar(
+            "SELECT id FROM events \
+             WHERE community_id = $1 AND kind = $2 AND channel_id = $3 AND deleted_at IS NULL \
+             ORDER BY created_at DESC, id ASC LIMIT 1",
+        )
+        .bind(community.as_uuid())
+        .bind(buzz_core::kind::KIND_CANVAS as i32)
+        .bind(channel)
+        .fetch_one(&pool)
+        .await
+        .expect("read live head");
+        assert_eq!(
+            live_head, winner_id,
+            "live head must be the Inserted writer's event"
+        );
+
+        // The losing writer's event must not be present as a live row.
+        let loser_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events \
+             WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL",
+        )
+        .bind(community.as_uuid())
+        .bind(&loser_id)
+        .fetch_one(&pool)
+        .await
+        .expect("check loser absent");
+        assert_eq!(
+            loser_count, 0,
+            "the losing writer's event must not be a live row"
+        );
     }
 
     /// Race soundness for first-create: two writers both assert `ExpectNoHead`
     /// simultaneously. Exactly one must be `Inserted`; the other gets
     /// `RevisionMismatch`. The loser must not be persisted.
+    ///
+    /// Causal oracle: same external-blocker pattern as the same-head race test.
+    /// Both writers are queued before the blocker releases, making the outcome
+    /// deterministic regardless of scheduler ordering.
+    ///
+    /// Mutation oracle: removing `pg_advisory_xact_lock` from
+    /// `insert_channel_head_checked` lets both writers read `None` for the head,
+    /// both pass `ExpectNoHead`, both insert, and `head_count` becomes 2.
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn channel_head_checked_concurrent_first_create_only_one_wins() {
         let pool = setup_pool().await;
         let community = CommunityId::from_uuid(make_test_community(&pool).await);
         let channel = make_test_channel(&pool, community.as_uuid().to_owned(), None).await;
+
+        // Acquire the exact advisory key before either writer starts.
+        let lock_key = canvas_lock_key(community, channel);
+        let mut blocker = pool.begin().await.expect("blocker tx");
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(lock_key)
+            .execute(&mut *blocker)
+            .await
+            .expect("blocker acquires key");
 
         let a = make_canvas_event_at("# First A", 1000);
         let b = make_canvas_event_at("# First B", 1001);
@@ -3530,6 +3793,12 @@ mod postgres_tests {
             .await
             .map(|(stored, status)| (stored.event.id.to_bytes().to_vec(), status))
         });
+
+        // Give both tasks time to open their transactions and queue at the key.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Release — both race for the advisory lock.
+        blocker.rollback().await.expect("release blocker");
 
         let (id_a, status_a) = ta.await.expect("join A").expect("call A");
         let (id_b, status_b) = tb.await.expect("join B").expect("call B");
@@ -3569,5 +3838,163 @@ mod postgres_tests {
         .await
         .expect("read head");
         assert_eq!(head_id, inserted, "stored head must be the winner");
+    }
+
+    /// Serialization coverage: an untagged kind-40100 unconditional append must
+    /// acquire the same `(community, kind, channel)` advisory key as a tagged
+    /// write so the two cannot interleave on the head read.
+    ///
+    /// Proof: an external connection holds the advisory key; the untagged write
+    /// task is spawned. Since the write acquires the same key, it blocks while
+    /// the holder has it — `JoinHandle::is_finished()` returns false. After the
+    /// holder releases, the task completes and the row is committed.
+    ///
+    /// Mutation oracle: removing the `pg_advisory_xact_lock` block from
+    /// `insert_event_with_thread_metadata` for kind-40100 lets the write proceed
+    /// without acquiring the key. The task completes immediately (no block), so
+    /// `is_finished()` returns true while the holder still has the key —
+    /// `assert!(!write_task.is_finished())` fails.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn channel_head_untagged_canvas_append_serializes_on_advisory_key() {
+        let pool = setup_pool().await;
+        let community = CommunityId::from_uuid(make_test_community(&pool).await);
+        let channel = make_test_channel(&pool, community.as_uuid().to_owned(), None).await;
+        let lock_key = canvas_lock_key(community, channel);
+
+        // Hold the exact advisory key on a dedicated connection.
+        let mut holder = pool.begin().await.expect("holder tx");
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(lock_key)
+            .execute(&mut *holder)
+            .await
+            .expect("holder acquires key");
+
+        // Spawn the untagged write — it should block at pg_advisory_xact_lock.
+        let event = make_canvas_event_at("# Untagged", 1000);
+        let pool_write = pool.clone();
+        let write_task = tokio::spawn(async move {
+            insert_event_with_thread_metadata(&pool_write, community, &event, Some(channel), None)
+                .await
+        });
+
+        // Give the write task time to open its transaction and reach the lock.
+        // The runtime drives the task until it blocks (advisory-lock wait suspends
+        // the async task back to the executor).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // The write task must NOT have finished while the holder has the key.
+        assert!(
+            !write_task.is_finished(),
+            "untagged canvas write must block on the advisory key while holder has it; \
+             the task finished immediately, meaning the lock was not acquired"
+        );
+
+        // Release the holder — the blocked write can now acquire the key.
+        holder.rollback().await.expect("release holder");
+
+        // The write must now complete successfully.
+        let (stored, was_inserted) = write_task
+            .await
+            .expect("join write task")
+            .expect("untagged canvas insert");
+        assert!(
+            was_inserted,
+            "untagged canvas write must be inserted after holder releases"
+        );
+        let row_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM events WHERE community_id = $1 AND id = $2")
+                .bind(community.as_uuid())
+                .bind(stored.event.id.as_bytes().as_slice())
+                .fetch_one(&pool)
+                .await
+                .expect("count untagged row");
+        assert_eq!(row_count, 1, "untagged canvas row must be committed");
+    }
+
+    /// Serialization coverage: `soft_delete_event_and_update_thread` for a
+    /// kind-40100 event must acquire the same advisory key as tagged writes.
+    ///
+    /// Proof: an external connection holds the advisory key; the delete task
+    /// is spawned and blocks while the holder has it — `is_finished()` returns
+    /// false. After the holder releases, the task completes and the row is
+    /// soft-deleted.
+    ///
+    /// Mutation oracle: removing the advisory-lock branch from
+    /// `soft_delete_event_and_update_thread` lets the delete bypass the key.
+    /// The task finishes immediately while the holder still holds the key —
+    /// `assert!(!delete_task.is_finished())` fails.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn channel_head_canvas_deletion_serializes_on_advisory_key() {
+        let pool = setup_pool().await;
+        let community = CommunityId::from_uuid(make_test_community(&pool).await);
+        let channel = make_test_channel(&pool, community.as_uuid().to_owned(), None).await;
+        let lock_key = canvas_lock_key(community, channel);
+
+        // Insert a canvas event to delete.
+        let event = make_canvas_event_at("# To delete", 1000);
+        insert_channel_head_checked(
+            &pool,
+            community,
+            &event,
+            channel,
+            ChannelHeadPrecondition::ExpectNoHead,
+        )
+        .await
+        .expect("seed canvas for deletion test");
+        let event_id = event.id.to_bytes().to_vec();
+
+        // Hold the exact advisory key on a dedicated connection.
+        let mut holder = pool.begin().await.expect("holder tx");
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(lock_key)
+            .execute(&mut *holder)
+            .await
+            .expect("holder acquires key");
+
+        // Spawn the delete task — it should block at pg_advisory_xact_lock.
+        let pool_del = pool.clone();
+        let eid = event_id.clone();
+        let delete_task = tokio::spawn(async move {
+            soft_delete_event_and_update_thread(&pool_del, community, &eid, None, None).await
+        });
+
+        // Give the delete task time to open its transaction and reach the lock.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // The delete task must NOT have finished while the holder has the key.
+        assert!(
+            !delete_task.is_finished(),
+            "canvas soft-delete must block on the advisory key while holder has it; \
+             the task finished immediately, meaning the lock was not acquired"
+        );
+
+        // Release the holder — the blocked delete can now acquire the key.
+        holder.rollback().await.expect("release holder");
+
+        // The delete must now complete successfully.
+        let deleted = delete_task
+            .await
+            .expect("join delete task")
+            .expect("canvas soft-delete");
+        assert!(
+            deleted,
+            "canvas event must be deleted after holder releases"
+        );
+
+        let is_deleted: bool = sqlx::query_scalar(
+            "SELECT deleted_at IS NOT NULL FROM events \
+             WHERE community_id = $1 AND id = $2",
+        )
+        .bind(community.as_uuid())
+        .bind(&event_id)
+        .fetch_one(&pool)
+        .await
+        .expect("check deleted_at");
+        assert!(
+            is_deleted,
+            "canvas event must have deleted_at set after soft-delete"
+        );
     }
 }

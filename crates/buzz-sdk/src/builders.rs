@@ -557,16 +557,11 @@ pub fn build_custom_emoji_set(emojis: &[CustomEmoji]) -> Result<EventBuilder, Sd
 /// Build a canvas update event (kind 40100).
 ///
 /// When `expected_revision` is set, an `["expected-revision", …]` tag is
-/// attached documenting the head the write was composed against: a 64-hex
-/// event ID names the head it expects, and the literal `none` asserts no head
-/// exists yet. Concurrency enforcement is **client-side** and best-effort: the
-/// CLI/Desktop compare against a freshly read head before publishing and
-/// re-read once after (see `canvas_write_survived`) to detect a competitor
-/// visible by then. The relay does not interpret this tag today, so it is
-/// advisory/documentary — detection only, not prevention; closing the race
-/// entirely needs relay enforcement, which this design leaves room to add with
-/// zero client change. Omit the tag for an unconditional append (backward
-/// compatible).
+/// attached. A 64-hex event ID names the head the write was composed against;
+/// the literal `none` asserts no head exists yet. The relay enforces this tag
+/// as a compare-and-swap (CAS): it reads the canonical live head under an
+/// advisory lock, checks the precondition, and rejects mismatched writes before
+/// insertion. Omit the tag for an unconditional append (backward compatible).
 pub fn build_set_canvas(
     channel_id: Uuid,
     content: &str,
@@ -708,8 +703,10 @@ pub const CANVAS_ANCESTRY_WALK_MAX: usize = 256;
 ///
 /// All id comparisons are case-insensitive, matching the precondition check's
 /// `eq_ignore_ascii_case` convention. This only detects a competitor already
-/// visible at verification time; a competitor that lands *after* this read is
-/// still missed — closing that window needs relay-side linearization (phase 2).
+/// visible at verification time; a competitor that lands after this read is
+/// still missed — the relay's advisory-lock CAS prevents concurrent conflicting
+/// writes from both being accepted, but this client check is a secondary
+/// confirmation for the caller's own visibility.
 pub fn canvas_write_survived(our_id: &str, revisions: &[(String, Option<String>)]) -> bool {
     let Some((head_id, _)) = revisions.first() else {
         return false; // no head after an accepted write → conservatively superseded

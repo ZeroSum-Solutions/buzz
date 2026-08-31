@@ -418,12 +418,11 @@ pub fn build_remove_reaction(reaction_event_id: EventId) -> Result<EventBuilder,
 /// Kind 40100 — set canvas.
 ///
 /// When `expected_revision` is `Some`, an `["expected-revision", <event-id>]`
-/// tag is attached. The tag is documentary/advisory: today's relay does not
-/// enforce it, so optimistic concurrency is checked client-side — before submit
-/// (stale-edit) and once after (`canvas_write_survived` supersession detection)
-/// in `set_canvas`. Detection is best-effort, not prevention; the residual race
-/// needs relay enforcement (phase 2). Omitting the tag preserves the historical
-/// unconditional-append behavior.
+/// tag is attached. The relay enforces this tag as a compare-and-swap (CAS):
+/// it reads the canonical live head under an advisory lock and rejects writes
+/// whose precondition no longer matches. Client-side checks (stale-edit before
+/// submit and `canvas_write_survived` after) are secondary confirmations.
+/// Omitting the tag preserves the historical unconditional-append behavior.
 pub fn build_set_canvas(
     channel_id: Uuid,
     content: &str,

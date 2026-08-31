@@ -386,14 +386,16 @@ pub async fn cmd_canvas_history(
 ///
 /// The target revision is fetched by an ID-scoped query (resolves any age) and
 /// the head by a separate `limit: 1` query — neither scans the full stream.
-/// Fetching the head immediately before the write is the advisory
-/// concurrency check: a missing target revision or absent head fails here, and
+/// Fetching the head immediately before the write is an optimistic
+/// precondition check: a missing target revision or absent head fails here, and
 /// restoring the current head is short-circuited so history never grows a
 /// redundant revision. The republished event is built via
 /// [`buzz_sdk::build_set_canvas_after_head`], which applies writer discipline
 /// (`created_at = max(now, head.created_at + 1)`) so the restore sorts strictly
 /// ahead of the head it read; the `expected-revision` tag it carries is
-/// advisory (no relay enforcement).
+/// enforced by the relay as a CAS (compare-and-swap): the relay reads the
+/// canonical live head under an advisory lock and rejects writes whose
+/// precondition no longer matches.
 ///
 /// After publishing, a single post-write re-read classifies whether the restore
 /// still holds the visible head (or a later write legitimately built on it). If
@@ -402,8 +404,6 @@ pub async fn cmd_canvas_history(
 /// in history. If the verification read itself fails, the accepted restore is
 /// reported as success (exit 0) with a stderr warning that verification was
 /// unavailable — a failed read must never masquerade as a failed restore.
-/// Detection is bounded to competitors visible by verification time;
-/// preventing the race entirely requires relay-side linearization (phase 2).
 pub async fn cmd_restore_canvas(
     client: &BuzzClient,
     channel_id: &str,
