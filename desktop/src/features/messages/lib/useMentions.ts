@@ -38,7 +38,11 @@ import { useActiveAgentPubkeys } from "./useActiveAgentPubkeys";
 import { useDefaultAgentSuggestion } from "./useDefaultAgentSuggestion";
 import { flushMentionDebounce, isPlainSpace } from "./flushMentionDebounce";
 import { useAgentMentionRevalidation } from "./agentMentionRevalidation";
-import { extractMentionPubkeys } from "./extractMentionPubkeys";
+import {
+  extractMentionPubkeys,
+  selectedMentionLabel,
+  selectedMentionLabels,
+} from "./extractMentionPubkeys";
 import {
   extractMentionPersonasFromMaps,
   type PersonaMentionTarget,
@@ -449,15 +453,21 @@ export function useMentions(
         clearTimeout(debounceTimerRef.current);
         debounceTimerRef.current = null;
       }
-      const displayName = suggestion.displayName;
+      const [boundSuggestion] = selectedMentionLabels(
+        [suggestion],
+        mentionMapRef.current,
+      );
+      const displayName = boundSuggestion.displayName;
       const teamMembers =
-        suggestion.kind === "team" ? suggestion.teamMembers : null;
+        suggestion.kind === "team" && suggestion.teamMembers
+          ? selectedMentionLabels(suggestion.teamMembers, mentionMapRef.current)
+          : null;
       const insertText = teamMembers
         ? formatTeamMention(displayName, teamMembers)
         : `@${displayName} `;
       const mentions = mentionMapRef.current;
       const personaMentions = personaMentionMapRef.current;
-      const selectedMentions = teamMembers ?? [suggestion];
+      const selectedMentions = teamMembers ?? [boundSuggestion];
       for (const selected of selectedMentions) {
         if (selected.kind === "persona" && selected.personaId) {
           personaMentions.set(selected.displayName, selected.personaId);
@@ -519,7 +529,11 @@ export function useMentions(
   );
   const registerMentionPubkey = React.useCallback(
     (displayName: string, pubkey: string, options?: { isAgent?: boolean }) => {
-      const trimmedName = displayName.trim();
+      const trimmedName = selectedMentionLabel(
+        displayName.trim(),
+        pubkey,
+        mentionMapRef.current,
+      );
       if (!trimmedName) {
         return;
       }
@@ -536,6 +550,7 @@ export function useMentions(
         );
         setSelectedAgentMentionNames(selectedAgentMentionNamesRef.current);
       }
+      return trimmedName;
     },
     [],
   );
@@ -553,11 +568,11 @@ export function useMentions(
       replaceToOffset: number;
       isAgent?: boolean;
     }): AutocompleteEdit => {
-      registerMentionPubkey(displayName, pubkey, { isAgent });
+      const label = registerMentionPubkey(displayName, pubkey, { isAgent });
       return {
         replaceFromOffset,
         replaceToOffset,
-        insertText: `@${displayName.trim()} `,
+        insertText: `@${label ?? displayName.trim()} `,
       };
     },
     [registerMentionPubkey],
