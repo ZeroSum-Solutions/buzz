@@ -2,6 +2,7 @@ import * as React from "react";
 
 import { EditorContent } from "@tiptap/react";
 import { ChevronDown } from "lucide-react";
+import { toast } from "sonner";
 import { buildOutgoingMessage } from "@/features/messages/lib/imetaMediaMarkdown";
 import { useChannelLinks } from "@/features/messages/lib/useChannelLinks";
 import type { ChannelSuggestion } from "@/features/messages/lib/useChannelLinks";
@@ -278,8 +279,9 @@ export function ForumComposer({
           media.setPendingImeta(savedImeta);
           if (compact) setIsCompactExpanded(true);
         }
-      } catch {
-        // Keep the draft intact when authorization refresh fails.
+      } catch (error) {
+        // Fresh authorization failures must be visible; preserve the draft.
+        toast.error(error instanceof Error ? error.message : String(error));
       } finally {
         isSubmissionPendingRef.current = false;
         setIsSubmissionPending(false);

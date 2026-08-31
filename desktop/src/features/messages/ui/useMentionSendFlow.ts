@@ -32,17 +32,19 @@ import { buildCustomEmojiTags } from "@/shared/lib/customEmojiTags";
 import {
   formatMessageSendError,
   getErrorMessage,
+  mentionRevalidationOptions,
+  withoutInvitingRecipients,
   isManagedAgentRunning,
   isProviderBackedAgent,
   mergeMentionRecipients,
   MENTION_REFERENCE_TAG,
-  mergeOutgoingTagsWithReferenceMentions,
   type PendingNonMemberMentionSend,
   type SendMessageWithMentionFlowInput,
   resolvePreviewTags,
   uniqueNormalizedPubkeys,
 } from "./useMentionSendFlow.helpers";
 import { buildAgentAddressMentionTags } from "@/features/messages/lib/agentAddressMention.mjs";
+import { AgentMentionAuthorizationError } from "@/features/messages/lib/agentMentionRevalidation";
 import type { UseMentionSendFlowOptions } from "./useMentionSendFlow.types";
 
 export function useMentionSendFlow({
@@ -429,7 +431,11 @@ export function useMentionSendFlow({
       let uploadStarted = false;
       try {
         const admittedMentionPubkeys = uniqueNormalizedPubkeys(
-          await mentions.revalidateMentionPubkeys(mentionPubkeys),
+          await mentions.revalidateMentionPubkeys(
+            mentionPubkeys,
+            draft.capturedChannelId,
+            mentionRevalidationOptions(draft, "prepare"),
+          ),
         );
         if (isSendCancelled()) return restoreComposerAfterFailure();
         if (!isMountedRef.current) return persistPreflightDraft();
@@ -439,7 +445,9 @@ export function useMentionSendFlow({
             (pubkey) => admittedMentionPubkeySet.has(pubkey),
           ),
         );
-        const managedAgentsByPubkey = await getManagedAgentsByPubkey();
+        const managedAgentsByPubkey = await getManagedAgentsByPubkey().catch(
+          () => new Map<string, ManagedAgent>(),
+        );
         if (isSendCancelled()) return restoreComposerAfterFailure();
         if (!isMountedRef.current) {
           persistPreflightDraft();
@@ -539,7 +547,15 @@ export function useMentionSendFlow({
           if (!finalOutgoingTags || signal?.aborted || isSendCancelled())
             return;
           const revalidatedMentionPubkeys =
-            await mentions.revalidateMentionPubkeys(mentionPubkeys);
+            await mentions.revalidateMentionPubkeys(
+              mentionPubkeys,
+              sendChannelId,
+              mentionRevalidationOptions(
+                draft,
+                "publish",
+                preparedAgentPubkeys,
+              ),
+            );
           if (signal?.aborted || isSendCancelled()) return;
           const finalTagsWithAgentAddress = [
             ...finalOutgoingTags,
@@ -598,7 +614,11 @@ export function useMentionSendFlow({
                 await finishSend(uploaded, signal);
               } catch (error) {
                 restoreComposerAfterFailure();
-                toast.error(formatMessageSendError(error));
+                toast.error(
+                  error instanceof AgentMentionAuthorizationError
+                    ? error.message
+                    : formatMessageSendError(error),
+                );
               } finally {
                 settleUpload();
               }
@@ -626,12 +646,18 @@ export function useMentionSendFlow({
             await finishSend([]);
           } catch (error) {
             restoreComposerAfterFailure();
-            toast.error(formatMessageSendError(error));
+            toast.error(
+              error instanceof AgentMentionAuthorizationError
+                ? error.message
+                : formatMessageSendError(error),
+            );
           }
         }
       } catch (error) {
         restoreComposerAfterFailure();
-        throw error;
+        toast.error(
+          getErrorMessage(error, "Could not send message. Please retry."),
+        );
       } finally {
         if (draft.preparedLinkPreviews) {
           activePreparedLinkPreviews.delete(draft.preparedLinkPreviews);
@@ -847,18 +873,8 @@ export function useMentionSendFlow({
   }, [mentions.getMentionDisplayName, pendingNonMemberSend]);
   const handleSendWithoutInviting = React.useCallback(() => {
     if (!pendingNonMemberSend) return;
-    const nonMemberPubkeys = new Set(
-      pendingNonMemberSend.nonMemberPubkeys.map((pubkey) =>
-        normalizePubkey(pubkey),
-      ),
-    );
-    const mentionPubkeys = pendingNonMemberSend.mentionPubkeys.filter(
-      (pubkey) => !nonMemberPubkeys.has(normalizePubkey(pubkey)),
-    );
-    const outgoingTags = mergeOutgoingTagsWithReferenceMentions(
-      pendingNonMemberSend.outgoingTags,
-      nonMemberPubkeys,
-    );
+    const { mentionPubkeys, outgoingTags } =
+      withoutInvitingRecipients(pendingNonMemberSend);
     void completeSend(pendingNonMemberSend, mentionPubkeys, outgoingTags);
   }, [completeSend, pendingNonMemberSend]);
   const handleInviteNonMembers = React.useCallback(() => {
@@ -870,10 +886,14 @@ export function useMentionSendFlow({
     setNonMemberPromptError(null);
     void (async () => {
       const mentionPubkeys = uniqueNormalizedPubkeys(
-        await mentions.revalidateMentionPubkeys([
-          ...pendingNonMemberSend.mentionPubkeys,
-          ...pendingNonMemberSend.nonMemberPubkeys,
-        ]),
+        await mentions.revalidateMentionPubkeys(
+          [
+            ...pendingNonMemberSend.mentionPubkeys,
+            ...pendingNonMemberSend.nonMemberPubkeys,
+          ],
+          pendingNonMemberSend.capturedChannelId,
+          mentionRevalidationOptions(pendingNonMemberSend, "prepare"),
+        ),
       );
       const admittedMentionPubkeys = new Set(mentionPubkeys);
       const originalNonMemberPubkeys = new Set(
@@ -887,7 +907,9 @@ export function useMentionSendFlow({
           tag[0] !== MENTION_REFERENCE_TAG ||
           !originalNonMemberPubkeys.has(normalizePubkey(tag[1] ?? "")),
       );
-      const managedAgentsByPubkey = await getManagedAgentsByPubkey();
+      const managedAgentsByPubkey = await getManagedAgentsByPubkey().catch(
+        () => new Map<string, ManagedAgent>(),
+      );
       if (!isMountedRef.current) return;
       const peoplePubkeys: string[] = [];
       const relayAgentPubkeys: string[] = [];
