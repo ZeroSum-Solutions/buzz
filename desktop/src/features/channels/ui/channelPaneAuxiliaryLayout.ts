@@ -44,21 +44,23 @@ export function createChannelPaneAuxiliaryLayout({
     priorityIdleAuxiliary && hasThreadSurface && !isOverlay;
   const replaceThreadWithIdleAuxiliary =
     priorityIdleAuxiliary && hasThreadSurface && isOverlay;
+  const openMarkdownDoc =
+    markdownDocUrl && markdownDocName
+      ? { filename: markdownDocName, url: markdownDocUrl }
+      : null;
   const useFocusIdleDrawer = shouldUseFocusIdleDrawer({
     channelManagementOpen,
     hasAgentSession,
     hasIdleAuxiliaryPanel,
     hasIdlePanelCloseHandler,
+    hasMarkdownDoc: Boolean(openMarkdownDoc) && !priorityIdleAuxiliary,
     hasProfilePanel,
     hasThreadSurface,
     overrideThread: overlayIdleAuxiliaryOverThread,
     useSplitAuxiliaryPane,
   });
 
-  const openMarkdownDoc =
-    markdownDocUrl && markdownDocName
-      ? { filename: markdownDocName, url: markdownDocUrl }
-      : null;
+  const displayedMarkdownDoc = priorityIdleAuxiliary ? null : openMarkdownDoc;
   const hasSplitAuxiliaryPane =
     useSplitAuxiliaryPane &&
     (channelManagementOpen ||
@@ -68,7 +70,7 @@ export function createChannelPaneAuxiliaryLayout({
 
   return {
     hasSplitAuxiliaryPane,
-    openMarkdownDoc,
+    openMarkdownDoc: displayedMarkdownDoc,
     priorityIdleAuxiliary,
     replaceThreadWithIdleAuxiliary,
     showIdleAuxiliaryOverThread:
