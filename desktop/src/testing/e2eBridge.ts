@@ -1198,9 +1198,46 @@ function updateMockRelayMembershipFromAdminEvent(event: RelayEvent): boolean {
   return false;
 }
 
+/**
+ * Mirror the native clipboard command's dual-flavor write.
+ *
+ * `navigator.clipboard.writeText` can only carry the plain flavor, so specs
+ * asserting on the identity sidecar read the captured payload instead. The
+ * rich write is still attempted so real paste round-trips work.
+ */
+async function writeClipboardFlavors({
+  html,
+  text,
+}: {
+  html?: string;
+  text: string;
+}): Promise<void> {
+  window.__BUZZ_E2E_LAST_CLIPBOARD__ = { html: html ?? null, text };
+  if (
+    html &&
+    typeof ClipboardItem !== "undefined" &&
+    navigator.clipboard?.write
+  ) {
+    try {
+      await navigator.clipboard.write([
+        new ClipboardItem({
+          "text/html": new Blob([html], { type: "text/html" }),
+          "text/plain": new Blob([text], { type: "text/plain" }),
+        }),
+      ]);
+      return;
+    } catch {
+      // Fall back to the plain flavor; headless permissions vary by browser.
+    }
+  }
+  await navigator.clipboard.writeText(text);
+}
+
 declare global {
   interface Window {
     __BUZZ_E2E__?: E2eConfig;
+    /** Last payload written through the native clipboard command. */
+    __BUZZ_E2E_LAST_CLIPBOARD__?: { html: string | null; text: string };
     __BUZZ_E2E_COMMANDS__?: string[];
     __BUZZ_E2E_COMMAND_PAYLOADS__?: Array<{
       command: string;
@@ -1621,6 +1658,11 @@ const CHARLIE_PUBKEY =
   "554cef57437abac34522ac2c9f0490d685b72c80478cf9f7ed6f9570ee8624ea";
 const OUTSIDER_PUBKEY =
   "df8e91b86fda13a9a67896df77232f7bdab2ba9c3e165378e1ba3d24c13a328e";
+// A non-member human whose display name has a space in it. Multi-word names are
+// the case a plain-text copy cannot recover — "@John Smith" is indistinguishable
+// from "@John" followed by a word — so the clipboard round-trip fixtures use it.
+const MULTI_WORD_NON_MEMBER_PUBKEY =
+  "7c1f2ad0b4e93856a1d0c2f4e6b8093a5d7f1c3e5a79b1d3f5072a4c6e80931b";
 const PROFILE_ONLY_AGENT_PUBKEY =
   "8f83d6b7f3d74f7d933ae3a54dd8c6cc85c7f98e531c16e5a827b953441a8d67";
 // A relay-classified bot agent whose declared NIP-OA owner is the mock viewer,
@@ -1684,6 +1726,7 @@ const mockDisplayNames = new Map<string, string>([
   [PROFILE_ONLY_AGENT_PUBKEY, "mira"],
   [OWNED_RELAY_AGENT_PUBKEY, "nadia"],
   [OUTSIDER_PUBKEY, "outsider"],
+  [MULTI_WORD_NON_MEMBER_PUBKEY, "John Smith"],
   [DEFAULT_REAL_IDENTITY.pubkey, DEFAULT_REAL_IDENTITY.username],
 ]);
 const mockAgentPubkeys = new Set([
@@ -4149,6 +4192,7 @@ const mockPresence = new Map<string, PresenceStatus>([
   [PROFILE_ONLY_AGENT_PUBKEY, "online"],
   [OWNED_RELAY_AGENT_PUBKEY, "online"],
   [OUTSIDER_PUBKEY, "offline"],
+  [MULTI_WORD_NON_MEMBER_PUBKEY, "offline"],
 ]);
 const mockFeedOverrides: RawHomeFeedResponse["feed"] = {
   mentions: [],
@@ -14389,7 +14433,7 @@ export function maybeInstallE2eTauriMocks() {
       case "copy_image_to_clipboard":
         return;
       case "copy_text_to_clipboard":
-        await navigator.clipboard.writeText((payload as { text: string }).text);
+        await writeClipboardFlavors(payload as { html?: string; text: string });
         return;
       case "read_clipboard_text":
         return navigator.clipboard.readText();

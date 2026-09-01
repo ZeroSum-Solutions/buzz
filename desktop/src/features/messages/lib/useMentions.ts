@@ -39,6 +39,7 @@ import { useDefaultAgentSuggestion } from "./useDefaultAgentSuggestion";
 import { flushMentionDebounce, isPlainSpace } from "./flushMentionDebounce";
 import { useAgentMentionRevalidation } from "./agentMentionRevalidation";
 import { extractMentionPubkeys } from "./extractMentionPubkeys";
+import type { MentionIdentity } from "./mentionClipboard";
 import {
   extractMentionPersonasFromMaps,
   type PersonaMentionTarget,
@@ -539,6 +540,38 @@ export function useMentions(
     },
     [],
   );
+  const getMentionIdentities = React.useCallback((): MentionIdentity[] => {
+    const agentNames = new Set(
+      selectedAgentMentionNamesRef.current.map((name) =>
+        name.trim().toLowerCase(),
+      ),
+    );
+    const identities: MentionIdentity[] = [];
+    const claimed = new Set<string>();
+    const add = (label: string, pubkey: string, isAgent: boolean) => {
+      const trimmed = label.trim();
+      const key = trimmed.toLowerCase();
+      if (!trimmed || !pubkey || claimed.has(key)) return;
+      claimed.add(key);
+      identities.push({ isAgent, label: trimmed, pubkey });
+    };
+    // Explicitly picked mentions first: they are authoritative when a manually
+    // typed member name collides with one the user selected from the picker.
+    for (const [label, pubkey] of mentionMapRef.current) {
+      add(label, pubkey, agentNames.has(label.trim().toLowerCase()));
+    }
+    for (const candidate of mentionCandidates) {
+      if (!candidate.isMember || !candidate.pubkey || !candidate.displayName) {
+        continue;
+      }
+      add(
+        candidate.displayName,
+        candidate.pubkey,
+        knownAgentPubkeys.has(normalizePubkey(candidate.pubkey)),
+      );
+    }
+    return identities;
+  }, [knownAgentPubkeys, mentionCandidates]);
   const insertResolvedMention = React.useCallback(
     ({
       displayName,
@@ -824,6 +857,7 @@ export function useMentions(
     extractMentionPubkeys: extractMentionPubkeysForCurrentMentions,
     revalidateMentionPubkeys,
     getDraftMentionRefs,
+    getMentionIdentities,
     getMentionDisplayName,
     handleMentionKeyDown,
     hasResolvedMembers: members !== undefined,

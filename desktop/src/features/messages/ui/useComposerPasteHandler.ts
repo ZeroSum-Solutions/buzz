@@ -2,14 +2,17 @@ import * as React from "react";
 import type { Editor } from "@tiptap/react";
 import { handleAgentSnapshotPaste } from "@/features/messages/lib/agentSnapshotClipboard";
 import type { BlobDescriptor } from "@/shared/api/tauri";
+import { hasMentionClipboardHtml } from "@/features/messages/lib/normalizeMentionClipboard";
 import {
-  hasMentionClipboardHtml,
-  normalizeMentionClipboardHtml,
-} from "@/features/messages/lib/normalizeMentionClipboard";
+  handleMentionClipboardPaste,
+  type RegisterMentionPubkey,
+} from "@/features/messages/lib/mentionClipboardPaste";
 import { getBuzzCodeBlockClipboardText } from "@/shared/lib/codeBlockClipboard";
 
 export function useComposerPasteHandler(options: {
   editor: Editor | null;
+  /** Teaches the composer each `name → pubkey` pair a Buzz copy carried. */
+  registerMentionPubkey?: RegisterMentionPubkey;
   scrollToBottom: () => void;
   setPendingImeta: (
     update: (current: BlobDescriptor[]) => BlobDescriptor[],
@@ -18,6 +21,8 @@ export function useComposerPasteHandler(options: {
 }) {
   const uploadFileRef = React.useRef(options.uploadFile);
   uploadFileRef.current = options.uploadFile;
+  const registerMentionPubkeyRef = React.useRef(options.registerMentionPubkey);
+  registerMentionPubkeyRef.current = options.registerMentionPubkey;
   React.useEffect(() => {
     const editor = options.editor;
     if (!editor) return;
@@ -57,13 +62,20 @@ export function useComposerPasteHandler(options: {
           }
           if (handleAgentSnapshotPaste(event, options.setPendingImeta))
             return true;
-          const html = event.clipboardData?.getData("text/html");
-          if (html && hasMentionClipboardHtml(html)) {
-            event.preventDefault();
-            view.pasteHTML(normalizeMentionClipboardHtml(html));
-            return true;
+          const clipboardData = event.clipboardData;
+          const html = clipboardData?.getData("text/html");
+          if (clipboardData && html && hasMentionClipboardHtml(html)) {
+            if (clipboardData.getData("text/plain").includes("\n")) {
+              options.scrollToBottom();
+            }
+            return handleMentionClipboardPaste({
+              clipboardData,
+              preventDefault: () => event.preventDefault(),
+              registerMentionPubkey: registerMentionPubkeyRef.current,
+              view,
+            });
           }
-          if ((event.clipboardData?.getData("text/plain") ?? "").includes("\n"))
+          if ((clipboardData?.getData("text/plain") ?? "").includes("\n"))
             options.scrollToBottom();
           return false;
         },

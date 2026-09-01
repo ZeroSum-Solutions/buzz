@@ -1,0 +1,282 @@
+import { getMentionOffsets } from "./hasMention";
+
+/**
+ * Dual-flavor clipboard support for mentions.
+ *
+ * Every Buzz copy writes two flavors:
+ *  - `text/plain` — what a human should read anywhere: sigils restored, no
+ *    pubkeys. This is what external apps (TextEdit, Slack, …) receive.
+ *  - `text/html` — the same content, with each mention wrapped in a span
+ *    carrying its pubkey. Pasting back into a Buzz composer harvests those
+ *    records, registers `name → pubkey` with the mention machinery, and the
+ *    chip re-lights with the exact tagged identity.
+ *
+ * The wrapper marker declares what the *plain* flavor holds so paste knows
+ * which content path to use — see `BuzzCopyKind`.
+ */
+
+/** Marks clipboard HTML that Buzz produced, and what its plain flavor holds. */
+export const BUZZ_COPY_ATTRIBUTE = "data-buzz-copy";
+/** 64-hex pubkey of the mentioned identity. */
+export const MENTION_PUBKEY_ATTRIBUTE = "data-mention-pubkey";
+/** `human` or `agent` — decides which highlight the re-lit chip gets. */
+export const MENTION_KIND_ATTRIBUTE = "data-mention-kind";
+/** Full mention label, so a partially selected chip is detectable. */
+export const MENTION_LABEL_ATTRIBUTE = "data-mention-label";
+/** Full channel-reference label, same partial-selection role as above. */
+export const CHANNEL_LABEL_ATTRIBUTE = "data-channel-label";
+
+/**
+ * What the `text/plain` flavor of a Buzz copy contains.
+ *
+ * - `markdown` — Markdown source (copy-message, composer copy/cut). Paste
+ *   inserts the plain flavor so TipTap's Markdown parsing behaves exactly as
+ *   it does for a plain-text paste.
+ * - `rich` — rendered timeline HTML. Paste keeps the HTML content path.
+ */
+export type BuzzCopyKind = "markdown" | "rich";
+
+/** A `name → pubkey` pair the composer can register on paste. */
+export type MentionIdentity = {
+  label: string;
+  pubkey: string;
+  isAgent: boolean;
+};
+
+/**
+ * Clipboard HTML is untrusted input — a foreign app can put anything on the
+ * pasteboard. Bound the record count and label length, and require a
+ * well-formed pubkey, before any of it can become an outbound `p` tag.
+ */
+const MAX_MENTION_RECORDS = 50;
+const MAX_MENTION_LABEL_LENGTH = 200;
+
+const HTML_ESCAPES: Record<string, string> = {
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  '"': "&quot;",
+  "'": "&#39;",
+};
+
+const HTML_UNESCAPES: Record<string, string> = {
+  "&amp;": "&",
+  "&lt;": "<",
+  "&gt;": ">",
+  "&quot;": '"',
+  "&#39;": "'",
+};
+
+/** Escape a value for interpolation into clipboard HTML text or attributes. */
+export function escapeClipboardHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (char) => HTML_ESCAPES[char] ?? char);
+}
+
+function unescapeClipboardHtml(value: string): string {
+  return value.replace(
+    /&(?:amp|lt|gt|quot|#39);/g,
+    (entity) => HTML_UNESCAPES[entity] ?? entity,
+  );
+}
+
+function isMentionPubkey(value: string): boolean {
+  return /^[0-9a-f]{64}$/.test(value);
+}
+
+/** Wrap one mention occurrence so paste can recover its exact identity. */
+export function buildMentionSpanHtml({
+  identity,
+  text,
+}: {
+  identity: MentionIdentity;
+  /** The matched `@Name` run exactly as it appears in the plain flavor. */
+  text: string;
+}): string {
+  return [
+    `<span data-mention=""`,
+    ` ${MENTION_PUBKEY_ATTRIBUTE}="${escapeClipboardHtml(identity.pubkey)}"`,
+    ` ${MENTION_KIND_ATTRIBUTE}="${identity.isAgent ? "agent" : "human"}"`,
+    ` ${MENTION_LABEL_ATTRIBUTE}="${escapeClipboardHtml(identity.label)}"`,
+    `>${escapeClipboardHtml(text)}</span>`,
+  ].join("");
+}
+
+type MentionMatch = {
+  offset: number;
+  length: number;
+  identity: MentionIdentity;
+};
+
+/**
+ * Locate every mention of a known identity in `text`.
+ *
+ * Longest-match-wins at each offset, mirroring `extractMentionPubkeys` so the
+ * span we write and the pubkey the send path recovers can't disagree when one
+ * display name prefixes another ("Alex" vs "Alex Kim").
+ */
+function findMentionMatches(
+  text: string,
+  identities: readonly MentionIdentity[],
+): MentionMatch[] {
+  const byOffset = new Map<number, MentionMatch>();
+
+  for (const identity of identities) {
+    const label = identity.label.trim();
+    // Callers hand over whatever their own lookup holds; the clipboard is the
+    // wire format here, so it always carries a canonical lowercase pubkey.
+    const pubkey = identity.pubkey.trim().toLowerCase();
+    if (!label || !isMentionPubkey(pubkey)) continue;
+    // `@` + label; `getMentionOffsets` returns the offset of the sigil.
+    const length = label.length + 1;
+    for (const offset of getMentionOffsets(text, label)) {
+      const existing = byOffset.get(offset);
+      if (!existing || existing.length < length) {
+        byOffset.set(offset, {
+          offset,
+          identity: { ...identity, label, pubkey },
+          length,
+        });
+      }
+    }
+  }
+
+  const matches = [...byOffset.values()].sort((a, b) => a.offset - b.offset);
+  // A shorter name nested inside a longer one can match at a later offset
+  // ("@Alex Kim" also matches "Kim" if someone is called that). The outer
+  // match already carries an identity, so drop anything it covers.
+  const disjoint: MentionMatch[] = [];
+  let consumedTo = 0;
+  for (const match of matches) {
+    if (match.offset < consumedTo) continue;
+    disjoint.push(match);
+    consumedTo = match.offset + match.length;
+  }
+  return disjoint;
+}
+
+/**
+ * Build the `text/html` identity sidecar for a plain-text (Markdown) body.
+ *
+ * Returns `null` when the body carries no known mention — callers use that to
+ * leave ordinary copies on their default path rather than replacing the
+ * clipboard's rich flavor for no gain.
+ */
+export function buildMentionClipboardHtml({
+  text,
+  identities,
+  kind = "markdown",
+}: {
+  text: string;
+  identities: readonly MentionIdentity[];
+  kind?: BuzzCopyKind;
+}): string | null {
+  const matches = findMentionMatches(text, identities);
+  if (matches.length === 0) return null;
+
+  const parts: string[] = [];
+  const pushText = (value: string) => {
+    if (value) parts.push(escapeClipboardHtml(value).replace(/\n/g, "<br>"));
+  };
+
+  let cursor = 0;
+  for (const match of matches) {
+    pushText(text.slice(cursor, match.offset));
+    parts.push(
+      buildMentionSpanHtml({
+        identity: match.identity,
+        // Match casing as written, not the identity's canonical casing:
+        // mention resolution is case-insensitive end to end.
+        text: text.slice(match.offset, match.offset + match.length),
+      }),
+    );
+    cursor = match.offset + match.length;
+  }
+  pushText(text.slice(cursor));
+
+  return `<span ${BUZZ_COPY_ATTRIBUTE}="${kind}">${parts.join("")}</span>`;
+}
+
+/** The Buzz copy marker on clipboard HTML, or `null` for foreign HTML. */
+export function getBuzzCopyKind(html: string): BuzzCopyKind | null {
+  const match = html.match(
+    new RegExp(
+      `\\b${BUZZ_COPY_ATTRIBUTE}\\s*=\\s*["'](markdown|rich)["']`,
+      "i",
+    ),
+  );
+  return (match?.[1] as BuzzCopyKind | undefined) ?? null;
+}
+
+function readAttribute(tag: string, name: string): string | null {
+  const match = tag.match(
+    new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, "i"),
+  );
+  const value = match?.[1] ?? match?.[2];
+  return value === undefined ? null : unescapeClipboardHtml(value);
+}
+
+/**
+ * Recover the `label → pubkey` records a Buzz copy embedded in its HTML.
+ *
+ * Reads the label from `data-mention-label` rather than the element's text so
+ * the result never depends on how a pasteboard round-trip reformatted the
+ * markup. Malformed or oversized records are dropped, not repaired.
+ */
+export function parseMentionClipboardRecords(html: string): MentionIdentity[] {
+  const tagPattern = new RegExp(
+    `<[a-zA-Z][^>]*\\b${MENTION_PUBKEY_ATTRIBUTE}\\s*=[^>]*>`,
+    "g",
+  );
+  const records: MentionIdentity[] = [];
+  const seen = new Set<string>();
+
+  for (const [tag] of html.matchAll(tagPattern)) {
+    if (records.length >= MAX_MENTION_RECORDS) break;
+    const pubkey = readAttribute(tag, MENTION_PUBKEY_ATTRIBUTE)
+      ?.trim()
+      .toLowerCase();
+    const label = readAttribute(tag, MENTION_LABEL_ATTRIBUTE)?.trim();
+    if (
+      !pubkey ||
+      !isMentionPubkey(pubkey) ||
+      !label ||
+      label.length > MAX_MENTION_LABEL_LENGTH
+    ) {
+      continue;
+    }
+    const key = `${label.toLowerCase()} ${pubkey}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    records.push({
+      label,
+      pubkey,
+      isAgent: readAttribute(tag, MENTION_KIND_ATTRIBUTE) === "agent",
+    });
+  }
+
+  return records;
+}
+
+/**
+ * Teach a composer every identity a Buzz copy carried.
+ *
+ * Registration is what makes a pasted multi-word name known to the mention
+ * decorations *and* to the send-time extractor, so the chip re-lights and the
+ * original pubkey survives the round trip.
+ */
+export function registerMentionClipboardIdentities(
+  html: string,
+  registerMentionPubkey: (
+    displayName: string,
+    pubkey: string,
+    options?: { isAgent?: boolean },
+  ) => void,
+): MentionIdentity[] {
+  const records = parseMentionClipboardRecords(html);
+  for (const record of records) {
+    registerMentionPubkey(record.label, record.pubkey, {
+      isAgent: record.isAgent,
+    });
+  }
+  return records;
+}

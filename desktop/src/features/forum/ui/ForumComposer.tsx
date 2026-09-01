@@ -9,10 +9,8 @@ import { useComposerFocusOwnership } from "@/features/messages/lib/useComposerFo
 import { useMediaUpload } from "@/features/messages/lib/useMediaUpload";
 import { isMentionCodeContext } from "@/features/messages/lib/mentionCodeContext";
 import { useMentions } from "@/features/messages/lib/useMentions";
-import {
-  hasMentionClipboardHtml,
-  normalizeMentionClipboardHtml,
-} from "@/features/messages/lib/normalizeMentionClipboard";
+import { hasMentionClipboardHtml } from "@/features/messages/lib/normalizeMentionClipboard";
+import { handleMentionClipboardPaste } from "@/features/messages/lib/mentionClipboardPaste";
 import {
   type LinkSelectionInfo,
   useRichTextEditor,
@@ -121,6 +119,7 @@ export function ForumComposer({
     mentionNames: mentions.knownNames,
     channelNames: channelLinks.knownChannelNames,
     messageLinkChannels: channelLinks.channels,
+    getMentionIdentities: mentions.getMentionIdentities,
     onSubmit: () => submitMessageRef.current(),
     isAutocompleteOpen: isAutocompleteOpenRef,
     onEditLink: (info) => onEditLinkRef.current?.(info),
@@ -359,6 +358,8 @@ export function ForumComposer({
   // ── Media paste ─────────────────────────────────────────────────────
   const uploadFileRef = React.useRef(media.uploadFile);
   uploadFileRef.current = media.uploadFile;
+  const registerMentionPubkeyRef = React.useRef(mentions.registerMentionPubkey);
+  registerMentionPubkeyRef.current = mentions.registerMentionPubkey;
 
   React.useEffect(() => {
     if (!richText.editor) return;
@@ -379,12 +380,15 @@ export function ForumComposer({
             return true;
           }
 
-          const html = event.clipboardData?.getData("text/html");
-          if (html && hasMentionClipboardHtml(html)) {
-            const cleanHtml = normalizeMentionClipboardHtml(html);
-            event.preventDefault();
-            _view.pasteHTML(cleanHtml);
-            return true;
+          const clipboardData = event.clipboardData;
+          const html = clipboardData?.getData("text/html");
+          if (clipboardData && html && hasMentionClipboardHtml(html)) {
+            return handleMentionClipboardPaste({
+              clipboardData,
+              preventDefault: () => event.preventDefault(),
+              registerMentionPubkey: registerMentionPubkeyRef.current,
+              view: _view,
+            });
           }
 
           return false;

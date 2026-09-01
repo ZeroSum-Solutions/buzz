@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { hasMentionClipboardHtml } from "./normalizeMentionClipboard.ts";
+import {
+  hasMentionClipboardHtml,
+  restoreChipSigil,
+} from "./normalizeMentionClipboard.ts";
 
 // NOTE: normalizeMentionClipboardHtml uses the browser DOMParser API which
 // is not available in Node.  Those paths are covered by the e2e paste tests.
@@ -41,4 +44,20 @@ test("returns false for text that mentions 'data-mention' as content", () => {
   // the normalization function is a no-op when no matching elements exist.
   const html = "<p>The attribute is called data-mention</p>";
   assert.equal(hasMentionClipboardHtml(html), true);
+});
+
+// ── restoreChipSigil ──────────────────────────────────────────────────
+
+test("puts back the sigil the rendered chip strips", () => {
+  assert.equal(restoreChipSigil("John Smith", "@"), "@John Smith");
+  assert.equal(restoreChipSigil("general", "#"), "#general");
+});
+
+test("leaves an already-sigiled label alone", () => {
+  assert.equal(restoreChipSigil("@John Smith", "@"), "@John Smith");
+  assert.equal(restoreChipSigil("#general", "#"), "#general");
+});
+
+test("never invents a lone sigil for empty chip text", () => {
+  assert.equal(restoreChipSigil("", "@"), "");
 });

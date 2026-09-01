@@ -7,6 +7,17 @@ export function hasMentionClipboardHtml(html: string): boolean {
 }
 
 /**
+ * Put back the `@` / `#` a rendered chip strips for display.
+ *
+ * Exported for unit coverage: the surrounding normalization needs a DOM, this
+ * decision doesn't.
+ */
+export function restoreChipSigil(text: string, sigil: "@" | "#"): string {
+  if (!text || text.startsWith(sigil)) return text;
+  return `${sigil}${text}`;
+}
+
+/**
  * Normalize clipboard HTML that contains Buzz mention / channel-link
  * elements.  Replaces the styled `<span data-mention>` and
  * `<button data-channel-link>` wrappers with unstyled text nodes so
@@ -26,7 +37,14 @@ export function normalizeMentionClipboardHtml(html: string): string {
     // This preserves the text content inline while stripping the
     // font-weight/color styles that would confuse Tiptap's mark detection.
     const span = doc.createElement("span");
-    span.textContent = el.textContent ?? "";
+    // The rendered chip strips its sigil for display, so flattening it
+    // verbatim would paste dead text that no composer can re-light. Restore
+    // the sigil unless the source already carries it (Buzz's own copy
+    // handlers write it back before the HTML reaches the clipboard).
+    span.textContent = restoreChipSigil(
+      el.textContent ?? "",
+      el.hasAttribute("data-mention") ? "@" : "#",
+    );
     el.replaceWith(span);
   }
 

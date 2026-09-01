@@ -285,6 +285,7 @@ function MessageComposerImpl({
     channelNames: channelLinks.knownChannelNames,
     messageLinkChannels: channelLinks.channels,
     customEmoji,
+    getMentionIdentities: mentions.getMentionIdentities,
     onSubmit: () => submitMessageRef.current(),
     onEditLastOwnMessage: () => {
       if (editTargetRef.current) return false;
@@ -791,6 +792,7 @@ function MessageComposerImpl({
   );
   useComposerPasteHandler({
     editor: richText.editor,
+    registerMentionPubkey: mentions.registerMentionPubkey,
     scrollToBottom: scrollComposerToBottom,
     setPendingImeta: voiceNote.setPendingImetaWhenIdle,
     uploadFile: voiceNote.uploadFileWhenIdle,
