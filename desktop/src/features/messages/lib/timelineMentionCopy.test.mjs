@@ -4,7 +4,10 @@ import { after, before, test } from "node:test";
 import { JSDOM } from "jsdom";
 import { truncateInlineChipLabel } from "@/shared/ui/mentionChip";
 
-import { buildTimelineClipboardFlavors } from "./timelineMentionCopy.ts";
+import {
+  buildTimelineClipboardFlavors,
+  handleTimelineMentionCopy,
+} from "./timelineMentionCopy.ts";
 
 // The copy handler works off a live selection and a rendered clone, so it needs
 // real Selection/Range/getComputedStyle. jsdom has no layout, so `innerText` is
@@ -27,8 +30,8 @@ after(() => dom.window.close());
 
 const JOHN_SMITH_PUBKEY = "7c".repeat(32);
 
-/** Render `bodyHtml` into the document and copy the whole thing. */
-function copyRenderedBody(bodyHtml) {
+/** Render `bodyHtml`, select the whole thing, and run `fn` in that state. */
+function withRenderedSelection(bodyHtml, fn) {
   const body = dom.window.document.createElement("div");
   body.className = "message-markdown";
   body.innerHTML = bodyHtml;
@@ -41,11 +44,16 @@ function copyRenderedBody(bodyHtml) {
   selection.addRange(range);
 
   try {
-    return buildTimelineClipboardFlavors(selection);
+    return fn(selection);
   } finally {
     selection.removeAllRanges();
     body.remove();
   }
+}
+
+/** Render `bodyHtml` into the document and copy the whole thing. */
+function copyRenderedBody(bodyHtml) {
+  return withRenderedSelection(bodyHtml, buildTimelineClipboardFlavors);
 }
 
 test("a whole mention chip copies with its sigil and identity", () => {
@@ -91,4 +99,51 @@ test("a partially selected chip loses its identity and gains no sigil", () => {
   );
 
   assert.equal(flavors, null);
+});
+
+const WHOLE_CHIP_BODY =
+  `hey <span data-mention="" data-mention-pubkey="${JOHN_SMITH_PUBKEY}" ` +
+  'data-mention-label="John Smith" class="mention-chip">John Smith' +
+  "</span> fixed it";
+
+test("the copy handler claims the event and writes both flavors", () => {
+  withRenderedSelection(WHOLE_CHIP_BODY, () => {
+    const written = new Map();
+    let prevented = false;
+
+    handleTimelineMentionCopy({
+      defaultPrevented: false,
+      preventDefault: () => {
+        prevented = true;
+      },
+      clipboardData: {
+        setData: (type, value) => written.set(type, value),
+      },
+    });
+
+    assert.equal(prevented, true);
+    assert.equal(written.get("text/html").includes("@John Smith"), true);
+    // jsdom has no layout, so the plain flavor is the selection's own text —
+    // sigil-less, but present.
+    assert.equal(written.get("text/plain").includes("John Smith"), true);
+  });
+});
+
+test("a copy whose clipboard data the browser withheld stays a no-op", () => {
+  // preventDefault() ahead of the clipboardData guard would suppress the
+  // default copy and then throw on setData — an empty clipboard. The handler
+  // must decline before touching the event.
+  withRenderedSelection(WHOLE_CHIP_BODY, () => {
+    let prevented = false;
+
+    handleTimelineMentionCopy({
+      defaultPrevented: false,
+      preventDefault: () => {
+        prevented = true;
+      },
+      clipboardData: null,
+    });
+
+    assert.equal(prevented, false);
+  });
 });

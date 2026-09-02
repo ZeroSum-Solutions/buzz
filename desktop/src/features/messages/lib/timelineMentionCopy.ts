@@ -156,9 +156,14 @@ export function buildTimelineClipboardFlavors(
  */
 export function handleTimelineMentionCopy(event: React.ClipboardEvent): void {
   if (event.defaultPrevented) return;
+  // React's types claim clipboardData is always present, but the runtime can
+  // withhold it — guard before preventDefault(), or the default copy is
+  // suppressed and setData throws, leaving the clipboard empty.
+  const clipboardData: DataTransfer | null = event.clipboardData;
+  if (!clipboardData) return;
   const flavors = buildTimelineClipboardFlavors(window.getSelection());
   if (!flavors) return;
   event.preventDefault();
-  event.clipboardData.setData("text/plain", flavors.text);
-  event.clipboardData.setData("text/html", flavors.html);
+  clipboardData.setData("text/plain", flavors.text);
+  clipboardData.setData("text/html", flavors.html);
 }
