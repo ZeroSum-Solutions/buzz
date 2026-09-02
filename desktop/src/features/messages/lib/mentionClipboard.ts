@@ -1,3 +1,5 @@
+import { truncateInlineChipLabel } from "@/shared/ui/mentionChip";
+
 import { getMentionOffsets } from "./hasMention";
 
 /**
@@ -25,6 +27,55 @@ export const MENTION_KIND_ATTRIBUTE = "data-mention-kind";
 export const MENTION_LABEL_ATTRIBUTE = "data-mention-label";
 /** Full channel-reference label, same partial-selection role as above. */
 export const CHANNEL_LABEL_ATTRIBUTE = "data-channel-label";
+
+/** How a chip's copied text relates to the full label it declares. */
+export type ChipTextMatch = "full" | "truncated" | "fragment";
+
+/**
+ * Classify a chip's copied text against the label its attributes declare.
+ *
+ * Both clipboard sides ask this one question — the copy handler deciding
+ * whether to write a sigil back, and the paste normalizer deciding whether to
+ * keep one — so they cannot drift apart on what counts as a whole chip.
+ *
+ * - `full` — the text carries the whole label, allowing for what a legitimate
+ *   chip picks up in transit: Buzz's copy handlers write the sigil into the
+ *   text, `buildMentionSpanHtml` keeps the author's casing over the label's,
+ *   and a pasteboard round trip can swap spaces for U+00A0.
+ * - `truncated` — the text is the ellipsized form `truncateInlineChipLabel`
+ *   renders for a label past the inline-chip cap. A *fully* selected long chip
+ *   carries this rather than the label, so treating it as a fragment would
+ *   strip the identity off every copy of a long channel reference and drop the
+ *   whole selection back to the browser's dead-text default.
+ * - `fragment` — anything else: the slice a boundary-crossing selection leaves
+ *   behind. It must neither regain a sigil nor keep an identity, so that a
+ *   paste can never bind a real pubkey to a partial name.
+ *
+ * Deliberately not an equality test against the rendered text: a chip that
+ * grows any text of its own (a badge, a glyph's text fallback) must not
+ * silently reclassify every chip as a fragment. Text a chip adds *beyond* its
+ * label still reads as `fragment` — the safe direction, since that costs a
+ * copy its identity rather than inventing one.
+ */
+export function matchChipTextToLabel(
+  text: string,
+  label: string,
+  sigil: "@" | "#",
+): ChipTextMatch {
+  const canonical = (value: string) =>
+    value
+      .replace(/\u00a0/g, " ")
+      .trim()
+      .toLowerCase();
+  const body = canonical(text);
+  const matches = (form: string) => body === form || body === `${sigil}${form}`;
+  if (matches(canonical(label))) return "full";
+  // Derived from the helper the chips render with, so the tolerated form
+  // cannot drift from what a fully selected capped chip actually carries.
+  const truncated = truncateInlineChipLabel(label);
+  if (truncated !== label && matches(canonical(truncated))) return "truncated";
+  return "fragment";
+}
 
 /**
  * What the `text/plain` flavor of a Buzz copy contains.

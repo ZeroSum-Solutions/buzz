@@ -1,5 +1,6 @@
 import {
   CHANNEL_LABEL_ATTRIBUTE,
+  matchChipTextToLabel,
   MENTION_LABEL_ATTRIBUTE,
 } from "./mentionClipboard";
 
@@ -20,30 +21,6 @@ export function hasMentionClipboardHtml(html: string): boolean {
 export function restoreChipSigil(text: string, sigil: "@" | "#"): string {
   if (!text || text.startsWith(sigil)) return text;
   return `${sigil}${text}`;
-}
-
-/**
- * Whether a chip's clipboard text still carries its full label.
- *
- * A mismatch means the chip is a fragment of a boundary-crossing selection —
- * see the caller. The comparison tolerates what a legitimate full chip picks
- * up in transit: Buzz's own copy handlers write the sigil back into the text,
- * `buildMentionSpanHtml` keeps the author's casing rather than the label's,
- * and a pasteboard round trip can swap spaces for U+00A0.
- */
-export function chipTextMatchesLabel(
-  text: string,
-  label: string,
-  sigil: "@" | "#",
-): boolean {
-  const canonical = (value: string) =>
-    value
-      .replace(/\u00a0/g, " ")
-      .trim()
-      .toLowerCase();
-  const body = canonical(text);
-  const full = canonical(label);
-  return body === full || body === `${sigil}${full}`;
 }
 
 /**
@@ -183,10 +160,20 @@ export function normalizeMentionClipboardContent(
     // plain text, mirroring `restoreChipSigils` on the copy side, and with
     // no sigiled label in the inserted content the visibility gate discards
     // the identity record too.
+    //
+    // A fully selected chip whose label passed the inline-chip cap carries the
+    // ellipsized rendering rather than the label, so write the label back:
+    // the visibility gate matches records against this inserted text, and the
+    // "…" form would drop the identity of a chip the user copied whole.
+    const match =
+      label === null ? "full" : matchChipTextToLabel(text, label, sigil);
     span.textContent =
-      label !== null && !chipTextMatchesLabel(text, label, sigil)
+      match === "fragment"
         ? text
-        : restoreChipSigil(text, sigil);
+        : restoreChipSigil(
+            match === "truncated" && label !== null ? label : text,
+            sigil,
+          );
     el.replaceWith(span);
   }
 

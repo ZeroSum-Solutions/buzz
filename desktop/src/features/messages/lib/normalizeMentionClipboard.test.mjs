@@ -2,12 +2,12 @@ import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 
 import { JSDOM } from "jsdom";
+import { truncateInlineChipLabel } from "@/shared/ui/mentionChip";
 import {
   parseMentionClipboardRecords,
   selectVisibleMentionIdentities,
 } from "./mentionClipboard.ts";
 import {
-  chipTextMatchesLabel,
   hasMentionClipboardHtml,
   normalizeMentionClipboardContent,
   restoreChipSigil,
@@ -82,38 +82,6 @@ test("never invents a lone sigil for empty chip text", () => {
   assert.equal(restoreChipSigil("", "@"), "");
 });
 
-// ── chipTextMatchesLabel ──────────────────────────────────────────────
-
-test("accepts a full chip, with or without the sigil written back", () => {
-  assert.equal(chipTextMatchesLabel("John Smith", "John Smith", "@"), true);
-  assert.equal(chipTextMatchesLabel("@John Smith", "John Smith", "@"), true);
-  assert.equal(chipTextMatchesLabel("#general", "general", "#"), true);
-});
-
-test("accepts the author's casing and pasteboard whitespace", () => {
-  // `buildMentionSpanHtml` preserves the run as written, not the label's case.
-  assert.equal(chipTextMatchesLabel("@john smith", "John Smith", "@"), true);
-  // A pasteboard round trip can pad the markup or swap spaces for U+00A0.
-  assert.equal(chipTextMatchesLabel(" John Smith ", "John Smith", "@"), true);
-  assert.equal(
-    chipTextMatchesLabel("John\u00a0Smith", "John Smith", "@"),
-    true,
-  );
-});
-
-test("rejects the fragment a boundary-crossing selection leaves behind", () => {
-  // The browser's default copy keeps the chip's attributes around whatever
-  // slice of its text the selection covered — from either end.
-  assert.equal(chipTextMatchesLabel("John", "John Smith", "@"), false);
-  assert.equal(chipTextMatchesLabel("Smith", "John Smith", "@"), false);
-  assert.equal(chipTextMatchesLabel("", "John Smith", "@"), false);
-});
-
-test("rejects a nonempty fragment of an empty declared label", () => {
-  assert.equal(chipTextMatchesLabel("John", "", "@"), false);
-  assert.equal(chipTextMatchesLabel("", "", "@"), true);
-});
-
 // ── normalizeMentionClipboardContent ──────────────────────────────────
 
 /** Nobody's key — what a crafted clipboard sidecar would name instead. */
@@ -183,6 +151,28 @@ test("a mention span nested in an ignored tag contributes nothing", () => {
   assert.equal(content.text.includes("Jane Doe"), false);
   assert.equal(content.html.includes("Jane Doe"), false);
   assert.deepEqual(visibleIdentities(html, content.text), []);
+});
+
+test("a chip rendered past the length cap keeps the label it declares", () => {
+  // A long channel name renders ellipsized while `data-channel-label` still
+  // declares it whole. Reading that as a partial selection would drop the `#`
+  // and paste dead text — the original bug, on any long channel reference.
+  const label = `release-${"x".repeat(80)}-notes`;
+  const rendered = truncateInlineChipLabel(label);
+  assert.notEqual(rendered, label, "fixture must exceed the chip cap");
+
+  const content = normalizeMentionClipboardContent(
+    `<p>see <span data-channel-link="" data-channel-label="${label}">` +
+      `${rendered}</span> for details</p>`,
+  );
+
+  assert.equal(content.text.includes(`#${label}`), true);
+  // A genuine fragment of that same chip still gains no sigil.
+  const fragment = normalizeMentionClipboardContent(
+    `<p><span data-channel-link="" data-channel-label="${label}">` +
+      `${rendered.slice(0, 10)}</span> for details</p>`,
+  );
+  assert.equal(fragment.text.includes("#"), false);
 });
 
 test("an ordinary chip still flattens to a registrable mention", () => {

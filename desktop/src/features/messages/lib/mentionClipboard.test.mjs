@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { truncateInlineChipLabel } from "@/shared/ui/mentionChip";
+
 import {
   buildMentionClipboardHtml,
   getBuzzCopyKind,
+  matchChipTextToLabel,
   parseMentionClipboardRecords,
   registerMentionClipboardIdentities,
   selectVisibleMentionIdentities,
@@ -321,4 +324,59 @@ test("registers nothing for a record the paste does not show", () => {
   });
 
   assert.deepEqual(registered, [["Fizz", FIZZ]]);
+});
+
+// ── matchChipTextToLabel ──────────────────────────────────────────────
+
+test("accepts a full chip, with or without the sigil written back", () => {
+  assert.equal(matchChipTextToLabel("John Smith", "John Smith", "@"), "full");
+  assert.equal(matchChipTextToLabel("@John Smith", "John Smith", "@"), "full");
+  assert.equal(matchChipTextToLabel("#general", "general", "#"), "full");
+});
+
+test("accepts the author's casing and pasteboard whitespace", () => {
+  // `buildMentionSpanHtml` preserves the run as written, not the label's case.
+  assert.equal(matchChipTextToLabel("@john smith", "John Smith", "@"), "full");
+  // A pasteboard round trip can pad the markup or swap spaces for U+00A0.
+  assert.equal(matchChipTextToLabel(" John Smith ", "John Smith", "@"), "full");
+  assert.equal(
+    matchChipTextToLabel("John\u00a0Smith", "John Smith", "@"),
+    "full",
+  );
+});
+
+test("rejects the fragment a boundary-crossing selection leaves behind", () => {
+  // The browser's default copy keeps the chip's attributes around whatever
+  // slice of its text the selection covered — from either end.
+  assert.equal(matchChipTextToLabel("John", "John Smith", "@"), "fragment");
+  assert.equal(matchChipTextToLabel("Smith", "John Smith", "@"), "fragment");
+  assert.equal(matchChipTextToLabel("", "John Smith", "@"), "fragment");
+});
+
+test("rejects a nonempty fragment of an empty declared label", () => {
+  assert.equal(matchChipTextToLabel("John", "", "@"), "fragment");
+  assert.equal(matchChipTextToLabel("", "", "@"), "full");
+});
+
+test("accepts the ellipsized text a chip past the length cap renders", () => {
+  // A long channel name renders truncated while `data-channel-label` still
+  // declares it in full, so a *whole* chip's text is not the label. Reading
+  // that as a fragment would strip the identity off every copy of it.
+  const label = `long-${"a".repeat(80)}-channel`;
+  const rendered = truncateInlineChipLabel(label);
+  assert.notEqual(rendered, label, "fixture must exceed the chip cap");
+
+  assert.equal(matchChipTextToLabel(rendered, label, "#"), "truncated");
+  assert.equal(matchChipTextToLabel(`#${rendered}`, label, "#"), "truncated");
+  // A partial selection of that same chip is still a fragment.
+  assert.equal(
+    matchChipTextToLabel(rendered.slice(0, 10), label, "#"),
+    "fragment",
+  );
+});
+
+test("does not treat an uncapped label's ellipsis as a truncation", () => {
+  // "truncated" is only ever the cap's own output — a label that renders
+  // whole must not gain a second accepted form.
+  assert.equal(matchChipTextToLabel("John…", "John Smith", "@"), "fragment");
 });

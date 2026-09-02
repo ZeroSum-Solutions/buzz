@@ -5,6 +5,7 @@ import { MESSAGE_MARKDOWN_CLASS } from "@/shared/ui/mentionChip";
 import {
   BUZZ_COPY_ATTRIBUTE,
   CHANNEL_LABEL_ATTRIBUTE,
+  matchChipTextToLabel,
   MENTION_KIND_ATTRIBUTE,
   MENTION_LABEL_ATTRIBUTE,
   MENTION_PUBKEY_ATTRIBUTE,
@@ -30,17 +31,27 @@ const CLONE_HOST_STYLE =
 /**
  * Restore the sigil each chip strips for display.
  *
- * A chip whose cloned text differs from its full label was only partially
+ * A chip whose cloned text no longer carries its full label was only partially
  * selected. Prefixing a sigil there would invent a mention the user didn't
  * copy, so the fragment degrades to plain text and its identity attributes are
  * dropped — paste must not register a name from a partial label.
+ *
+ * The classification is `matchChipTextToLabel`, the same predicate the paste
+ * side applies, rather than an equality test against the chip's rendered text:
+ * a chip that renders anything but its bare label — an ellipsized long label
+ * today — would otherwise read as a fragment, and a selection whose only chip
+ * did that would lose its identity and fall back to the browser's dead-text
+ * default with nothing to signal it.
  */
 function restoreChipSigils(root: HTMLElement): boolean {
   let restored = false;
 
   for (const element of root.querySelectorAll<HTMLElement>("[data-mention]")) {
     const label = element.getAttribute(MENTION_LABEL_ATTRIBUTE);
-    if (label && element.textContent === label) {
+    if (
+      label &&
+      matchChipTextToLabel(element.textContent ?? "", label, "@") !== "fragment"
+    ) {
       element.textContent = `@${label}`;
       restored = true;
       continue;
@@ -55,7 +66,10 @@ function restoreChipSigils(root: HTMLElement): boolean {
     "[data-channel-link]",
   )) {
     const label = element.getAttribute(CHANNEL_LABEL_ATTRIBUTE);
-    if (label && element.textContent === label) {
+    if (
+      label &&
+      matchChipTextToLabel(element.textContent ?? "", label, "#") !== "fragment"
+    ) {
       element.textContent = `#${label}`;
       restored = true;
       continue;
