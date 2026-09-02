@@ -28,6 +28,22 @@ export const MENTION_LABEL_ATTRIBUTE = "data-mention-label";
 /** Full channel-reference label, same partial-selection role as above. */
 export const CHANNEL_LABEL_ATTRIBUTE = "data-channel-label";
 
+/**
+ * Canonical form for comparing two spellings of one mention label.
+ *
+ * Tolerates what a label picks up in transit and nothing more: a pasteboard
+ * round trip swaps spaces for U+00A0, markup gains padding, and mention
+ * resolution is case-insensitive end to end. Every clipboard comparison of
+ * two labels goes through here, so "the same name" means one thing across the
+ * copy-side chip classifier and the paste-side trust check.
+ */
+export function canonicalMentionLabel(value: string): string {
+  return value
+    .replace(/\u00a0/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
 /** How a chip's copied text relates to the full label it declares. */
 export type ChipTextMatch = "full" | "truncated" | "fragment";
 
@@ -62,18 +78,15 @@ export function matchChipTextToLabel(
   label: string,
   sigil: "@" | "#",
 ): ChipTextMatch {
-  const canonical = (value: string) =>
-    value
-      .replace(/\u00a0/g, " ")
-      .trim()
-      .toLowerCase();
-  const body = canonical(text);
+  const body = canonicalMentionLabel(text);
   const matches = (form: string) => body === form || body === `${sigil}${form}`;
-  if (matches(canonical(label))) return "full";
+  if (matches(canonicalMentionLabel(label))) return "full";
   // Derived from the helper the chips render with, so the tolerated form
   // cannot drift from what a fully selected capped chip actually carries.
   const truncated = truncateInlineChipLabel(label);
-  if (truncated !== label && matches(canonical(truncated))) return "truncated";
+  if (truncated !== label && matches(canonicalMentionLabel(truncated))) {
+    return "truncated";
+  }
   return "fragment";
 }
 
@@ -333,35 +346,54 @@ export function selectVisibleMentionIdentities(
 }
 
 /**
- * Teach a composer every identity a Buzz copy carried *and* showed.
+ * Narrow copied records to the pairs trusted Buzz state vouches for.
  *
- * Registration is what makes a pasted multi-word name known to the mention
- * decorations *and* to the send-time extractor, so the chip re-lights and the
- * original pubkey survives the round trip.
+ * Must resolve to a subset of what it was handed; callers enforce that rather
+ * than assume it, so the seam cannot widen into "the verifier decides what
+ * gets bound". See `useVerifyMentionIdentities` for the implementation and
+ * `mentionIdentityTrust` for why the check exists.
  */
-export function registerMentionClipboardIdentities({
+export type VerifyMentionIdentities = (
+  records: readonly MentionIdentity[],
+) => Promise<readonly MentionIdentity[]>;
+
+/** Case-insensitive identity of a `label → pubkey` pair. */
+function mentionIdentityKey(identity: MentionIdentity): string {
+  return `${canonicalMentionLabel(identity.label)} ${identity.pubkey.trim().toLowerCase()}`;
+}
+
+/**
+ * The identities a paste is allowed to bind.
+ *
+ * Three conditions, all necessary. The clipboard has to *carry* the record;
+ * the content the paste inserts has to *show* its label, so no binding
+ * outlives a paste the user could not see; and trusted Buzz state has to
+ * *vouch* for the pair, because a visible `@John Smith` beside an attacker's
+ * key is visible either way.
+ *
+ * Binding is what makes a pasted multi-word name known to the mention
+ * decorations *and* to the send-time extractor — so the chip re-lights and
+ * the original pubkey survives the round trip. Everything dropped here stays
+ * readable text that tags nobody.
+ */
+export async function selectBindableMentionIdentities({
   html,
-  registerMentionPubkey,
   text,
+  verifyMentionIdentities,
 }: {
   /** Clipboard HTML holding the identity records — untrusted. */
   html: string;
-  registerMentionPubkey: (
-    displayName: string,
-    pubkey: string,
-    options?: { isAgent?: boolean },
-  ) => void;
   /** The text the paste inserts; a record unmentioned there is discarded. */
   text: string;
-}): MentionIdentity[] {
-  const records = selectVisibleMentionIdentities(
+  verifyMentionIdentities: VerifyMentionIdentities;
+}): Promise<MentionIdentity[]> {
+  const visible = selectVisibleMentionIdentities(
     parseMentionClipboardRecords(html),
     text,
   );
-  for (const record of records) {
-    registerMentionPubkey(record.label, record.pubkey, {
-      isAgent: record.isAgent,
-    });
-  }
-  return records;
+  if (visible.length === 0) return [];
+  const vouched = new Set(
+    (await verifyMentionIdentities(visible)).map(mentionIdentityKey),
+  );
+  return visible.filter((record) => vouched.has(mentionIdentityKey(record)));
 }

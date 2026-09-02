@@ -355,6 +355,21 @@ async function readSentMentionPubkeys(page: Page, content: string) {
   }, content);
 }
 
+/** Whether a profile lookup naming `pubkey` reached the backend. */
+async function askedRelayAboutProfile(page: Page, pubkey: string) {
+  return page.evaluate(
+    (wanted) =>
+      (window.__BUZZ_E2E_COMMAND_LOG__ ?? []).some(
+        (entry) =>
+          entry.command === "get_users_batch" &&
+          (
+            (entry.payload as { pubkeys?: string[] } | undefined)?.pubkeys ?? []
+          ).includes(wanted),
+      ),
+    pubkey,
+  );
+}
+
 function expectCarriesJohnSmith(flavors: ClipboardFlavors) {
   expect(flavors.defaultPrevented).toBe(true);
   // Readable anywhere, and safe to hand an external app: the sigil is back and
@@ -542,6 +557,53 @@ test("an identity vouched for only by dropped markup binds no name", async ({
   expect(await readSentMentionPubkeys(page, MESSAGE_BODY)).not.toContain(
     IMPOSTOR_PUBKEY,
   );
+});
+
+test("a visible pair no trusted state vouches for binds no name", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-bob-tyler").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("bob-tyler");
+
+  // Nothing is concealed this time. The record claims a real display name
+  // against a key of its choosing and writes that name where the paste puts
+  // it on screen, so the visibility gate has no objection. What the user sees
+  // is a plausible "@John Smith"; what nothing in this community says is that
+  // the key beside it is his.
+  const input = page.getByTestId("message-input");
+  await pasteIntoComposer(page, {
+    html:
+      '<span data-buzz-copy="markdown">' +
+      `<span data-mention="" data-mention-pubkey="${IMPOSTOR_PUBKEY}" ` +
+      'data-mention-label="John Smith">@John Smith</span> fixed the bug' +
+      "</span>",
+    text: MESSAGE_BODY,
+  });
+  await expect(input).toHaveText(MESSAGE_BODY);
+
+  // The paste did put the question: no local directory can speak for that
+  // key, so it cost a profile lookup. Waiting on it is also what gives an
+  // ungated build the time it needs to light the chip below.
+  await expect
+    .poll(() => askedRelayAboutProfile(page, IMPOSTOR_PUBKEY))
+    .toBe(true);
+  await expect(input.locator(".mention-chip")).toHaveCount(0);
+
+  await page.getByTestId("send-message").click();
+  await expect(input).toHaveText("");
+  await expect
+    .poll(() => readSentMentionPubkeys(page, MESSAGE_BODY))
+    .not.toBeNull();
+  expect(await readSentMentionPubkeys(page, MESSAGE_BODY)).not.toContain(
+    IMPOSTOR_PUBKEY,
+  );
+
+  // And the refusal does not outlive the paste in the other direction: the
+  // name stays unbound, so writing it by hand afterwards tags nobody either.
+  await pasteIntoComposer(page, { html: "", text: MESSAGE_BODY });
+  await expect(input).toHaveText(MESSAGE_BODY);
+  await expect(input.locator(".mention-chip")).toHaveCount(0);
 });
 
 test("forum post and reply selection copies carry the mention", async ({

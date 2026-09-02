@@ -8,7 +8,7 @@ import {
   getBuzzCopyKind,
   matchChipTextToLabel,
   parseMentionClipboardRecords,
-  registerMentionClipboardIdentities,
+  selectBindableMentionIdentities,
   selectVisibleMentionIdentities,
 } from "./mentionClipboard.ts";
 
@@ -288,42 +288,102 @@ test("ignores a mention the extractor would mask as code", () => {
   );
 });
 
-// ── registerMentionClipboardIdentities ────────────────────────────────
+// ── selectBindableMentionIdentities ───────────────────────────────────
 
-test("registers each recovered pair with its agent flag", () => {
-  const registered = [];
-  registerMentionClipboardIdentities({
-    html: buildMentionClipboardHtml({
+/** A verifier that vouches for every pair — isolates the other two gates. */
+const vouchForAll = async (records) => records;
+
+test("keeps each recovered pair with its agent flag", async () => {
+  assert.deepEqual(
+    await selectBindableMentionIdentities({
+      html: buildMentionClipboardHtml({
+        text: "@John Smith and @Fizz",
+        identities: [john, fizz],
+      }),
       text: "@John Smith and @Fizz",
-      identities: [john, fizz],
+      verifyMentionIdentities: vouchForAll,
     }),
-    registerMentionPubkey: (displayName, pubkey, options) =>
-      registered.push([displayName, pubkey, options?.isAgent]),
-    text: "@John Smith and @Fizz",
-  });
-
-  assert.deepEqual(registered, [
-    ["John Smith", JOHN, false],
-    ["Fizz", FIZZ, true],
-  ]);
+    [john, fizz],
+  );
 });
 
-test("registers nothing for a record the paste does not show", () => {
-  const registered = [];
+test("keeps nothing for a record the paste does not show", async () => {
   // A crafted sidecar: an empty span rebinding a name the content never
   // carries, riding alongside one the user can actually see.
-  registerMentionClipboardIdentities({
-    html:
-      `<span data-mention="" data-mention-pubkey="${ALEX}" ` +
-      `data-mention-label="John Smith"></span>` +
-      `<span data-mention="" data-mention-pubkey="${FIZZ}" ` +
-      `data-mention-kind="agent" data-mention-label="Fizz">@Fizz</span>`,
-    registerMentionPubkey: (displayName, pubkey) =>
-      registered.push([displayName, pubkey]),
-    text: "@Fizz take a look",
-  });
+  assert.deepEqual(
+    await selectBindableMentionIdentities({
+      html:
+        `<span data-mention="" data-mention-pubkey="${ALEX}" ` +
+        `data-mention-label="John Smith"></span>` +
+        `<span data-mention="" data-mention-pubkey="${FIZZ}" ` +
+        `data-mention-kind="agent" data-mention-label="Fizz">@Fizz</span>`,
+      text: "@Fizz take a look",
+      verifyMentionIdentities: vouchForAll,
+    }),
+    [fizz],
+  );
+});
 
-  assert.deepEqual(registered, [["Fizz", FIZZ]]);
+test("keeps nothing for a visible pair trusted state will not vouch for", async () => {
+  // The shape a hostile page carries: a plausible name against a key of its
+  // choosing, written where the user *does* see it. Visibility is not the
+  // question here — the verifier declining it is.
+  const impostor = { label: "John Smith", pubkey: ALEX, isAgent: false };
+  const asked = [];
+  assert.deepEqual(
+    await selectBindableMentionIdentities({
+      html: buildMentionClipboardHtml({
+        text: "@John Smith fixed the bug",
+        identities: [impostor],
+      }),
+      text: "@John Smith fixed the bug",
+      verifyMentionIdentities: async (records) => {
+        asked.push(...records);
+        return [];
+      },
+    }),
+    [],
+  );
+  // The visible pair still reached the verifier: it is the trust answer that
+  // dropped it, not an earlier gate quietly doing the work.
+  assert.deepEqual(asked, [impostor]);
+});
+
+test("binds only what it asked about, whatever the verifier returns", async () => {
+  // The verifier is a seam, not an authority: a bug or a future implementation
+  // that answers with a pair nobody copied must not widen the paste.
+  assert.deepEqual(
+    await selectBindableMentionIdentities({
+      html: buildMentionClipboardHtml({
+        text: "@John Smith fixed the bug",
+        identities: [john],
+      }),
+      text: "@John Smith fixed the bug",
+      verifyMentionIdentities: async (records) => [
+        ...records,
+        { label: "John Smith", pubkey: ALEX, isAgent: false },
+      ],
+    }),
+    [john],
+  );
+});
+
+test("does not consult the verifier when nothing is visible", async () => {
+  let consulted = false;
+  assert.deepEqual(
+    await selectBindableMentionIdentities({
+      html:
+        `<span data-mention="" data-mention-pubkey="${ALEX}" ` +
+        `data-mention-label="John Smith"></span>`,
+      text: "look at this",
+      verifyMentionIdentities: async () => {
+        consulted = true;
+        return [];
+      },
+    }),
+    [],
+  );
+  assert.equal(consulted, false, "a hidden record must cost no lookup");
 });
 
 // ── matchChipTextToLabel ──────────────────────────────────────────────

@@ -7,12 +7,15 @@ import {
   handleMentionClipboardPaste,
   type RegisterMentionPubkey,
 } from "@/features/messages/lib/mentionClipboardPaste";
+import type { VerifyMentionIdentities } from "@/features/messages/lib/mentionClipboard";
 import { getBuzzCodeBlockClipboardText } from "@/shared/lib/codeBlockClipboard";
 
 export function useComposerPasteHandler(options: {
   editor: Editor | null;
   /** Teaches the composer each `name → pubkey` pair a Buzz copy carried. */
   registerMentionPubkey?: RegisterMentionPubkey;
+  /** Confirms a carried pair against trusted state; without it none bind. */
+  verifyMentionIdentities?: VerifyMentionIdentities;
   scrollToBottom: () => void;
   setPendingImeta: (
     update: (current: BlobDescriptor[]) => BlobDescriptor[],
@@ -23,6 +26,10 @@ export function useComposerPasteHandler(options: {
   uploadFileRef.current = options.uploadFile;
   const registerMentionPubkeyRef = React.useRef(options.registerMentionPubkey);
   registerMentionPubkeyRef.current = options.registerMentionPubkey;
+  const verifyMentionIdentitiesRef = React.useRef(
+    options.verifyMentionIdentities,
+  );
+  verifyMentionIdentitiesRef.current = options.verifyMentionIdentities;
   React.useEffect(() => {
     const editor = options.editor;
     if (!editor) return;
@@ -72,6 +79,7 @@ export function useComposerPasteHandler(options: {
               clipboardData,
               preventDefault: () => event.preventDefault(),
               registerMentionPubkey: registerMentionPubkeyRef.current,
+              verifyMentionIdentities: verifyMentionIdentitiesRef.current,
               view,
             });
           }

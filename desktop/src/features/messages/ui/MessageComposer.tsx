@@ -793,6 +793,7 @@ function MessageComposerImpl({
   useComposerPasteHandler({
     editor: richText.editor,
     registerMentionPubkey: mentions.registerMentionPubkey,
+    verifyMentionIdentities: mentions.verifyMentionIdentities,
     scrollToBottom: scrollComposerToBottom,
     setPendingImeta: voiceNote.setPendingImetaWhenIdle,
     uploadFile: voiceNote.uploadFileWhenIdle,

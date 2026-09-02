@@ -360,6 +360,10 @@ export function ForumComposer({
   uploadFileRef.current = media.uploadFile;
   const registerMentionPubkeyRef = React.useRef(mentions.registerMentionPubkey);
   registerMentionPubkeyRef.current = mentions.registerMentionPubkey;
+  const verifyMentionIdentitiesRef = React.useRef(
+    mentions.verifyMentionIdentities,
+  );
+  verifyMentionIdentitiesRef.current = mentions.verifyMentionIdentities;
 
   React.useEffect(() => {
     if (!richText.editor) return;
@@ -387,6 +391,7 @@ export function ForumComposer({
               clipboardData,
               preventDefault: () => event.preventDefault(),
               registerMentionPubkey: registerMentionPubkeyRef.current,
+              verifyMentionIdentities: verifyMentionIdentitiesRef.current,
               view: _view,
             });
           }

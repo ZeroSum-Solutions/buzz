@@ -40,6 +40,7 @@ import { flushMentionDebounce, isPlainSpace } from "./flushMentionDebounce";
 import { useAgentMentionRevalidation } from "./agentMentionRevalidation";
 import { extractMentionPubkeys } from "./extractMentionPubkeys";
 import type { MentionIdentity } from "./mentionClipboard";
+import { useVerifyMentionIdentities } from "./useVerifyMentionIdentities";
 import {
   extractMentionPersonasFromMaps,
   type PersonaMentionTarget,
@@ -572,6 +573,12 @@ export function useMentions(
     }
     return identities;
   }, [knownAgentPubkeys, mentionCandidates]);
+  // Untrusted clipboard records only become bindable identities once trusted
+  // Buzz state confirms the pair — see `mentionIdentityTrust`.
+  const verifyMentionIdentities = useVerifyMentionIdentities({
+    mentionCandidates,
+    profiles,
+  });
   const insertResolvedMention = React.useCallback(
     ({
       displayName,
@@ -880,6 +887,7 @@ export function useMentions(
     hasMoreSuggestions: Boolean(userSearchQuery.hasNextPage),
     isFetchingMoreSuggestions: userSearchQuery.isFetchingNextPage,
     updateMentionQuery,
+    verifyMentionIdentities,
   };
 }
 export type UseMentionsResult = ReturnType<typeof useMentions>;
