@@ -59,10 +59,18 @@ export function CanvasHistoryPanel({
   const [selectedId, setSelectedId] = React.useState<string | null>(null);
   // Restore rewrites the shared channel canvas for everyone, so it is gated
   // behind an explicit confirmation identifying the target revision. Holds the
-  // revision awaiting confirmation; `null` means no dialog is open. Nothing
-  // mutates until the user confirms.
-  const [confirmRevision, setConfirmRevision] =
-    React.useState<CanvasRevision | null>(null);
+  // revision awaiting confirmation and the head revision captured at open time;
+  // `null` means no dialog is open. Nothing mutates until the user confirms.
+  //
+  // `frozenExpectedRevision` is snapshotted at dialog-open rather than read
+  // from the current render at confirm-time. Without this, a background
+  // refetch that installs a new head between "open" and "confirm" would
+  // silently submit the newer head as the CAS guard, bypassing the conflict
+  // check for the user's original intent.
+  const [confirmRevision, setConfirmRevision] = React.useState<{
+    revision: CanvasRevision;
+    frozenExpectedRevision: string | null;
+  } | null>(null);
   // Non-destructive notice shown after a restore the relay accepted but could
   // not verify (the post-write supersession read failed). The restore is
   // durable; the note tells the user to check the current canvas if a
@@ -102,13 +110,18 @@ export function CanvasHistoryPanel({
     return summary?.displayName?.trim() || truncatePubkey(pubkey);
   }
 
-  async function handleRestore(revision: CanvasRevision) {
-    // Restore is a conflict-checked publish against the live head: if the
-    // canvas moved since this panel loaded, the save command's advisory check
-    // fails and we surface the same reload state as a normal save.
+  async function handleRestore(
+    revision: CanvasRevision,
+    frozenExpectedRevision: string | null,
+  ) {
+    // Restore is a conflict-checked publish against the head that was live when
+    // the user opened the confirmation dialog. Using the frozen value rather
+    // than the current render's `currentRevision` prevents a background refetch
+    // that lands a new head between "open" and "confirm" from silently advancing
+    // the CAS guard past the user's decision point.
     const result = await restoreMutation.mutateAsync({
       content: revision.content,
-      expectedRevision: currentRevision ?? CANVAS_EXPECTED_REVISION_NONE,
+      expectedRevision: frozenExpectedRevision ?? CANVAS_EXPECTED_REVISION_NONE,
     });
     // The restore was accepted. `verified: false` means the post-write
     // supersession read failed, not that the restore failed — collapse the
@@ -227,7 +240,12 @@ export function CanvasHistoryPanel({
                     <Button
                       data-testid="channel-canvas-restore"
                       disabled={restoreMutation.isPending}
-                      onClick={() => setConfirmRevision(revision)}
+                      onClick={() =>
+                        setConfirmRevision({
+                          revision,
+                          frozenExpectedRevision: currentRevision,
+                        })
+                      }
                       size="sm"
                       type="button"
                       variant="outline"
@@ -274,7 +292,7 @@ export function CanvasHistoryPanel({
             <AlertDialogDescription>
               This publishes{" "}
               {confirmRevision
-                ? `${authorLabel(confirmRevision.author)}'s revision from ${formatItemTimestamp(confirmRevision.createdAt, { withTime: true })}`
+                ? `${authorLabel(confirmRevision.revision.author)}'s revision from ${formatItemTimestamp(confirmRevision.revision.createdAt, { withTime: true })}`
                 : "the selected revision"}{" "}
               as the current canvas for everyone in this channel. History is
               preserved.
@@ -290,10 +308,13 @@ export function CanvasHistoryPanel({
               <Button
                 data-testid="channel-canvas-restore-confirm-action"
                 onClick={() => {
-                  const revision = confirmRevision;
+                  const pending = confirmRevision;
                   setConfirmRevision(null);
-                  if (revision) {
-                    void handleRestore(revision).catch(() => {
+                  if (pending) {
+                    void handleRestore(
+                      pending.revision,
+                      pending.frozenExpectedRevision,
+                    ).catch(() => {
                       // Surfaced below via restoreMutation.error.
                     });
                   }

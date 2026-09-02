@@ -51,6 +51,10 @@ const dom = new JSDOM("<!doctype html><html><body></body></html>", {
 
 const HEAD = "a".repeat(64);
 const OLDER = "b".repeat(64);
+// A distinct head used to simulate a concurrent writer installing a new canvas
+// head between the time the user opens the restore dialog and the time they
+// confirm. Must differ from HEAD to make the frozen vs live read observable.
+const CONCURRENT = "c".repeat(64);
 
 let React;
 let act;
@@ -66,6 +70,13 @@ let ChannelCanvas;
 // state that the components must handle non-destructively.
 let failRefetches = false;
 let nextSetCanvasVerified = false;
+// Overrides the event_id returned by `get_canvas` (and matching history head)
+// to simulate a concurrent-writer head arriving via a successful refetch.
+// `null` means use the default HEAD constant.
+let overrideCanvasEventId = null;
+// Tracks the most-recent arguments passed to `set_canvas` so tests can assert
+// on the frozen expectedRevision without coupling to mutation internals.
+let lastSetCanvasArgs = null;
 
 before(async () => {
   Object.assign(globalThis, {
@@ -88,14 +99,21 @@ before(async () => {
   installRadixDialogGlobals(dom);
 
   dom.window.__TAURI_INTERNALS__ = {
-    invoke: async (cmd) => {
+    invoke: async (cmd, args) => {
       if (cmd === "get_canvas") {
         if (failRefetches) {
           throw new Error("relay unavailable");
         }
-        return { content: "hi", event_id: HEAD, updated_at: 1, author: HEAD };
+        const eventId = overrideCanvasEventId ?? HEAD;
+        return {
+          content: "hi",
+          event_id: eventId,
+          updated_at: 1,
+          author: HEAD,
+        };
       }
       if (cmd === "set_canvas") {
+        lastSetCanvasArgs = args;
         return {
           ok: true,
           event_id: "e".repeat(64),
@@ -106,9 +124,10 @@ before(async () => {
         if (failRefetches) {
           throw new Error("relay unavailable");
         }
+        const headId = overrideCanvasEventId ?? HEAD;
         return {
           revisions: [
-            { event_id: HEAD, content: "hi", created_at: 2, author: HEAD },
+            { event_id: headId, content: "hi", created_at: 2, author: HEAD },
             { event_id: OLDER, content: "old", created_at: 1, author: HEAD },
           ],
           next_cursor: null,
@@ -451,6 +470,99 @@ test("canvas: initial load failure with no data renders full error state", async
   );
 
   failRefetches = false;
+  await act(async () => root.unmount());
+  queryClient.clear();
+  container.remove();
+});
+
+// ── Frozen expectedRevision ───────────────────────────────────────────────────
+
+test("restore: expectedRevision is frozen at dialog-open, not re-read from current render at confirm", async () => {
+  // This test exercises the fix for the following sequence:
+  //   1. User opens the restore confirmation dialog while head = HEAD.
+  //   2. A background refetch succeeds and installs a new head = CONCURRENT.
+  //   3. User confirms the dialog.
+  // The mutation must submit expectedRevision = HEAD (the head at open time),
+  // NOT CONCURRENT (the head at confirm time). If handleRestore reads
+  // `currentRevision` from the live render instead of the frozen value,
+  // the CAS guard silently advances past the user's decision point.
+  //
+  // Revert-causality: removing the `frozenExpectedRevision` parameter from
+  // handleRestore and restoring the `currentRevision` closure read causes this
+  // test to fail because the mutation receives CONCURRENT instead of HEAD.
+  failRefetches = false;
+  nextSetCanvasVerified = true;
+  overrideCanvasEventId = null;
+  lastSetCanvasArgs = null;
+
+  const queryClient = makeClient();
+  const { container, root } = await mountCanvas(queryClient);
+
+  // Open history panel and prime history query.
+  await act(async () =>
+    click(
+      container.querySelector("[data-testid='channel-canvas-history-toggle']"),
+    ),
+  );
+  await act(async () => {
+    await queryClient.refetchQueries({ queryKey: ["channel-canvas-history"] });
+  });
+  await settle(12);
+
+  // Expand the older (non-current) revision.
+  const items = container.querySelectorAll(
+    "[data-testid='channel-canvas-history-item'] button",
+  );
+  await act(async () => click(items[items.length - 1]));
+  await settle();
+
+  // Click Restore to open the confirmation dialog while head is still HEAD.
+  await act(async () => {
+    click(container.querySelector("[data-testid='channel-canvas-restore']"));
+  });
+  await settle();
+
+  // Verify dialog is open.
+  assert.ok(
+    dom.window.document.querySelector(
+      "[data-testid='channel-canvas-restore-confirm']",
+    ),
+    "restore confirmation dialog is open at HEAD",
+  );
+
+  // Simulate a concurrent writer: next successful refetch installs CONCURRENT.
+  overrideCanvasEventId = CONCURRENT;
+  await act(async () => {
+    await queryClient.refetchQueries({ queryKey: ["channel-canvas"] });
+  });
+  await settle(12);
+
+  // Confirm the dialog.
+  await act(async () => {
+    click(
+      dom.window.document.querySelector(
+        "[data-testid='channel-canvas-restore-confirm-action']",
+      ),
+    );
+  });
+  await settle(20);
+
+  // The mutation must have fired with the head that was current when the dialog
+  // opened (HEAD), not the head installed by the intervening refetch (CONCURRENT).
+  assert.ok(lastSetCanvasArgs, "set_canvas was called");
+  assert.equal(
+    lastSetCanvasArgs.expectedRevision,
+    HEAD,
+    "expectedRevision is the head at dialog-open (HEAD), not the post-refetch head (CONCURRENT)",
+  );
+  assert.notEqual(
+    lastSetCanvasArgs.expectedRevision,
+    CONCURRENT,
+    "expectedRevision must not be the concurrent writer's head",
+  );
+
+  overrideCanvasEventId = null;
+  lastSetCanvasArgs = null;
   await act(async () => root.unmount());
   queryClient.clear();
   container.remove();
