@@ -394,6 +394,45 @@ test("an identity the pasted content never shows binds no name", async ({
   );
 });
 
+test("an identity vouched for only by dropped markup binds no name", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-bob-tyler").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("bob-tyler");
+
+  // The same claim as above, hidden where ProseMirror's parser throws it away
+  // rather than in an empty span. No `data-buzz-copy` marker, so this takes
+  // the rich HTML branch, where the gate reads the normalized markup's text.
+  const input = page.getByTestId("message-input");
+  await pasteIntoComposer(page, {
+    html:
+      "visible <style>@John Smith </style>" +
+      `<span data-mention="" data-mention-pubkey="${IMPOSTOR_PUBKEY}" ` +
+      'data-mention-label="John Smith"></span>',
+    text: "visible",
+  });
+  // The premise the gate has to share: `<style>` text is never inserted.
+  await expect(input).toHaveText("visible");
+
+  // The name that sidecar tried to claim, written afterwards by hand.
+  await input.press("ControlOrMeta+a");
+  await input.press("Backspace");
+  await expect(input).toHaveText("");
+  await pasteIntoComposer(page, { html: "", text: MESSAGE_BODY });
+  await expect(input).toHaveText(MESSAGE_BODY);
+  await expect(input.locator(".mention-chip")).toHaveCount(0);
+
+  await page.getByTestId("send-message").click();
+  await expect(input).toHaveText("");
+  await expect
+    .poll(() => readSentMentionPubkeys(page, MESSAGE_BODY))
+    .not.toBeNull();
+  expect(await readSentMentionPubkeys(page, MESSAGE_BODY)).not.toContain(
+    IMPOSTOR_PUBKEY,
+  );
+});
+
 test("forum post and reply selection copies carry the mention", async ({
   page,
 }) => {

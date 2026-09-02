@@ -90,6 +90,20 @@ const BLOCK_LEVEL_TAGS = new Set([
   "UL",
 ]);
 
+/**
+ * Tags whose entire content ProseMirror's `DOMParser` drops on paste — its
+ * `ignoreTags` list (prosemirror-model 1.25.4).
+ *
+ * The visibility gate reads the text returned here, so text under one of these
+ * must not vouch for an identity record: `view.pasteHTML` never inserts it, and
+ * a `<style>@Jane Doe</style>` beside an empty record span would otherwise
+ * register a binding nobody can see. On a prosemirror-model upgrade, mirror
+ * additions to its list — a tag PM ignores but we count reopens that bypass;
+ * a tag we strip but PM inserts only over-drops a record, the safe direction.
+ */
+const PROSEMIRROR_IGNORED_TAGS_SELECTOR =
+  "head, noscript, object, script, style, title";
+
 /** The text `node`'s subtree contributes, with block boundaries as newlines. */
 function readRenderedText(node: Node): string {
   let text = "";
@@ -130,6 +144,18 @@ export function normalizeMentionClipboardContent(
   html: string,
 ): MentionClipboardContent {
   const doc = new DOMParser().parseFromString(html, "text/html");
+
+  // Drop what the paste will drop, before either output is derived — the pair
+  // stays one view of what the composer ends up holding. Sweep the whole
+  // document, not just `<body>`: the parser hoists a leading `<style>` or
+  // `<title>` into `<head>`. Stripping ahead of the chip flattening below also
+  // removes a `data-mention` span nested in `<noscript>`/`<object>` outright,
+  // rather than flattening it into text the gate would then count as visible.
+  for (const el of Array.from(
+    doc.querySelectorAll(PROSEMIRROR_IGNORED_TAGS_SELECTOR),
+  )) {
+    el.remove();
+  }
 
   for (const el of Array.from(
     doc.querySelectorAll("[data-mention], [data-channel-link]"),
