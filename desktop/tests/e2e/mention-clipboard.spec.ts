@@ -371,3 +371,86 @@ test("a half-selected chip copies as plain text with no identity attached", asyn
   expect(flavors.html).toBe("");
   expect(flavors.text).toBe("");
 });
+
+test("a boundary-crossing default copy pastes its chip fragment without a sigil", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+  await waitForMockLiveSubscription(page, "general");
+  await emitMentionMessage(page, "general");
+
+  // A drag from inside the chip into the sentence after it covers no chip
+  // fully, so Buzz's copy handler declines and the browser's default copy
+  // runs — serializing the partially covered chip element with its full
+  // identity attributes around only the covered slice of its text.
+  const flavors = await page.evaluate((pubkey) => {
+    const chip = document.querySelector<HTMLElement>(
+      `[data-testid="message-body"] [data-mention-pubkey="${pubkey}"]`,
+    );
+    if (!chip) throw new Error("Message body rendered no mention chip.");
+    const body = chip.closest<HTMLElement>(".message-markdown");
+    if (!body) throw new Error("Mention chip is outside a rendered body.");
+
+    const textNodesUnder = (root: Node) => {
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      const nodes: Text[] = [];
+      while (walker.nextNode()) nodes.push(walker.currentNode as Text);
+      return nodes;
+    };
+    const label = textNodesUnder(chip).find((node) =>
+      node.nodeValue?.includes("John Smith"),
+    );
+    const tail = textNodesUnder(body).find((node) =>
+      node.nodeValue?.includes("fixed the bug"),
+    );
+    if (!label?.nodeValue || !tail?.nodeValue) {
+      throw new Error("Timeline text nodes not found.");
+    }
+
+    const selection = window.getSelection();
+    if (!selection) throw new Error("Selection API unavailable.");
+    selection.removeAllRanges();
+    const range = document.createRange();
+    // "Smith fixed the" — starts mid-chip, ends mid-sentence.
+    range.setStart(label, label.nodeValue.indexOf("Smith"));
+    range.setEnd(tail, tail.nodeValue.indexOf("the bug") + "the".length);
+    selection.addRange(range);
+
+    const clipboardData = new DataTransfer();
+    const event = new ClipboardEvent("copy", {
+      bubbles: true,
+      cancelable: true,
+      clipboardData,
+    });
+    body.dispatchEvent(event);
+
+    // A synthetic event cannot trigger the browser's real default copy, so
+    // serialize the same range the way that default does: partially covered
+    // elements are cloned whole, attributes intact.
+    const host = document.createElement("div");
+    host.append(range.cloneContents());
+    return {
+      defaultPrevented: event.defaultPrevented,
+      html: host.innerHTML,
+      text: selection.toString(),
+    };
+  }, JOHN_SMITH_PUBKEY);
+
+  // The production handler really does decline this selection…
+  expect(flavors.defaultPrevented).toBe(false);
+  // …and what the default path writes still claims the full identity.
+  expect(flavors.html).toContain(`data-mention-pubkey="${JOHN_SMITH_PUBKEY}"`);
+  expect(flavors.html).toContain('data-mention-label="John Smith"');
+
+  await page.getByTestId("channel-bob-tyler").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("bob-tyler");
+  await pasteIntoComposer(page, flavors);
+
+  // The fragment pastes as the words the user copied: no invented "@Smith",
+  // no chip, and the identity record has nothing visible to bind to.
+  const input = page.getByTestId("message-input");
+  await expect(input).toHaveText("Smith fixed the");
+  await expect(input.locator(".mention-chip")).toHaveCount(0);
+});

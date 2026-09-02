@@ -1,3 +1,8 @@
+import {
+  CHANNEL_LABEL_ATTRIBUTE,
+  MENTION_LABEL_ATTRIBUTE,
+} from "./mentionClipboard";
+
 /**
  * Detect whether clipboard HTML contains Buzz mention / channel-link
  * elements (marked with `data-mention` or `data-channel-link` attributes).
@@ -15,6 +20,30 @@ export function hasMentionClipboardHtml(html: string): boolean {
 export function restoreChipSigil(text: string, sigil: "@" | "#"): string {
   if (!text || text.startsWith(sigil)) return text;
   return `${sigil}${text}`;
+}
+
+/**
+ * Whether a chip's clipboard text still carries its full label.
+ *
+ * A mismatch means the chip is a fragment of a boundary-crossing selection —
+ * see the caller. The comparison tolerates what a legitimate full chip picks
+ * up in transit: Buzz's own copy handlers write the sigil back into the text,
+ * `buildMentionSpanHtml` keeps the author's casing rather than the label's,
+ * and a pasteboard round trip can swap spaces for U+00A0.
+ */
+export function chipTextMatchesLabel(
+  text: string,
+  label: string,
+  sigil: "@" | "#",
+): boolean {
+  const canonical = (value: string) =>
+    value
+      .replace(/\u00a0/g, " ")
+      .trim()
+      .toLowerCase();
+  const body = canonical(text);
+  const full = canonical(label);
+  return body === full || body === `${sigil}${full}`;
 }
 
 /**
@@ -105,18 +134,33 @@ export function normalizeMentionClipboardContent(
   for (const el of Array.from(
     doc.querySelectorAll("[data-mention], [data-channel-link]"),
   )) {
-    // Replace the styled wrapper with a plain <span> containing the text.
+    // Replace the styled wrapper with a plain <span> containing the text —
+    // and nothing else, so the identity attributes never reach the composer.
     // This preserves the text content inline while stripping the
     // font-weight/color styles that would confuse Tiptap's mark detection.
     const span = doc.createElement("span");
+    const isMention = el.hasAttribute("data-mention");
+    const sigil = isMention ? "@" : "#";
+    const label = el.getAttribute(
+      isMention ? MENTION_LABEL_ATTRIBUTE : CHANNEL_LABEL_ATTRIBUTE,
+    );
+    const text = el.textContent ?? "";
     // The rendered chip strips its sigil for display, so flattening it
     // verbatim would paste dead text that no composer can re-light. Restore
     // the sigil unless the source already carries it (Buzz's own copy
-    // handlers write it back before the HTML reaches the clipboard).
-    span.textContent = restoreChipSigil(
-      el.textContent ?? "",
-      el.hasAttribute("data-mention") ? "@" : "#",
-    );
+    // handlers write it back before the HTML reaches the clipboard) —
+    // unless the chip is a fragment. Buzz's copy handlers decline a
+    // selection whose only chip is partially covered, so the browser's
+    // default copy serializes that chip with its full attributes around the
+    // covered slice of its text. A sigil there would invent a mention the
+    // user never copied ("@John" out of "John Smith"); the fragment stays
+    // plain text, mirroring `restoreChipSigils` on the copy side, and with
+    // no sigiled label in the inserted content the visibility gate discards
+    // the identity record too.
+    span.textContent =
+      label !== null && !chipTextMatchesLabel(text, label, sigil)
+        ? text
+        : restoreChipSigil(text, sigil);
     el.replaceWith(span);
   }
 

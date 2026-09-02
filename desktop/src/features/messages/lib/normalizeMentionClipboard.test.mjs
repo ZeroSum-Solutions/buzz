@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  chipTextMatchesLabel,
   hasMentionClipboardHtml,
   restoreChipSigil,
 } from "./normalizeMentionClipboard.ts";
@@ -60,4 +61,36 @@ test("leaves an already-sigiled label alone", () => {
 
 test("never invents a lone sigil for empty chip text", () => {
   assert.equal(restoreChipSigil("", "@"), "");
+});
+
+// ── chipTextMatchesLabel ──────────────────────────────────────────────
+
+test("accepts a full chip, with or without the sigil written back", () => {
+  assert.equal(chipTextMatchesLabel("John Smith", "John Smith", "@"), true);
+  assert.equal(chipTextMatchesLabel("@John Smith", "John Smith", "@"), true);
+  assert.equal(chipTextMatchesLabel("#general", "general", "#"), true);
+});
+
+test("accepts the author's casing and pasteboard whitespace", () => {
+  // `buildMentionSpanHtml` preserves the run as written, not the label's case.
+  assert.equal(chipTextMatchesLabel("@john smith", "John Smith", "@"), true);
+  // A pasteboard round trip can pad the markup or swap spaces for U+00A0.
+  assert.equal(chipTextMatchesLabel(" John Smith ", "John Smith", "@"), true);
+  assert.equal(
+    chipTextMatchesLabel("John\u00a0Smith", "John Smith", "@"),
+    true,
+  );
+});
+
+test("rejects the fragment a boundary-crossing selection leaves behind", () => {
+  // The browser's default copy keeps the chip's attributes around whatever
+  // slice of its text the selection covered — from either end.
+  assert.equal(chipTextMatchesLabel("John", "John Smith", "@"), false);
+  assert.equal(chipTextMatchesLabel("Smith", "John Smith", "@"), false);
+  assert.equal(chipTextMatchesLabel("", "John Smith", "@"), false);
+});
+
+test("rejects a nonempty fragment of an empty declared label", () => {
+  assert.equal(chipTextMatchesLabel("John", "", "@"), false);
+  assert.equal(chipTextMatchesLabel("", "", "@"), true);
 });
