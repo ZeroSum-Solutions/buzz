@@ -18,6 +18,7 @@ import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
 const JOHN_SMITH_PUBKEY =
   "7c1f2ad0b4e93856a1d0c2f4e6b8093a5d7f1c3e5a79b1d3f5072a4c6e80931b";
 const MESSAGE_BODY = "@John Smith fixed the bug";
+const FORUM_REPLY_BODY = "Agreed, @John Smith should confirm";
 /** A pubkey must never reach the flavor an external app pastes. */
 const ANY_64_HEX = /[0-9a-f]{64}/i;
 /** Nobody's key — what a crafted clipboard sidecar would name instead. */
@@ -133,6 +134,44 @@ async function copyFromTimeline(
     },
     { pubkey: JOHN_SMITH_PUBKEY, selectPartialChip: partialChip },
   );
+}
+
+/**
+ * Copy a whole rendered forum body — post card or thread reply — through the
+ * real `copy` event. The event bubbles to the surface container, which is
+ * where the forum wires `handleTimelineMentionCopy`.
+ */
+async function copyFromForumMarkdown(
+  page: Page,
+  marker: string,
+): Promise<ClipboardFlavors> {
+  return page.evaluate((bodyMarker) => {
+    const body = [
+      ...document.querySelectorAll<HTMLElement>(".message-markdown"),
+    ].find((candidate) => candidate.textContent?.includes(bodyMarker));
+    if (!body)
+      throw new Error(`No rendered forum body contains: ${bodyMarker}`);
+
+    const selection = window.getSelection();
+    if (!selection) throw new Error("Selection API unavailable.");
+    selection.removeAllRanges();
+    const range = document.createRange();
+    range.selectNodeContents(body);
+    selection.addRange(range);
+
+    const clipboardData = new DataTransfer();
+    const event = new ClipboardEvent("copy", {
+      bubbles: true,
+      cancelable: true,
+      clipboardData,
+    });
+    body.dispatchEvent(event);
+    return {
+      defaultPrevented: event.defaultPrevented,
+      html: clipboardData.getData("text/html"),
+      text: clipboardData.getData("text/plain"),
+    };
+  }, marker);
 }
 
 /** Copy or cut the composer's current selection through the real DOM event. */
@@ -353,6 +392,86 @@ test("an identity the pasted content never shows binds no name", async ({
   expect(await readSentMentionPubkeys(page, MESSAGE_BODY)).not.toContain(
     IMPOSTOR_PUBKEY,
   );
+});
+
+test("forum post and reply selection copies carry the mention", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await expect(page.getByTestId("channel-watercooler")).toBeVisible();
+
+  // Seeded straight into the mock store before the forum mounts: forum posts
+  // are fetched via `get_forum_posts`, not received over a live subscription.
+  const { postId, replyId } = await page.evaluate(
+    ({ postBody, replyBody, mentionPubkey, pubkey }) => {
+      const emit = window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__;
+      if (!emit) throw new Error("Mock message emitter is not installed");
+      const post = emit({
+        channelName: "watercooler",
+        content: postBody,
+        kind: 45001,
+        mentionPubkeys: [mentionPubkey],
+        pubkey,
+      });
+      const reply = emit({
+        channelName: "watercooler",
+        content: replyBody,
+        kind: 45003,
+        mentionPubkeys: [mentionPubkey],
+        parentEventId: post.id,
+        pubkey,
+      });
+      return { postId: post.id, replyId: reply.id };
+    },
+    {
+      postBody: MESSAGE_BODY,
+      replyBody: FORUM_REPLY_BODY,
+      mentionPubkey: JOHN_SMITH_PUBKEY,
+      pubkey: TEST_IDENTITIES.alice.pubkey,
+    },
+  );
+
+  await page.getByTestId("channel-watercooler").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("watercooler");
+
+  // The chip resolves a non-member's name off a profile round trip — wait for
+  // the identity, not the card.
+  const cardChip = page.locator(
+    `.message-markdown [data-mention-pubkey="${JOHN_SMITH_PUBKEY}"]`,
+  );
+  await expect(cardChip).toHaveText("John Smith", { timeout: 15_000 });
+
+  const cardFlavors = await copyFromForumMarkdown(page, "fixed the bug");
+  expectCarriesJohnSmith(cardFlavors);
+  expect(cardFlavors.text.trim()).toBe(MESSAGE_BODY);
+
+  // Open the thread; both the root post and the reply render in the panel.
+  await page
+    .locator('[role="button"]')
+    .filter({ hasText: "fixed the bug" })
+    .click({ position: { x: 8, y: 8 } });
+  const replyChip = page.locator(
+    `[data-forum-event-id="${replyId}"] [data-mention-pubkey="${JOHN_SMITH_PUBKEY}"]`,
+  );
+  await expect(replyChip).toHaveText("John Smith", { timeout: 15_000 });
+  await expect(page.locator(`[data-forum-event-id="${postId}"]`)).toBeVisible();
+
+  const replyFlavors = await copyFromForumMarkdown(page, "should confirm");
+  expectCarriesJohnSmith(replyFlavors);
+  expect(replyFlavors.text.trim()).toBe(FORUM_REPLY_BODY);
+
+  // Close the loop on the forum's own composer: the pasted reply re-lights
+  // the chip and the send recovers the identity in its `p` tag.
+  await pasteIntoComposer(page, replyFlavors);
+  const input = page.getByTestId("message-input");
+  await expect(input).toHaveText(FORUM_REPLY_BODY);
+  await expect(input.locator(".mention-chip")).toHaveText("John Smith");
+
+  await page.getByTestId("send-message").click();
+  await expect(input).toHaveText("");
+  await expect
+    .poll(() => readSentMentionPubkeys(page, FORUM_REPLY_BODY))
+    .toContain(JOHN_SMITH_PUBKEY);
 });
 
 test("a half-selected chip copies as plain text with no identity attached", async ({
