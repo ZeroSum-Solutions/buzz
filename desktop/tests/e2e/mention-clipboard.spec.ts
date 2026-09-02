@@ -19,6 +19,8 @@ const JOHN_SMITH_PUBKEY =
   "7c1f2ad0b4e93856a1d0c2f4e6b8093a5d7f1c3e5a79b1d3f5072a4c6e80931b";
 const MESSAGE_BODY = "@John Smith fixed the bug";
 const FORUM_REPLY_BODY = "Agreed, @John Smith should confirm";
+/** The mock `general` channel — a feed item needs its UUID, not its name. */
+const GENERAL_CHANNEL_ID = "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50";
 /** A pubkey must never reach the flavor an external app pastes. */
 const ANY_64_HEX = /[0-9a-f]{64}/i;
 /** Nobody's key — what a crafted clipboard sidecar would name instead. */
@@ -144,6 +146,60 @@ async function copyFromTimeline(
 }
 
 /**
+ * Seed the home inbox with a mention message and open it.
+ *
+ * The message mentions the viewer, which is what routes it to the inbox, and
+ * John Smith, whose identity every assertion here is about. The feed item is
+ * pushed separately: a live channel message alone does not enter the feed the
+ * home surface reads.
+ */
+async function openInboxMentionItem(page: Page) {
+  const item = await page.evaluate(
+    ({ channelId, content, mentionPubkey, pubkey, viewerPubkey }) => {
+      const emit = window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__;
+      const push = window.__BUZZ_E2E_PUSH_MOCK_FEED_ITEM__;
+      if (!emit || !push)
+        throw new Error("Mock feed helpers are not installed");
+      const event = emit({
+        channelName: "general",
+        content,
+        mentionPubkeys: [viewerPubkey, mentionPubkey],
+        pubkey,
+      });
+      push({
+        category: "mention",
+        channel_id: channelId,
+        channel_name: "general",
+        content: event.content,
+        created_at: event.created_at,
+        id: event.id,
+        kind: event.kind,
+        pubkey: event.pubkey,
+        tags: event.tags,
+      });
+      return event;
+    },
+    {
+      channelId: GENERAL_CHANNEL_ID,
+      content: MESSAGE_BODY,
+      mentionPubkey: JOHN_SMITH_PUBKEY,
+      pubkey: TEST_IDENTITIES.alice.pubkey,
+      viewerPubkey: TEST_IDENTITIES.tyler.pubkey,
+    },
+  );
+
+  await page.getByTestId(`home-inbox-item-${item.id}`).click();
+  // The inbox resolves a non-member's display name off its own profile batch,
+  // so wait for the chip's identity rather than for the row — same setup
+  // allowance the channel-timeline seed makes.
+  const chip = page
+    .getByTestId("home-inbox-detail-scroll")
+    .locator(`[data-mention-pubkey="${JOHN_SMITH_PUBKEY}"]`);
+  await expect(chip).toHaveText("John Smith", { timeout: 15_000 });
+  return item;
+}
+
+/**
  * Copy a whole rendered forum body — post card or thread reply — through the
  * real `copy` event. The event bubbles to the surface container, which is
  * where the forum wires `handleTimelineMentionCopy`.
@@ -179,6 +235,54 @@ async function copyFromForumMarkdown(
       text: clipboardData.getData("text/plain"),
     };
   }, marker);
+}
+
+/**
+ * Copy the rendered body holding the mention chip inside `containerTestId`.
+ *
+ * The event is dispatched on the body and bubbles to that container, which is
+ * where a surface wires `handleTimelineMentionCopy` — so a missing wiring shows
+ * up as a declined copy rather than as a lookup failure.
+ */
+async function copyMentionBodyWithin(
+  page: Page,
+  containerTestId: string,
+): Promise<ClipboardFlavors> {
+  return page.evaluate(
+    ({ pubkey, testId }) => {
+      const container = document.querySelector<HTMLElement>(
+        `[data-testid="${testId}"]`,
+      );
+      if (!container) throw new Error(`No container: ${testId}`);
+      const chip = container.querySelector<HTMLElement>(
+        `[data-mention-pubkey="${pubkey}"]`,
+      );
+      if (!chip) throw new Error(`${testId} rendered no mention chip.`);
+      const body = chip.closest<HTMLElement>(".message-markdown");
+      if (!body) throw new Error("Mention chip is outside a rendered body.");
+
+      const selection = window.getSelection();
+      if (!selection) throw new Error("Selection API unavailable.");
+      selection.removeAllRanges();
+      const range = document.createRange();
+      range.selectNodeContents(body);
+      selection.addRange(range);
+
+      const clipboardData = new DataTransfer();
+      const event = new ClipboardEvent("copy", {
+        bubbles: true,
+        cancelable: true,
+        clipboardData,
+      });
+      body.dispatchEvent(event);
+      return {
+        defaultPrevented: event.defaultPrevented,
+        html: clipboardData.getData("text/html"),
+        text: clipboardData.getData("text/plain"),
+      };
+    },
+    { pubkey: JOHN_SMITH_PUBKEY, testId: containerTestId },
+  );
 }
 
 /** Copy or cut the composer's current selection through the real DOM event. */
@@ -517,6 +621,68 @@ test("forum post and reply selection copies carry the mention", async ({
   await expect(input).toHaveText("");
   await expect
     .poll(() => readSentMentionPubkeys(page, FORUM_REPLY_BODY))
+    .toContain(JOHN_SMITH_PUBKEY);
+});
+
+test("home inbox copy message carries the mention out of the detail pane", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await expect(page.getByTestId("home-inbox-list")).toBeVisible();
+  const item = await openInboxMentionItem(page);
+
+  const row = page.getByTestId("home-inbox-selected-message");
+  await row.hover();
+  await row.getByTestId(`more-actions-${item.id}`).click({ force: true });
+  await page.getByRole("menuitem", { name: "Copy message" }).click();
+
+  const written = await page.evaluate(
+    () => window.__BUZZ_E2E_LAST_CLIPBOARD__ ?? null,
+  );
+  expect(written?.text).toBe(MESSAGE_BODY);
+  expect(written?.text).not.toMatch(ANY_64_HEX);
+  // Without the row's `profiles`, the identities resolve empty and the copy
+  // writes no HTML flavor at all.
+  expect(written?.html).toContain(`data-mention-pubkey="${JOHN_SMITH_PUBKEY}"`);
+  expect(written?.html).toContain('data-buzz-copy="markdown"');
+
+  await page.getByTestId("channel-bob-tyler").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("bob-tyler");
+  await pasteIntoComposer(page, {
+    html: written?.html ?? "",
+    text: written?.text ?? "",
+  });
+  await expectComposerChip(page);
+
+  await page.getByTestId("send-message").click();
+  await expect(page.getByTestId("message-input")).toHaveText("");
+  await expect
+    .poll(() => readSentMentionPubkeys(page, MESSAGE_BODY))
+    .toContain(JOHN_SMITH_PUBKEY);
+});
+
+test("home inbox selection copy carries the mention out of the detail pane", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await expect(page.getByTestId("home-inbox-list")).toBeVisible();
+  await openInboxMentionItem(page);
+
+  // Unwired, this copy falls through to the browser's default: sigil-less
+  // text, no identity, nothing for a paste to bind.
+  const flavors = await copyMentionBodyWithin(page, "home-inbox-detail-scroll");
+  expectCarriesJohnSmith(flavors);
+  expect(flavors.text.trim()).toBe(MESSAGE_BODY);
+
+  await page.getByTestId("channel-bob-tyler").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("bob-tyler");
+  await pasteIntoComposer(page, flavors);
+  await expectComposerChip(page);
+
+  await page.getByTestId("send-message").click();
+  await expect(page.getByTestId("message-input")).toHaveText("");
+  await expect
+    .poll(() => readSentMentionPubkeys(page, MESSAGE_BODY))
     .toContain(JOHN_SMITH_PUBKEY);
 });
 
