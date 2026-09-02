@@ -24,6 +24,13 @@ const ANY_64_HEX = /[0-9a-f]{64}/i;
 /** Nobody's key — what a crafted clipboard sidecar would name instead. */
 const IMPOSTOR_PUBKEY =
   "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f";
+/**
+ * What a pasteboard round trip can swap a copied chip's spaces for.
+ *
+ * Built rather than written as an escape: a U+00A0 that decays into an
+ * invisible literal is unreadable in a diff and silently changes the fixture.
+ */
+const NBSP = String.fromCharCode(0xa0);
 
 type ClipboardFlavors = {
   defaultPrevented: boolean;
@@ -528,6 +535,35 @@ test("a half-selected chip copies as plain text with no identity attached", asyn
   expect(flavors.defaultPrevented).toBe(false);
   expect(flavors.html).toBe("");
   expect(flavors.text).toBe("");
+});
+
+test("a chip whose spaces became NBSP in transit still pastes as a mention", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-bob-tyler").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("bob-tyler");
+
+  // A Buzz timeline copy as the pasteboard can hand it back: the chip's spaces
+  // swapped for U+00A0. The paste normalizer tolerates that when judging the
+  // chip whole, so it must insert the label the chip declares — the mention
+  // decorations, the visibility gate, and the send-time extractor all want the
+  // label's literal characters, and none of them would find "@John<NBSP>Smith".
+  await pasteIntoComposer(page, {
+    html:
+      '<span data-buzz-copy="rich">' +
+      `<span data-mention="" data-mention-pubkey="${JOHN_SMITH_PUBKEY}" ` +
+      `data-mention-label="John Smith">@John${NBSP}Smith</span>` +
+      " fixed the bug</span>",
+    text: `@John${NBSP}Smith fixed the bug`,
+  });
+  await expectComposerChip(page);
+
+  await page.getByTestId("send-message").click();
+  await expect(page.getByTestId("message-input")).toHaveText("");
+  await expect
+    .poll(() => readSentMentionPubkeys(page, MESSAGE_BODY))
+    .toContain(JOHN_SMITH_PUBKEY);
 });
 
 test("a boundary-crossing default copy pastes its chip fragment without a sigil", async ({

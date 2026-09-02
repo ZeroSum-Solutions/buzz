@@ -161,19 +161,23 @@ export function normalizeMentionClipboardContent(
     // no sigiled label in the inserted content the visibility gate discards
     // the identity record too.
     //
-    // A fully selected chip whose label passed the inline-chip cap carries the
-    // ellipsized rendering rather than the label, so write the label back:
-    // the visibility gate matches records against this inserted text, and the
-    // "…" form would drop the identity of a chip the user copied whole.
+    // Every non-fragment match writes the *declared* label back, trimmed, the
+    // way `restoreChipSigils` does on the copy side. `matchChipTextToLabel`
+    // deliberately tolerates what a whole chip picks up in transit — a
+    // pasteboard's U+00A0 for a space, padding, the author's casing, the
+    // ellipsis the inline-chip cap renders — but every downstream matcher
+    // (`getMentionOffsets`, and so the visibility gate, the decorations, and
+    // the send-time extractor) requires the label's literal characters. Writing
+    // the text verbatim would let a tolerance leak into the composer as sigiled
+    // dead text whose identity record is then silently dropped; deriving it
+    // from the same attribute the records carry keeps the two provably
+    // consistent, whatever the classifier goes on to tolerate.
     const match =
       label === null ? "full" : matchChipTextToLabel(text, label, sigil);
     span.textContent =
       match === "fragment"
         ? text
-        : restoreChipSigil(
-            match === "truncated" && label !== null ? label : text,
-            sigil,
-          );
+        : restoreChipSigil(label === null ? text : label.trim(), sigil);
     el.replaceWith(span);
   }
 

@@ -175,6 +175,80 @@ test("a chip rendered past the length cap keeps the label it declares", () => {
   assert.equal(fragment.text.includes("#"), false);
 });
 
+/**
+ * What a pasteboard round trip can swap a chip's spaces for.
+ *
+ * Built rather than written as an escape: a U+00A0 that decays into an
+ * invisible literal is unreadable in a diff and silently changes what these
+ * fixtures assert.
+ */
+const NBSP = String.fromCharCode(0x00a0);
+
+test("a chip whose spaces became NBSP in transit still delivers its identity", () => {
+  // `matchChipTextToLabel` tolerates this mutation when classifying the chip as
+  // whole — so the text written back must not carry it. Every downstream
+  // matcher goes through `getMentionOffsets`, which wants the label's literal
+  // characters: an inserted "@John<NBSP>Smith" is sigiled dead text whose
+  // identity record the visibility gate then silently drops.
+  const html =
+    "<p>hey " +
+    `<span data-mention="" data-mention-pubkey="${JOHN_SMITH_PUBKEY}" ` +
+    `data-mention-label="John Smith">@John${NBSP}Smith</span> here</p>`;
+  const content = normalizeMentionClipboardContent(html);
+
+  assert.equal(content.text.includes("@John Smith"), true);
+  assert.equal(content.text.includes(NBSP), false);
+  assert.deepEqual(
+    visibleIdentities(html, content.text).map((record) => record.pubkey),
+    [JOHN_SMITH_PUBKEY],
+  );
+});
+
+test("a chip padded around its label pastes the label, not the padding", () => {
+  // The classifier's other transit tolerance, through the same door: written
+  // verbatim this inserts "@ John Smith ", which matches nothing.
+  const html =
+    "<p>hey " +
+    `<span data-mention="" data-mention-pubkey="${JOHN_SMITH_PUBKEY}" ` +
+    'data-mention-label="John Smith"> John Smith </span> here</p>';
+  const content = normalizeMentionClipboardContent(html);
+
+  assert.equal(content.text.includes("@John Smith"), true);
+  assert.equal(content.text.includes("@ John"), false);
+  assert.deepEqual(
+    visibleIdentities(html, content.text).map((record) => record.pubkey),
+    [JOHN_SMITH_PUBKEY],
+  );
+});
+
+test("a padded label attribute is trimmed to what the record carries", () => {
+  // Pins the trim in the write-back rather than the write-back itself: the
+  // record parser trims `data-mention-label`, so an untrimmed write-back would
+  // insert "@ John Smith" against a record reading "John Smith" — the same
+  // silent drop as above. Drop the `.trim()` and this fails.
+  const html =
+    "<p>hey " +
+    `<span data-mention="" data-mention-pubkey="${JOHN_SMITH_PUBKEY}" ` +
+    'data-mention-label=" John Smith ">John Smith</span> here</p>';
+  const content = normalizeMentionClipboardContent(html);
+
+  assert.equal(content.text.includes("@John Smith"), true);
+  assert.deepEqual(
+    visibleIdentities(html, content.text).map((record) => record.pubkey),
+    [JOHN_SMITH_PUBKEY],
+  );
+});
+
+test("a chip declaring no label keeps its text verbatim", () => {
+  // Legacy markup from before the label attributes: there is no declared label
+  // to write back and no record to deliver, so the text stands as copied.
+  const content = normalizeMentionClipboardContent(
+    `<p>hey <span data-mention="">John${NBSP}Smith</span> here</p>`,
+  );
+
+  assert.equal(content.text.includes(`@John${NBSP}Smith`), true);
+});
+
 test("an ordinary chip still flattens to a registrable mention", () => {
   const html =
     "<p>hey " +
