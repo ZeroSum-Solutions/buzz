@@ -6,7 +6,7 @@ import {
   restoreChipSigil,
 } from "./normalizeMentionClipboard.ts";
 
-// NOTE: normalizeMentionClipboardHtml uses the browser DOMParser API which
+// NOTE: normalizeMentionClipboardContent uses the browser DOMParser API which
 // is not available in Node.  Those paths are covered by the e2e paste tests.
 // This file tests the pure string-matching detection function.
 

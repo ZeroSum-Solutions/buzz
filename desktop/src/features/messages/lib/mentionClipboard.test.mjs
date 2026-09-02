@@ -6,6 +6,7 @@ import {
   getBuzzCopyKind,
   parseMentionClipboardRecords,
   registerMentionClipboardIdentities,
+  selectVisibleMentionIdentities,
 } from "./mentionClipboard.ts";
 
 const JOHN = "a".repeat(64);
@@ -247,21 +248,77 @@ test("finds nothing in foreign clipboard html", () => {
   );
 });
 
+// ── selectVisibleMentionIdentities ────────────────────────────────────
+
+const fizz = { label: "Fizz", pubkey: FIZZ, isAgent: true };
+
+test("keeps identities the inserted content mentions", () => {
+  assert.deepEqual(
+    selectVisibleMentionIdentities([john, fizz], "@John Smith fixed the bug"),
+    [john],
+  );
+});
+
+test("drops an identity the inserted content never mentions", () => {
+  // The hostile shape: a hidden record on copied HTML would otherwise rebind
+  // a real member's display name for the rest of the composer session.
+  assert.deepEqual(selectVisibleMentionIdentities([john], "look at this"), []);
+  // The bare name is not a mention — only the sigil form binds.
+  assert.deepEqual(
+    selectVisibleMentionIdentities([john], "John Smith fixed the bug"),
+    [],
+  );
+});
+
+test("holds a partial label to the same standard as the extractor", () => {
+  assert.deepEqual(
+    selectVisibleMentionIdentities([john], "@John fixed it"),
+    [],
+  );
+});
+
+test("ignores a mention the extractor would mask as code", () => {
+  assert.deepEqual(selectVisibleMentionIdentities([john], "`@John Smith`"), []);
+  assert.deepEqual(
+    selectVisibleMentionIdentities([john], "```\n@John Smith\n```"),
+    [],
+  );
+});
+
 // ── registerMentionClipboardIdentities ────────────────────────────────
 
 test("registers each recovered pair with its agent flag", () => {
   const registered = [];
-  registerMentionClipboardIdentities(
-    buildMentionClipboardHtml({
+  registerMentionClipboardIdentities({
+    html: buildMentionClipboardHtml({
       text: "@John Smith and @Fizz",
-      identities: [john, { label: "Fizz", pubkey: FIZZ, isAgent: true }],
+      identities: [john, fizz],
     }),
-    (displayName, pubkey, options) =>
+    registerMentionPubkey: (displayName, pubkey, options) =>
       registered.push([displayName, pubkey, options?.isAgent]),
-  );
+    text: "@John Smith and @Fizz",
+  });
 
   assert.deepEqual(registered, [
     ["John Smith", JOHN, false],
     ["Fizz", FIZZ, true],
   ]);
+});
+
+test("registers nothing for a record the paste does not show", () => {
+  const registered = [];
+  // A crafted sidecar: an empty span rebinding a name the content never
+  // carries, riding alongside one the user can actually see.
+  registerMentionClipboardIdentities({
+    html:
+      `<span data-mention="" data-mention-pubkey="${ALEX}" ` +
+      `data-mention-label="John Smith"></span>` +
+      `<span data-mention="" data-mention-pubkey="${FIZZ}" ` +
+      `data-mention-kind="agent" data-mention-label="Fizz">@Fizz</span>`,
+    registerMentionPubkey: (displayName, pubkey) =>
+      registered.push([displayName, pubkey]),
+    text: "@Fizz take a look",
+  });
+
+  assert.deepEqual(registered, [["Fizz", FIZZ]]);
 });

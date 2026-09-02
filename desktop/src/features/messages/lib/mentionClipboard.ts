@@ -258,21 +258,55 @@ export function parseMentionClipboardRecords(html: string): MentionIdentity[] {
 }
 
 /**
- * Teach a composer every identity a Buzz copy carried.
+ * Keep only the records the paste actually shows.
+ *
+ * A record binds a display name for the rest of the composer session, well
+ * past the paste that carried it — so an empty or hidden
+ * `<span data-mention-pubkey … data-mention-label="Jane Doe">` on any copied
+ * page would silently rebind a real member's name, and a later hand-typed
+ * `@Jane Doe` would chip-light convincingly against the attacker's pubkey.
+ * Requiring the label to be mentioned in the inserted content keeps every
+ * binding visible to the user who accepted it.
+ *
+ * `getMentionOffsets` is the same matcher the send-time extractor uses, so a
+ * dropped record is one that could not have tagged anyone from this content
+ * anyway — code spans and fences excluded on the same terms.
+ */
+export function selectVisibleMentionIdentities(
+  records: readonly MentionIdentity[],
+  text: string,
+): MentionIdentity[] {
+  return records.filter(
+    (record) => getMentionOffsets(text, record.label).length > 0,
+  );
+}
+
+/**
+ * Teach a composer every identity a Buzz copy carried *and* showed.
  *
  * Registration is what makes a pasted multi-word name known to the mention
  * decorations *and* to the send-time extractor, so the chip re-lights and the
  * original pubkey survives the round trip.
  */
-export function registerMentionClipboardIdentities(
-  html: string,
+export function registerMentionClipboardIdentities({
+  html,
+  registerMentionPubkey,
+  text,
+}: {
+  /** Clipboard HTML holding the identity records — untrusted. */
+  html: string;
   registerMentionPubkey: (
     displayName: string,
     pubkey: string,
     options?: { isAgent?: boolean },
-  ) => void,
-): MentionIdentity[] {
-  const records = parseMentionClipboardRecords(html);
+  ) => void;
+  /** The text the paste inserts; a record unmentioned there is discarded. */
+  text: string;
+}): MentionIdentity[] {
+  const records = selectVisibleMentionIdentities(
+    parseMentionClipboardRecords(html),
+    text,
+  );
   for (const record of records) {
     registerMentionPubkey(record.label, record.pubkey, {
       isAgent: record.isAgent,

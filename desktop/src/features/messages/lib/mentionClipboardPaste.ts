@@ -4,7 +4,7 @@ import {
   getBuzzCopyKind,
   registerMentionClipboardIdentities,
 } from "./mentionClipboard";
-import { normalizeMentionClipboardHtml } from "./normalizeMentionClipboard";
+import { normalizeMentionClipboardContent } from "./normalizeMentionClipboard";
 
 export type RegisterMentionPubkey = (
   displayName: string,
@@ -28,16 +28,19 @@ function pastePlainText(view: EditorView, text: string): void {
 /**
  * Paste clipboard HTML that carries Buzz mention markers.
  *
- * Identity and content are handled separately. Every recognised record is
- * registered first — that alone makes a pasted multi-word name known to the
- * composer, so its chip re-lights and the send path recovers the original
- * pubkey. Content then follows the flavor the copy declared:
+ * Content follows the flavor the copy declared:
  *
  * - `markdown` — the copy's plain flavor *is* the Markdown source, so insert
  *   it through the text pipeline and TipTap parses `**bold**` exactly as it
  *   does for any other plain paste.
  * - `rich` (or legacy Buzz HTML with no marker) — keep the HTML path, with
  *   chip wrappers flattened to sigil-bearing text.
+ *
+ * Identity rides along: registering the records is what makes a pasted
+ * multi-word name known to the composer, so its chip re-lights and the send
+ * path recovers the original pubkey. Each branch registers against the content
+ * *it* inserts — the plain flavor is not evidence for what the HTML branch
+ * shows, and vice versa — so a record the user never sees binds nothing.
  */
 export function handleMentionClipboardPaste({
   clipboardData,
@@ -53,18 +56,26 @@ export function handleMentionClipboardPaste({
   const html = clipboardData.getData("text/html");
   if (!html) return false;
 
-  if (registerMentionPubkey) {
-    registerMentionClipboardIdentities(html, registerMentionPubkey);
-  }
+  const registerVisibleIdentities = (insertedText: string) => {
+    if (!registerMentionPubkey) return;
+    registerMentionClipboardIdentities({
+      html,
+      registerMentionPubkey,
+      text: insertedText,
+    });
+  };
 
   const text = clipboardData.getData("text/plain");
   if (getBuzzCopyKind(html) === "markdown" && text) {
+    registerVisibleIdentities(text);
     preventDefault();
     pastePlainText(view, text);
     return true;
   }
 
+  const content = normalizeMentionClipboardContent(html);
+  registerVisibleIdentities(content.text);
   preventDefault();
-  view.pasteHTML(normalizeMentionClipboardHtml(html));
+  view.pasteHTML(content.html);
   return true;
 }

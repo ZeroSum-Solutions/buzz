@@ -18,16 +18,88 @@ export function restoreChipSigil(text: string, sigil: "@" | "#"): string {
 }
 
 /**
+ * Tags whose boundaries a reader sees as a line break.
+ *
+ * `innerText` derives this from layout, but a `DOMParser` document is never
+ * rendered, so it falls back to `textContent` and runs "…the bug" straight into
+ * "@John Smith". The visibility check that reads this text requires a boundary
+ * before the sigil, so without the breaks a mention opening a paragraph would
+ * look invisible and lose the identity it was copied with.
+ */
+const BLOCK_LEVEL_TAGS = new Set([
+  "ADDRESS",
+  "ARTICLE",
+  "ASIDE",
+  "BLOCKQUOTE",
+  "BR",
+  "DD",
+  "DIV",
+  "DL",
+  "DT",
+  "FIGCAPTION",
+  "FIGURE",
+  "FOOTER",
+  "H1",
+  "H2",
+  "H3",
+  "H4",
+  "H5",
+  "H6",
+  "HEADER",
+  "HR",
+  "LI",
+  "MAIN",
+  "NAV",
+  "OL",
+  "P",
+  "PRE",
+  "SECTION",
+  "TABLE",
+  "TD",
+  "TH",
+  "TR",
+  "UL",
+]);
+
+/** The text `node`'s subtree contributes, with block boundaries as newlines. */
+function readRenderedText(node: Node): string {
+  let text = "";
+  for (const child of Array.from(node.childNodes)) {
+    if (child.nodeType === Node.TEXT_NODE) {
+      text += child.nodeValue ?? "";
+      continue;
+    }
+    if (!(child instanceof Element)) continue;
+    const inner = readRenderedText(child);
+    text += BLOCK_LEVEL_TAGS.has(child.tagName) ? `\n${inner}\n` : inner;
+  }
+  return text;
+}
+
+/** Clipboard HTML ready to insert, paired with the text it will contribute. */
+export type MentionClipboardContent = {
+  html: string;
+  /**
+   * What the reader will see. Both come from the same parse, so a caller
+   * deciding what the paste made visible cannot be reading different markup
+   * from the one being inserted.
+   */
+  text: string;
+};
+
+/**
  * Normalize clipboard HTML that contains Buzz mention / channel-link
  * elements.  Replaces the styled `<span data-mention>` and
  * `<button data-channel-link>` wrappers with unstyled text nodes so
  * TipTap's Bold extension doesn't misinterpret their font-weight as bold.
  *
- * Returns cleaned HTML string that preserves surrounding formatting
- * (bold, italic, line breaks, etc.) while stripping only the mention/
- * channel-link styling.
+ * Returns cleaned HTML that preserves surrounding formatting (bold, italic,
+ * line breaks, etc.) while stripping only the mention/channel-link styling,
+ * alongside that HTML's rendered text.
  */
-export function normalizeMentionClipboardHtml(html: string): string {
+export function normalizeMentionClipboardContent(
+  html: string,
+): MentionClipboardContent {
   const doc = new DOMParser().parseFromString(html, "text/html");
 
   for (const el of Array.from(
@@ -64,5 +136,5 @@ export function normalizeMentionClipboardHtml(html: string): string {
     }
   }
 
-  return doc.body.innerHTML;
+  return { html: doc.body.innerHTML, text: readRenderedText(doc.body) };
 }

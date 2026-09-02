@@ -20,6 +20,9 @@ const JOHN_SMITH_PUBKEY =
 const MESSAGE_BODY = "@John Smith fixed the bug";
 /** A pubkey must never reach the flavor an external app pastes. */
 const ANY_64_HEX = /[0-9a-f]{64}/i;
+/** Nobody's key — what a crafted clipboard sidecar would name instead. */
+const IMPOSTOR_PUBKEY =
+  "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f";
 
 type ClipboardFlavors = {
   defaultPrevented: boolean;
@@ -312,6 +315,44 @@ test("composer copy and cut round-trip the mention they were pasted with", async
   // The cut flavors are a complete round trip on their own.
   await pasteIntoComposer(page, cut);
   await expectComposerChip(page);
+});
+
+test("an identity the pasted content never shows binds no name", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-bob-tyler").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("bob-tyler");
+
+  // Any copied page can carry this: an empty span claiming a real display
+  // name against a key of its choosing. A registration outlives its paste, so
+  // accepting one the user cannot see would rebind the name for the session.
+  await pasteIntoComposer(page, {
+    html:
+      '<span data-buzz-copy="markdown">' +
+      `<span data-mention="" data-mention-pubkey="${IMPOSTOR_PUBKEY}" ` +
+      'data-mention-label="John Smith"></span>look at this</span>',
+    text: "look at this",
+  });
+  const input = page.getByTestId("message-input");
+  await expect(input).toHaveText("look at this");
+
+  // The name that sidecar tried to claim, written afterwards by hand.
+  await input.press("ControlOrMeta+a");
+  await input.press("Backspace");
+  await expect(input).toHaveText("");
+  await pasteIntoComposer(page, { html: "", text: MESSAGE_BODY });
+  await expect(input).toHaveText(MESSAGE_BODY);
+  await expect(input.locator(".mention-chip")).toHaveCount(0);
+
+  await page.getByTestId("send-message").click();
+  await expect(input).toHaveText("");
+  await expect
+    .poll(() => readSentMentionPubkeys(page, MESSAGE_BODY))
+    .not.toBeNull();
+  expect(await readSentMentionPubkeys(page, MESSAGE_BODY)).not.toContain(
+    IMPOSTOR_PUBKEY,
+  );
 });
 
 test("a half-selected chip copies as plain text with no identity attached", async ({
