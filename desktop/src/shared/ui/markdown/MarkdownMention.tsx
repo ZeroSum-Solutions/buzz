@@ -2,6 +2,7 @@ import type * as React from "react";
 import { AgentManagementMarker } from "@/features/agents/ui/OtherSetupAgentMarker";
 import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
 import { cn } from "@/shared/lib/cn";
+import { WRAPPING_INLINE_CHIP_CLASSES } from "@/shared/ui/mentionChip";
 import { InlineChip } from "@/shared/ui/InlineChip";
 import { useMarkdownRuntime } from "./runtimeContext";
 
@@ -30,7 +31,12 @@ export function createMarkdownMention(interactive: boolean) {
     const mentionNode = (
       <InlineChip
         data-mention=""
-        className={cn(isAgentMention && "agent-mention-highlight")}
+        className={cn(
+          WRAPPING_INLINE_CHIP_CLASSES,
+          isAgentMention && "agent-mention-highlight",
+        )}
+        title={mentionLabel}
+        aria-label={mentionLabel}
         icon={isAgentMention ? "agent" : "human"}
         interactive={opensProfile}
       >
