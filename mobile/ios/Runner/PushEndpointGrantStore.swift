@@ -11,6 +11,7 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
   private static let recordsAccount = "v2"
   private static let pendingAccount = "pending-v2"
   private static let cleanupAccount = "gateway-cleanup-v1"
+  private static let canonicalLegacyGatewayOrigin = "https://push.buzz.xyz"
 
   private let accessGroup: String?
 
@@ -19,8 +20,7 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
   }
 
   func reset(forGatewayOrigin gatewayOrigin: String) throws {
-    try delete(account: Self.legacyRecordsAccount)
-    try delete(account: Self.legacyPendingAccount)
+    try migrateLegacyState()
 
     let allRecords = try records()
     let allPending = try pendingEnrollments()
@@ -34,6 +34,51 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
       replaceRecords: { try self.replace($0, account: Self.recordsAccount) },
       replacePendingEnrollments: { try self.replace($0, account: Self.pendingAccount) }
     )
+  }
+
+  private func migrateLegacyState() throws {
+    let legacyGrantData = try data(account: Self.legacyRecordsAccount)
+    let legacyPendingData = try data(account: Self.legacyPendingAccount)
+    if let legacyGrantData {
+      let keyId = try appAttestKeyId()
+      let legacyGrants = try BuzzPushLegacyStateMigration.grants(
+        from: legacyGrantData,
+        gatewayOrigin: Self.canonicalLegacyGatewayOrigin,
+        appAttestKeyId: keyId ?? ""
+      )
+      guard legacyGrants.isEmpty || keyId != nil else {
+        throw NSError(
+          domain: "BuzzPushEndpointGrantStore",
+          code: 3,
+          userInfo: [NSLocalizedDescriptionKey: "Legacy grants require their App Attest key"]
+        )
+      }
+      var migrated = try records()
+      for record in legacyGrants {
+        migrated.removeAll {
+          $0.gatewayOrigin == record.gatewayOrigin && $0.relayOrigin == record.relayOrigin
+            && $0.appProfile == record.appProfile
+        }
+        migrated.append(record)
+      }
+      try replace(migrated, account: Self.recordsAccount)
+    }
+    if let legacyPendingData {
+      var migrated = try pendingEnrollments()
+      for pending in try BuzzPushLegacyStateMigration.pendingEnrollments(
+        from: legacyPendingData,
+        gatewayOrigin: Self.canonicalLegacyGatewayOrigin
+      ) {
+        migrated.removeAll {
+          $0.gatewayOrigin == pending.gatewayOrigin && $0.relayOrigin == pending.relayOrigin
+            && $0.appProfile == pending.appProfile
+        }
+        migrated.append(pending)
+      }
+      try replace(migrated, account: Self.pendingAccount)
+    }
+    try delete(account: Self.legacyRecordsAccount)
+    try delete(account: Self.legacyPendingAccount)
   }
 
   func records() throws -> [BuzzPushEndpointGrantRecord] {
@@ -169,6 +214,41 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
         userInfo: [NSLocalizedDescriptionKey: "Stored pending enrollments are invalid: \(error)"]
       )
     }
+  }
+
+  private func data(account: String) throws -> Data? {
+    var query = baseQuery(account: account)
+    query[kSecReturnData as String] = true
+    query[kSecMatchLimit as String] = kSecMatchLimitOne
+    var result: CFTypeRef?
+    let status = SecItemCopyMatching(query as CFDictionary, &result)
+    if status == errSecItemNotFound { return nil }
+    guard status == errSecSuccess, let data = result as? Data else {
+      throw keychainError(status, operation: "read legacy state")
+    }
+    return data
+  }
+
+  private func appAttestKeyId() throws -> String? {
+    var query: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: "buzz.push.app-attest",
+      kSecAttrAccount as String: "key-id-v1",
+      kSecReturnData as String: true,
+      kSecMatchLimit as String: kSecMatchLimitOne,
+    ]
+    if let accessGroup, !accessGroup.isEmpty {
+      query[kSecAttrAccessGroup as String] = accessGroup
+    }
+    var result: CFTypeRef?
+    let status = SecItemCopyMatching(query as CFDictionary, &result)
+    if status == errSecItemNotFound { return nil }
+    guard status == errSecSuccess, let data = result as? Data,
+      let keyId = String(data: data, encoding: .utf8), !keyId.isEmpty
+    else {
+      throw keychainError(status, operation: "read legacy App Attest key")
+    }
+    return keyId
   }
 
   private func replace<T: Encodable>(_ values: [T], account: String) throws {

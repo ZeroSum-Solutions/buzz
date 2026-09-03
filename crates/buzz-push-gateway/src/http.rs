@@ -283,15 +283,19 @@ async fn verify_installation_assertion<T: serde::Serialize>(
     assertion: &str,
     domain: &str,
     signed: &T,
+    include_revoked: bool,
 ) -> Result<(), Response> {
     let now = (s.now)();
     let challenge = decode_challenge(challenge_text)
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "invalid_request"))?;
-    let installation = s
-        .authority
-        .installation(installation_id, now)
-        .await
-        .map_err(authority_error)?;
+    let installation = if include_revoked {
+        s.authority
+            .installation_for_revocation(installation_id, now)
+            .await
+    } else {
+        s.authority.installation(installation_id, now).await
+    }
+    .map_err(authority_error)?;
     if installation.profile != AppProfile::BuzzIosDogfood {
         return Err(error(StatusCode::NOT_FOUND, "not_authorized"));
     }
@@ -372,6 +376,7 @@ async fn delegate(State(s): State<AppState>, body: Bytes) -> Response {
         &r.assertion,
         "buzz.push.delegate.v1",
         &t,
+        false,
     )
     .await
     {
@@ -464,6 +469,7 @@ async fn rotate_endpoint(State(s): State<AppState>, body: Bytes) -> Response {
         &r.assertion,
         "buzz.push.rotate-endpoint.v1",
         &t,
+        false,
     )
     .await
     {
@@ -523,6 +529,7 @@ async fn revoke_delegation(State(s): State<AppState>, body: Bytes) -> Response {
         &r.assertion,
         "buzz.push.revoke-delegation.v1",
         &t,
+        false,
     )
     .await
     {
@@ -575,6 +582,7 @@ async fn revoke_installation(State(s): State<AppState>, body: Bytes) -> Response
         &r.assertion,
         "buzz.push.revoke-installation.v1",
         &t,
+        true,
     )
     .await
     {

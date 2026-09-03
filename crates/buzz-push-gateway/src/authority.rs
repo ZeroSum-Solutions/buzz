@@ -140,6 +140,13 @@ pub trait AuthorityStore: Send + Sync {
         now: i64,
     ) -> Result<Option<Installation>, AuthorityError>;
     async fn installation(&self, id: Uuid, now: i64) -> Result<Installation, AuthorityError>;
+    /// Load an unexpired installation for authenticated revocation retry,
+    /// including its terminal tombstone.
+    async fn installation_for_revocation(
+        &self,
+        id: Uuid,
+        now: i64,
+    ) -> Result<Installation, AuthorityError>;
     async fn advance_assertion_counter(
         &self,
         installation_id: Uuid,
@@ -324,6 +331,20 @@ impl AuthorityStore for MemoryAuthorityStore {
         Ok(i.clone())
     }
 
+    async fn installation_for_revocation(
+        &self,
+        id: Uuid,
+        now: i64,
+    ) -> Result<Installation, AuthorityError> {
+        let s = self.0.lock().map_err(|_| AuthorityError::Unavailable)?;
+        let i = s
+            .installations
+            .get(&id)
+            .filter(|i| i.expires_at >= now)
+            .ok_or(AuthorityError::Rejected)?;
+        Ok(i.clone())
+    }
+
     async fn matching_installation(
         &self,
         key_id: &[u8],
@@ -362,7 +383,7 @@ impl AuthorityStore for MemoryAuthorityStore {
             .installations
             .get_mut(&id)
             .ok_or(AuthorityError::Rejected)?;
-        if i.revoked || i.assertion_counter != previous {
+        if i.assertion_counter != previous {
             return Err(AuthorityError::Rejected);
         }
         i.assertion_counter = next;
@@ -474,6 +495,9 @@ impl AuthorityStore for MemoryAuthorityStore {
             .installations
             .get_mut(&id)
             .ok_or(AuthorityError::Rejected)?;
+        if i.revoked && i.endpoint_epoch == new {
+            return Ok(());
+        }
         if i.revoked || i.endpoint_epoch != expected {
             return Err(AuthorityError::Rejected);
         }
@@ -885,5 +909,34 @@ mod tests {
             )
             .await
             .expect("generation 2 authority is active");
+    }
+
+    #[tokio::test]
+    async fn installation_revocation_is_authenticated_and_idempotent() {
+        let store = store().await;
+        let id = Uuid::from_u128(1);
+        let before = store.installation(id, 1_000).await.unwrap();
+
+        store
+            .revoke_installation(id, 1, 2)
+            .await
+            .expect("the current endpoint epoch can be revoked");
+        let tombstone = store
+            .installation_for_revocation(id, 1_000)
+            .await
+            .expect("revocation retry can authenticate against the tombstone");
+        assert!(tombstone.revoked);
+        store
+            .advance_assertion_counter(id, before.assertion_counter, before.assertion_counter + 1)
+            .await
+            .expect("an authenticated tombstone retry can advance its assertion counter");
+        store
+            .revoke_installation(id, 1, 2)
+            .await
+            .expect("the exact installation revocation is idempotent");
+        assert_eq!(
+            store.revoke_installation(id, 2, 3).await,
+            Err(AuthorityError::Rejected)
+        );
     }
 }

@@ -230,6 +230,37 @@ impl AuthorityStore for PostgresAuthorityStore {
             revoked: false,
         })
     }
+    async fn installation_for_revocation(
+        &self,
+        id: Uuid,
+        now: i64,
+    ) -> Result<Installation, AuthorityError> {
+        let r = sqlx::query(
+            "SELECT * FROM push_gateway_installations WHERE id=$1 AND expires_at >= $2",
+        )
+        .bind(id)
+        .bind(at(now)?)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db)?
+        .ok_or(AuthorityError::Rejected)?;
+        Ok(Installation {
+            id,
+            app_attest_key_id: r.try_get("app_attest_key_id").map_err(db)?,
+            app_attest_public_key: r.try_get("app_attest_public_key").map_err(db)?,
+            assertion_counter: u32::try_from(r.try_get::<i64, _>("assertion_counter").map_err(db)?)
+                .map_err(|_| AuthorityError::Unavailable)?,
+            profile: profile(r.try_get("app_profile").map_err(db)?)?,
+            token_ciphertext: r.try_get("token_ciphertext").map_err(db)?,
+            token_fingerprint: bytes32(r.try_get("token_fingerprint").map_err(db)?)?,
+            endpoint_epoch: r.try_get("endpoint_epoch").map_err(db)?,
+            expires_at: ts(r.try_get("expires_at").map_err(db)?),
+            revoked: r
+                .try_get::<Option<DateTime<Utc>>, _>("revoked_at")
+                .map_err(db)?
+                .is_some(),
+        })
+    }
     async fn matching_installation(
         &self,
         key_id: &[u8],
@@ -278,7 +309,7 @@ impl AuthorityStore for PostgresAuthorityStore {
         if next <= previous {
             return Err(AuthorityError::Rejected);
         }
-        let result=sqlx::query("UPDATE push_gateway_installations SET assertion_counter=$3,updated_at=now() WHERE id=$1 AND assertion_counter=$2 AND revoked_at IS NULL")
+        let result=sqlx::query("UPDATE push_gateway_installations SET assertion_counter=$3,updated_at=now() WHERE id=$1 AND assertion_counter=$2")
             .bind(id).bind(i64::from(previous)).bind(i64::from(next)).execute(&self.pool).await.map_err(db)?;
         if result.rows_affected() != 1 {
             return Err(AuthorityError::Rejected);
@@ -354,7 +385,10 @@ impl AuthorityStore for PostgresAuthorityStore {
         }
         let result=sqlx::query("UPDATE push_gateway_installations SET endpoint_epoch=$3,revoked_at=now(),updated_at=now() WHERE id=$1 AND endpoint_epoch=$2 AND revoked_at IS NULL").bind(id).bind(expected).bind(new).execute(&self.pool).await.map_err(db)?;
         if result.rows_affected() != 1 {
-            return Err(AuthorityError::Rejected);
+            let already_revoked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM push_gateway_installations WHERE id=$1 AND endpoint_epoch=$2 AND revoked_at IS NOT NULL)").bind(id).bind(new).fetch_one(&self.pool).await.map_err(db)?;
+            if !already_revoked {
+                return Err(AuthorityError::Rejected);
+            }
         }
         Ok(())
     }

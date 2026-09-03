@@ -389,6 +389,40 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     XCTAssertThrowsError(try JSONDecoder().decode(BuzzPushEndpointGrantRecord.self, from: data))
   }
 
+  func testLegacyKeychainStateMigratesToCanonicalGatewayRecords() throws {
+    let grantData = Data(
+      """
+      [{"relayOrigin":"wss://relay.example","relayPubkey":"\(Self.relayPubkey)","gatewayInstallationHandle":"\(Self.installationHandle)","installationId":"\(Self.installationId)","endpointGrant":"legacy-grant","endpointHash":"\(String(repeating: "b", count: 64))","appProfile":"buzz-ios-dogfood","endpointEpoch":1,"generation":1,"expiresAt":\(Self.expiresAt)}]
+      """.utf8
+    )
+    let pendingData = Data(
+      """
+      [{"relayOrigin":"wss://relay.example","relayPubkey":"\(Self.relayPubkey)","endpointHash":"\(String(repeating: "b", count: 64))","appProfile":"buzz-ios-dogfood","expiresAt":\(Self.expiresAt),"installationId":"\(Self.installationId)","gatewayInstallationHandle":"\(Self.installationHandle)","keyId":"\(Self.keyId)","delegationGeneration":2}]
+      """.utf8
+    )
+
+    let grant = try XCTUnwrap(
+      BuzzPushLegacyStateMigration.grants(
+        from: grantData,
+        gatewayOrigin: "https://push.buzz.xyz",
+        appAttestKeyId: Self.keyId
+      ).first
+    )
+    let pending = try XCTUnwrap(
+      BuzzPushLegacyStateMigration.pendingEnrollments(
+        from: pendingData,
+        gatewayOrigin: "https://push.buzz.xyz"
+      ).first
+    )
+
+    XCTAssertEqual(grant.gatewayOrigin, "https://push.buzz.xyz")
+    XCTAssertEqual(grant.appAttestKeyId, Self.keyId)
+    XCTAssertEqual(grant.gatewayInstallationHandle, Self.installationHandle)
+    XCTAssertEqual(pending.gatewayOrigin, "https://push.buzz.xyz")
+    XCTAssertEqual(pending.gatewayInstallationHandle, Self.installationHandle)
+    XCTAssertEqual(pending.delegationGeneration, 2)
+  }
+
   func testGrantWithoutAppAttestKeyIsRejected() throws {
     let data = Data(
       #"{"gatewayOrigin":"https://push.example","relayOrigin":"wss://relay.example","relayPubkey":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","installationId":"000102030405060708090a0b0c0d0e0f","endpointGrant":"opaque","endpointHash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","appProfile":"buzz-ios-dogfood","endpointEpoch":1,"generation":1,"expiresAt":1752624000}"#
