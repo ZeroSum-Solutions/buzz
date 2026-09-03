@@ -408,6 +408,33 @@ import os.log
           )
         )
       }
+    case "queueGatewayReplacements":
+      guard let arguments = call.arguments as? [String: Any],
+        let relayOrigins = arguments["relayOrigins"] as? [String],
+        !relayOrigins.isEmpty,
+        relayOrigins.allSatisfy({ !$0.isEmpty })
+      else {
+        result(
+          FlutterError(
+            code: "invalid_arguments",
+            message: "Gateway replacement queue requires relayOrigins.",
+            details: nil
+          )
+        )
+        return
+      }
+      do {
+        try endpointGrantStore.queueReplacementRelayOrigins(relayOrigins)
+        result(try pushGatewayMigrationInventory())
+      } catch {
+        result(
+          FlutterError(
+            code: "push_gateway_queue_failed",
+            message: "Push gateway replacement queue failed.",
+            details: error.localizedDescription
+          )
+        )
+      }
     case "checkpointGatewayReplacements":
       guard let arguments = call.arguments as? [String: Any],
         let relayOrigins = arguments["relayOrigins"] as? [String],

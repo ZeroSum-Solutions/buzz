@@ -127,6 +127,40 @@ void main() {
     },
   );
 
+  test('durably queues a complete delegation authority group', () async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(_channel, (call) async {
+          expect(call.method, 'queueGatewayReplacements');
+          expect(call.arguments, {
+            'relayOrigins': [
+              'wss://already-queued.example',
+              'wss://retired-only.example',
+            ],
+          });
+          return {
+            'retiredRelayOrigins': ['wss://retired-only.example'],
+            'replacementRelayOrigins': [
+              'wss://already-queued.example',
+              'wss://retired-only.example',
+            ],
+            'replacementGeneration': 5,
+          };
+        });
+
+    await queueBuzzPushGatewayReplacements({
+      'wss://retired-only.example',
+      'wss://already-queued.example',
+    });
+
+    expect(retiredBuzzPushRelayOrigins.value, {'wss://retired-only.example'});
+    expect(replacementBuzzPushRelayOrigins.value, {
+      'wss://already-queued.example',
+      'wss://retired-only.example',
+    });
+    expect(replacementBuzzPushGeneration.value, 5);
+  });
+
   test('atomically checkpoints origins sharing delegation authority', () async {
     debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
     replacementBuzzPushRelayOrigins.value = {

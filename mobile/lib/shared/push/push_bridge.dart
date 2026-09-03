@@ -185,6 +185,28 @@ Future<void> completeBuzzPushGatewayMigration() async {
   }
 }
 
+/// Durably queues every relay origin sharing delegation authority before any
+/// member is renewed, so a partial group cannot lose replacement work.
+Future<void> queueBuzzPushGatewayReplacements(Set<String> relayOrigins) async {
+  if (defaultTargetPlatform != TargetPlatform.iOS) return;
+  try {
+    final inventory = await _channel.invokeMapMethod<dynamic, dynamic>(
+      'queueGatewayReplacements',
+      {'relayOrigins': relayOrigins.toList()..sort()},
+    );
+    retiredBuzzPushRelayOrigins.value = _relayOriginSet(
+      inventory?['retiredRelayOrigins'],
+    );
+    replacementBuzzPushRelayOrigins.value = _relayOriginSet(
+      inventory?['replacementRelayOrigins'],
+    );
+    replacementBuzzPushGeneration.value =
+        inventory?['replacementGeneration'] as int? ?? 0;
+  } on MissingPluginException {
+    // Flutter tests and non-Runner embeddings do not install the native bridge.
+  }
+}
+
 /// Atomically removes same-gateway relay origins only after all community
 /// replacement leases sharing their delegation authority are durable.
 Future<void> checkpointBuzzPushGatewayReplacements(

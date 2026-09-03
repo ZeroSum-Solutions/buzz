@@ -84,6 +84,26 @@ class BuzzPushAttemptGate {
 }
 
 @visibleForTesting
+class BuzzPushAttemptFailureBudget {
+  String? _attempt;
+  int _failureCount = 0;
+
+  int recordFailure(String attempt) {
+    if (_attempt != attempt) {
+      _attempt = attempt;
+      _failureCount = 0;
+    }
+    return ++_failureCount;
+  }
+
+  void clear(String attempt) {
+    if (_attempt != attempt) return;
+    _attempt = null;
+    _failureCount = 0;
+  }
+}
+
+@visibleForTesting
 String buzzPushPublicationAttemptKey({
   required String communityId,
   required String relayBaseUrl,
@@ -232,6 +252,19 @@ buzzPushGroupGatewayMigrationsByDelegationAuthority(
 }
 
 @visibleForTesting
+Set<String> buzzPushGatewayMigrationGroupOriginsToQueue({
+  required Iterable<BuzzPushGatewayMigrationTarget> targets,
+  required Set<String> replacementRelayOrigins,
+}) {
+  final groupOrigins = targets.map((target) => target.relayOrigin).toSet();
+  if (groupOrigins.intersection(replacementRelayOrigins).isEmpty ||
+      replacementRelayOrigins.containsAll(groupOrigins)) {
+    return const {};
+  }
+  return groupOrigins;
+}
+
+@visibleForTesting
 Future<bool> processBuzzPushGatewayMigrationGroups<T>({
   required Iterable<T> groups,
   required Future<bool> Function(T group) process,
@@ -346,7 +379,9 @@ class BuzzPushBootstrap extends HookConsumerWidget {
     final gatewayInitializationFailures = useRef(0);
     final publicationRetry = useState(0);
     final gatewayMigrationRetry = useState(0);
-    final gatewayMigrationFailures = useRef(0);
+    final gatewayMigrationFailures = useMemoized(
+      BuzzPushAttemptFailureBudget.new,
+    );
     final tombstoneRetry = useState(0);
     final revocationOutbox = ref.watch(buzzPushLeaseRevocationOutboxProvider);
     final session = ref.watch(relaySessionProvider);
@@ -517,19 +552,18 @@ class BuzzPushBootstrap extends HookConsumerWidget {
         ].join('|');
         if (!gatewayMigrationAttempt.tryBegin(attempt)) return null;
         unawaited(() async {
+          bool attemptIsCurrent() => buzzPushGatewayMigrationAttemptIsCurrent(
+            attemptIsCurrent: gatewayMigrationAttempt.isCurrent(attempt),
+            token: token,
+            liveToken: apnsDeviceToken.value,
+            retiredRelayOrigins: retiredRelayOrigins,
+            liveRetiredRelayOrigins: retiredBuzzPushRelayOrigins.value,
+            replacementRelayOrigins: replacementRelayOrigins,
+            liveReplacementRelayOrigins: replacementBuzzPushRelayOrigins.value,
+            replacementGeneration: replacementGeneration,
+            liveReplacementGeneration: replacementBuzzPushGeneration.value,
+          );
           try {
-            bool attemptIsCurrent() => buzzPushGatewayMigrationAttemptIsCurrent(
-              attemptIsCurrent: gatewayMigrationAttempt.isCurrent(attempt),
-              token: token,
-              liveToken: apnsDeviceToken.value,
-              retiredRelayOrigins: retiredRelayOrigins,
-              liveRetiredRelayOrigins: retiredBuzzPushRelayOrigins.value,
-              replacementRelayOrigins: replacementRelayOrigins,
-              liveReplacementRelayOrigins:
-                  replacementBuzzPushRelayOrigins.value,
-              replacementGeneration: replacementGeneration,
-              liveReplacementGeneration: replacementBuzzPushGeneration.value,
-            );
             final candidates = buzzPushCommunitiesRequiringGatewayMigration(
               communities: communities,
               retiredRelayOrigins: migrationRelayOrigins,
@@ -549,6 +583,18 @@ class BuzzPushBootstrap extends HookConsumerWidget {
               initialError: resolution.firstError,
               initialStack: resolution.firstStack,
               process: (authorityTargets) async {
+                final originsToQueue =
+                    buzzPushGatewayMigrationGroupOriginsToQueue(
+                      targets: authorityTargets,
+                      replacementRelayOrigins: replacementRelayOrigins,
+                    );
+                if (originsToQueue.isNotEmpty) {
+                  if (!attemptIsCurrent()) return true;
+                  await queueBuzzPushGatewayReplacements(originsToQueue);
+                  // Queueing advances the inventory generation. Let the
+                  // resulting rebuild process the fully journaled group.
+                  return true;
+                }
                 final queuedOrigins = authorityTargets
                     .map((target) => target.relayOrigin)
                     .where(replacementRelayOrigins.contains)
@@ -589,12 +635,15 @@ class BuzzPushBootstrap extends HookConsumerWidget {
             if (stopped) return;
             if (!attemptIsCurrent()) return;
             await completeBuzzPushGatewayMigration();
-            gatewayMigrationFailures.value = 0;
+            gatewayMigrationFailures.clear(attempt);
             gatewayMigrationAttempt.complete(attempt);
           } catch (error, stack) {
-            gatewayMigrationFailures.value += 1;
+            if (!attemptIsCurrent()) return;
+            final failureCount = gatewayMigrationFailures.recordFailure(
+              attempt,
+            );
             final retryDelay = buzzPushGatewayInitializationRetryDelay(
-              gatewayMigrationFailures.value,
+              failureCount,
             );
             if (retryDelay == null) {
               gatewayMigrationAttempt.complete(attempt);

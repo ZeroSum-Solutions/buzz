@@ -325,6 +325,37 @@ void main() {
     expect(groups[_hex('b')]!.map((target) => target.relayOrigin), [
       'wss://independent.example',
     ]);
+
+    expect(
+      buzzPushGatewayMigrationGroupOriginsToQueue(
+        targets: groups[_hex('a')]!,
+        replacementRelayOrigins: const {'wss://first.example'},
+      ),
+      {'wss://first.example', 'wss://second.example'},
+    );
+    expect(
+      buzzPushGatewayMigrationGroupOriginsToQueue(
+        targets: groups[_hex('a')]!,
+        replacementRelayOrigins: const {
+          'wss://first.example',
+          'wss://second.example',
+        },
+      ),
+      isEmpty,
+    );
+  });
+
+  test('migration retry budget resets for a new attempt generation', () {
+    final budget = BuzzPushAttemptFailureBudget();
+
+    expect(budget.recordFailure('generation-1'), 1);
+    expect(budget.recordFailure('generation-1'), 2);
+    expect(budget.recordFailure('generation-2'), 1);
+    expect(budget.recordFailure('generation-2'), 2);
+    budget.clear('generation-1');
+    expect(budget.recordFailure('generation-2'), 3);
+    budget.clear('generation-2');
+    expect(budget.recordFailure('generation-2'), 1);
   });
 
   test('descriptor resolution preserves reachable migration work', () async {
