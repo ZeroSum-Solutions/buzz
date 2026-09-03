@@ -58,6 +58,210 @@ final class NavigationGlassButton: UIButton {
   }
 }
 
+private struct NavigationGlassMenuItem {
+  let id: String
+  let title: String
+  let image: UIImage?
+  let preservesImageColor: Bool
+  let isSelected: Bool
+  let isDestructive: Bool
+}
+
+private final class NavigationGlassMenuCell: UITableViewCell {
+  static let reuseIdentifier = "NavigationGlassMenuCell"
+
+  private let itemImageView = UIImageView()
+  private let itemLabel = UILabel()
+  private let checkImageView = UIImageView(
+    image: UIImage(
+      systemName: "checkmark",
+      withConfiguration: UIImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
+    )
+  )
+
+  override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+    super.init(style: style, reuseIdentifier: reuseIdentifier)
+    backgroundColor = .clear
+    contentView.backgroundColor = .clear
+    let selectedBackground = UIView()
+    selectedBackground.backgroundColor = .tertiarySystemFill
+    selectedBackground.layer.cornerRadius = 12
+    selectedBackground.layer.cornerCurve = .continuous
+    selectedBackgroundView = selectedBackground
+
+    itemImageView.translatesAutoresizingMaskIntoConstraints = false
+    itemImageView.contentMode = .scaleAspectFit
+    itemImageView.clipsToBounds = true
+    itemLabel.translatesAutoresizingMaskIntoConstraints = false
+    itemLabel.font = UIFont.preferredFont(forTextStyle: .body)
+    itemLabel.numberOfLines = 1
+    itemLabel.lineBreakMode = .byTruncatingTail
+    checkImageView.translatesAutoresizingMaskIntoConstraints = false
+    checkImageView.contentMode = .center
+    checkImageView.tintColor = .label
+
+    contentView.addSubview(itemImageView)
+    contentView.addSubview(itemLabel)
+    contentView.addSubview(checkImageView)
+    NSLayoutConstraint.activate([
+      itemImageView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 10),
+      itemImageView.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
+      itemImageView.widthAnchor.constraint(equalToConstant: 28),
+      itemImageView.heightAnchor.constraint(equalToConstant: 28),
+      itemLabel.leadingAnchor.constraint(equalTo: itemImageView.trailingAnchor, constant: 10),
+      itemLabel.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
+      itemLabel.trailingAnchor.constraint(lessThanOrEqualTo: checkImageView.leadingAnchor, constant: -10),
+      checkImageView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -10),
+      checkImageView.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
+      checkImageView.widthAnchor.constraint(equalToConstant: 20),
+      checkImageView.heightAnchor.constraint(equalToConstant: 28),
+    ])
+  }
+
+  required init?(coder: NSCoder) {
+    nil
+  }
+
+  func apply(_ item: NavigationGlassMenuItem) {
+    itemImageView.image = item.preservesImageColor
+      ? item.image?.withRenderingMode(.alwaysOriginal)
+      : item.image?.withRenderingMode(.alwaysTemplate)
+    itemImageView.tintColor = item.isDestructive ? .systemRed : .label
+    itemLabel.text = item.title
+    itemLabel.textColor = item.isDestructive ? .systemRed : .label
+    checkImageView.isHidden = !item.isSelected
+    accessibilityTraits = item.isSelected ? [.button, .selected] : [.button]
+  }
+}
+
+private final class NavigationGlassMenuViewController: UIViewController,
+  UITableViewDataSource,
+  UITableViewDelegate,
+  UIPopoverPresentationControllerDelegate
+{
+  private static let menuWidth: CGFloat = 286
+  private static let rowHeight: CGFloat = 48
+  private static let outerInset: CGFloat = 8
+  private static let maximumHeight: CGFloat = 400
+
+  private let tableView = UITableView(frame: .zero, style: .plain)
+  private let onSelect: (String) -> Void
+  private let onDismiss: () -> Void
+  private var items: [NavigationGlassMenuItem]
+
+  init(
+    items: [NavigationGlassMenuItem],
+    onSelect: @escaping (String) -> Void,
+    onDismiss: @escaping () -> Void
+  ) {
+    self.items = items
+    self.onSelect = onSelect
+    self.onDismiss = onDismiss
+    super.init(nibName: nil, bundle: nil)
+    modalPresentationStyle = .popover
+    updatePreferredContentSize()
+  }
+
+  required init?(coder: NSCoder) {
+    nil
+  }
+
+  override func loadView() {
+    let effectView: UIVisualEffectView
+    if #available(iOS 26.0, *) {
+      effectView = UIVisualEffectView(effect: UIGlassEffect(style: .regular))
+    } else {
+      effectView = UIVisualEffectView(effect: UIBlurEffect(style: .systemMaterial))
+    }
+    effectView.backgroundColor = .clear
+    effectView.isOpaque = false
+    effectView.clipsToBounds = true
+    effectView.layer.cornerRadius = 20
+    effectView.layer.cornerCurve = .continuous
+    view = effectView
+
+    tableView.translatesAutoresizingMaskIntoConstraints = false
+    tableView.backgroundColor = .clear
+    tableView.separatorStyle = .none
+    tableView.rowHeight = Self.rowHeight
+    tableView.showsVerticalScrollIndicator = false
+    tableView.dataSource = self
+    tableView.delegate = self
+    tableView.register(
+      NavigationGlassMenuCell.self,
+      forCellReuseIdentifier: NavigationGlassMenuCell.reuseIdentifier
+    )
+    effectView.contentView.addSubview(tableView)
+    NSLayoutConstraint.activate([
+      tableView.topAnchor.constraint(
+        equalTo: effectView.contentView.topAnchor,
+        constant: Self.outerInset
+      ),
+      tableView.leadingAnchor.constraint(
+        equalTo: effectView.contentView.leadingAnchor,
+        constant: Self.outerInset
+      ),
+      tableView.trailingAnchor.constraint(
+        equalTo: effectView.contentView.trailingAnchor,
+        constant: -Self.outerInset
+      ),
+      tableView.bottomAnchor.constraint(
+        equalTo: effectView.contentView.bottomAnchor,
+        constant: -Self.outerInset
+      ),
+    ])
+  }
+
+  func update(items: [NavigationGlassMenuItem]) {
+    self.items = items
+    updatePreferredContentSize()
+    tableView.reloadData()
+  }
+
+  func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+    items.count
+  }
+
+  func tableView(
+    _ tableView: UITableView,
+    cellForRowAt indexPath: IndexPath
+  ) -> UITableViewCell {
+    guard let cell = tableView.dequeueReusableCell(
+      withIdentifier: NavigationGlassMenuCell.reuseIdentifier,
+      for: indexPath
+    ) as? NavigationGlassMenuCell else {
+      return UITableViewCell()
+    }
+    cell.apply(items[indexPath.row])
+    return cell
+  }
+
+  func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+    tableView.deselectRow(at: indexPath, animated: true)
+    let id = items[indexPath.row].id
+    dismiss(animated: true) { [onSelect] in onSelect(id) }
+  }
+
+  func adaptivePresentationStyle(
+    for controller: UIPresentationController
+  ) -> UIModalPresentationStyle {
+    .none
+  }
+
+  func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+    onDismiss()
+  }
+
+  private func updatePreferredContentSize() {
+    let contentHeight =
+      CGFloat(items.count) * Self.rowHeight + Self.outerInset * 2
+    preferredContentSize = CGSize(
+      width: Self.menuWidth,
+      height: min(contentHeight, Self.maximumHeight)
+    )
+  }
+}
+
 final class JumpToLatestGlassButtonPlatformView: NSObject, FlutterPlatformView {
   private let containerView: UIView
   private let channel: FlutterMethodChannel
@@ -171,7 +375,7 @@ final class NavigationGlassButtonFactory: NSObject, FlutterPlatformViewFactory {
 final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
   private static let shutterIconRatio: CGFloat = 80.0 / 115.0
   private static let shutterInsetRatio: CGFloat = 20.0 / 115.0
-  private static let channelIconSize: CGFloat = 16
+  private static let channelIconSize: CGFloat = 12
   private static let menuAvatarSize: CGFloat = 28
   private let containerView: UIView
   private let channel: FlutterMethodChannel
@@ -191,6 +395,7 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
   private var menuItemDefinitions: [[String: Any]] = []
   private var menuAvatarImages: [String: UIImage] = [:]
   private var menuAvatarLoadTasks: [String: URLSessionDataTask] = [:]
+  private weak var presentedMenuController: NavigationGlassMenuViewController?
 
   init(
     frame: CGRect,
@@ -243,7 +448,7 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
     button.translatesAutoresizingMaskIntoConstraints = false
     button.addAction(
       UIAction { [weak self] _ in
-        self?.channel.invokeMethod("pressed", arguments: nil)
+        self?.activate()
       },
       for: .touchUpInside
     )
@@ -433,9 +638,9 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
       button.contentHorizontalAlignment = .leading
       button.configuration?.contentInsets = NSDirectionalEdgeInsets(
         top: contentIcon == "avatar" ? 6 : 4,
-        leading: contentIcon == "avatar" ? 6 : 8,
+        leading: contentIcon == "avatar" ? 6 : 12,
         bottom: contentIcon == "avatar" ? 6 : 4,
-        trailing: buttonLabel == nil ? 6 : 8
+        trailing: contentIcon == "avatar" ? (buttonLabel == nil ? 6 : 8) : 12
       )
       button.configuration?.imagePadding = buttonLabel == nil ? 0 : 8
       button.configuration?.titleLineBreakMode = .byTruncatingTail
@@ -591,9 +796,11 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
     guard !items.isEmpty else {
       button.menu = nil
       button.showsMenuAsPrimaryAction = false
+      presentedMenuController?.dismiss(animated: true)
       return
     }
-    button.showsMenuAsPrimaryAction = true
+    button.menu = nil
+    button.showsMenuAsPrimaryAction = false
     rebuildMenu()
 
     for item in items {
@@ -607,13 +814,15 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
   }
 
   private func rebuildMenu() {
-    button.menu = UIMenu(children: menuItemDefinitions.compactMap { item in
+    presentedMenuController?.update(items: resolvedMenuItems())
+  }
+
+  private func resolvedMenuItems() -> [NavigationGlassMenuItem] {
+    menuItemDefinitions.compactMap { item in
       guard
         let id = item["id"] as? String,
         let label = item["label"] as? String
       else { return nil }
-      var attributes = UIMenuElement.Attributes()
-      if item["destructive"] as? Bool == true { attributes.insert(.destructive) }
       let imageURL = item["avatarImageUrl"] as? String
       let fallback = item["avatarFallback"] as? String
       let systemIconName = item["systemIconName"] as? String
@@ -622,20 +831,57 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
           Self.avatarFallbackImage(text: $0, size: Self.menuAvatarSize)
         }
         ?? systemIconName.flatMap { UIImage(systemName: $0) }
-      let selected = item["selected"] as? Bool == true
-      let keepsSingleLine = item["keepsSingleLine"] as? Bool == true
-      let title = keepsSingleLine
-        ? label.replacingOccurrences(of: " ", with: "\u{00A0}")
-        : label
-      return UIAction(
-        title: selected ? "\(title)   ✓" : title,
+      return NavigationGlassMenuItem(
+        id: id,
+        title: label,
         image: image,
-        attributes: attributes,
-        state: .off
-      ) { [weak self] _ in
+        preservesImageColor: imageURL != nil || fallback != nil,
+        isSelected: item["selected"] as? Bool == true,
+        isDestructive: item["destructive"] as? Bool == true
+      )
+    }
+  }
+
+  private func activate() {
+    guard !menuItemDefinitions.isEmpty else {
+      channel.invokeMethod("pressed", arguments: nil)
+      return
+    }
+    guard presentedMenuController == nil else { return }
+    let controller = NavigationGlassMenuViewController(
+      items: resolvedMenuItems(),
+      onSelect: { [weak self] id in
+        self?.presentedMenuController = nil
         self?.channel.invokeMethod("selected", arguments: id)
+      },
+      onDismiss: { [weak self] in
+        self?.presentedMenuController = nil
       }
-    })
+    )
+    guard
+      let presenter = Self.topViewController(from: containerView.window?.rootViewController),
+      let popover = controller.popoverPresentationController
+    else { return }
+    popover.sourceView = button
+    popover.sourceRect = button.bounds
+    popover.permittedArrowDirections = [.up]
+    popover.backgroundColor = .clear
+    popover.delegate = controller
+    presentedMenuController = controller
+    presenter.present(controller, animated: true)
+  }
+
+  private static func topViewController(from root: UIViewController?) -> UIViewController? {
+    if let presented = root?.presentedViewController {
+      return topViewController(from: presented)
+    }
+    if let navigation = root as? UINavigationController {
+      return topViewController(from: navigation.visibleViewController)
+    }
+    if let tabs = root as? UITabBarController {
+      return topViewController(from: tabs.selectedViewController)
+    }
+    return root
   }
 
   private func loadMenuAvatar(from imageURL: String) {

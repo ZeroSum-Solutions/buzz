@@ -41,7 +41,6 @@ class IosGlassNavigationMenuItem {
     this.avatarImageUrl,
     this.avatarFallback,
     this.systemIconName,
-    this.keepsSingleLine = false,
   });
 
   final String id;
@@ -51,7 +50,6 @@ class IosGlassNavigationMenuItem {
   final String? avatarImageUrl;
   final String? avatarFallback;
   final String? systemIconName;
-  final bool keepsSingleLine;
 
   Map<String, Object> toJson() {
     final json = <String, Object>{
@@ -59,7 +57,6 @@ class IosGlassNavigationMenuItem {
       'label': label,
       'selected': selected,
       'destructive': destructive,
-      'keepsSingleLine': keepsSingleLine,
     };
     if (avatarImageUrl != null) json['avatarImageUrl'] = avatarImageUrl!;
     if (avatarFallback != null) json['avatarFallback'] = avatarFallback!;
@@ -201,7 +198,7 @@ class IosGlassNavigationButton extends HookWidget {
           (item) =>
               '${item.id}:${item.label}:${item.selected}:${item.destructive}:'
               '${item.avatarImageUrl}:${item.avatarFallback}:'
-              '${item.systemIconName}:${item.keepsSingleLine}',
+              '${item.systemIconName}',
         )
         .join('|');
 

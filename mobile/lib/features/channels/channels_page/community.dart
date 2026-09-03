@@ -492,7 +492,6 @@ class _CommunityHeaderControl extends ConsumerWidget {
         id: 'manage',
         label: 'Manage Communities',
         systemIconName: 'gearshape',
-        keepsSingleLine: true,
       ),
     ];
 

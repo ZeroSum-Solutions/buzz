@@ -3,8 +3,8 @@ part of '../channel_detail_page.dart';
 const _dmHeaderAvatarSize = 32.0;
 const _channelHeaderAvatarSize = 40.0;
 const _iosChannelHeaderControlHeight = 40.0;
-const _iosChannelHeaderIconSize = 16.0;
-const _iosChannelHeaderHorizontalInset = 8.0;
+const _iosChannelHeaderIconSize = 12.0;
+const _iosChannelHeaderHorizontalInset = 12.0;
 const _iosChannelHeaderIconSpacing = 8.0;
 const _dmPresenceDotRatio = 8 / 14;
 

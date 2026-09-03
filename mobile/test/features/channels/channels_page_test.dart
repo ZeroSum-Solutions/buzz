@@ -795,7 +795,6 @@ void main() {
     expect(items.first, containsPair('avatarFallback', 'A'));
     expect(items.last, containsPair('label', 'Manage Communities'));
     expect(items.last, containsPair('systemIconName', 'gearshape'));
-    expect(items.last, containsPair('keepsSingleLine', true));
 
     final nativeProfile = tester.widget<UiKitView>(
       find.descendant(
