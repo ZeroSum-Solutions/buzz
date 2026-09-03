@@ -1239,6 +1239,10 @@ async fn handle_huddle_liveness_req(
     }
 
     let session_ids = huddle_liveness_session_ids(filters);
+    // P1-a instrumentation: increments before the DB boundary so the witness
+    // can confirm the query was (or was not) attempted. [nip_fi_test_hooks::liveness_query_counter]
+    #[cfg(test)]
+    crate::nip_fi_test_hooks::before_liveness_query(conn.tenant.community());
     let linked_sessions = match state
         .db
         .huddle_started_links(conn.tenant.community(), parent_channel_ids, &session_ids)
@@ -2713,9 +2717,12 @@ mod tests {
     //
     // Arms `before_liveness_req` — the hook immediately before `acquire_effect()`
     // in the `filters_are_huddle_liveness_only` branch of `handle_req`. Dispatches
-    // `handle_req` with a KIND_HUDDLE_LIVENESS filter and a live gate, waits for
-    // the hook, fires expiry, then releases. The handler must return CLOSED with
-    // \"session expired\" and must NOT have called any DB or emit path.
+    // `handle_req` with a KIND_HUDDLE_LIVENESS filter with an authorized `#h` channel
+    // (pre-populated in accessible_channels_cache so no DB call is needed) and a live
+    // gate. Waits for the hook, fires expiry, then releases. The handler must return
+    // CLOSED "session expired" and the `liveness_query_counter` must remain 0 —
+    // proving the permit gate stopped execution before the `huddle_started_links` DB
+    // call boundary, not merely at the denial-text seam.
     //
     // Hook location: `handlers/req.rs`, immediately before `acquire_effect()`
     // in the liveness branch.
@@ -2724,9 +2731,9 @@ mod tests {
     //   A) Delete `#[cfg(test)] before_liveness_req(...)` from req.rs →
     //      hook never fires → `arrived_rx` times out → test panics.
     //   B) Remove `acquire_effect()` from the liveness branch →
-    //      handler proceeds to `handle_huddle_liveness_req` despite expired gate →
-    //      CLOSED \"session expired\" is not sent → `try_recv` returns `Err` →
-    //      assertion panics.
+    //      handler proceeds past the gate into `handle_huddle_liveness_req` →
+    //      `before_liveness_query` fires → `liveness_query_counter` = 1 →
+    //      `assert_eq!(query_count, 0)` panics.
     //   C) Change gate to `off_mode` → `acquire_effect()` always succeeds →
     //      same as (B).
     #[tokio::test]
@@ -2744,9 +2751,11 @@ mod tests {
         let cancel = CancellationToken::new();
         let gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel.clone());
 
-        // Use Uuid::nil() community — same as W3, so the accessible-channels
-        // cache hit/miss behaviour is identical and pre-existing.
-        let community = buzz_core::tenant::CommunityId::from_uuid(Uuid::nil());
+        // Use a distinct community UUID for this test to avoid interference with
+        // other tests that also use Uuid::nil(). The liveness_query_counter and
+        // liveness_req_hook are keyed per community.
+        let community =
+            buzz_core::tenant::CommunityId::from_uuid(Uuid::from_u128(0x0000_0001_1500_0000));
 
         let (send_tx, mut send_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
         let (ctrl_tx, _ctrl_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
@@ -2779,13 +2788,36 @@ mod tests {
         });
 
         let state = crate::state::tests::test_state().await;
+
+        // Pre-populate the accessible_channels_cache so the handle_req
+        // membership check succeeds without a real DB connection.
+        let channel_uuid = Uuid::from_u128(0xDEAD_BEEF_CAFE_1500);
+        let pubkey_bytes = keys.public_key().to_bytes().to_vec();
+        state
+            .accessible_channels_cache
+            .insert((community, pubkey_bytes), vec![channel_uuid]);
+
+        // Register the liveness query counter — proves the DB call boundary.
+        let query_count = crate::nip_fi_test_hooks::liveness_query_counter::register(community);
+
         let sub_id = "p1a-liveness-barrier-test".to_string();
 
-        // KIND_HUDDLE_LIVENESS only — `filters_are_huddle_liveness_only` checks
-        // only the kinds field, not the #h tag.
-        let filters = vec![Filter::new().kind(nostr::Kind::Custom(
+        // KIND_HUDDLE_LIVENESS with #h = channel_uuid:
+        //   - `filters_are_huddle_liveness_only` → true (kind-only check)
+        //   - `extract_channel_ids_from_filters_limited` → Some([channel_uuid])
+        //   - accessible_channels_cache hit → channel is authorized
+        //   - `authorized_requested_channels` = Some([channel_uuid]) → non-empty
+        //   - handler enters the liveness branch, reaches before_liveness_req hook
+        let h_tag = nostr::SingleLetterTag::lowercase(nostr::Alphabet::H);
+        let mut filter = Filter::new().kind(nostr::Kind::Custom(
             buzz_core::kind::KIND_HUDDLE_LIVENESS as u16,
-        ))];
+        ));
+        filter
+            .generic_tags
+            .entry(h_tag)
+            .or_default()
+            .insert(channel_uuid.to_string());
+        let filters = vec![filter];
 
         // Arm the barrier: fires when handle_req reaches before_liveness_req.
         let (arrived_rx, release) = crate::nip_fi_test_hooks::liveness_req_hook::arm(community);
@@ -2811,6 +2843,15 @@ mod tests {
             .await
             .expect("P1-a: handle_req must return within 5s after hook release")
             .expect("handle_req task must not panic");
+
+        // The liveness_query_counter must be 0 — the permit gate must have
+        // blocked the handler before the `huddle_started_links` DB call.
+        let count = query_count.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            count, 0,
+            "P1-a: `huddle_started_links` must NOT be called when gate is expired; count = {count}"
+        );
+        crate::nip_fi_test_hooks::liveness_query_counter::deregister(community);
 
         // A CLOSED frame must have been sent with the session-expired message.
         let frame = send_rx

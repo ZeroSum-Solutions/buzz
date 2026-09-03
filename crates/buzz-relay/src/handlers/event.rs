@@ -2767,10 +2767,16 @@ mod tests {
     //
     // Arms `before_observer_event` — the hook immediately before `acquire_effect()`
     // in the `KIND_AGENT_OBSERVER_FRAME` branch of `handle_event`. Dispatches
-    // `handle_event` with a live gate, waits for the hook to signal the handler
-    // reached the permit boundary, fires expiry, then releases. The handler must
-    // return OK(false, "restricted: session expired") and must NOT have called
-    // `handle_agent_observer_event` (no owner/cache updates, no Redis fan-out).
+    // `handle_event` with a valid NIP-44-encrypted agent telemetry event and the
+    // authenticated session's `agent_owner_pubkey` set to the event's owner (fast
+    // path: skips DB ownership lookup). Waits for the hook, fires expiry, then
+    // releases. The handler must return OK(false, "restricted: session expired").
+    //
+    // With the permit REMOVED, the handler proceeds into `handle_agent_observer_event`:
+    // owner fast-path succeeds → rate limit passes → `mark_local_event` + `publish_event`
+    // + `fan_out_event_to_local_subscribers` + `conn.send(OK(true, ""))` are reached.
+    // The OK(true) response differs from the expected "session expired" → assertion panics.
+    // This proves the permit gate blocked at the real fan-out + ack seam.
     //
     // Hook location: `handlers/event.rs`, immediately before `acquire_effect()`
     // in the KIND_AGENT_OBSERVER_FRAME branch.
@@ -2779,30 +2785,36 @@ mod tests {
     //   A) Delete `#[cfg(test)] before_observer_event(...)` from event.rs →
     //      hook never fires → `arrived_rx` times out → test panics.
     //   B) Remove `acquire_effect()` from the observer branch →
-    //      handler proceeds to `handle_agent_observer_event` despite expired gate →
-    //      OK(false, "session expired") is not sent → `try_recv` returns `Err` →
-    //      assertion panics.
+    //      handler proceeds to fan-out → OK(true, "") sent →
+    //      `t.contains("session expired")` assertion panics.
     //   C) Change gate to `off_mode` → `acquire_effect()` always succeeds →
     //      same as (B).
     #[tokio::test]
     async fn p1b_agent_observer_event_barrier_expiry_blocks_fanout_and_ack() {
         use super::handle_event;
         use buzz_core::kind::KIND_AGENT_OBSERVER_FRAME;
-        use nostr::{EventBuilder, Keys, Kind};
+        use buzz_core::observer::{
+            encrypt_observer_payload, OBSERVER_AGENT_TAG, OBSERVER_FRAME_TAG,
+            OBSERVER_FRAME_TELEMETRY,
+        };
+        use nostr::{EventBuilder, Keys, Kind, Tag};
         use std::collections::HashMap;
         use std::sync::Arc;
         use tokio::sync::{mpsc, RwLock};
         use tokio_util::sync::CancellationToken;
         use uuid::Uuid;
 
-        let keys = Keys::generate();
+        // agent sends, owner receives — agent is the conn's authenticating key.
+        let agent_keys = Keys::generate();
+        let owner_keys = Keys::generate();
         let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
 
         let cancel = CancellationToken::new();
         let gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel.clone());
 
-        // Use Uuid::nil() community — same convention as W3/P1-a.
-        let community = buzz_core::tenant::CommunityId::from_uuid(Uuid::nil());
+        // Distinct community to avoid hook interference with other tests.
+        let community =
+            buzz_core::tenant::CommunityId::from_uuid(Uuid::from_u128(0x0000_0001_1B00_0000));
 
         let (send_tx, mut send_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
         let (ctrl_tx, _ctrl_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
@@ -2814,11 +2826,13 @@ mod tests {
             remote_addr: "127.0.0.1:1234".parse().unwrap(),
             auth_state: RwLock::new(crate::connection::AuthState::Authenticated(
                 buzz_auth::AuthContext {
-                    pubkey: keys.public_key(),
+                    pubkey: agent_keys.public_key(),
                     scopes: vec![],
                     channel_ids: None,
                     auth_method: buzz_auth::AuthMethod::Nip42,
-                    agent_owner_pubkey: None,
+                    // Fast path: session owner matches the event's target owner,
+                    // so `handle_agent_observer_event` skips the DB ownership lookup.
+                    agent_owner_pubkey: Some(owner_keys.public_key()),
                 },
             )),
             subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -2833,14 +2847,27 @@ mod tests {
             nip_fi_gate: gate,
         });
 
-        // Build a minimal KIND_AGENT_OBSERVER_FRAME event (kind:24200).
-        // Scopes are empty → passes the scope check and reaches the permit boundary.
-        let event = EventBuilder::new(
-            Kind::Custom(KIND_AGENT_OBSERVER_FRAME as u16),
-            "p1b-observer-barrier-test",
+        // Build a valid KIND_AGENT_OBSERVER_FRAME telemetry event:
+        //   - content: NIP-44 encrypted (passes content_looks_like_nip44 length check)
+        //   - tags: p = owner, agent = agent, frame = "telemetry"
+        //   - signed by agent key (event.pubkey == agent, recipient != agent → Telemetry)
+        // Without the permit, the handler reaches mark_local_event + publish + fanout + OK(true).
+        let encrypted = encrypt_observer_payload(
+            &agent_keys,
+            &owner_keys.public_key(),
+            &serde_json::json!({"type": "p1b_barrier_test"}),
         )
-        .sign_with_keys(&keys)
-        .unwrap();
+        .expect("P1-b: encrypt observer payload");
+
+        let event = EventBuilder::new(Kind::Custom(KIND_AGENT_OBSERVER_FRAME as u16), encrypted)
+            .tags([
+                Tag::parse(["p", &owner_keys.public_key().to_hex()]).expect("p tag"),
+                Tag::parse([OBSERVER_AGENT_TAG, &agent_keys.public_key().to_hex()])
+                    .expect("agent tag"),
+                Tag::parse([OBSERVER_FRAME_TAG, OBSERVER_FRAME_TELEMETRY]).expect("frame tag"),
+            ])
+            .sign_with_keys(&agent_keys)
+            .unwrap();
 
         let state = crate::state::tests::test_state().await;
 
@@ -2869,6 +2896,8 @@ mod tests {
             .expect("handle_event task must not panic");
 
         // An OK(false, "restricted: session expired") frame must have been sent.
+        // Mutation-red (remove acquire_effect): handler reaches fan-out → OK(true, "") →
+        // `t.contains("session expired")` fails → test panics.
         let frame = send_rx
             .try_recv()
             .expect("P1-b: handler must send OK(false) on expired gate");

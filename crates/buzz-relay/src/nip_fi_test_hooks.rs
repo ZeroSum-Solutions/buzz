@@ -35,11 +35,16 @@
 //! | **W4** (COUNT barrier) | same | Remove `acquire_effect()` from count.rs | CLOSED message changes from "session expired" → assertion panics |
 //! | **W4** (COUNT barrier) | same | Change gate to `off_mode` | no CLOSED sent → `try_recv` returns `Err` → assertion panics |
 //! | **P1-a** (huddle-liveness REQ barrier) | `handlers/req.rs` — immediately before `acquire_effect()` in `filters_are_huddle_liveness_only` branch | Delete `before_liveness_req(...)` call | `arrived_rx` times out → test panics |
-//! | **P1-a** (huddle-liveness REQ barrier) | same | Remove `acquire_effect()` from liveness branch | CLOSED "session expired" not sent → `try_recv` returns `Err` → assertion panics |
+//! | **P1-a** (huddle-liveness REQ barrier) | same | Remove `acquire_effect()` from liveness branch | handler proceeds to `huddle_started_links` DB call → `liveness_query_counter` = 1 → `assert_eq!(count, 0)` panics |
 //! | **P1-b** (agent-observer EVENT barrier) | `handlers/event.rs` — immediately before `acquire_effect()` in `KIND_AGENT_OBSERVER_FRAME` branch | Delete `before_observer_event(...)` call | `arrived_rx` times out → test panics |
-//! | **P1-b** (agent-observer EVENT barrier) | same | Remove `acquire_effect()` from observer branch | OK(false) "session expired" not sent → first `try_recv` assertion panics |
+//! | **P1-b** (agent-observer EVENT barrier) | same | Remove `acquire_effect()` from observer branch | handler proceeds to fan-out → OK(true, "") sent → `t.contains("session expired")` assertion panics |
 //! | **W5** (audio B1 expired-at-pairing) | `audio/handler.rs`, B1 deadline check after NIP-42 auth | Remove the already-expired deadline check | frame text changes to "not a relay member" → byte assertion panics |
 //! | **W6** (audio B1 mid-admission) | `audio/handler.rs`, biased `cancel.cancelled()` in auth select | Remove `_ = cancel.cancelled() => return` | handler proceeds to auth exchange; close assertion fires on 3s timeout |
+//! | **B1-pre-auth** (audio already-expired pre-auth fast path) | `audio/handler.rs` — synchronous fast-path before NIP-42 challenge | Remove pre-auth already-expired block | challenge sent before denial → first received message is Text challenge → restricted frame never arrives → timeout panics |
+//! | **B1-pre-auth** (audio already-expired pre-auth fast path) | same | Remove `authorization_denied_frame` send from fast-path | no restricted frame → timeout panics |
+//! | **B1-pre-auth** (audio already-expired pre-auth fast path) | same | Remove `cancel.cancel()` from fast-path | `cancel_for_assert.is_cancelled()` panics |
+//! | **P2-verify-fence** (audio verify_auth_event cancel fence) | `audio/handler.rs` — biased `select!` around `verify_auth_event` | Remove the select (bare `.await`) | verify completes post-cancel → pairing bookkeeping reached → `pairing_reached_after_cancel` counter > 0 → assertion panics |
+//! | **P2-verify-fence** (audio verify_auth_event cancel fence) | same | Delete `before_auth_verify(...)` call | `arrived_rx` times out → test panics |
 //! | **W7** (audio B3 expiry writer) | `nip_fi_session::spawn_nip_fi_expiry_task`, audio enqueue | Delete the audio denial enqueue | `frames[0]` is not the expected restricted JSON → assertion panics |
 //! | **W8** (audio membership barrier) | `audio/handler.rs:1572` — entry of `check_membership_for_admission` | Delete `before_membership_check(...)` call | `arrived_rx` times out → test panics |
 //! | **W8** (audio membership barrier) | same | Move hook to after `state.db.get_channel()` | DB error fires before hook on lazy pool → `arrived_rx` times out |
@@ -150,6 +155,13 @@ make_hook!(count_query_hook, before_count_query);
 make_hook!(liveness_req_hook, before_liveness_req);
 make_hook!(observer_event_hook, before_observer_event);
 
+// ── Audio NIP-42 verify_auth_event fence hook ──────────────────────────────
+// `before_auth_verify`: fires in `audio/handler.rs` immediately before the
+// biased `select!` that fences `verify_auth_event` against `cancel.cancelled()`.
+// Arms expiry here → proves that a cancellation fired while verification is in
+// flight prevents pairing bookkeeping from being reached.
+make_hook!(audio_auth_verify_hook, before_auth_verify);
+
 // ── Audio B1 hooks ─────────────────────────────────────────────────────────
 // `before_membership_check`: fires between NIP-42 pairing and the membership
 // DB read inside `check_membership_for_admission`. Arms expiry here → proves
@@ -222,4 +234,84 @@ pub(crate) mod event_publish_counter {
 
 pub(crate) fn before_event_publish(community: CommunityId) {
     event_publish_counter::increment(community);
+}
+
+// ── Huddle liveness query-attempt counter ─────────────────────────────────
+// `liveness_query_counter`: increments each time `handle_huddle_liveness_req`
+// calls `state.db.huddle_started_links`. Used by P1-a: after handle_req returns
+// under session-expired, assert this counter is 0 — proves the DB query was
+// never attempted (real DB-call boundary, not the denial-text seam).
+//
+// Mutation evidence (P1-a):
+//   Remove `acquire_effect()` from the liveness branch → handler reaches
+//   `huddle_started_links` → liveness_query_counter = 1 →
+//   `assert_eq!(count, 0)` panics.
+pub(crate) mod liveness_query_counter {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTERS: LazyLock<Mutex<HashMap<CommunityId, Arc<AtomicU32>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Register a counter for `community` and return it.
+    pub(crate) fn register(community: CommunityId) -> Arc<AtomicU32> {
+        let counter = Arc::new(AtomicU32::new(0));
+        COUNTERS.lock().unwrap().insert(community, counter.clone());
+        counter
+    }
+
+    /// Deregister the counter for `community`.
+    pub(crate) fn deregister(community: CommunityId) {
+        COUNTERS.lock().unwrap().remove(&community);
+    }
+
+    pub(crate) fn increment(community: CommunityId) {
+        if let Some(counter) = COUNTERS.lock().unwrap().get(&community) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub(crate) fn before_liveness_query(community: CommunityId) {
+    liveness_query_counter::increment(community);
+}
+
+// ── P2-verify-fence: pairing-reached-after-cancel counter ─────────────────
+// `pairing_reached_after_cancel_counter`: increments each time NIP-FI key
+// pairing is entered AFTER the cancel token is already set. Used by P2 witness:
+// assert this counter is 0 after the session fires expiry mid-verify — proves
+// pairing bookkeeping is never reached when verify is fenced by the cancel
+// select. Incremented inside `audio/handler.rs` at the pairing call site,
+// guarded by `cancel.is_cancelled()` at that point.
+//
+// Mutation evidence (P2-verify-fence):
+//   Remove the biased cancel select around `verify_auth_event` → verify
+//   completes after cancel fires → pairing call site is reached →
+//   counter = 1 → `assert_eq!(count, 0)` panics.
+pub(crate) mod pairing_reached_counter {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTERS: LazyLock<Mutex<HashMap<CommunityId, Arc<AtomicU32>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(crate) fn register(community: CommunityId) -> Arc<AtomicU32> {
+        let counter = Arc::new(AtomicU32::new(0));
+        COUNTERS.lock().unwrap().insert(community, counter.clone());
+        counter
+    }
+
+    pub(crate) fn deregister(community: CommunityId) {
+        COUNTERS.lock().unwrap().remove(&community);
+    }
+
+    pub(crate) fn increment(community: CommunityId) {
+        if let Some(counter) = COUNTERS.lock().unwrap().get(&community) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub(crate) fn record_pairing_reached_after_cancel(community: CommunityId) {
+    pairing_reached_counter::increment(community);
 }
