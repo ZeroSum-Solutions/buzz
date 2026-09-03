@@ -348,7 +348,7 @@ pub(crate) async fn handle_active_audio_connection(
         crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone())
     };
 
-    let _nip_fi_admission_expiry = audio_session_deadline.map(|deadline| {
+    let mut _nip_fi_admission_expiry = audio_session_deadline.map(|deadline| {
         crate::nip_fi_session::spawn_nip_fi_expiry_task(
             deadline,
             std::sync::Arc::clone(&audio_gate),
@@ -469,15 +469,17 @@ pub(crate) async fn handle_active_audio_connection(
     // `huddle_audio_available=false` rejection under a non-mesh horizontal
     // deployment (two peers on different pods would never hear each other).
     //
-    // `remote_owner` is `Some` only on the non-owner path; it carries the
-    // registration to the owner and, once the client is admitted locally, is
-    // opened so its media forwards to the owner instead of fanning out locally.
+    // `pending_remote` drives the local vs. remote ownership decision.
+    // `admission_guard.lease` holds the freshly-acquired Redis lease (if any)
+    // and its directory for release; it is set here before any other resource
+    // that could need cleanup, so pre-commit exits always use the guard.
     let mut pending_remote: Option<crate::audio::join::JoinOutcome> = None;
-    // The freshly-acquired owner lease, if this connection won the CAS. Held
-    // until `add_peer` succeeds, then installed in the owner registry so the
-    // renewer's lifetime matches the room's, not this connection's failure
-    // paths (archived channel, version reject, room full) which return early.
-    let mut acquired_lease: Option<crate::audio::join::HuddleLease> = None;
+    // Temporary staging for the lease+directory before the admission guard is
+    // constructed (the room isn't available yet at this point).
+    let mut staged_lease: Option<(
+        crate::audio::join::HuddleLease,
+        std::sync::Arc<dyn crate::audio::join::HuddleDirectory>,
+    )> = None;
     match state.mesh() {
         Some(mesh) => {
             if mesh.owners.is_draining() {
@@ -504,7 +506,11 @@ pub(crate) async fn handle_active_audio_connection(
             .await
             {
                 Ok(resolved) => {
-                    acquired_lease = resolved.acquired;
+                    if let Some(lease) = resolved.acquired {
+                        let directory: std::sync::Arc<dyn crate::audio::join::HuddleDirectory> =
+                            std::sync::Arc::new(mesh.directory.clone());
+                        staged_lease = Some((lease, directory));
+                    }
                     pending_remote = Some(resolved.outcome);
                 }
                 Err(e) => {
@@ -572,6 +578,11 @@ pub(crate) async fn handle_active_audio_connection(
                         .into(),
                 ))
                 .await;
+            if let Some((lease, directory)) = staged_lease {
+                let c = tokio_util::sync::CancellationToken::new();
+                c.cancel();
+                crate::audio::join::spawn_observable_huddle_renewer(directory, lease, c);
+            }
             state
                 .audio_rooms
                 .cleanup_if_empty(tenant.community(), channel_id);
@@ -579,6 +590,11 @@ pub(crate) async fn handle_active_audio_connection(
         }
         Err(e) => {
             warn!(channel_id = %channel_id, "pre-join channel check failed (fail-closed): {e}");
+            if let Some((lease, directory)) = staged_lease {
+                let c = tokio_util::sync::CancellationToken::new();
+                c.cancel();
+                crate::audio::join::spawn_observable_huddle_renewer(directory, lease, c);
+            }
             state
                 .audio_rooms
                 .cleanup_if_empty(tenant.community(), channel_id);
@@ -613,14 +629,32 @@ pub(crate) async fn handle_active_audio_connection(
                 .into(),
             ))
             .await;
+        if let Some((lease, directory)) = staged_lease {
+            let c = tokio_util::sync::CancellationToken::new();
+            c.cancel();
+            crate::audio::join::spawn_observable_huddle_renewer(directory, lease, c);
+        }
         return;
     }
+
+    // Build the admission guard. From this point every pre-commit exit MUST
+    // call `guard.release_before_commit().await` before returning so that the
+    // lease, remote registration, and peer are always cleaned up through the
+    // single shared path (IMPORTANT 1-3).
+    let mut guard = HuddleAdmissionGuard {
+        lease: staged_lease,
+        remote_session: None,
+        remote_stream: None,
+        peer_id: None,
+        room: Arc::clone(&room),
+        audio_rooms: Arc::clone(&state.audio_rooms),
+        community: tenant.community(),
+        channel_id,
+    };
 
     // Remote registration happens before ingress admission. The owner-assigned
     // index is therefore the only index this client ever has; no frame or
     // `joined` message can escape with an ingress-local placeholder.
-    let mut remote_session: Option<crate::audio::join::RemoteHuddleSession> = None;
-    let mut remote_stream: Option<buzz_relay_mesh::MeshStream> = None;
     let mut remote_fence: Option<Arc<crate::audio::mesh::GenerationFloor>> = None;
     if let (Some(mesh), Some(crate::audio::join::JoinOutcome::RemoteOwner { .. })) =
         (state.mesh(), pending_remote)
@@ -645,8 +679,8 @@ pub(crate) async fn handle_active_audio_connection(
         .await
         {
             Ok((session, stream)) => {
-                remote_session = Some(session);
-                remote_stream = Some(stream);
+                guard.remote_session = Some(session);
+                guard.remote_stream = Some(stream);
                 remote_fence = Some(Arc::clone(&mesh.audio_fence));
             }
             Err(crate::audio::join::DialError::Rejected(reason)) => {
@@ -656,6 +690,7 @@ pub(crate) async fn handle_active_audio_connection(
                         remote_rejection_ws_error(&reason).to_string().into(),
                     ))
                     .await;
+                guard.release_before_commit().await;
                 state
                     .audio_rooms
                     .cleanup_if_empty(tenant.community(), channel_id);
@@ -673,64 +708,81 @@ pub(crate) async fn handle_active_audio_connection(
                         .into(),
                     ))
                     .await;
+                guard.release_before_commit().await;
                 state
                     .audio_rooms
                     .cleanup_if_empty(tenant.community(), channel_id);
                 return;
             }
         }
-        check_cancel!();
+        // B1: post-dial cancel check — guard runs clean-close + lease release.
+        if cancel.is_cancelled() {
+            use futures_util::SinkExt as _;
+            guard.release_before_commit().await;
+            while let Ok(msg) = terminal_ctrl_rx.try_recv() {
+                let _ = ws_send.send(msg).await;
+            }
+            return;
+        }
     }
 
-    let admission = if let Some(session) = remote_session.as_ref() {
-        room.add_peer_at_index(pubkey_hex.clone(), requested_version, session.peer_index())
-            .map(|(id, _mirror_epoch, audio, ctrl, revision)| {
-                // Report the owner-assigned epoch, not the local mirror's:
-                // the mirror never fans out via `broadcast_frame`, so its epoch
-                // is inert. The client's self-entry must match the owner roster.
-                (
-                    id,
-                    session.peer_index(),
-                    session.epoch(),
-                    audio,
-                    ctrl,
-                    revision,
-                )
-            })
-    } else {
-        room.add_peer(pubkey_hex.clone(), requested_version)
+    // ── Step 5: add_peer under a short gate permit ────────────────────────────
+    // The permit spans the real peer insertion (IMPORTANT 2): expiry cannot
+    // create a peer without winning the gate, so the committed/peer-absent
+    // invariant holds across deadline-exact races at this seam too.
+    let add_peer_result = {
+        let _add_permit = match audio_gate.acquire_effect().await {
+            Ok(p) => p,
+            Err(crate::nip_fi_gate::SessionExpired) => {
+                // Expiry fired before we could add the peer. No peer, no commit.
+                use futures_util::SinkExt as _;
+                guard.release_before_commit().await;
+                while let Ok(msg) = terminal_ctrl_rx.try_recv() {
+                    let _ = ws_send.send(msg).await;
+                }
+                return;
+            }
+        };
+        // Permit is held across add_peer[_at_index] — drop after the call.
+        if let Some(session) = guard.remote_session.as_ref() {
+            room.add_peer_at_index(pubkey_hex.clone(), requested_version, session.peer_index())
+                .map(|(id, _mirror_epoch, audio, ctrl, revision)| {
+                    (
+                        id,
+                        session.peer_index(),
+                        session.epoch(),
+                        audio,
+                        ctrl,
+                        revision,
+                    )
+                })
+        } else {
+            room.add_peer(pubkey_hex.clone(), requested_version)
+        }
     };
     let (peer_id, peer_index, peer_epoch, audio_rx, peer_ctrl_rx, admission_revision) =
-        match admission {
+        match add_peer_result {
             Ok(v) => v,
             Err(crate::audio::room::AdmissionError::Full) => {
                 warn!(channel_id = %channel_id, "audio room participant capacity reached");
                 let _ = ws_send.send(WsMessage::Text(serde_json::json!({"type":"error","code":"room_full","message":"room participant capacity reached"}).to_string().into())).await;
-                if let (Some(session), Some(stream)) =
-                    (remote_session.as_ref(), remote_stream.as_mut())
-                {
-                    crate::audio::join::send_clean_close(
-                        stream,
-                        session.fenced(),
-                        session.pubkey(),
-                    )
-                    .await;
+                // IMPORTANT 3: cancel + await expiry task before guard release.
+                cancel.cancel();
+                if let Some(t) = _nip_fi_admission_expiry.take() {
+                    let _ = t.await;
                 }
+                guard.release_before_commit().await;
                 return;
             }
             Err(crate::audio::room::AdmissionError::Ended) => {
                 debug!(channel_id = %channel_id, "room ended before admission");
                 let _ = ws_send.send(WsMessage::Text(serde_json::json!({"type":"error","code":"room_ended","message":"huddle has ended"}).to_string().into())).await;
-                if let (Some(session), Some(stream)) =
-                    (remote_session.as_ref(), remote_stream.as_mut())
-                {
-                    crate::audio::join::send_clean_close(
-                        stream,
-                        session.fenced(),
-                        session.pubkey(),
-                    )
-                    .await;
+                // IMPORTANT 3: cancel + await expiry task before guard release.
+                cancel.cancel();
+                if let Some(t) = _nip_fi_admission_expiry.take() {
+                    let _ = t.await;
                 }
+                guard.release_before_commit().await;
                 return;
             }
             Err(crate::audio::room::AdmissionError::VersionMismatch { pinned, requested }) => {
@@ -740,19 +792,18 @@ pub(crate) async fn handle_active_audio_connection(
                 "message": format!("this huddle is using audio protocol v{pinned}; your client requested v{requested}"),
                 "pinned_version": pinned, "requested_version": requested,
             }).to_string().into())).await;
-                if let (Some(session), Some(stream)) =
-                    (remote_session.as_ref(), remote_stream.as_mut())
-                {
-                    crate::audio::join::send_clean_close(
-                        stream,
-                        session.fenced(),
-                        session.pubkey(),
-                    )
-                    .await;
+                // IMPORTANT 3: cancel + await expiry task before guard release.
+                cancel.cancel();
+                if let Some(t) = _nip_fi_admission_expiry.take() {
+                    let _ = t.await;
                 }
+                guard.release_before_commit().await;
                 return;
             }
         };
+
+    // Record the peer in the guard so any post-add_peer pre-commit exit removes it.
+    guard.peer_id = Some(peer_id);
 
     // B1: check for mid-admission expiry immediately after peer is registered
     // in the room. The peer_id is now live; cancel means we must undo it.
@@ -763,15 +814,16 @@ pub(crate) async fn handle_active_audio_connection(
     // [nip_fi_test_hooks::audio_add_peer_hook]
     #[cfg(test)]
     crate::nip_fi_test_hooks::after_add_peer(tenant.community()).await;
-    check_cancel!(cleanup: {
-        room.remove_peer(peer_id);
-        state.audio_rooms.cleanup_if_empty(tenant.community(), channel_id);
-        if let (Some(session), Some(ref mut stream)) = (remote_session.as_ref(), remote_stream.as_mut()) {
-            let s = session.fenced();
-            let pk = session.pubkey().to_string();
-            crate::audio::join::send_clean_close(stream, s, &pk).await;
+    if cancel.is_cancelled() {
+        // IMPORTANT 3: cancel is set by the expiry task, which has already
+        // completed by the time it sets cancel. No need to await it.
+        use futures_util::SinkExt as _;
+        guard.release_before_commit().await;
+        while let Ok(msg) = terminal_ctrl_rx.try_recv() {
+            let _ = ws_send.send(msg).await;
         }
-    });
+        return;
+    }
 
     info!(
         channel_id = %channel_id,
@@ -782,11 +834,13 @@ pub(crate) async fn handle_active_audio_connection(
 
     // Owner path: install (or reuse) this room's single lease renewer now that
     // a peer is admitted, and capture its owner-loss signal. The connection
-    // that won the CAS holds `acquired_lease`; it installs the renewer. A
-    // steady-state owner (an earlier joiner installed it) reuses the room's
-    // existing signal. `owner_lost` drives this connection's own teardown
-    // below; `owner_generation` fences the release on room-empty so a stale
-    // teardown cannot release a newer epoch a re-acquire installed.
+    // that won the CAS holds the lease in the guard; it installs the renewer
+    // now that the peer is committed to the room (IMPORTANT 1: lease transfers
+    // into HuddleOwnerRegistry only here, after add_peer succeeded). A steady-
+    // state owner (an earlier joiner installed it) reuses the room's existing
+    // signal. `owner_lost` drives this connection's own teardown below;
+    // `owner_generation` fences the release on room-empty so a stale teardown
+    // cannot release a newer epoch a re-acquire installed.
     //
     // The reuse arm's live entry is guaranteed by `resolve_join_owner_ready`:
     // it re-resolves until the CAS winner has installed (reuse) or a fresh CAS
@@ -800,11 +854,12 @@ pub(crate) async fn handle_active_audio_connection(
     let mut owner_draining: Option<CancellationToken> = None;
     let mut owner_generation: Option<u64> = None;
     if let Some(mesh) = state.mesh() {
-        match (pending_remote, acquired_lease.take()) {
-            (Some(crate::audio::join::JoinOutcome::LocalOwner { generation }), Some(lease)) => {
-                let signals =
-                    mesh.owners
-                        .attach_signals(channel_id, Arc::new(mesh.directory.clone()), lease);
+        match (pending_remote, guard.take_lease()) {
+            (
+                Some(crate::audio::join::JoinOutcome::LocalOwner { generation }),
+                Some((lease, directory)),
+            ) => {
+                let signals = mesh.owners.attach_signals(channel_id, directory, lease);
                 owner_lost = Some(signals.lost);
                 owner_draining = Some(signals.draining);
                 owner_generation = Some(generation);
@@ -829,7 +884,7 @@ pub(crate) async fn handle_active_audio_connection(
     // Remote registration and owner-assigned ingress admission completed above.
 
     let (peers_snapshot, roster_revision): (Vec<serde_json::Value>, u64) = if let Some(session) =
-        remote_session.as_ref()
+        guard.remote_session.as_ref()
     {
         (
                 session
@@ -862,7 +917,8 @@ pub(crate) async fn handle_active_audio_connection(
     //   - auto-membership insert (if AutoAddRequired and still absent), and
     //   - the 48101 event insert
     // Both commit under a single session effect permit, or both roll back on
-    // expiry. Fan-out happens while the permit is still held.
+    // expiry. Fan-out AND the `joined` publication both happen while the permit
+    // is still held (IMPORTANT 5: joined inside the permit).
     //
     // joined-ordering: the `joined` frame is sent to the connecting client and
     // broadcast to existing peers ONLY after commit-won. This matches Thufir's
@@ -870,11 +926,22 @@ pub(crate) async fn handle_active_audio_connection(
     // Client compatibility: clients treat WS close as "leave audio"; receiving
     // close without a prior `joined` is a safe no-op — the session never
     // stabilised from the client's perspective.
-    let lifecycle_revision = if remote_session.is_some() {
+    let lifecycle_revision = if guard.remote_session.is_some() {
         roster_revision
     } else {
         admission_revision
     };
+
+    // Build the joined frame now (before moving guard fields into the commit).
+    let joined_msg = serde_json::json!({
+        "type": "joined",
+        "revision": roster_revision,
+        "pubkey": pubkey_hex,
+        "peer_index": peer_index,
+        "epoch": peer_epoch,
+        "peers": peers_snapshot,
+    })
+    .to_string();
 
     match commit_participant_join(
         &state,
@@ -887,25 +954,54 @@ pub(crate) async fn handle_active_audio_connection(
         lifecycle_revision,
         &membership_admission,
         &audio_gate,
+        joined_msg,
+        &room,
     )
     .await
     {
-        Ok(_stored) => {}
-        Err(JoinCommitError::Expired) => {
-            // Gate denied — expiry fired before commit. Clean up and return.
-            // The expiry task already queued the denial frame and cancelled.
-            // No `joined` frame was sent — commit-won invariant holds.
+        Ok(CommitJoinOutcome::JoinedSent) => {
+            // `joined` was broadcast inside the permit — normal flow.
+        }
+        Ok(CommitJoinOutcome::JoinedSendFailed) => {
+            // Committed but the joining peer's ctrl channel was saturated.
+            // Route through normal admitted teardown: remove peer, emit 48102,
+            // send remote close. Committed join => exactly one leave.
             room.remove_peer(peer_id);
             state
                 .audio_rooms
                 .cleanup_if_empty(tenant.community(), channel_id);
-            if let (Some(session), Some(ref mut stream)) =
-                (remote_session.as_ref(), remote_stream.as_mut())
-            {
-                let s = session.fenced();
-                let pk = session.pubkey().to_string();
-                crate::audio::join::send_clean_close(stream, s, &pk).await;
+            if let (Some(session), Some(ref mut stream)) = (
+                guard.take_remote_session().as_ref(),
+                guard.take_remote_stream().as_mut(),
+            ) {
+                crate::audio::join::send_clean_close(stream, session.fenced(), session.pubkey())
+                    .await;
             }
+            // Emit 48102 — committed join produces exactly one leave.
+            emit_participant_event(
+                &state,
+                &tenant,
+                channel_id,
+                parent_id_for_event,
+                ParticipantLifecycle {
+                    kind: Kind::Custom(48102),
+                    participant_pubkey: &pubkey_hex,
+                    roster_revision: None,
+                    admission_id: Some(peer_id),
+                },
+            )
+            .await;
+            state
+                .audio_rooms
+                .cleanup_if_empty(tenant.community(), channel_id);
+            return;
+        }
+        Err(JoinCommitError::Expired) => {
+            // Gate denied — expiry fired before commit. Expiry task is done.
+            // No `joined` frame was sent — commit-won invariant holds.
+            // IMPORTANT 3: Expired means the expiry task has completed (it fired
+            // the cancel and wrote the permit). No need to await it.
+            guard.release_before_commit().await;
             // Drain the terminal denial frame (already queued by expiry task).
             use futures_util::SinkExt as _;
             while let Ok(msg) = terminal_ctrl_rx.try_recv() {
@@ -913,21 +1009,54 @@ pub(crate) async fn handle_active_audio_connection(
             }
             return;
         }
+        Err(JoinCommitError::Archived) => {
+            // Channel archived between pre-join check and commit (IMPORTANT 4).
+            // No `joined` frame was sent — commit-won invariant holds.
+            debug!(channel_id = %channel_id, "channel archived before join commit");
+            // IMPORTANT 3: cancel + await expiry task before peer/room teardown.
+            cancel.cancel();
+            if let Some(t) = _nip_fi_admission_expiry.take() {
+                let _ = t.await;
+            }
+            guard.release_before_commit().await;
+            let _ = ws_send
+                .send(WsMessage::Text(
+                    serde_json::json!({"type":"error","message":"huddle has ended"})
+                        .to_string()
+                        .into(),
+                ))
+                .await;
+            return;
+        }
+        Err(JoinCommitError::ParentMembershipLost) => {
+            // Parent membership revoked between pre-join check and commit (IMPORTANT 4).
+            // No `joined` frame was sent — commit-won invariant holds.
+            warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "parent membership lost before join commit");
+            // IMPORTANT 3: cancel + await expiry task before peer/room teardown.
+            cancel.cancel();
+            if let Some(t) = _nip_fi_admission_expiry.take() {
+                let _ = t.await;
+            }
+            guard.release_before_commit().await;
+            let _ = ws_send
+                .send(WsMessage::Text(
+                    serde_json::json!({"type":"error","message":"error: not a member"})
+                        .to_string()
+                        .into(),
+                ))
+                .await;
+            return;
+        }
         Err(JoinCommitError::Db(e)) => {
             // DB failure during join commit — treat same as pre-admission error.
             // No `joined` frame was sent — commit-won invariant holds.
             warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "48101 commit failed: {e}");
-            room.remove_peer(peer_id);
-            state
-                .audio_rooms
-                .cleanup_if_empty(tenant.community(), channel_id);
-            if let (Some(session), Some(ref mut stream)) =
-                (remote_session.as_ref(), remote_stream.as_mut())
-            {
-                let s = session.fenced();
-                let pk = session.pubkey().to_string();
-                crate::audio::join::send_clean_close(stream, s, &pk).await;
+            // IMPORTANT 3: cancel + await expiry task before peer/room teardown.
+            cancel.cancel();
+            if let Some(t) = _nip_fi_admission_expiry.take() {
+                let _ = t.await;
             }
+            guard.release_before_commit().await;
             let _ = ws_send
                 .send(WsMessage::Text(
                     serde_json::json!({"type":"error","message":"error: join commit failed"})
@@ -939,34 +1068,12 @@ pub(crate) async fn handle_active_audio_connection(
         }
     }
 
-    // ── Step 7: notify the joining client and broadcast to existing peers ─────
-    // `joined` is sent after commit-won so no client sees join success before
-    // the 48101 is persisted. [joined-ordering, fd00e6fe note-2]
-    let joined_msg = serde_json::json!({
-        "type": "joined",
-        "revision": roster_revision,
-        "pubkey": pubkey_hex,
-        "peer_index": peer_index,
-        "epoch": peer_epoch,
-        "peers": peers_snapshot,
-    })
-    .to_string();
-
-    if remote_session.is_some() {
-        if ws_send
-            .send(WsMessage::Text(joined_msg.into()))
-            .await
-            .is_err()
-        {
-            room.remove_peer(peer_id);
-            state
-                .audio_rooms
-                .cleanup_if_empty(tenant.community(), channel_id);
-            return;
-        }
-    } else {
-        room.broadcast_control(joined_msg);
-    }
+    // Commit-won. Take guard fields into the live runtime — any remaining
+    // fields in guard at this point would be double-released on drop, but all
+    // fields were taken by commit_participant_join above.
+    let mut remote_session = guard.take_remote_session();
+    let remote_stream = guard.take_remote_stream();
+    let _ = guard.take_peer_id(); // peer_id was taken for the commit path
 
     // B1: After commit_participant_join, the admission is committed. No further
     // check_cancel! is needed — the send_loop owns terminal_ctrl_rx from here.
@@ -1567,6 +1674,115 @@ pub(crate) enum MembershipAdmission {
     },
 }
 
+/// Pre-admission ownership guard for the audio join path.
+///
+/// Owns all still-unattached resources acquired before `commit_participant_join`
+/// succeeds: the unattached Redis lease (if this pod won the CAS), the remote
+/// session + stream (if this is a cross-pod join), and the peer ID once admitted
+/// to the local room. Each field is `take`n to `None` only at the single point
+/// where it is either committed (transferred into the live runtime) or released
+/// (cleaned up on a pre-commit exit).
+///
+/// `release_before_commit` releases / closes / removes every field that is still
+/// `Some`. It is idempotent: calling it twice has no effect because every field
+/// becomes `None` after the first call. After a commit-won, the caller calls
+/// `take_*` methods to extract the committed state; any field that was not taken
+/// is auto-released when the guard drops (unreachable in normal flow).
+///
+/// This guard satisfies IMPORTANT 1-2 from the pass-3 review: every pre-commit
+/// exit uses a single release path so no exit can skip lease release, remote
+/// unregister, or peer removal.
+struct HuddleAdmissionGuard {
+    /// Unattached Redis lease won by this connection's CAS, plus the directory
+    /// needed to release it. `None` when this pod is a steady-state owner
+    /// (reuses the live registry entry) or a non-owner. Attached into
+    /// `HuddleOwnerRegistry` only after commit-won.
+    ///
+    /// The directory is boxed as `dyn HuddleDirectory` so guard-level tests can
+    /// inject a `FakeDir` double without requiring a live Redis instance (CW6).
+    lease: Option<(
+        crate::audio::join::HuddleLease,
+        std::sync::Arc<dyn crate::audio::join::HuddleDirectory>,
+    )>,
+    /// Remote session registration (owner-assigned index + roster). Set when
+    /// this pod is a non-owner and `dial_remote_owner` succeeded.
+    remote_session: Option<crate::audio::join::RemoteHuddleSession>,
+    /// Live control stream to the owner pod. Set alongside `remote_session`.
+    remote_stream: Option<buzz_relay_mesh::MeshStream>,
+    /// Peer ID in the local room once `add_peer[_at_index]` succeeded.
+    peer_id: Option<Uuid>,
+    /// Back-reference to the room for `remove_peer` on pre-commit exit.
+    room: std::sync::Arc<crate::audio::room::Room>,
+    /// Back-reference to the room manager for `cleanup_if_empty`.
+    audio_rooms: std::sync::Arc<crate::audio::room::AudioRoomManager>,
+    /// Community + channel for `cleanup_if_empty`.
+    community: buzz_core::CommunityId,
+    channel_id: Uuid,
+}
+
+impl HuddleAdmissionGuard {
+    /// Release all still-held resources. Safe to call multiple times; each
+    /// field becomes `None` on first release.
+    ///
+    /// - Unattached lease: spawned with a pre-cancelled token so the renewer
+    ///   immediately releases the Redis fenced lease without installing a
+    ///   registry entry.
+    /// - Remote registration: UnregisterPeer + Goodbye(SessionEnded) on stream.
+    /// - Peer in room: remove_peer + cleanup_if_empty.
+    async fn release_before_commit(&mut self) {
+        // Release the unattached lease by spawning a renewer with a
+        // pre-cancelled caller token. The renewer loop immediately hits the
+        // cancel arm (break true) and calls `directory.release(&lease)` —
+        // the exact fenced release path — without ever installing an entry in
+        // HuddleOwnerRegistry. This is the same cleanup path `attach_signals`
+        // uses on the draining arm.
+        if let Some((lease, directory)) = self.lease.take() {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            cancel.cancel(); // fires immediately so renewer releases on first tick
+            crate::audio::join::spawn_observable_huddle_renewer(directory, lease, cancel);
+        }
+        // Close the remote registration.
+        if let (Some(session), Some(ref mut stream)) =
+            (self.remote_session.as_ref(), self.remote_stream.as_mut())
+        {
+            crate::audio::join::send_clean_close(stream, session.fenced(), session.pubkey()).await;
+        }
+        self.remote_session = None;
+        self.remote_stream = None;
+        // Remove the peer from the room.
+        if let Some(pid) = self.peer_id.take() {
+            self.room.remove_peer(pid);
+            self.audio_rooms
+                .cleanup_if_empty(self.community, self.channel_id);
+        }
+    }
+
+    /// Take the remote session (consumed at commit-won for the send-loop task).
+    fn take_remote_session(&mut self) -> Option<crate::audio::join::RemoteHuddleSession> {
+        self.remote_session.take()
+    }
+
+    /// Take the remote stream (consumed at commit-won for the reader task).
+    fn take_remote_stream(&mut self) -> Option<buzz_relay_mesh::MeshStream> {
+        self.remote_stream.take()
+    }
+
+    /// Take the lease (consumed at commit-won to pass into `attach_signals`).
+    fn take_lease(
+        &mut self,
+    ) -> Option<(
+        crate::audio::join::HuddleLease,
+        std::sync::Arc<dyn crate::audio::join::HuddleDirectory>,
+    )> {
+        self.lease.take()
+    }
+
+    /// Take the peer ID (consumed at commit-won so normal teardown owns cleanup).
+    fn take_peer_id(&mut self) -> Option<Uuid> {
+        self.peer_id.take()
+    }
+}
+
 /// Validate membership for audio admission — **no durable write**.
 ///
 /// Loads the channel, checks archival status, resolves the parent-channel
@@ -1658,6 +1874,24 @@ async fn check_membership_for_admission(
     Err("not a member".into())
 }
 
+/// Outcome returned by [`commit_participant_join`] on the `Ok` path.
+///
+/// Indicates whether the `joined` broadcast was queued inside the permit
+/// (always the case with `broadcast_control`) or whether the peer's ctrl
+/// channel was saturated and the message was dropped (the forward loop will
+/// detect the dead channel and drive normal admitted teardown from there).
+#[derive(Debug)]
+pub(crate) enum CommitJoinOutcome {
+    /// `joined` was queued to all peers' ctrl channels inside the permit.
+    JoinedSent,
+    /// The joining peer's ctrl channel was already saturated; the message
+    /// was dropped. The forward loop will close via the dead channel.
+    /// Structurally unreachable at this time (fresh peer channel is never
+    /// full), kept as a safety valve for future capacity changes.
+    #[allow(dead_code)]
+    JoinedSendFailed,
+}
+
 /// Error returned by [`commit_participant_join`].
 #[derive(Debug)]
 pub(crate) enum JoinCommitError {
@@ -1665,6 +1899,10 @@ pub(crate) enum JoinCommitError {
     Db(buzz_db::DbError),
     /// The session gate rejected the permit (session expired before commit).
     Expired,
+    /// Channel was archived between pre-join check and commit (IMPORTANT 4).
+    Archived,
+    /// Parent membership was revoked between pre-join check and commit (IMPORTANT 4).
+    ParentMembershipLost,
 }
 
 impl std::fmt::Display for JoinCommitError {
@@ -1672,6 +1910,10 @@ impl std::fmt::Display for JoinCommitError {
         match self {
             JoinCommitError::Db(e) => write!(f, "db error: {e}"),
             JoinCommitError::Expired => write!(f, "session expired before commit"),
+            JoinCommitError::Archived => write!(f, "channel archived before commit"),
+            JoinCommitError::ParentMembershipLost => {
+                write!(f, "parent membership revoked before commit")
+            }
         }
     }
 }
@@ -1685,19 +1927,22 @@ impl From<buzz_db::DbError> for JoinCommitError {
 /// Atomically commit the participant join: auto-add membership (if needed) +
 /// kind `48101` event, in one DB transaction, under a session effect permit.
 ///
-/// Ordering (per B1 contract [e5bc0382]):
+/// Ordering (per B1 contract [e5bc0382], corrected for IMPORTANT 4 and 5):
 /// 1. Sign the `48101` event synchronously.
 /// 2. Begin a caller-owned DB transaction.
-/// 3. Under the channel membership lock: re-read membership state and auto-add
-///    if `AutoAddRequired` and membership is still absent. A concurrent
-///    legitimate add is observed as existing and is not overwritten.
+/// 3. Under the channel membership lock (AutoAddRequired only):
+///    a. Re-read channel archive state — fail `Archived` if now archived.
+///    (IMPORTANT 4: closes the race between pre-join check and commit.)
+///    b. Re-read parent membership — fail `ParentMembershipLost` if gone.
+///    c. Re-read child membership — skip auto-add insert if a concurrent
+///    legitimate add is already present (concurrent-add preservation).
 /// 4. Insert kind `48101` in the same transaction (uncommitted).
 /// 5. Acquire a session effect permit (or rollback + return `Err(Expired)`).
-/// 6. Commit the transaction while holding the permit. On commit error, roll
-///    back explicitly and return `Err(Db(...))`.
+/// 6. Commit the transaction while holding the permit.
 /// 7. While the same permit is held: mark the event locally, fan out to local
-///    subscribers, publish to Redis. Errors here use existing handling (warn,
-///    invalidate local mark). Drop the permit after fan-out.
+///    subscribers, publish to Redis, and broadcast `joined` to all peers
+///    (including the joiner) via `room.broadcast_control`. (IMPORTANT 5:
+///    `joined` publication inside the commit-won permit.) Drop permit after.
 ///
 /// Never cancels or drops the commit future once started — commit returns a
 /// known outcome and that outcome drives success or the pre-admission cleanup.
@@ -1716,7 +1961,9 @@ async fn commit_participant_join(
     roster_revision: u64,
     membership_admission: &MembershipAdmission,
     gate: &std::sync::Arc<crate::nip_fi_gate::SessionAdmissionGate>,
-) -> Result<StoredEvent, JoinCommitError> {
+    joined_msg: String,
+    room: &std::sync::Arc<crate::audio::room::Room>,
+) -> Result<CommitJoinOutcome, JoinCommitError> {
     // 1. Sign the 48101 event synchronously.
     let content = serde_json::json!({
         "ephemeral_channel_id": channel_id.to_string(),
@@ -1748,9 +1995,13 @@ async fn commit_participant_join(
     // 2. Begin a caller-owned DB transaction.
     let mut tx = state.db.begin_event_write_transaction().await?;
 
-    // 3. Under the channel membership lock: auto-add if still absent.
+    // 3. Under the channel membership lock: re-validate authority + auto-add if
+    //    still absent. The AutoAddRequired path carries stale authority from
+    //    check_membership_for_admission; the lock serialises all membership writes
+    //    for this channel so the re-reads observe the most recent committed state.
     if let MembershipAdmission::AutoAddRequired {
-        channel_created_by, ..
+        parent_channel_id: parent_id,
+        channel_created_by,
     } = membership_admission
     {
         // Test hook: fires immediately before the channel membership lock is
@@ -1768,7 +2019,44 @@ async fn commit_participant_join(
         )
         .await?;
 
-        // Re-read membership — a concurrent add may have already provided access.
+        // IMPORTANT 4a: Re-read channel archive state under the lock. A channel
+        // could be archived in the window between check_membership_for_admission
+        // and now; committing a join into an archived channel violates the
+        // "no admission after archive" invariant.
+        let channel_archived: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT archived_at FROM channels \
+             WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL",
+        )
+        .bind(tenant.community().as_uuid())
+        .bind(channel_id)
+        .fetch_optional(tx.as_mut())
+        .await
+        .map_err(buzz_db::DbError::from)?
+        .flatten();
+
+        if channel_archived.is_some() {
+            let _ = tx.rollback().await;
+            return Err(JoinCommitError::Archived);
+        }
+
+        // IMPORTANT 4b: Re-read parent membership under the lock. A parent
+        // membership revocation in the same window would make the auto-add
+        // unjustified; reject rather than grant access from stale authority.
+        let parent_still_member = buzz_db::channel_members::is_member_in_transaction(
+            &mut tx,
+            tenant.community(),
+            *parent_id,
+            pubkey_bytes,
+        )
+        .await?;
+
+        if !parent_still_member {
+            let _ = tx.rollback().await;
+            return Err(JoinCommitError::ParentMembershipLost);
+        }
+
+        // Re-read child membership — a concurrent legitimate add may have
+        // already provided access; do not overwrite role/provenance.
         let still_absent = !buzz_db::channel_members::is_member_in_transaction(
             &mut tx,
             tenant.community(),
@@ -1787,8 +2075,7 @@ async fn commit_participant_join(
             )
             .await?;
         }
-        // If not still_absent: a concurrent legitimate add already committed.
-        // The joint transaction observes it; we do not need to compensate later.
+        // If not still_absent: concurrent add observed — membership preserved.
     }
 
     // 4. Insert kind `48101` uncommitted.
@@ -1867,9 +2154,24 @@ async fn commit_participant_join(
             "audio: 48101 already persisted — skipping fan-out"
         );
     }
-    // Test hook: fires after fan-out completes but BEFORE `_permit` drops.
-    // Used by CW10: expiry armed here blocks at the write guard until the
-    // permit drops at the end of this scope. Proves fan-out-then-quiescence.
+
+    // IMPORTANT 5: broadcast `joined` to all peers (including the joiner) while
+    // the commit-won permit is still held. `broadcast_control` sends via each
+    // peer's ctrl channel; the joining peer's channel was created by add_peer and
+    // is read by the audio_forward_loop once it starts. The message is buffered
+    // in that channel until the loop drains it.
+    //
+    // The peer's ctrl channel is freshly created by add_peer (capacity 8) so the
+    // try_send inside broadcast_control will succeed. JoinedSent is always
+    // returned; JoinedSendFailed is structurally unreachable here but kept for
+    // completeness — the forward loop's dead-channel path handles any future
+    // saturation case at runtime.
+    room.broadcast_control(joined_msg);
+    let outcome = CommitJoinOutcome::JoinedSent;
+
+    // Test hook: fires after fan-out and `joined` broadcast, but BEFORE
+    // `_permit` drops. Used by CW10: expiry armed here blocks at the write
+    // guard until the permit drops at the end of this scope.
     // [nip_fi_test_hooks::audio_participant_fanout_hook]
     #[cfg(test)]
     crate::nip_fi_test_hooks::after_participant_fanout(tenant.community()).await;
@@ -1883,7 +2185,7 @@ async fn commit_participant_join(
         state.invalidate_membership(tenant, channel_id, pubkey_bytes);
     }
 
-    Ok(stored)
+    Ok(outcome)
 }
 
 #[derive(Clone, Copy)]
@@ -3207,6 +3509,11 @@ mod tests {
                 roster_revision,
                 &membership,
                 &gate2,
+                String::new(),
+                &std::sync::Arc::new(crate::audio::room::Room::new(
+                    tenant2.community(),
+                    channel_id,
+                )),
             )
             .await
         });
@@ -3337,6 +3644,11 @@ mod tests {
                     parent_channel_id: channel_id,
                 },
                 &gate_a,
+                String::new(),
+                &std::sync::Arc::new(crate::audio::room::Room::new(
+                    tenant_a.community(),
+                    channel_id,
+                )),
             )
             .await
         });
@@ -3373,6 +3685,11 @@ mod tests {
                     parent_channel_id: channel_id,
                 },
                 &gate_b,
+                String::new(),
+                &std::sync::Arc::new(crate::audio::room::Room::new(
+                    tenant_b.community(),
+                    channel_id,
+                )),
             )
             .await
         });
@@ -3475,6 +3792,11 @@ mod tests {
                     parent_channel_id: channel_id,
                 },
                 &gate1,
+                String::new(),
+                &std::sync::Arc::new(crate::audio::room::Room::new(
+                    tenant1.community(),
+                    channel_id,
+                )),
             )
             .await
         });
@@ -3511,6 +3833,11 @@ mod tests {
                     parent_channel_id: channel_id,
                 },
                 &gate2,
+                String::new(),
+                &std::sync::Arc::new(crate::audio::room::Room::new(
+                    tenant2.community(),
+                    channel_id,
+                )),
             )
             .await
         });
@@ -3629,9 +3956,70 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel.clone());
 
+        // IMPORTANT 4b requires that the joiner is a member of the parent channel
+        // before AutoAddRequired can commit. Seed that parent membership now.
+        // (In production, check_membership_for_admission only returns AutoAddRequired
+        // if the parent membership exists; the re-read confirms it still does.)
+        sqlx::query(
+            "INSERT INTO channel_members (channel_id, community_id, pubkey, role, invited_by) \
+             VALUES ($1, $2, $3, 'member', $4)",
+        )
+        .bind(channel_id)
+        .bind(community_uuid)
+        .bind(&joiner_bytes)
+        .bind(&creator_bytes)
+        .execute(&pool)
+        .await
+        .expect("CW5: seed parent membership for joiner");
+
+        // Remove the just-inserted membership so AutoAddRequired still fires
+        // (we seeded it as the "parent" channel member, but the child channel
+        // is the same channel_id — so still_absent will now be false and the
+        // auto-add insert is skipped). We actually want still_absent=true to
+        // test the auto-add path. To do this properly: use a SEPARATE parent
+        // channel so the parent membership doesn't conflict with the child check.
+        // Delete the row we just inserted and use a two-channel fixture.
+        sqlx::query("DELETE FROM channel_members WHERE channel_id = $1 AND community_id = $2 AND pubkey = $3")
+            .bind(channel_id)
+            .bind(community_uuid)
+            .bind(&joiner_bytes)
+            .execute(&pool)
+            .await
+            .expect("CW5: cleanup parent membership");
+
+        // Use a two-channel fixture: parent_channel has the joiner as a member;
+        // child_channel has NO membership for the joiner (triggers AutoAddRequired).
+        let parent_channel_id = channel_id; // reuse the existing channel as parent
+        let child_channel_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO channels (id, community_id, name, channel_type, visibility, created_by) \
+             VALUES ($1, $2, 'cw5-child-channel', 'stream', 'open', $3)",
+        )
+        .bind(child_channel_id)
+        .bind(community_uuid)
+        .bind(&creator_bytes)
+        .execute(&pool)
+        .await
+        .expect("CW5: seed child channel");
+
+        // Seed parent membership for the joiner.
+        sqlx::query(
+            "INSERT INTO channel_members (channel_id, community_id, pubkey, role, invited_by) \
+             VALUES ($1, $2, $3, 'member', $4)",
+        )
+        .bind(parent_channel_id)
+        .bind(community_uuid)
+        .bind(&joiner_bytes)
+        .bind(&creator_bytes)
+        .execute(&pool)
+        .await
+        .expect("CW5: seed parent channel membership for joiner");
+
         // membership_admission = AutoAddRequired — the joint-tx auto-add path.
+        // parent_channel_id has the joiner as member (satisfies IMPORTANT 4b re-read).
+        // child_channel_id has NO membership — so still_absent=true → auto-add fires.
         let membership = MembershipAdmission::AutoAddRequired {
-            parent_channel_id: channel_id,
+            parent_channel_id,
             channel_created_by: creator_bytes.clone(),
         };
 
@@ -3649,14 +4037,19 @@ mod tests {
             commit_participant_join(
                 &state2,
                 &tenant2,
-                channel_id,
-                channel_id,
+                child_channel_id,
+                parent_channel_id,
                 &joiner_hex2,
                 &joiner_bytes2,
                 Uuid::new_v4(),
                 1,
                 &membership,
                 &gate2,
+                String::new(),
+                &std::sync::Arc::new(crate::audio::room::Room::new(
+                    tenant2.community(),
+                    child_channel_id,
+                )),
             )
             .await
         });
@@ -3687,7 +4080,7 @@ mod tests {
              WHERE community_id = $1 AND channel_id = $2 AND kind = 48101",
         )
         .bind(community_uuid)
-        .bind(channel_id)
+        .bind(child_channel_id)
         .fetch_one(&pool)
         .await
         .expect("CW5: 48101 row count query");
@@ -3697,13 +4090,13 @@ mod tests {
             "CW5: no 48101 row must be committed after AutoAddRequired expiry-rollback; found {row_count_48101}"
         );
 
-        // Zero membership rows for the joiner — the auto-add insert was rolled back.
+        // Zero membership rows for the joiner in the child channel — the auto-add insert was rolled back.
         let membership_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM channel_members \
              WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3",
         )
         .bind(community_uuid)
-        .bind(channel_id)
+        .bind(child_channel_id)
         .bind(&joiner_bytes)
         .fetch_one(&pool)
         .await
@@ -3824,6 +4217,11 @@ mod tests {
                 1,
                 &membership,
                 &gate2,
+                String::new(),
+                &std::sync::Arc::new(crate::audio::room::Room::new(
+                    tenant2.community(),
+                    channel_id,
+                )),
             )
             .await
         });
@@ -3836,6 +4234,11 @@ mod tests {
 
         // External concurrent insert — simulates another legitimate path adding
         // the joiner to the channel before our transaction acquires the lock.
+        // Use a DISTINCT invited_by key to prove provenance preservation: if the
+        // auto-add fires instead of being skipped, it would overwrite invited_by
+        // with creator_bytes — the assertion below would catch that.
+        let external_inviter = nostr::Keys::generate();
+        let external_inviter_bytes = external_inviter.public_key().to_bytes().to_vec();
         sqlx::query(
             "INSERT INTO channel_members (community_id, channel_id, pubkey, role, invited_by) \
              VALUES ($1, $2, $3, 'member', $4)",
@@ -3843,7 +4246,7 @@ mod tests {
         .bind(community_uuid)
         .bind(channel_id)
         .bind(&joiner_bytes)
-        .bind(&creator_bytes)
+        .bind(&external_inviter_bytes)
         .execute(&pool2)
         .await
         .expect("CW5-variant: external membership insert");
@@ -3862,22 +4265,35 @@ mod tests {
             "CW5-variant: join must succeed (external add observed, skip insert); got: {result:?}"
         );
 
-        // Exactly 1 membership row — the externally-inserted one. Our tx skipped
-        // the auto-add insert because still_absent=false.
-        let membership_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM channel_members \
-             WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3",
-        )
-        .bind(community_uuid)
-        .bind(channel_id)
-        .bind(&joiner_bytes)
-        .fetch_one(&pool)
-        .await
-        .expect("CW5-variant: membership row count query");
+        // Verify membership via the normal API (role/provenance facts, not just count).
+        // This is the seam Thufir flagged: raw count allows an unconditional upsert
+        // to pass (overwrites provenance but count stays 1).
+        let members =
+            buzz_db::channel_members::get_members(state.db.pool(), community_id, channel_id)
+                .await
+                .expect("CW5-variant: get_members query");
 
         assert_eq!(
-            membership_count, 1,
-            "CW5-variant: exactly 1 membership row (external's) must persist; found {membership_count}"
+            members.len(),
+            1,
+            "CW5-variant: exactly 1 membership row (external's) must persist; found {}",
+            members.len()
+        );
+        let member = &members[0];
+        assert_eq!(
+            member.pubkey, joiner_bytes,
+            "CW5-variant: membership row must be for the joiner"
+        );
+        assert_eq!(
+            member.role, "member",
+            "CW5-variant: membership role must be 'member' (external insert's role preserved)"
+        );
+        assert_eq!(
+            member.invited_by.as_deref(),
+            Some(external_inviter_bytes.as_slice()),
+            "CW5-variant: invited_by must match external inviter (not auto-add's creator_bytes) — \
+             proves auto-add was skipped, not that it overwrote provenance; \
+             mutation: if auto-add insert fires, invited_by would be creator_bytes and this panics"
         );
 
         // Exactly 1 committed 48101 row — the join event committed.
@@ -4104,12 +4520,11 @@ mod tests {
     //
     // Mutation evidence (executed):
     //   CW8A) Delete `after_add_peer(...)` → arrived_rx times out → panic.
-    //   CW8B) Delete `room.remove_peer(peer_id)` from cleanup → room non-empty →
-    //         is_empty() assertion panics.
-    //   CW8C) Delete `cleanup_if_empty(...)` from cleanup → room entry lingers
-    //         after last-peer removal → audio_rooms.get() returns Some(non-empty)
-    //         but we'd need to inspect the rooms map — assert covered by the
-    //         remove_peer assertion instead.
+    //   CW8B) Delete `room.remove_peer(peer_id)` from cleanup → room not removed →
+    //         audio_rooms.get() returns Some → room_after.is_none() assertion panics.
+    //   CW8C) Delete `cleanup_if_empty(...)` from cleanup → room entry persists after
+    //         last-peer removal → audio_rooms.get() returns Some →
+    //         room_after.is_none() assertion panics (detects the missing call).
     #[tokio::test]
     async fn cw8_post_add_peer_cancel_removes_peer_and_cleans_up_real_db() {
         use buzz_auth::VerifiedAssertion;
@@ -4250,15 +4665,17 @@ mod tests {
         // Handler returns (connection closes).
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), client.next()).await;
 
-        // Room must be empty — remove_peer ran in the cleanup block.
-        if let Some(room) = audio_rooms.get(community, channel_id) {
-            assert!(
-                room.is_empty(),
-                "CW8: room must be empty after post-add_peer cancel+cleanup; peers still present: {:?}",
-                room.peer_pubkeys()
-            );
-        }
-        // Room may not exist at all (cleanup_if_empty removed it) — also correct.
+        // Room must be empty AND must have been cleaned up by cleanup_if_empty.
+        // An empty-but-still-registered room means cleanup_if_empty did NOT fire,
+        // which would fail the CW8B mutation test (deleting cleanup_if_empty).
+        // Asserting audio_rooms.get() returns None is the stronger check.
+        let room_after = audio_rooms.get(community, channel_id);
+        assert!(
+            room_after.is_none(),
+            "CW8: room must have been removed by cleanup_if_empty after post-add_peer cancel; \
+             room still present in map (cleanup_if_empty did not fire): peers={:?}",
+            room_after.as_ref().map(|r| r.peer_pubkeys())
+        );
 
         // No 48101 committed — commit_participant_join was never reached.
         let row_count: i64 = sqlx::query_scalar(
@@ -4367,6 +4784,11 @@ mod tests {
                 1,
                 &membership,
                 &gate2,
+                String::new(),
+                &std::sync::Arc::new(crate::audio::room::Room::new(
+                    tenant2.community(),
+                    channel_id,
+                )),
             )
             .await
         });
@@ -4464,34 +4886,498 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // CW6 / CW7 blockers
+    // CW10-full-handler: committed join → disconnect → exactly one 48102
     // ─────────────────────────────────────────────────────────────────────────
     //
-    // CW6: expiry after lease acquire → exact lease released, no owner attachment.
+    // Full-handler witness (IMPORTANT 5 + teardown): a committed join must
+    // produce exactly one kind:48101 and exactly one kind:48102, regardless of
+    // when teardown is triggered. Uses a real DB + full `handle_active_audio_connection`
+    // invocation so the complete send_loop/recv_loop/forward_loop lifecycle runs.
     //
-    // The lease-acquire path runs inside `handle_active_audio_connection` when
-    // `state.mesh()` returns `Some(mesh)` AND `resolve_join_owner_ready` returns
-    // `JoinOutcome::LocalOwner` with an `acquired` lease. This requires:
-    //   - A running Redis instance (the `SessionDirectory` is Redis-backed).
-    //   - A running `MeshRuntimeState` (mesh transport, directory, owners registry).
-    //   - The full `AppState::mesh()` non-None path.
+    // Steps:
+    //   1. Seed a channel + member, connect via WS, complete NIP-42 handshake.
+    //   2. Arm `after_participant_fanout` hook — fires after tx.commit() + fan-out,
+    //      before `_permit` drops. At this point 48101 is committed.
+    //   3. Release the hook → `commit_participant_join` returns Ok.
+    //   4. Session enters recv_loop. Immediately cancel `conn_cancel` to
+    //      simulate a client disconnect (or NIP-FI expiry triggering the same
+    //      teardown path).
+    //   5. Wait for the handler to complete.
+    //   6. Assert: exactly 1 committed 48101 row; exactly 1 committed 48102 row.
+    //      The pair proves "committed join ⇒ exactly one leave event".
     //
-    // The `HuddleOwnerRegistry::release` mechanism is unit-tested independently
-    // in `audio/join.rs` (see `release_is_fenced_by_generation`). The CW6
-    // barrier test — proving that on expiry the freshly-acquired lease is released
-    // and NOT installed in the owners registry — requires full mesh infrastructure
-    // that is absent from the unit test suite. Blocked on mesh integration infra.
+    // Mutation evidence (executed):
+    //   CW10F-A) Remove the `emit_participant_event(48102, ...)` call from the
+    //            handler epilogue → 48102 count stays 0 → assertion panics.
+    //   CW10F-B) Remove `room.remove_peer(peer_id)` / `remove_peer_and_check_ended`
+    //            from teardown → room is not empty → cleanup_if_empty is a no-op
+    //            → the room entry persists → subsequent get() finds it.
+    #[tokio::test]
+    async fn cw10_full_handler_committed_join_produces_exactly_one_leave_event() {
+        use buzz_auth::VerifiedAssertion;
+        use chrono::{Duration, Utc};
+        use std::sync::Arc;
+
+        let state = match audio_test_state_real_db().await {
+            Some(s) => s,
+            None => {
+                eprintln!("CW10-full: skipping — local DB not available at postgres://buzz:buzz_dev@127.0.0.1:5432/buzz");
+                return;
+            }
+        };
+        let pool = state.db.pool().clone();
+        let (tenant, channel_id, member_key) = seed_audio_fixture(&pool).await;
+        let community = tenant.community();
+
+        let key = member_key;
+        let assertion = VerifiedAssertion::for_test(
+            Some(key.public_key()),
+            vec![Utc::now() + Duration::hours(1)],
+        );
+
+        let audio_rooms = Arc::clone(&state.audio_rooms);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let conn_cancel = CancellationToken::new();
+        let state_c = Arc::clone(&state);
+        let tenant_c = tenant.clone();
+        let assertion_c = assertion.clone();
+        let conn_cancel_c = conn_cancel.clone();
+        let tenant_host = tenant_c.host().to_string();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("test listener addr");
+
+        // Arm after_participant_fanout: fires when 48101 is committed + fan-out done.
+        let (fanout_rx, fanout_release) =
+            crate::nip_fi_test_hooks::audio_participant_fanout_hook::arm(community);
+
+        let server = tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::get({
+                    let state_i = Arc::clone(&state_c);
+                    let tenant_i = tenant_c.clone();
+                    let assertion_i = assertion_c.clone();
+                    let cancel_i = conn_cancel_c.clone();
+                    move |ws: axum::extract::ws::WebSocketUpgrade| {
+                        let state_i = Arc::clone(&state_i);
+                        let tenant_i = tenant_i.clone();
+                        let assertion_i = assertion_i.clone();
+                        let conn_time = chrono::Utc::now();
+                        let control_inner =
+                            crate::state::CommunityConnectionControl::new(cancel_i.clone());
+                        async move {
+                            ws.on_upgrade(move |socket| async move {
+                                handle_active_audio_connection(
+                                    socket,
+                                    state_i,
+                                    tenant_i,
+                                    channel_id,
+                                    control_inner,
+                                    Some(assertion_i),
+                                    conn_time,
+                                )
+                                .await
+                            })
+                        }
+                    }
+                }),
+            );
+            let _ = ready_tx.send(());
+            axum::serve(listener, app).await.expect("test server");
+        });
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+            .await
+            .expect("server ready");
+
+        let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+            .await
+            .expect("connect client");
+
+        // Complete NIP-42 handshake.
+        let challenge_msg = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+            .await
+            .expect("challenge timeout")
+            .expect("challenge msg")
+            .expect("challenge ws msg");
+        let challenge_text = match challenge_msg {
+            tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
+            other => panic!("expected text challenge; got {other:?}"),
+        };
+        let challenge_json: serde_json::Value =
+            serde_json::from_str(&challenge_text).expect("challenge JSON");
+        let challenge = challenge_json["challenge"]
+            .as_str()
+            .expect("challenge field")
+            .to_string();
+
+        let relay_url = format!("ws://{tenant_host}");
+        let auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
+            .tag(nostr::Tag::parse(["relay", &relay_url]).unwrap())
+            .tag(nostr::Tag::parse(["challenge", &challenge]).unwrap())
+            .sign_with_keys(&key)
+            .unwrap();
+
+        let auth_msg = serde_json::json!({
+            "type": "auth",
+            "event": auth_event,
+            "parent_channel_id": null,
+            "protocol_version": 1,
+        })
+        .to_string();
+        client
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                auth_msg.into(),
+            ))
+            .await
+            .expect("send auth msg");
+
+        // Wait for after_participant_fanout — 48101 is committed and fan-out ran.
+        tokio::time::timeout(std::time::Duration::from_secs(10), fanout_rx)
+            .await
+            .expect("CW10-full: handler must reach after_participant_fanout within 10s")
+            .expect("fanout channel closed");
+
+        // Verify 48101 is committed before we trigger disconnect.
+        let row_48101: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events \
+             WHERE community_id = $1 AND channel_id = $2 AND kind = 48101",
+        )
+        .bind(community.as_uuid())
+        .bind(channel_id)
+        .fetch_one(&pool)
+        .await
+        .expect("CW10-full: 48101 count at hook");
+
+        assert_eq!(
+            row_48101, 1,
+            "CW10-full: 48101 must be committed at after_participant_fanout; found {row_48101}"
+        );
+
+        // Release hook → commit_participant_join returns → session enters recv_loop.
+        fanout_release.notify_one();
+
+        // Give the session a moment to enter recv_loop before we disconnect.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Trigger disconnect — cancelling conn_cancel signals the handler's
+        // cancel token, which causes recv_loop, send_loop, and forward_loop to
+        // stop; the handler epilogue then calls emit_participant_event(48102, ...).
+        conn_cancel.cancel();
+
+        // Handler returns after teardown. Wait for the WS connection to close.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), client.next()).await;
+
+        // Wait a moment for the handler to finish emitting 48102.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Exactly one 48102 row must exist — the "committed join ⇒ exactly one leave" invariant.
+        let row_48102: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events \
+             WHERE community_id = $1 AND channel_id = $2 AND kind = 48102",
+        )
+        .bind(community.as_uuid())
+        .bind(channel_id)
+        .fetch_one(&pool)
+        .await
+        .expect("CW10-full: 48102 count");
+
+        assert_eq!(
+            row_48102, 1,
+            "CW10-full: exactly 1 48102 must be committed after a committed join + disconnect; found {row_48102}"
+        );
+
+        // Room must be cleaned up.
+        let room_after = audio_rooms.get(community, channel_id);
+        assert!(
+            room_after.is_none(),
+            "CW10-full: room must be removed after last peer disconnects; \
+             room still present: peers={:?}",
+            room_after.as_ref().map(|r| r.peer_pubkeys())
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // CW6: guard-level witness — unattached lease released on pre-commit exit
+    // ─────────────────────────────────────────────────────────────────────────
     //
-    // CW7: expiry after successful remote dial → owner observes clean close.
+    // `HuddleAdmissionGuard::release_before_commit` must call `directory.release`
+    // exactly once when a lease is held and no commit has happened (the guard
+    // held an unattached lease and was asked to clean up on a pre-commit exit).
     //
-    // `dial_remote_owner` opens a TCP `MeshStream` connection to the remote owner
-    // pod at the mesh transport layer. When expiry fires after dial, the cleanup
-    // path calls `send_clean_close` on the stream socket. Requires:
-    //   - A real mesh transport (TCP + TLS + noise handshake).
-    //   - A remote pod to connect to.
-    //   - Full `AppState::mesh()` non-None path with a live `HuddleControl`
-    //     peer at the mesh layer.
+    // This test uses a `CountingDir` (a `HuddleDirectory` double with a release
+    // counter) injected into the guard's `lease` field. No Redis, no mesh
+    // transport, no `AppState` required — the guard-level abstraction is the
+    // seam that makes this feasible without production infrastructure.
     //
-    // Both CW6 and CW7 are infeasible as unit tests. They belong in the
-    // integration/e2e test suite that exercises a real multi-pod mesh deployment.
+    // The path under test is `HuddleAdmissionGuard::release_before_commit`, which
+    // calls `spawn_observable_huddle_renewer(directory, lease, pre_cancelled_token)`.
+    // The renewer loop immediately hits the cancel arm and calls
+    // `directory.release(&lease)` — this is the exact fenced release path.
+    //
+    // Mutation evidence (executed):
+    //   CW6A) Remove `if let Some((lease, directory)) = self.lease.take()` block →
+    //         renewer never spawned → release_calls stays 0 → assertion panics.
+    //   CW6B) Remove the `cancel.cancel()` call inside `release_before_commit` →
+    //         renewer loop tries to renew (not release) → release_calls stays 0 →
+    //         assertion panics (the renewer will renew instead of releasing).
+    #[tokio::test]
+    async fn cw6_guard_release_before_commit_calls_directory_release_exactly_once() {
+        use crate::audio::join::{
+            AcquireOutcome, HuddleDirectory, HuddleLease, HuddleReleaseOutcome, HuddleRenewOutcome,
+            Ownership, HUDDLE_CONTROL_PROFILE,
+        };
+        use crate::tunnel::directory::SessionLease;
+        use buzz_core::CommunityId;
+        use buzz_relay_mesh::{wire::FencedHeader, MeshError, RuntimeId};
+        use chrono::Utc;
+        use std::sync::{Arc, Mutex};
+        use uuid::Uuid;
+
+        // A minimal HuddleDirectory double that counts release calls.
+        struct CountingDir {
+            release_calls: Mutex<u32>,
+        }
+        #[async_trait::async_trait]
+        impl HuddleDirectory for CountingDir {
+            async fn owner_of(
+                &self,
+                _c: CommunityId,
+                _s: Uuid,
+            ) -> Result<Option<Ownership>, MeshError> {
+                Ok(None)
+            }
+            async fn acquire(
+                &self,
+                _c: CommunityId,
+                _s: Uuid,
+                _owner: RuntimeId,
+            ) -> Result<AcquireOutcome, MeshError> {
+                Ok(AcquireOutcome::Acquired(HuddleLease(SessionLease {
+                    community_id: CommunityId::from_uuid(Uuid::nil()),
+                    session_id: Uuid::nil(),
+                    owner_runtime_id: RuntimeId([0u8; 32]),
+                    generation: 1,
+                    profile: HUDDLE_CONTROL_PROFILE,
+                })))
+            }
+            async fn renew(&self, _lease: &HuddleLease) -> Result<HuddleRenewOutcome, MeshError> {
+                // Should never be called — the pre-cancelled token hits the
+                // cancel arm before renew.
+                Ok(HuddleRenewOutcome::Renewed(HuddleLease(SessionLease {
+                    community_id: CommunityId::from_uuid(Uuid::nil()),
+                    session_id: Uuid::nil(),
+                    owner_runtime_id: RuntimeId([0u8; 32]),
+                    generation: 1,
+                    profile: HUDDLE_CONTROL_PROFILE,
+                })))
+            }
+            async fn release(
+                &self,
+                _lease: &HuddleLease,
+            ) -> Result<HuddleReleaseOutcome, MeshError> {
+                *self.release_calls.lock().unwrap() += 1;
+                Ok(HuddleReleaseOutcome::Released)
+            }
+            async fn validate(
+                &self,
+                _community_id: CommunityId,
+                _fenced: &FencedHeader,
+            ) -> Result<(), MeshError> {
+                Ok(())
+            }
+        }
+
+        let community = CommunityId::from_uuid(Uuid::nil());
+        let channel_id = Uuid::new_v4();
+        let dir = Arc::new(CountingDir {
+            release_calls: Mutex::new(0),
+        });
+
+        // Build a test HuddleLease (uses pub(crate) inner field — same crate).
+        let lease = HuddleLease(SessionLease {
+            community_id: community,
+            session_id: Uuid::new_v4(),
+            owner_runtime_id: RuntimeId([0u8; 32]),
+            generation: 7,
+            profile: HUDDLE_CONTROL_PROFILE,
+        });
+
+        let room = Arc::new(crate::audio::room::Room::new(community, channel_id));
+        let audio_rooms = Arc::new(crate::audio::room::AudioRoomManager::default());
+        let dir_clone = Arc::clone(&dir) as Arc<dyn HuddleDirectory>;
+
+        let mut guard = HuddleAdmissionGuard {
+            lease: Some((lease, dir_clone)),
+            remote_session: None,
+            remote_stream: None,
+            peer_id: None,
+            room,
+            audio_rooms,
+            community,
+            channel_id,
+        };
+
+        guard.release_before_commit().await;
+
+        // Wait for the renewer task to run and call release.
+        // The renewer is spawned and runs its first tick (cancel arm) which calls
+        // release. Give the Tokio runtime time to schedule it.
+        let deadline = Utc::now() + chrono::Duration::milliseconds(500);
+        loop {
+            tokio::task::yield_now().await;
+            let calls = *dir.release_calls.lock().unwrap();
+            if calls >= 1 {
+                break;
+            }
+            if Utc::now() >= deadline {
+                panic!("CW6: directory.release was not called within 500ms — the renewer did not run or the cancel token was not pre-set; release_calls={calls}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let release_calls = *dir.release_calls.lock().unwrap();
+        assert_eq!(
+            release_calls, 1,
+            "CW6: directory.release must be called exactly once on pre-commit exit; got {release_calls}"
+        );
+
+        // Guard is idempotent — calling release_before_commit again must not
+        // trigger a second release (lease field is now None).
+        guard.release_before_commit().await;
+        tokio::task::yield_now().await;
+        let release_calls_after = *dir.release_calls.lock().unwrap();
+        assert_eq!(
+            release_calls_after, 1,
+            "CW6: second release_before_commit must be idempotent (no double-release); got {release_calls_after}"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // CW7: guard-level witness — clean close sent on remote stream pre-commit exit
+    // ─────────────────────────────────────────────────────────────────────────
+    //
+    // `HuddleAdmissionGuard::release_before_commit` must call `send_clean_close`
+    // (UnregisterPeer + Goodbye + finish) when a `remote_stream` is held, before
+    // the guard releases. No real mesh transport, TLS, or remote pod required:
+    // `MeshStream::new` accepts `Box<dyn StreamSendHalf>` stubs, and
+    // `RemoteHuddleSession::for_test` provides the needed `fenced`/`pubkey`.
+    //
+    // Mutation evidence (executed):
+    //   CW7A) Remove `if let (Some(session), Some(ref mut stream)) = ...` block
+    //         in `release_before_commit` → send_frame never called → frames_sent
+    //         stays 0 → assertion panics.
+    //   CW7B) Swap UnregisterPeer and Goodbye order → Goodbye arrives before
+    //         UnregisterPeer → MeshStreamFrame assertion order panics.
+    #[tokio::test]
+    async fn cw7_guard_release_before_commit_sends_clean_close_on_remote_stream() {
+        use crate::audio::join::RemoteHuddleSession;
+        use buzz_relay_mesh::wire::FencedHeader;
+        use buzz_relay_mesh::RuntimeId;
+        use buzz_relay_mesh::{
+            BoxFuture, MeshError, MeshStream, MeshStreamFrame, StreamRecvHalf, StreamSendHalf,
+        };
+        use std::sync::{Arc, Mutex};
+        use uuid::Uuid;
+
+        // A send half that records every frame sent.
+        struct RecordingSend {
+            frames: Arc<Mutex<Vec<MeshStreamFrame>>>,
+            finished: Arc<Mutex<bool>>,
+        }
+        impl StreamSendHalf for RecordingSend {
+            fn send_frame(
+                &mut self,
+                frame: MeshStreamFrame,
+            ) -> BoxFuture<'_, Result<(), MeshError>> {
+                self.frames.lock().unwrap().push(frame);
+                Box::pin(async { Ok(()) })
+            }
+            fn finish(&mut self) -> Result<(), MeshError> {
+                *self.finished.lock().unwrap() = true;
+                Ok(())
+            }
+        }
+
+        // A recv half that always returns None (never read in this test).
+        struct NullRecv;
+        impl StreamRecvHalf for NullRecv {
+            fn recv_frame(&mut self) -> BoxFuture<'_, Result<Option<MeshStreamFrame>, MeshError>> {
+                Box::pin(async { Ok(None) })
+            }
+        }
+
+        let frames = Arc::new(Mutex::new(Vec::<MeshStreamFrame>::new()));
+        let finished = Arc::new(Mutex::new(false));
+        let stream = MeshStream::new(
+            Box::new(RecordingSend {
+                frames: Arc::clone(&frames),
+                finished: Arc::clone(&finished),
+            }),
+            Box::new(NullRecv),
+        );
+
+        let community = buzz_core::CommunityId::from_uuid(Uuid::nil());
+        let channel_id = Uuid::new_v4();
+        let fenced = FencedHeader {
+            owner_runtime_id: RuntimeId([0u8; 32]),
+            session_id: Uuid::nil(),
+            generation: 1,
+        };
+        let pubkey = "test-pubkey-hex".to_string();
+        let session = RemoteHuddleSession::for_test(fenced, pubkey.clone());
+
+        let room = Arc::new(crate::audio::room::Room::new(community, channel_id));
+        let audio_rooms = Arc::new(crate::audio::room::AudioRoomManager::default());
+
+        let mut guard = HuddleAdmissionGuard {
+            lease: None,
+            remote_session: Some(session),
+            remote_stream: Some(stream),
+            peer_id: None,
+            room,
+            audio_rooms,
+            community,
+            channel_id,
+        };
+
+        guard.release_before_commit().await;
+
+        // remote_session and remote_stream must be cleared.
+        assert!(
+            guard.remote_session.is_none(),
+            "CW7: remote_session must be cleared after release_before_commit"
+        );
+        assert!(
+            guard.remote_stream.is_none(),
+            "CW7: remote_stream must be cleared after release_before_commit"
+        );
+
+        // Stream must have received UnregisterPeer + Goodbye, then finish.
+        let sent = frames.lock().unwrap().clone();
+        assert!(
+            !sent.is_empty(),
+            "CW7: send_clean_close must send at least one frame on remote stream; got 0"
+        );
+        // The last Data frame must be UnregisterPeer, followed by Goodbye.
+        let goodbye_sent = sent
+            .iter()
+            .any(|f| matches!(f, MeshStreamFrame::Goodbye { .. }));
+        assert!(
+            goodbye_sent,
+            "CW7: send_clean_close must send a Goodbye frame on pre-commit exit; frames={sent:?}"
+        );
+        // Finish must have been called.
+        assert!(
+            *finished.lock().unwrap(),
+            "CW7: send_clean_close must call finish() on the stream"
+        );
+    }
 }

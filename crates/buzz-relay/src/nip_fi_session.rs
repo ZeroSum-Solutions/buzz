@@ -159,10 +159,10 @@ pub(crate) fn authorization_denied_frame(route: NipFiWsRoute) -> WsMessage {
 /// 1. Calls `gate.expire(terminal)` with the route-specific terminal closure.
 ///    Inside `gate.expire()`:
 ///    a. The terminal closure enqueues the denial frame on `terminal_ctrl_tx`
-///       and increments the lease-expiration metric.
+///    and increments the lease-expiration metric.
 ///    b. `cancel.cancel()` — socket termination starts immediately.
 ///    c. The gate acquires the write guard (quiescence barrier) — blocks until
-///       all outstanding effect permits are released, then records `Expired`.
+///    all outstanding effect permits are released, then records `Expired`.
 /// 2. The task then returns, allowing connection teardown to proceed.
 ///
 /// Equality at deadline is expired; already-expired deadlines fire immediately.

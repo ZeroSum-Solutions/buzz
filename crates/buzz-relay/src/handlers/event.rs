@@ -2679,5 +2679,34 @@ mod tests {
              mark_local_event is only called after ingest_event/fan-out, \
              which must not have been reached when acquire_effect returns SessionExpired"
         );
+
+        // ── Durable persistence assertion (real DB, skip-if-unavailable) ───────
+        //
+        // Thufir's concern: with a lazy pool, the lazy-DB could reject the ingest
+        // call before mark_local_event fires, leaving the local_event_ids assertion
+        // green even without the permit check. The fix: if a real DB is available,
+        // query the events table and confirm the event row is absent.
+        //
+        // Mutation evidence:
+        //   Remove `acquire_effect()` → ingest_event is attempted → with a real DB,
+        //   the row IS inserted → COUNT(*) = 1 → this assertion panics.
+        let db_url = "postgres://buzz:buzz_dev@127.0.0.1:5432/buzz";
+        if let Ok(pool) = sqlx::PgPool::connect(db_url).await {
+            let event_id_hex = hex::encode(event_id_bytes);
+            let row_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE id = decode($1, 'hex')")
+                    .bind(&event_id_hex)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("W2: event row count query");
+
+            assert_eq!(
+                row_count, 0,
+                "W2: event row must NOT be in the DB — \
+                 ingest_event must not have been called when acquire_effect returns SessionExpired; \
+                 found {row_count} row(s)"
+            );
+        }
+        // If DB unavailable: the local_event_ids assertion above is the gate.
     }
 }

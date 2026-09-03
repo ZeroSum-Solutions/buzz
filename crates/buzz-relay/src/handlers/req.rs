@@ -254,6 +254,18 @@ pub async fn handle_req(
             ));
             return;
         }
+        // IMPORTANT 6: acquire a REQ effect permit before the search query and
+        // hold it through historical delivery/EOSE, just as the normal REQ branch
+        // does around registration/history. Without this, an authenticated frame
+        // can finish validation after the deadline and return history without an
+        // authoritative seam check. [FI-TRACE-LEASE-BOUND, NIP-50 search seam]
+        let _search_permit = match conn.nip_fi_gate.acquire_effect().await {
+            Ok(permit) => permit,
+            Err(crate::nip_fi_gate::SessionExpired) => {
+                conn.send(RelayMessage::closed(&sub_id, "restricted: session expired"));
+                return;
+            }
+        };
         handle_search_req(
             &sub_id,
             &filters,
