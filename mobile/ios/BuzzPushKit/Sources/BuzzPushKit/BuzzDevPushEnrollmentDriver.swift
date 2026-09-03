@@ -152,10 +152,15 @@ public protocol BuzzPushEndpointGrantStore {
   /// Opaque grants retained from the gateway-neutral legacy schema. A gateway
   /// may open one as proof that it owns the conflicting installation.
   func quarantinedLegacyEndpointGrants() throws -> [String]
+  func quarantinedLegacyPendingEnrollments() throws
+    -> [BuzzPushLegacyRecoveryInventory.BuzzPushLegacyPendingRecovery]
 }
 
 extension BuzzPushEndpointGrantStore {
   public func quarantinedLegacyEndpointGrants() throws -> [String] { [] }
+  public func quarantinedLegacyPendingEnrollments() throws
+    -> [BuzzPushLegacyRecoveryInventory.BuzzPushLegacyPendingRecovery]
+  { [] }
 }
 
 public enum BuzzDevPushEnrollmentError: Error, LocalizedError, Equatable {
@@ -1222,6 +1227,51 @@ public final class BuzzDevPushEnrollmentDriver {
       } catch BuzzDevPushEnrollmentError.unexpectedStatus(
         route: "v1/installations/recover", _, actual: 404, _
       ) {
+        continue
+      }
+    }
+    let endpointHash = Self.endpointHash(endpoint)
+    for pending in try store.quarantinedLegacyPendingEnrollments() {
+      guard pending.appProfile == Self.appProfile,
+        pending.endpointHash == endpointHash,
+        pending.expiresAt > Int64(now().timeIntervalSince1970),
+        let keyId = pending.keyId,
+        BuzzAppAttestKeyId.isValid(keyId)
+      else { continue }
+      do {
+        let installation: UUID
+        if let handle = pending.gatewayInstallationHandle,
+          let existing = UUID(uuidString: handle),
+          handle == existing.uuidString.lowercased()
+        {
+          installation = existing
+        } else {
+          guard let challengeId = pending.challengeId,
+            let challengeUUID = UUID(uuidString: challengeId),
+            challengeId == challengeUUID.uuidString.lowercased(),
+            let challenge = pending.challenge,
+            Self.isBase64URLChallenge(challenge),
+            let attestation = pending.attestation,
+            !attestation.isEmpty,
+            attestation.utf8.count <= 24_000
+          else { continue }
+          installation = try await enrollInstallation(
+            challenge: Challenge(id: challengeUUID, value: challenge),
+            endpoint: endpoint,
+            expiresAt: pending.expiresAt,
+            attestation: BuzzDevAttestation(keyId: keyId, attestation: attestation)
+          )
+        }
+        try await revokeInstallation(
+          installationHandle: installation,
+          endpointEpoch: Self.endpointEpoch,
+          appAttestKeyId: keyId
+        )
+        return true
+      } catch BuzzDevPushEnrollmentError.unexpectedStatus(_, _, actual: 401, _),
+        BuzzDevPushEnrollmentError.unexpectedStatus(_, _, actual: 404, _),
+        BuzzDevPushEnrollmentError.unexpectedStatus(_, _, actual: 409, _)
+      {
         continue
       }
     }

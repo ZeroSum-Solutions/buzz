@@ -4,10 +4,16 @@ import Foundation
 public struct BuzzPushLegacyRecoveryInventory: Equatable {
   public let relayOrigins: [String]
   public let endpointGrants: [String]
+  public let pendingEnrollments: [BuzzPushLegacyPendingRecovery]
 
-  public init(relayOrigins: [String], endpointGrants: [String]) {
+  public init(
+    relayOrigins: [String],
+    endpointGrants: [String],
+    pendingEnrollments: [BuzzPushLegacyPendingRecovery]
+  ) {
     self.relayOrigins = relayOrigins
     self.endpointGrants = endpointGrants
+    self.pendingEnrollments = pendingEnrollments
   }
 
   private struct LegacyGrant: Decodable {
@@ -15,8 +21,38 @@ public struct BuzzPushLegacyRecoveryInventory: Equatable {
     let endpointGrant: String
   }
 
-  private struct LegacyPending: Decodable {
-    let relayOrigin: String
+  public struct BuzzPushLegacyPendingRecovery: Decodable, Equatable {
+    public let relayOrigin: String
+    public let endpointHash: String
+    public let appProfile: String
+    public let expiresAt: Int64
+    public let gatewayInstallationHandle: String?
+    public let challengeId: String?
+    public let challenge: String?
+    public let keyId: String?
+    public let attestation: String?
+
+    public init(
+      relayOrigin: String,
+      endpointHash: String,
+      appProfile: String,
+      expiresAt: Int64,
+      gatewayInstallationHandle: String? = nil,
+      challengeId: String? = nil,
+      challenge: String? = nil,
+      keyId: String? = nil,
+      attestation: String? = nil
+    ) {
+      self.relayOrigin = relayOrigin
+      self.endpointHash = endpointHash
+      self.appProfile = appProfile
+      self.expiresAt = expiresAt
+      self.gatewayInstallationHandle = gatewayInstallationHandle
+      self.challengeId = challengeId
+      self.challenge = challenge
+      self.keyId = keyId
+      self.attestation = attestation
+    }
   }
 
   /// Extracts only gateway-neutral relay origins and opaque gateway proofs.
@@ -28,7 +64,7 @@ public struct BuzzPushLegacyRecoveryInventory: Equatable {
       } ?? []
     let legacyPending =
       try pending.map {
-        try JSONDecoder().decode([LegacyPending].self, from: $0)
+        try JSONDecoder().decode([BuzzPushLegacyPendingRecovery].self, from: $0)
       } ?? []
     let relayOrigins = try (legacyGrants.map(\.relayOrigin) + legacyPending.map(\.relayOrigin))
       .map { origin -> String in
@@ -61,7 +97,8 @@ public struct BuzzPushLegacyRecoveryInventory: Equatable {
     }
     return Self(
       relayOrigins: Array(Set(relayOrigins)).sorted(),
-      endpointGrants: Array(Set(endpointGrants)).sorted()
+      endpointGrants: Array(Set(endpointGrants)).sorted(),
+      pendingEnrollments: legacyPending
     )
   }
 }

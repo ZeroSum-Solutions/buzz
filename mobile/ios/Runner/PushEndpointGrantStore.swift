@@ -42,6 +42,12 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
     try quarantinedLegacyInventory().endpointGrants
   }
 
+  func quarantinedLegacyPendingEnrollments() throws
+    -> [BuzzPushLegacyRecoveryInventory.BuzzPushLegacyPendingRecovery]
+  {
+    try quarantinedLegacyInventory().pendingEnrollments
+  }
+
   func clearQuarantinedLegacyState() throws {
     try delete(account: Self.legacyRecordsAccount)
     try delete(account: Self.legacyPendingAccount)

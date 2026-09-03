@@ -12,7 +12,7 @@ struct BuzzPushLegacyRecoveryTests {
     )
     let pending = try #require(
       """
-      [{"relayOrigin":"https://pending.example"}]
+      [{"relayOrigin":"https://pending.example","endpointHash":"abc","appProfile":"buzz-ios-dogfood","expiresAt":99}]
       """.data(using: .utf8)
     )
 
@@ -25,6 +25,7 @@ struct BuzzPushLegacyRecoveryTests {
       inventory.relayOrigins == ["wss://pending.example", "wss://relay.example"]
     )
     #expect(inventory.endpointGrants == ["opaque-grant"])
+    #expect(inventory.pendingEnrollments.map(\.endpointHash) == ["abc"])
   }
 
   @Test func rejectsInvalidRelayOriginsWithoutAssigningGatewayAuthority() throws {
