@@ -425,10 +425,12 @@ class _CommunityHeaderControl extends ConsumerWidget {
   const _CommunityHeaderControl({
     required this.collapseProgress,
     required this.onOpenSwitcher,
+    required this.nativeViewSuppressed,
   });
 
   final double collapseProgress;
   final VoidCallback onOpenSwitcher;
+  final ValueListenable<bool> nativeViewSuppressed;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -436,7 +438,7 @@ class _CommunityHeaderControl extends ConsumerWidget {
     final communities = ref.watch(communityListProvider).value ?? const [];
     final title = activeCommunity?.name.trim();
     final displayName = title == null || title.isEmpty ? 'Community' : title;
-    final isCollapsed = collapseProgress >= 0.5;
+    final normalizedCollapse = collapseProgress.clamp(0.0, 1.0).toDouble();
     final iconUrl = activeCommunity == null
         ? null
         : ref.watch(communityIconProvider(activeCommunity.relayUrl)).value;
@@ -460,15 +462,27 @@ class _CommunityHeaderControl extends ConsumerWidget {
                 Grid.xxs * 3 +
                 textPainter.width)
             .clamp(96.0, maxExpandedWidth);
-    final targetWidth = isCollapsed
-        ? AdaptiveGlassAvatarButton.height
-        : expandedWidth;
+    final width = MediaQuery.disableAnimationsOf(context)
+        ? normalizedCollapse >= 0.5
+              ? AdaptiveGlassAvatarButton.height
+              : expandedWidth
+        : lerpDouble(
+            expandedWidth,
+            AdaptiveGlassAvatarButton.height,
+            Curves.easeInOutCubic.transform(normalizedCollapse),
+          )!;
     final menuItems = [
       for (final community in communities)
         IosGlassNavigationMenuItem(
           id: 'community:${community.id}',
           label: community.name,
           selected: community.id == activeCommunity?.id,
+          avatarImageUrl: ref
+              .watch(communityIconProvider(community.relayUrl))
+              .value,
+          avatarFallback: community.name.trim().isEmpty
+              ? '?'
+              : community.name.characters.first.toUpperCase(),
         ),
       const IosGlassNavigationMenuItem(
         id: 'manage',
@@ -488,94 +502,91 @@ class _CommunityHeaderControl extends ConsumerWidget {
     }
 
     return Builder(
-      builder: (buttonContext) => TweenAnimationBuilder<double>(
-        tween: Tween(end: targetWidth),
-        duration: MediaQuery.disableAnimationsOf(context)
-            ? Duration.zero
-            : const Duration(milliseconds: 180),
-        curve: Curves.easeOutCubic,
-        builder: (context, width, _) => AdaptiveGlassAvatarButton(
-          key: const ValueKey('community-header-glass-control'),
-          imageUrl: iconUrl,
-          fallbackText: initial,
-          label: isCollapsed ? null : displayName,
-          semanticLabel: '$displayName community. Double tap to switch.',
-          width: width,
-          iosMenuItems: menuItems,
-          onIosMenuSelected: (selection) =>
-              unawaited(handleSelection(selection)),
-          onPressed: () async {
-            unawaited(HapticFeedback.selectionClick());
-            if (defaultTargetPlatform == TargetPlatform.iOS ||
-                communities.isEmpty) {
-              onOpenSwitcher();
-              return;
-            }
-            final selection = await showAnchoredPopover<String>(
-              context: buttonContext,
-              width: 280,
-              alignment: AnchoredPopoverAlignment.start,
-              offset: const Offset(0, Grid.xxs),
-              surfaceKey: const ValueKey('community-header-popover'),
-              items: [
-                for (final community in communities)
-                  PopupMenuItem<String>(
-                    value: 'community:${community.id}',
-                    child: Row(
-                      children: [
-                        _CommunityAvatar(
-                          name: community.name,
-                          relayUrl: community.relayUrl,
-                          size: 32,
-                        ),
-                        const SizedBox(width: Grid.xs),
-                        Expanded(
-                          child: Text(
-                            community.name,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                        if (community.id == activeCommunity?.id)
-                          Icon(
-                            LucideIcons.check,
-                            size: 18,
-                            color: context.colors.primary,
-                          ),
-                      ],
-                    ),
-                  ),
-                const PopupMenuDivider(),
-                const PopupMenuItem<String>(
-                  value: 'manage',
+      builder: (buttonContext) => AdaptiveGlassAvatarButton(
+        key: const ValueKey('community-header-glass-control'),
+        imageUrl: iconUrl,
+        fallbackText: initial,
+        label: displayName,
+        semanticLabel: '$displayName community. Double tap to switch.',
+        width: width,
+        iosMenuItems: menuItems,
+        nativeViewSuppressed: nativeViewSuppressed,
+        onIosMenuSelected: (selection) => unawaited(handleSelection(selection)),
+        onPressed: () async {
+          unawaited(HapticFeedback.selectionClick());
+          if (defaultTargetPlatform == TargetPlatform.iOS ||
+              communities.isEmpty) {
+            onOpenSwitcher();
+            return;
+          }
+          final selection = await showAnchoredPopover<String>(
+            context: buttonContext,
+            width: 280,
+            alignment: AnchoredPopoverAlignment.start,
+            offset: const Offset(0, Grid.xxs),
+            surfaceKey: const ValueKey('community-header-popover'),
+            items: [
+              for (final community in communities)
+                PopupMenuItem<String>(
+                  value: 'community:${community.id}',
                   child: Row(
                     children: [
-                      Icon(LucideIcons.settings2, size: 18),
-                      SizedBox(width: Grid.xs),
+                      _CommunityAvatar(
+                        name: community.name,
+                        relayUrl: community.relayUrl,
+                        size: 32,
+                      ),
+                      const SizedBox(width: Grid.xs),
                       Expanded(
                         child: Text(
-                          'Manage Communities…',
+                          community.name,
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                         ),
                       ),
+                      if (community.id == activeCommunity?.id)
+                        Icon(
+                          LucideIcons.check,
+                          size: 18,
+                          color: context.colors.primary,
+                        ),
                     ],
                   ),
                 ),
-              ],
-            );
-            if (selection != null) await handleSelection(selection);
-          },
-        ),
+              const PopupMenuDivider(),
+              const PopupMenuItem<String>(
+                value: 'manage',
+                child: Row(
+                  children: [
+                    Icon(LucideIcons.settings2, size: 18),
+                    SizedBox(width: Grid.xs),
+                    Expanded(
+                      child: Text(
+                        'Manage Communities…',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          );
+          if (selection != null) await handleSelection(selection);
+        },
       ),
     );
   }
 }
 
 class _ProfileHeaderControl extends ConsumerWidget {
-  const _ProfileHeaderControl({required this.onTap});
+  const _ProfileHeaderControl({
+    required this.onTap,
+    required this.nativeViewSuppressed,
+  });
 
   final VoidCallback onTap;
+  final ValueListenable<bool> nativeViewSuppressed;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -588,6 +599,7 @@ class _ProfileHeaderControl extends ConsumerWidget {
       semanticLabel: 'Open profile and settings',
       onPressed: onTap,
       width: AdaptiveGlassAvatarButton.height,
+      nativeViewSuppressed: nativeViewSuppressed,
     );
   }
 }

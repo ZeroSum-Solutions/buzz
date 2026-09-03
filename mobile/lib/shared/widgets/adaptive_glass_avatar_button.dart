@@ -20,6 +20,7 @@ class AdaptiveGlassAvatarButton extends StatelessWidget {
     this.label,
     this.iosMenuItems = const [],
     this.onIosMenuSelected,
+    this.nativeViewSuppressed,
   });
 
   final String? imageUrl;
@@ -30,27 +31,58 @@ class AdaptiveGlassAvatarButton extends StatelessWidget {
   final String? label;
   final List<IosGlassNavigationMenuItem> iosMenuItems;
   final ValueChanged<String>? onIosMenuSelected;
+  final ValueListenable<bool>? nativeViewSuppressed;
 
   static const double height = 48;
-  static const double avatarSize = 34;
+  static const double avatarSize = 36;
 
   @override
   Widget build(BuildContext context) {
     if (defaultTargetPlatform == TargetPlatform.iOS) {
-      return IosGlassNavigationButton(
-        icon: IosGlassNavigationIcon.avatar,
-        label: label,
-        semanticLabel: semanticLabel,
-        onPressed: onPressed,
+      return SizedBox(
         width: width,
         height: height,
-        controlSize: height,
-        fillWidth: true,
-        foregroundColor: context.colors.onSurface,
-        avatarImageUrl: imageUrl,
-        avatarFallback: fallbackText,
-        menuItems: iosMenuItems,
-        onMenuSelected: onIosMenuSelected,
+        child: Stack(
+          clipBehavior: Clip.hardEdge,
+          children: [
+            IosGlassNavigationButton(
+              icon: IosGlassNavigationIcon.avatar,
+              label: label,
+              semanticLabel: semanticLabel,
+              onPressed: onPressed,
+              width: width,
+              height: height,
+              controlSize: height,
+              fillWidth: true,
+              foregroundColor: context.colors.onSurface,
+              avatarImageUrl: imageUrl,
+              avatarFallback: fallbackText,
+              menuItems: iosMenuItems,
+              onMenuSelected: onIosMenuSelected,
+              nativeViewSuppressed: nativeViewSuppressed,
+            ),
+            Positioned(
+              left: 6,
+              top: 6,
+              width: avatarSize,
+              height: avatarSize,
+              child: IgnorePointer(
+                child: AvatarImage(
+                  imageUrl: imageUrl,
+                  radius: avatarSize / 2,
+                  backgroundColor: context.colors.primaryContainer,
+                  fallback: Text(
+                    fallbackText,
+                    style: context.textTheme.labelMedium?.copyWith(
+                      color: context.colors.onPrimaryContainer,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
       );
     }
 
@@ -69,7 +101,9 @@ class AdaptiveGlassAvatarButton extends StatelessWidget {
               child: Container(
                 width: width,
                 height: height,
-                padding: const EdgeInsets.all(6),
+                // The 1dp border participates in layout, so 5dp of content
+                // padding leaves the 36dp avatar exactly 6dp from every edge.
+                padding: const EdgeInsets.all(5),
                 decoration: BoxDecoration(
                   borderRadius: radius,
                   border: Border.all(
@@ -93,7 +127,7 @@ class AdaptiveGlassAvatarButton extends StatelessWidget {
                         ),
                       ),
                     ),
-                    if (label != null)
+                    if (label != null && width >= 60)
                       Positioned(
                         left: avatarSize + Grid.xxs,
                         right: Grid.xxs,

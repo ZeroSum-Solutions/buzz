@@ -646,15 +646,19 @@ void main() {
       matching: find.byType(AvatarImage),
     );
 
-    expect(tester.getSize(communityAvatar), const Size.square(34));
-    expect(tester.getSize(profileAvatar), const Size.square(34));
+    expect(tester.getSize(communityAvatar), const Size.square(36));
+    expect(tester.getSize(profileAvatar), const Size.square(36));
     expect(tester.getSize(profileControl), const Size.square(48));
     final communityRect = tester.getRect(communityAvatar);
     final profileRect = tester.getRect(profileAvatar);
+    final communityControlRect = tester.getRect(communityControl);
+    expect(communityRect.left - communityControlRect.left, 6);
+    expect(communityRect.top - communityControlRect.top, 6);
+    expect(communityControlRect.bottom - communityRect.bottom, 6);
     expect(profileRect.center.dy, communityRect.center.dy);
   });
 
-  testWidgets('collapses the community capsule to its avatar while scrolling', (
+  testWidgets('morphs the community capsule symmetrically with scroll', (
     tester,
   ) async {
     tester.view.physicalSize = const Size(320, 480);
@@ -690,13 +694,34 @@ void main() {
       find.byKey(const ValueKey('community-header-glass-control')),
     );
     expect(control().label, 'Community');
-    expect(control().width, greaterThan(48));
+    final expandedWidth = control().width;
+    expect(expandedWidth, greaterThan(48));
 
-    await tester.drag(find.byType(CustomScrollView), const Offset(0, -160));
-    await tester.pumpAndSettle();
+    final scrollable = tester.state<ScrollableState>(
+      find
+          .descendant(
+            of: find.byType(CustomScrollView),
+            matching: find.byType(Scrollable),
+          )
+          .first,
+    );
+    scrollable.position.jumpTo(32);
+    await tester.pump();
+    final collapsingWidth = control().width;
+    expect(collapsingWidth, inExclusiveRange(48, expandedWidth));
 
-    expect(control().label, isNull);
+    scrollable.position.jumpTo(64);
+    await tester.pump();
     expect(control().width, closeTo(48, 0.01));
+
+    scrollable.position.jumpTo(32);
+    await tester.pump();
+    expect(control().width, closeTo(collapsingWidth, 0.01));
+
+    scrollable.position.jumpTo(0);
+    await tester.pump();
+    expect(control().label, 'Community');
+    expect(control().width, closeTo(expandedWidth, 0.01));
   });
 
   testWidgets('provides avatar content and a contextual menu to native iOS', (
@@ -721,6 +746,10 @@ void main() {
 
     await tester.pumpWidget(
       buildTestable(
+        communityIcons: const {
+          'wss://alpha.example.com': 'https://example.com/alpha.png',
+          'wss://bravo.example.com': 'https://example.com/bravo.png',
+        },
         overrides: [
           channelsProvider.overrideWith(() => _FakeNotifier(testChannels)),
           communityListProvider.overrideWith(
@@ -747,6 +776,11 @@ void main() {
     final items = params['menuItems']! as List<Object?>;
     expect(items, hasLength(3));
     expect(items.first, containsPair('selected', true));
+    expect(
+      items.first,
+      containsPair('avatarImageUrl', 'https://example.com/alpha.png'),
+    );
+    expect(items.first, containsPair('avatarFallback', 'A'));
     expect(items.last, containsPair('label', 'Manage Communities…'));
 
     final nativeProfile = tester.widget<UiKitView>(
@@ -756,6 +790,76 @@ void main() {
       ),
     );
     expect(nativeProfile.creationParams, containsPair('icon', 'avatar'));
+    debugDefaultTargetPlatformOverride = null;
+  });
+
+  testWidgets('suppresses native header glass beneath the community sheet', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    await tester.pumpWidget(
+      buildTestable(
+        overrides: [
+          channelsProvider.overrideWith(() => _FakeNotifier(testChannels)),
+        ],
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final controlFinder = find.byKey(
+      const ValueKey('community-header-glass-control'),
+    );
+    final control = tester.widget<AdaptiveGlassAvatarButton>(controlFinder);
+    control.onIosMenuSelected!('manage');
+    await tester.pump();
+
+    expect(
+      find.descendant(of: controlFinder, matching: find.byType(UiKitView)),
+      findsNothing,
+    );
+    expect(find.byKey(const Key('community-switcher-sheet')), findsOneWidget);
+
+    Navigator.of(tester.element(find.text('Switch Community'))).pop();
+    await tester.pumpAndSettle();
+    expect(
+      find.descendant(of: controlFinder, matching: find.byType(UiKitView)),
+      findsOneWidget,
+    );
+    debugDefaultTargetPlatformOverride = null;
+  });
+
+  testWidgets('suppresses the Home profile glass beneath Settings', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    await tester.pumpWidget(
+      buildTestable(
+        overrides: [
+          channelsProvider.overrideWith(() => _FakeNotifier(testChannels)),
+        ],
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final controlFinder = find.byKey(
+      const ValueKey('profile-header-glass-control'),
+    );
+    tester.widget<AdaptiveGlassAvatarButton>(controlFinder).onPressed();
+    await tester.pump();
+
+    expect(
+      find.descendant(of: controlFinder, matching: find.byType(UiKitView)),
+      findsNothing,
+    );
+    await tester.pumpAndSettle();
+    Navigator.of(tester.element(find.text('Injected settings'))).pop();
+    await tester.pumpAndSettle();
+    expect(
+      find.descendant(of: controlFinder, matching: find.byType(UiKitView)),
+      findsOneWidget,
+    );
     debugDefaultTargetPlatformOverride = null;
   });
 
@@ -2641,8 +2745,13 @@ class _ReconnectingRelaySession extends RelaySessionNotifier {
 
 class _FakeProfileNotifier extends ProfileNotifier {
   @override
-  Future<UserProfile?> build() async =>
-      const UserProfile(pubkey: 'aabb', displayName: 'Test');
+  Future<UserProfile?> build() async => const UserProfile(
+    pubkey: 'aabb',
+    displayName: 'Test',
+    avatarUrl:
+        'data:image/png;base64,'
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+  );
 }
 
 class _FakePresenceNotifier extends PresenceNotifier {

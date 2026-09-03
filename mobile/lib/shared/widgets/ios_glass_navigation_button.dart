@@ -36,19 +36,28 @@ class IosGlassNavigationMenuItem {
     required this.label,
     this.selected = false,
     this.destructive = false,
+    this.avatarImageUrl,
+    this.avatarFallback,
   });
 
   final String id;
   final String label;
   final bool selected;
   final bool destructive;
+  final String? avatarImageUrl;
+  final String? avatarFallback;
 
-  Map<String, Object> toJson() => {
-    'id': id,
-    'label': label,
-    'selected': selected,
-    'destructive': destructive,
-  };
+  Map<String, Object> toJson() {
+    final json = <String, Object>{
+      'id': id,
+      'label': label,
+      'selected': selected,
+      'destructive': destructive,
+    };
+    if (avatarImageUrl != null) json['avatarImageUrl'] = avatarImageUrl!;
+    if (avatarFallback != null) json['avatarFallback'] = avatarFallback!;
+    return json;
+  }
 }
 
 /// Leading width used by iOS channel-style headers.
@@ -157,7 +166,8 @@ class IosGlassNavigationButton extends HookWidget {
     final menuSignature = menuItems
         .map(
           (item) =>
-              '${item.id}:${item.label}:${item.selected}:${item.destructive}',
+              '${item.id}:${item.label}:${item.selected}:${item.destructive}:'
+              '${item.avatarImageUrl}:${item.avatarFallback}',
         )
         .join('|');
 

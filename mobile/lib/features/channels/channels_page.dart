@@ -197,6 +197,7 @@ class ChannelsPage extends HookConsumerWidget {
     final channelsScrollController = useScrollController();
     final reducedMotion = MediaQuery.disableAnimationsOf(context);
     final headerFrostProgress = useState(0.0);
+    final nativeHeaderControlsSuppressed = useState(false);
     useEffect(() {
       void updateHeaderTreatment() {
         final nextProgress = !channelsScrollController.hasClients
@@ -305,12 +306,17 @@ class ChannelsPage extends HookConsumerWidget {
 
     void openCommunitySwitcher() {
       unawaited(HapticFeedback.selectionClick());
+      nativeHeaderControlsSuppressed.value = true;
       ref.invalidate(communityIconProvider);
-      showBuzzModalBottomSheet<void>(
-        context: context,
-        showCloseButton: false,
-        showDragHandle: false,
-        builder: (_) => const _CommunitySwitcherSheet(),
+      unawaited(
+        showBuzzModalBottomSheet<void>(
+          context: context,
+          showCloseButton: false,
+          showDragHandle: false,
+          builder: (_) => const _CommunitySwitcherSheet(),
+        ).whenComplete(() {
+          if (context.mounted) nativeHeaderControlsSuppressed.value = false;
+        }),
       );
     }
 
@@ -338,19 +344,25 @@ class ChannelsPage extends HookConsumerWidget {
         leading: _CommunityHeaderControl(
           collapseProgress: headerFrostProgress.value,
           onOpenSwitcher: openCommunitySwitcher,
+          nativeViewSuppressed: nativeHeaderControlsSuppressed,
         ),
         centerTitle: false,
         titleStyle: headerTitleStyle,
         title: null,
         actions: [
           _ProfileHeaderControl(
-            onTap: () {
+            nativeViewSuppressed: nativeHeaderControlsSuppressed,
+            onTap: () async {
               unawaited(HapticFeedback.lightImpact());
               final route = _SettingsPageRoute(
                 builder: settingsPageBuilder,
                 onTransitionProgress: onSettingsTransitionProgress,
               );
-              Navigator.of(context).push(route);
+              nativeHeaderControlsSuppressed.value = true;
+              await Navigator.of(context).push(route);
+              if (context.mounted) {
+                nativeHeaderControlsSuppressed.value = false;
+              }
             },
           ),
         ],

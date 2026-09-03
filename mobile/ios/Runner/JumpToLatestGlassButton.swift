@@ -185,6 +185,9 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
   private var avatarImageURL: String?
   private var avatarFallback = "?"
   private var avatarLoadTask: URLSessionDataTask?
+  private var menuItemDefinitions: [[String: Any]] = []
+  private var menuAvatarImages: [String: UIImage] = [:]
+  private var menuAvatarLoadTasks: [String: URLSessionDataTask] = [:]
 
   init(
     frame: CGRect,
@@ -223,6 +226,7 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
     }
     configuration.cornerStyle = .capsule
     button.configuration = configuration
+    button.clipsToBounds = true
     applyContent(from: arguments)
     button.titleLabel?.numberOfLines = 1
     button.titleLabel?.lineBreakMode = .byClipping
@@ -420,6 +424,7 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
     default: buttonIconName = "chevron.backward"
     }
     if contentIcon == "avatar" {
+      button.contentHorizontalAlignment = .leading
       button.configuration?.contentInsets = NSDirectionalEdgeInsets(
         top: 6,
         leading: 6,
@@ -440,6 +445,7 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
         }
       updateAvatar(from: arguments?["avatarImageUrl"] as? String)
     } else if buttonLabel != nil {
+      button.contentHorizontalAlignment = .center
       avatarLoadTask?.cancel()
       avatarImageURL = nil
       buttonImage = nil
@@ -461,6 +467,7 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
           return outgoing
         }
     } else {
+      button.contentHorizontalAlignment = .center
       avatarLoadTask?.cancel()
       avatarImageURL = nil
       button.configuration?.titleTextAttributesTransformer = nil
@@ -546,27 +553,71 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
   }
 
   private func updateMenu(from items: [[String: Any]]) {
+    menuAvatarLoadTasks.values.forEach { $0.cancel() }
+    menuAvatarLoadTasks.removeAll()
+    menuItemDefinitions = items
     guard !items.isEmpty else {
       button.menu = nil
       button.showsMenuAsPrimaryAction = false
       return
     }
     button.showsMenuAsPrimaryAction = true
-    button.menu = UIMenu(children: items.compactMap { item in
+    rebuildMenu()
+
+    for item in items {
+      guard
+        let imageURL = item["avatarImageUrl"] as? String,
+        !imageURL.isEmpty,
+        menuAvatarImages[imageURL] == nil
+      else { continue }
+      loadMenuAvatar(from: imageURL)
+    }
+  }
+
+  private func rebuildMenu() {
+    button.menu = UIMenu(children: menuItemDefinitions.compactMap { item in
       guard
         let id = item["id"] as? String,
         let label = item["label"] as? String
       else { return nil }
       var attributes = UIMenuElement.Attributes()
       if item["destructive"] as? Bool == true { attributes.insert(.destructive) }
+      let imageURL = item["avatarImageUrl"] as? String
+      let fallback = item["avatarFallback"] as? String
+      let image = imageURL.flatMap { menuAvatarImages[$0] }
+        ?? fallback.map { Self.avatarFallbackImage(text: $0) }
       return UIAction(
         title: label,
+        image: image,
         attributes: attributes,
         state: item["selected"] as? Bool == true ? .on : .off
       ) { [weak self] _ in
         self?.channel.invokeMethod("selected", arguments: id)
       }
     })
+  }
+
+  private func loadMenuAvatar(from imageURL: String) {
+    if let comma = imageURL.firstIndex(of: ","), imageURL.hasPrefix("data:image") {
+      let encoded = String(imageURL[imageURL.index(after: comma)...])
+      if let data = Data(base64Encoded: encoded), let image = UIImage(data: data) {
+        menuAvatarImages[imageURL] = Self.circularAvatarImage(image)
+        rebuildMenu()
+      }
+      return
+    }
+    guard let url = URL(string: imageURL) else { return }
+    let task = URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+      guard let data, let image = UIImage(data: data) else { return }
+      DispatchQueue.main.async {
+        guard self?.menuAvatarLoadTasks[imageURL] != nil else { return }
+        self?.menuAvatarImages[imageURL] = Self.circularAvatarImage(image)
+        self?.menuAvatarLoadTasks[imageURL] = nil
+        self?.rebuildMenu()
+      }
+    }
+    menuAvatarLoadTasks[imageURL] = task
+    task.resume()
   }
 
   private static func circularAvatarImage(_ image: UIImage) -> UIImage {
@@ -612,6 +663,7 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
 
   deinit {
     avatarLoadTask?.cancel()
+    menuAvatarLoadTasks.values.forEach { $0.cancel() }
     channel.setMethodCallHandler(nil)
   }
 }
