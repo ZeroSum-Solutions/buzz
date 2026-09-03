@@ -2,14 +2,16 @@ import 'dart:ui';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../theme/theme.dart';
 import 'avatar_image.dart';
 import 'ios_glass_navigation_button.dart';
+import 'native_avatar_data_uri_provider.dart';
 
 /// A compact avatar control that uses native Liquid Glass on iOS and the
 /// matching composited glass treatment on other platforms.
-class AdaptiveGlassAvatarButton extends StatelessWidget {
+class AdaptiveGlassAvatarButton extends ConsumerWidget {
   const AdaptiveGlassAvatarButton({
     super.key,
     required this.imageUrl,
@@ -37,52 +39,27 @@ class AdaptiveGlassAvatarButton extends StatelessWidget {
   static const double avatarSize = 36;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     if (defaultTargetPlatform == TargetPlatform.iOS) {
-      return SizedBox(
+      final source = imageUrl;
+      final nativeImage = source == null
+          ? null
+          : ref.watch(nativeAvatarDataUriProvider(source)).value;
+      return IosGlassNavigationButton(
+        icon: IosGlassNavigationIcon.avatar,
+        label: label,
+        semanticLabel: semanticLabel,
+        onPressed: onPressed,
         width: width,
         height: height,
-        child: Stack(
-          clipBehavior: Clip.hardEdge,
-          children: [
-            IosGlassNavigationButton(
-              icon: IosGlassNavigationIcon.avatar,
-              label: label,
-              semanticLabel: semanticLabel,
-              onPressed: onPressed,
-              width: width,
-              height: height,
-              controlSize: height,
-              fillWidth: true,
-              foregroundColor: context.colors.onSurface,
-              avatarImageUrl: imageUrl,
-              avatarFallback: fallbackText,
-              menuItems: iosMenuItems,
-              onMenuSelected: onIosMenuSelected,
-              nativeViewSuppressed: nativeViewSuppressed,
-            ),
-            Positioned(
-              left: 6,
-              top: 6,
-              width: avatarSize,
-              height: avatarSize,
-              child: IgnorePointer(
-                child: AvatarImage(
-                  imageUrl: imageUrl,
-                  radius: avatarSize / 2,
-                  backgroundColor: context.colors.primaryContainer,
-                  fallback: Text(
-                    fallbackText,
-                    style: context.textTheme.labelMedium?.copyWith(
-                      color: context.colors.onPrimaryContainer,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ),
-              ),
-            ),
-          ],
-        ),
+        controlSize: height,
+        fillWidth: true,
+        foregroundColor: context.colors.onSurface,
+        avatarImageUrl: nativeImage,
+        avatarFallback: fallbackText,
+        menuItems: iosMenuItems,
+        onMenuSelected: onIosMenuSelected,
+        nativeViewSuppressed: nativeViewSuppressed,
       );
     }
 

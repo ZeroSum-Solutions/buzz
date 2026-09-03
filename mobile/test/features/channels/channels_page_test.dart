@@ -706,20 +706,28 @@ void main() {
           .first,
     );
     scrollable.position.jumpTo(32);
-    await tester.pump();
+    await tester.pumpAndSettle();
     final collapsingWidth = control().width;
     expect(collapsingWidth, inExclusiveRange(48, expandedWidth));
 
     scrollable.position.jumpTo(64);
     await tester.pump();
+    expect(control().width, closeTo(collapsingWidth, 0.01));
+    await tester.pump(const Duration(milliseconds: 70));
+    expect(control().width, inExclusiveRange(48, collapsingWidth));
+    await tester.pumpAndSettle();
     expect(control().width, closeTo(48, 0.01));
 
     scrollable.position.jumpTo(32);
-    await tester.pump();
+    await tester.pumpAndSettle();
     expect(control().width, closeTo(collapsingWidth, 0.01));
 
     scrollable.position.jumpTo(0);
     await tester.pump();
+    expect(control().width, closeTo(collapsingWidth, 0.01));
+    await tester.pump(const Duration(milliseconds: 70));
+    expect(control().width, inExclusiveRange(collapsingWidth, expandedWidth));
+    await tester.pumpAndSettle();
     expect(control().label, 'Community');
     expect(control().width, closeTo(expandedWidth, 0.01));
   });
@@ -747,8 +755,12 @@ void main() {
     await tester.pumpWidget(
       buildTestable(
         communityIcons: const {
-          'wss://alpha.example.com': 'https://example.com/alpha.png',
-          'wss://bravo.example.com': 'https://example.com/bravo.png',
+          'wss://alpha.example.com':
+              'data:image/png;base64,'
+              'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+          'wss://bravo.example.com':
+              'data:image/png;base64,'
+              'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
         },
         overrides: [
           channelsProvider.overrideWith(() => _FakeNotifier(testChannels)),
@@ -777,11 +789,12 @@ void main() {
     expect(items, hasLength(3));
     expect(items.first, containsPair('selected', true));
     expect(
-      items.first,
-      containsPair('avatarImageUrl', 'https://example.com/alpha.png'),
+      (items.first! as Map<String, Object>)['avatarImageUrl'],
+      startsWith('data:image/png;base64,'),
     );
     expect(items.first, containsPair('avatarFallback', 'A'));
-    expect(items.last, containsPair('label', 'Manage Communities…'));
+    expect(items.last, containsPair('label', 'Manage Communities'));
+    expect(items.last, containsPair('systemIconName', 'gearshape'));
 
     final nativeProfile = tester.widget<UiKitView>(
       find.descendant(

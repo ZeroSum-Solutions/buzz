@@ -457,11 +457,10 @@ class _CommunityHeaderControl extends ConsumerWidget {
         _kTopSectionInset * 2 -
         AdaptiveGlassAvatarButton.height;
     final expandedWidth =
-        (AdaptiveGlassAvatarButton.avatarSize +
-                12 +
-                Grid.xxs * 3 +
-                textPainter.width)
-            .clamp(96.0, maxExpandedWidth);
+        (AdaptiveGlassAvatarButton.avatarSize + 22 + textPainter.width).clamp(
+          96.0,
+          maxExpandedWidth,
+        );
     final width = MediaQuery.disableAnimationsOf(context)
         ? normalizedCollapse >= 0.5
               ? AdaptiveGlassAvatarButton.height
@@ -471,22 +470,28 @@ class _CommunityHeaderControl extends ConsumerWidget {
             AdaptiveGlassAvatarButton.height,
             Curves.easeInOutCubic.transform(normalizedCollapse),
           )!;
+    String? nativeMenuIcon(Community community) {
+      final source = ref.watch(communityIconProvider(community.relayUrl)).value;
+      return source == null
+          ? null
+          : ref.watch(nativeAvatarDataUriProvider(source)).value;
+    }
+
     final menuItems = [
       for (final community in communities)
         IosGlassNavigationMenuItem(
           id: 'community:${community.id}',
           label: community.name,
           selected: community.id == activeCommunity?.id,
-          avatarImageUrl: ref
-              .watch(communityIconProvider(community.relayUrl))
-              .value,
+          avatarImageUrl: nativeMenuIcon(community),
           avatarFallback: community.name.trim().isEmpty
               ? '?'
               : community.name.characters.first.toUpperCase(),
         ),
       const IosGlassNavigationMenuItem(
         id: 'manage',
-        label: 'Manage Communities…',
+        label: 'Manage Communities',
+        systemIconName: 'gearshape',
       ),
     ];
 
@@ -502,78 +507,86 @@ class _CommunityHeaderControl extends ConsumerWidget {
     }
 
     return Builder(
-      builder: (buttonContext) => AdaptiveGlassAvatarButton(
-        key: const ValueKey('community-header-glass-control'),
-        imageUrl: iconUrl,
-        fallbackText: initial,
-        label: displayName,
-        semanticLabel: '$displayName community. Double tap to switch.',
-        width: width,
-        iosMenuItems: menuItems,
-        nativeViewSuppressed: nativeViewSuppressed,
-        onIosMenuSelected: (selection) => unawaited(handleSelection(selection)),
-        onPressed: () async {
-          unawaited(HapticFeedback.selectionClick());
-          if (defaultTargetPlatform == TargetPlatform.iOS ||
-              communities.isEmpty) {
-            onOpenSwitcher();
-            return;
-          }
-          final selection = await showAnchoredPopover<String>(
-            context: buttonContext,
-            width: 280,
-            alignment: AnchoredPopoverAlignment.start,
-            offset: const Offset(0, Grid.xxs),
-            surfaceKey: const ValueKey('community-header-popover'),
-            items: [
-              for (final community in communities)
-                PopupMenuItem<String>(
-                  value: 'community:${community.id}',
+      builder: (buttonContext) => TweenAnimationBuilder<double>(
+        tween: Tween(end: width),
+        duration: MediaQuery.disableAnimationsOf(context)
+            ? Duration.zero
+            : const Duration(milliseconds: 140),
+        curve: Curves.easeOutCubic,
+        builder: (context, smoothedWidth, _) => AdaptiveGlassAvatarButton(
+          key: const ValueKey('community-header-glass-control'),
+          imageUrl: iconUrl,
+          fallbackText: initial,
+          label: displayName,
+          semanticLabel: '$displayName community. Double tap to switch.',
+          width: smoothedWidth,
+          iosMenuItems: menuItems,
+          nativeViewSuppressed: nativeViewSuppressed,
+          onIosMenuSelected: (selection) =>
+              unawaited(handleSelection(selection)),
+          onPressed: () async {
+            unawaited(HapticFeedback.selectionClick());
+            if (defaultTargetPlatform == TargetPlatform.iOS ||
+                communities.isEmpty) {
+              onOpenSwitcher();
+              return;
+            }
+            final selection = await showAnchoredPopover<String>(
+              context: buttonContext,
+              width: 280,
+              alignment: AnchoredPopoverAlignment.start,
+              offset: const Offset(0, Grid.xxs),
+              surfaceKey: const ValueKey('community-header-popover'),
+              items: [
+                for (final community in communities)
+                  PopupMenuItem<String>(
+                    value: 'community:${community.id}',
+                    child: Row(
+                      children: [
+                        _CommunityAvatar(
+                          name: community.name,
+                          relayUrl: community.relayUrl,
+                          size: 32,
+                        ),
+                        const SizedBox(width: Grid.xs),
+                        Expanded(
+                          child: Text(
+                            community.name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        if (community.id == activeCommunity?.id)
+                          Icon(
+                            LucideIcons.check,
+                            size: 18,
+                            color: context.colors.primary,
+                          ),
+                      ],
+                    ),
+                  ),
+                const PopupMenuDivider(),
+                const PopupMenuItem<String>(
+                  value: 'manage',
                   child: Row(
                     children: [
-                      _CommunityAvatar(
-                        name: community.name,
-                        relayUrl: community.relayUrl,
-                        size: 32,
-                      ),
-                      const SizedBox(width: Grid.xs),
+                      Icon(LucideIcons.settings2, size: 18),
+                      SizedBox(width: Grid.xs),
                       Expanded(
                         child: Text(
-                          community.name,
+                          'Manage Communities…',
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                         ),
                       ),
-                      if (community.id == activeCommunity?.id)
-                        Icon(
-                          LucideIcons.check,
-                          size: 18,
-                          color: context.colors.primary,
-                        ),
                     ],
                   ),
                 ),
-              const PopupMenuDivider(),
-              const PopupMenuItem<String>(
-                value: 'manage',
-                child: Row(
-                  children: [
-                    Icon(LucideIcons.settings2, size: 18),
-                    SizedBox(width: Grid.xs),
-                    Expanded(
-                      child: Text(
-                        'Manage Communities…',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          );
-          if (selection != null) await handleSelection(selection);
-        },
+              ],
+            );
+            if (selection != null) await handleSelection(selection);
+          },
+        ),
       ),
     );
   }

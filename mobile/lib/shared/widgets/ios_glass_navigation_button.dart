@@ -38,6 +38,7 @@ class IosGlassNavigationMenuItem {
     this.destructive = false,
     this.avatarImageUrl,
     this.avatarFallback,
+    this.systemIconName,
   });
 
   final String id;
@@ -46,6 +47,7 @@ class IosGlassNavigationMenuItem {
   final bool destructive;
   final String? avatarImageUrl;
   final String? avatarFallback;
+  final String? systemIconName;
 
   Map<String, Object> toJson() {
     final json = <String, Object>{
@@ -56,6 +58,7 @@ class IosGlassNavigationMenuItem {
     };
     if (avatarImageUrl != null) json['avatarImageUrl'] = avatarImageUrl!;
     if (avatarFallback != null) json['avatarFallback'] = avatarFallback!;
+    if (systemIconName != null) json['systemIconName'] = systemIconName!;
     return json;
   }
 }
@@ -167,7 +170,8 @@ class IosGlassNavigationButton extends HookWidget {
         .map(
           (item) =>
               '${item.id}:${item.label}:${item.selected}:${item.destructive}:'
-              '${item.avatarImageUrl}:${item.avatarFallback}',
+              '${item.avatarImageUrl}:${item.avatarFallback}:'
+              '${item.systemIconName}',
         )
         .join('|');
 

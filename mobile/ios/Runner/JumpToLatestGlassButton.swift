@@ -429,7 +429,7 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
         top: 6,
         leading: 6,
         bottom: 6,
-        trailing: buttonLabel == nil ? 6 : 10
+        trailing: buttonLabel == nil ? 6 : 8
       )
       button.configuration?.imagePadding = buttonLabel == nil ? 0 : 8
       button.configuration?.titleLineBreakMode = .byTruncatingTail
@@ -584,13 +584,16 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
       if item["destructive"] as? Bool == true { attributes.insert(.destructive) }
       let imageURL = item["avatarImageUrl"] as? String
       let fallback = item["avatarFallback"] as? String
+      let systemIconName = item["systemIconName"] as? String
       let image = imageURL.flatMap { menuAvatarImages[$0] }
         ?? fallback.map { Self.avatarFallbackImage(text: $0) }
+        ?? systemIconName.flatMap { UIImage(systemName: $0) }
+      let selected = item["selected"] as? Bool == true
       return UIAction(
-        title: label,
+        title: selected ? "\(label)   ✓" : label,
         image: image,
         attributes: attributes,
-        state: item["selected"] as? Bool == true ? .on : .off
+        state: .off
       ) { [weak self] _ in
         self?.channel.invokeMethod("selected", arguments: id)
       }
