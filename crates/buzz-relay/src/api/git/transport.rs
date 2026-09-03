@@ -232,10 +232,13 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
         )
         .await?;
 
-        // NIP-FI: enforce assertion+NIP-98 pairing before granting git access.
+        // NIP-FI admission: pubkey proven by NIP-98 above; closure supplies it.
+        // Assertion verify → pair → deny-map run in fixed order.
         // [FI-TRACE-AUTHORITY-UNIFORM]
-        if let crate::nip_fi_http::NipFiHttpOutcome::Denied(resp) =
-            crate::nip_fi_http::check_nip_fi_http_on_state(state, &parts.headers, &pubkey)
+        if let Err(resp) =
+            crate::nip_fi_http::admit_nip_fi_http_on_state(state, &parts.headers, || {
+                Ok((pubkey, ()))
+            })
         {
             return Err(resp);
         }

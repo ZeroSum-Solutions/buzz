@@ -21,7 +21,7 @@ use buzz_auth::NipFiMode;
 
 use crate::{
     api::{api_error, bridge, internal_error, parse_query_or_400},
-    nip_fi_http::{check_nip_fi_http_on_state, NipFiHttpOutcome},
+    nip_fi_http::admit_nip_fi_http_on_state,
     state::AppState,
 };
 
@@ -70,23 +70,22 @@ async fn authorize_workflow_read(
     // the X-Pubkey dev-mode fallback must never satisfy the pairing requirement.
     // [NIP-FI.md:594-607, FI-TRACE-HTTP-INGRESS]
     let nip_fi_active = !matches!(state.config.nip_fi.mode, NipFiMode::Off);
-    let bridge::VerifiedBridgeAuth {
-        pubkey,
-        event_id_bytes,
-        signed_created_at,
-    } = bridge::verify_bridge_auth(
-        headers,
-        "GET",
-        &url,
-        None,
-        state.config.require_auth_token || nip_fi_active,
-    )
-    .map_err(|e| e.into_response())?;
 
-    // NIP-FI: enforce assertion+NIP-98 pairing. [FI-TRACE-AUTHORITY-UNIFORM]
-    if let NipFiHttpOutcome::Denied(resp) = check_nip_fi_http_on_state(state, headers, &pubkey) {
-        return Err(resp);
-    }
+    // NIP-FI admission. [FI-TRACE-AUTHORITY-UNIFORM]
+    let admission = admit_nip_fi_http_on_state(state, headers, || {
+        bridge::verify_bridge_auth(
+            headers,
+            "GET",
+            &url,
+            None,
+            state.config.require_auth_token || nip_fi_active,
+        )
+        .map(|auth| (auth.pubkey, (auth.event_id_bytes, auth.signed_created_at)))
+        .map_err(|e| e.into_response())
+    })
+    .map_err(|resp| resp)?;
+    let pubkey = *admission.proven_pubkey();
+    let (event_id_bytes, signed_created_at) = admission.into_extra();
 
     bridge::enforce_http_admission(state, &tenant, &pubkey)
         .await

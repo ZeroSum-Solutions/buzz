@@ -1,17 +1,25 @@
 //! NIP-FI HTTP ingress enforcement.
 //!
 //! Every protected HTTP surface in enforce mode MUST call
-//! [`check_nip_fi_http`] before processing the request.  The function owns
-//! the complete NIP-FI admission decision for one HTTP request:
+//! [`admit_nip_fi_http`] (or its state-convenience wrapper
+//! [`admit_nip_fi_http_on_state`]) which is the single authority for the
+//! complete NIP-FI admission decision for one HTTP request:
 //!
-//! 1. Extract the `Nostr-Federated-Identity: Bearer <JWS>` assertion.
-//! 2. Verify it offline against the configured issuer JWKS.
-//! 3. Confirm the assertion's `nostr_pubkey` equals the NIP-98 event's
-//!    `pubkey` (the proven actor). [FI-INV-05]
-//! 4. Check the deny map for the proven pubkey. [FI-INV-14]
+//! 1. Run the caller's NIP-98 extraction closure → `proven_pubkey`.
+//! 2. Extract the `Nostr-Federated-Identity: Bearer <JWS>` assertion.
+//! 3. Verify it offline against the configured issuer JWKS.
+//! 4. Confirm the assertion's `nostr_pubkey` equals `proven_pubkey`. [FI-INV-05]
+//! 5. Check the deny map for the proven pubkey. [FI-INV-14]
 //!
 //! HTTP is sessionless: every request re-verifies.  There is no lifetime-
 //! partition concept — the session-bounds section of NIP-FI.md is WS-only.
+//!
+//! ## Structural authority
+//!
+//! [`NipFiAdmission`] has a private constructor.  The only way to produce
+//! one is via [`admit_nip_fi_http`].  Handler code that requires a
+//! `NipFiAdmission` to obtain `proven_pubkey` cannot be reached without
+//! executing the full admission sequence.
 //!
 //! ## Carrier / precedence
 //!
@@ -19,22 +27,24 @@
 //! - Assertion: `Nostr-Federated-Identity: Bearer <compact-JWS>` (this
 //!   module's responsibility).
 //! - Nostr proof: `Authorization: Nostr <base64-event>` (NIP-98, owned by
-//!   `bridge.rs` / each surface's existing auth extractor).
+//!   the NIP-98 closure passed to `admit_nip_fi_http`).
 //! - `Authorization` is RESERVED for NIP-98; the assertion MUST NOT appear
 //!   there.  Mixing the two fields is an `EvidenceRejected` (403) denial.
 //!
 //! ## Deny map
 //!
 //! The deny map is S4 (Duncan).  Until S4 lands this module stubs it as a
-//! fail-closed no-op: [`HttpDenyMap::check`] always admits.  When S4 adds
-//! the real implementation, replace the stub `impl` below with an import
-//! and a real check.  The integration commit should be a trivial one-liner.
+//! fail-open no-op: [`HttpDenyMap::is_denied`] always returns false.  When S4
+//! adds the real implementation, replace the stub in `admit_nip_fi_http_on_state`
+//! with a reference to the real map.  The integration is a one-liner.
 //!
 //! ## Off-mode regression
 //!
-//! When `NipFiMode::Off`, `check_nip_fi_http` returns `Ok(None)` immediately.
-//! Every surface that calls it must NOT change its behavior for `Ok(None)`.
-//! This preserves the exact pre-NIP-FI behavior for OSS deployments.
+//! When `NipFiMode::Off`, `admit_nip_fi_http` still calls the NIP-98 closure
+//! (preserving whatever auth the surface required before NIP-FI), then returns
+//! `Ok(NipFiAdmission { assertion: None, ... })` immediately without the
+//! assertion/pairing/deny steps.  Pre-NIP-FI behavior is fully preserved for
+//! OSS deployments.
 //!
 //! [FI-TRACE-DENIAL-ORACLE]: exact HTTP response bytes are fixed in NIP-FI.md.
 //! [FI-TRACE-TRANSPORT-CLOSED]: assertion transport is exactly one header.
@@ -43,13 +53,13 @@
 use axum::{
     body::Body,
     http::{HeaderMap, Response, StatusCode},
-    response::IntoResponse,
 };
 use buzz_auth::{
     DenialClass, NipFiMode, VerifiedAssertion, VerifyAssertion, CLIENT_ATTACHED_HEADER,
 };
 use chrono::{DateTime, Utc};
 use nostr::PublicKey;
+use std::fmt;
 
 // ── Deny-map seam (S4 stub) ───────────────────────────────────────────────────
 
@@ -94,86 +104,158 @@ impl HttpDenyMap for AlwaysAdmitStubDenyMap {
     }
 }
 
-// ── Outcome ───────────────────────────────────────────────────────────────────
+// ── Admission type ────────────────────────────────────────────────────────────
 
-/// Outcome of NIP-FI HTTP admission for one request.
+/// Proof that the full NIP-FI admission sequence completed for one HTTP request.
 ///
-/// `Admitted(Some(assertion))` — enforce mode, assertion verified, pubkey
-/// pairing confirmed, deny-map clear.  The caller may proceed.
+/// Construction is private to [`admit_nip_fi_http`].  **No other code path
+/// produces this type.**  A handler signature that requires `NipFiAdmission`
+/// as input can therefore not be reached without executing the full sequence:
 ///
-/// `Admitted(None)` — off mode.  The caller proceeds unchanged (no NIP-FI
-/// requirement).
+///   NIP-98 extraction → assertion extraction → verify → pair → deny-map → admit
 ///
-/// `Denied(response)` — emit `response` verbatim and return; do not process
-/// the request.
+/// `X` is caller-supplied side-data returned by the NIP-98 extraction closure
+/// (e.g. replay-detection fields).  Use `()` when no side-data is needed.
+///
+/// [FI-TRACE-AUTHORITY-UNIFORM] Every protected HTTP surface produces this
+/// type via `admit_nip_fi_http`; there is no other source.
 #[must_use]
-pub(crate) enum NipFiHttpOutcome {
-    /// Request admitted.  The `VerifiedAssertion` is available for future use
-    /// (e.g., forwarding claims to downstream services); callers that don't
-    /// need it may ignore the inner value.
+pub(crate) struct NipFiAdmission<X = ()> {
+    /// The pubkey proven by NIP-98 and confirmed by assertion pairing.
+    ///
+    /// Private: obtain via [`NipFiAdmission::proven_pubkey`].
+    /// Only set from within [`admit_nip_fi_http`].
+    proven_pubkey: PublicKey,
+    /// The verified federation assertion (Some in Enforce mode, None in Off).
+    assertion: Option<VerifiedAssertion>,
+    /// Caller-supplied side-data from the NIP-98 extraction closure.
+    extra: X,
+}
+
+impl<X> fmt::Debug for NipFiAdmission<X> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NipFiAdmission")
+            .field("proven_pubkey", &self.proven_pubkey)
+            .field("assertion", &self.assertion)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<X> NipFiAdmission<X> {
+    /// The pubkey proven by both NIP-98 and assertion pairing.
+    ///
+    /// This is the only way to obtain an authoritative pubkey for downstream
+    /// authorization checks.  It is equal to the NIP-98 `pubkey` (what the
+    /// request proved) and to the assertion's `nostr_pubkey` (what the
+    /// federation identity bound).
+    pub(crate) fn proven_pubkey(&self) -> &PublicKey {
+        &self.proven_pubkey
+    }
+
+    /// The verified federation assertion, if NIP-FI was in Enforce mode.
+    ///
+    /// `None` in Off mode — the assertion was not required.
     #[allow(dead_code)]
-    Admitted(Option<VerifiedAssertion>),
-    Denied(Response<Body>),
+    pub(crate) fn assertion(&self) -> Option<&VerifiedAssertion> {
+        self.assertion.as_ref()
+    }
+
+    /// Caller-supplied side-data from the NIP-98 extraction closure.
+    #[allow(dead_code)]
+    pub(crate) fn extra(&self) -> &X {
+        &self.extra
+    }
+
+    /// Consume the admission, returning ownership of the side-data.
+    pub(crate) fn into_extra(self) -> X {
+        self.extra
+    }
 }
 
 // ── Main admission function ───────────────────────────────────────────────────
 
-/// Gate one HTTP request against the NIP-FI assertion + NIP-98 pairing
-/// requirement.
+/// Run the full NIP-FI admission sequence for one HTTP request.
 ///
-/// `proven_pubkey` is the pubkey already extracted from the NIP-98
-/// `Authorization: Nostr` event by the surface's own auth extractor.  This
-/// function checks only the NIP-FI layer on top.
+/// ## Sequence (per NIP-FI.md §Admission procedure)
 ///
-/// Call sites: `bridge.rs`, `media.rs`, `invites.rs`, `git/transport.rs`.
+/// 1. Run `extract_nip98` — the caller's NIP-98 extraction closure.  Returns
+///    `(proven_pubkey, X)` on success, or a `Response` to emit on failure.
+///    Running NIP-98 first allows the closure to short-circuit (e.g. missing
+///    `Authorization` header) before the more expensive assertion verification.
+/// 2. Off mode: skip assertion steps; return `Ok(NipFiAdmission { proven_pubkey,
+///    assertion: None, extra: X })`.  Off-mode behavior is identical to
+///    pre-NIP-FI (no assertion requirement).  [FI-INV-15]
+/// 3. DenyProtected mode: unconditional 503 regardless of assertion presence.
+/// 4. Enforce mode: extract `Nostr-Federated-Identity: Bearer <JWS>`.
+/// 5. Verify assertion (signature, issuer, expiry, claims).
+/// 6. Assert `assertion.asserted_key == proven_pubkey`.  [FI-INV-05]
+/// 7. Check deny map for `(iss, proven_pubkey)`.  [FI-INV-14]
+/// 8. Return `Ok(NipFiAdmission { proven_pubkey, assertion: Some(...), extra: X })`.
 ///
-/// [FI-TRACE-AUTHORITY-UNIFORM] All protected surfaces reach one admission
-/// authority — this function.
-pub(crate) fn check_nip_fi_http<D: HttpDenyMap>(
+/// ## Bypass impossibility
+///
+/// [`NipFiAdmission`] has a private constructor.  The only source of a
+/// `NipFiAdmission` value is this function.  A handler that skips this call
+/// has no `NipFiAdmission` and cannot obtain `proven_pubkey` through the
+/// NIP-FI admission channel.
+///
+/// ## Off-mode semantics
+///
+/// The NIP-98 closure is always called (steps 1–2).  In Off mode the closure
+/// result still gates entry — if NIP-98 auth is required for non-NIP-FI
+/// reasons (e.g. `require_auth_token`), the closure encodes that.  NIP-FI
+/// layers (assertion/pairing/deny) are skipped entirely.
+///
+/// [FI-TRACE-AUTHORITY-UNIFORM]
+pub(crate) fn admit_nip_fi_http<D, X, F>(
     headers: &HeaderMap,
-    proven_pubkey: &PublicKey,
+    extract_nip98: F,
     verifier: Option<&dyn VerifyAssertion>,
     mode: NipFiMode,
     deny_map: &D,
-) -> NipFiHttpOutcome {
-    // Off mode: no NIP-FI requirement.  Caller unchanged. [FI-INV-15 exemption]
+) -> Result<NipFiAdmission<X>, Response<Body>>
+where
+    D: HttpDenyMap,
+    F: FnOnce() -> Result<(PublicKey, X), Response<Body>>,
+{
+    // Step 1: run NIP-98 extraction.  Always runs regardless of mode.
+    let (proven_pubkey, extra) = extract_nip98()?;
+
+    // Step 2 — Off mode: NIP-FI not required.  Return admission immediately.
+    // The NIP-98 closure already enforced whatever auth the surface required.
+    // [FI-INV-15 exemption]
     if matches!(mode, NipFiMode::Off) {
-        return NipFiHttpOutcome::Admitted(None);
+        return Ok(NipFiAdmission {
+            proven_pubkey,
+            assertion: None,
+            extra,
+        });
     }
 
-    // DenyProtected mode: unconditional 503.  All protected HTTP routes
-    // fail closed during operator repair.  Same rationale as upgrade denials:
-    // the client's evidence may be valid but authorization is unavailable.
+    // Step 3 — DenyProtected mode: unconditional 503.
     if matches!(mode, NipFiMode::DenyProtected) {
-        return NipFiHttpOutcome::Denied(http_denial(DenialClass::AuthorizationUnavailable));
+        return Err(http_denial(DenialClass::AuthorizationUnavailable));
     }
 
-    // Enforce mode: extract and verify the assertion.
-    let token = match extract_bearer_token(headers) {
-        Ok(t) => t,
-        Err(class) => return NipFiHttpOutcome::Denied(http_denial(class)),
-    };
+    // Steps 4–8 — Enforce mode.
 
-    let verifier = match verifier {
-        Some(v) => v,
-        None => {
-            // Verifier not yet constructed (startup race); fail closed.
-            return NipFiHttpOutcome::Denied(http_denial(DenialClass::AuthorizationUnavailable));
-        }
-    };
+    // Step 4: extract the assertion token.
+    let token = extract_bearer_token(headers).map_err(|class| http_denial(class))?;
 
-    let assertion = match verifier.verify_assertion(token) {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::debug!(code = e.code(), "nip-fi assertion denied at http ingress");
-            return NipFiHttpOutcome::Denied(http_denial(e.denial_class()));
-        }
-    };
+    // Step 5: cryptographic verification (signature, issuer, expiry, claims).
+    let verifier = verifier.ok_or_else(|| {
+        // Verifier not yet constructed (startup race); fail closed.
+        http_denial(DenialClass::AuthorizationUnavailable)
+    })?;
+    let assertion = verifier.verify_assertion(token).map_err(|e| {
+        tracing::debug!(code = e.code(), "nip-fi assertion denied at http ingress");
+        http_denial(e.denial_class())
+    })?;
 
-    // Key pairing: assertion's nostr_pubkey MUST equal the proven NIP-98 key.
+    // Step 6: key pairing — assertion.asserted_key MUST equal proven NIP-98 key.
     // A claimless assertion (no nostr_pubkey) is also a denial.  [FI-INV-05]
     match assertion.asserted_key() {
-        Some(k) if k == *proven_pubkey => {}
+        Some(k) if k == proven_pubkey => {}
         _ => {
             metrics::counter!(
                 "buzz_auth_failures_total",
@@ -186,25 +268,29 @@ pub(crate) fn check_nip_fi_http<D: HttpDenyMap>(
             );
             // Key mismatch is a private-state denial: authorization_denied (403).
             // [FI-TRACE-DENIAL-ORACLE]
-            return NipFiHttpOutcome::Denied(http_denial(DenialClass::AuthorizationDenied));
+            return Err(http_denial(DenialClass::AuthorizationDenied));
         }
     }
 
-    // Deny-map check: (iss, pubkey) must not be in an active deny window.
-    // The issuer comes from the already-verified assertion; `now` is used by
-    // the real map for TTL comparison.  [FI-INV-14] [NIP-FI.md:624-627]
+    // Step 7: deny-map check — (iss, pubkey) must not be in an active deny window.
+    // [FI-INV-14] [NIP-FI.md:624-627]
     let issuer = assertion.identity().issuer();
-    if deny_map.is_denied(issuer, proven_pubkey, Utc::now()) {
+    if deny_map.is_denied(issuer, &proven_pubkey, Utc::now()) {
         metrics::counter!(
             "buzz_auth_failures_total",
             "reason" => "nip_fi_http_denied_pubkey"
         )
         .increment(1);
         // Denied-pubkey is a private-state denial.  [FI-TRACE-DENIAL-ORACLE]
-        return NipFiHttpOutcome::Denied(http_denial(DenialClass::AuthorizationDenied));
+        return Err(http_denial(DenialClass::AuthorizationDenied));
     }
 
-    NipFiHttpOutcome::Admitted(Some(assertion))
+    // Step 8: admit.
+    Ok(NipFiAdmission {
+        proven_pubkey,
+        assertion: Some(assertion),
+        extra,
+    })
 }
 
 // ── Transport extraction ──────────────────────────────────────────────────────
@@ -273,47 +359,34 @@ pub(crate) fn http_denial(class: DenialClass) -> Response<Body> {
 // ── State-convenience wrapper ─────────────────────────────────────────────────
 
 /// Convenience wrapper: pull mode + verifier from `AppState` and call
-/// [`check_nip_fi_http`].
+/// [`admit_nip_fi_http`].
 ///
-/// This is the one-liner every surface calls after its own NIP-98 verification
-/// has established `proven_pubkey`.  Surfaces that need a custom deny-map
-/// should call [`check_nip_fi_http`] directly.
+/// `extract_nip98` is a closure that performs NIP-98 authentication and
+/// returns `(proven_pubkey, X)`.  This wrapper supplies `deny_map =
+/// &AlwaysAdmitStubDenyMap`; S4 can replace the stub without touching call
+/// sites by changing this wrapper.
+///
+/// This is the single entry-point every NIP-FI-protected surface calls.
+/// There is no other way to produce a [`NipFiAdmission`].
 ///
 /// [FI-TRACE-AUTHORITY-UNIFORM]
-pub(crate) fn check_nip_fi_http_on_state(
+pub(crate) fn admit_nip_fi_http_on_state<X, F>(
     state: &crate::state::AppState,
     headers: &HeaderMap,
-    proven_pubkey: &PublicKey,
-) -> NipFiHttpOutcome {
+    extract_nip98: F,
+) -> Result<NipFiAdmission<X>, Response<Body>>
+where
+    F: FnOnce() -> Result<(PublicKey, X), Response<Body>>,
+{
     let mode = state.config.nip_fi.mode;
     let verifier = state.nip_fi_verifier.as_deref();
-    check_nip_fi_http(
+    admit_nip_fi_http(
         headers,
-        proven_pubkey,
+        extract_nip98,
         verifier,
         mode,
         &AlwaysAdmitStubDenyMap,
     )
-}
-
-// ── IntoResponse shim for NipFiHttpOutcome ────────────────────────────────────
-
-impl IntoResponse for NipFiHttpOutcome {
-    fn into_response(self) -> axum::response::Response {
-        match self {
-            NipFiHttpOutcome::Denied(r) => r,
-            // Admitted should never be converted to a response; the caller
-            // must check for Denied first.
-            NipFiHttpOutcome::Admitted(_) => {
-                // Defensive fallback: internal invariant violation.
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "nip-fi: admitted path called as response",
-                )
-                    .into_response()
-            }
-        }
-    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -506,48 +579,69 @@ mod tests {
         );
     }
 
-    // ── check_nip_fi_http — off mode ─────────────────────────────────────────
+    // ── admit_nip_fi_http — off mode ─────────────────────────────────────────
 
-    // Off mode → Admitted(None) regardless of headers.
+    // Off mode → Ok(NipFiAdmission) with assertion=None regardless of headers.
+    // The NIP-98 closure is still called; its pubkey is forwarded.
     //
-    // Mutation evidence: returning Denied from off mode makes
-    // `matches!(outcome, NipFiHttpOutcome::Admitted(None))` panic.
+    // Mutation evidence: returning Err from off mode makes `unwrap()` panic.
     #[test]
     fn off_mode_admits_unconditionally() {
         let headers = HeaderMap::new(); // no assertion
-        let pubkey = any_pubkey();
-        let outcome = check_nip_fi_http(
+        let expected_pubkey = any_pubkey();
+        let ep = expected_pubkey;
+        let outcome = admit_nip_fi_http(
             &headers,
-            &pubkey,
+            || Ok((ep, ())),
             None::<&dyn VerifyAssertion>,
             NipFiMode::Off,
             &AlwaysAdmitStubDenyMap,
         );
-        assert!(
-            matches!(outcome, NipFiHttpOutcome::Admitted(None)),
-            "Off mode MUST not require NIP-FI assertion — OSS default regression"
-        );
+        let admission =
+            outcome.expect("Off mode MUST not require NIP-FI assertion — OSS default regression");
+        assert_eq!(*admission.proven_pubkey(), expected_pubkey);
+        assert!(admission.assertion().is_none());
     }
 
-    // ── check_nip_fi_http — deny_protected ───────────────────────────────────
-
-    // DenyProtected → Denied(503 authorization_unavailable).
+    // Off mode: NIP-98 closure failure propagates even in off mode.
     //
-    // Mutation evidence: returning Admitted from deny_protected mode makes
-    // `matches!(outcome, NipFiHttpOutcome::Denied(_))` panic.
+    // Mutation evidence: if off-mode short-circuits before the closure, the
+    // returned Err is swallowed → `unwrap_err()` panics.
+    #[test]
+    fn off_mode_propagates_nip98_closure_failure() {
+        let headers = HeaderMap::new();
+        let deny_resp = http_denial(DenialClass::MissingEvidence);
+        let deny_status = deny_resp.status();
+        let outcome = admit_nip_fi_http::<_, (), _>(
+            &headers,
+            || Err(deny_resp),
+            None::<&dyn VerifyAssertion>,
+            NipFiMode::Off,
+            &AlwaysAdmitStubDenyMap,
+        );
+        let resp = outcome.unwrap_err();
+        assert_eq!(resp.status(), deny_status);
+    }
+
+    // ── admit_nip_fi_http — deny_protected ───────────────────────────────────
+
+    // DenyProtected → Err(503 authorization_unavailable).
+    //
+    // Mutation evidence: returning Ok from deny_protected mode makes
+    // `unwrap_err()` panic.
     #[test]
     fn deny_protected_returns_503() {
         let headers = HeaderMap::new();
         let pubkey = any_pubkey();
-        let outcome = check_nip_fi_http(
+        let outcome = admit_nip_fi_http(
             &headers,
-            &pubkey,
+            || Ok((pubkey, ())),
             None::<&dyn VerifyAssertion>,
             NipFiMode::DenyProtected,
             &AlwaysAdmitStubDenyMap,
         );
         match outcome {
-            NipFiHttpOutcome::Denied(resp) => {
+            Err(resp) => {
                 assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
                 assert_eq!(body_bytes(resp), b"authorization unavailable\n");
             }
@@ -555,9 +649,9 @@ mod tests {
         }
     }
 
-    // ── check_nip_fi_http — enforce, missing assertion ───────────────────────
+    // ── admit_nip_fi_http — enforce, missing assertion ───────────────────────
 
-    // Enforce + missing assertion header → 401.
+    // Enforce + missing assertion header → Err(401).
     //
     // Mutation evidence: the status assertion on the response panics if the
     // missing-header path returns 403 instead of 401.
@@ -565,16 +659,16 @@ mod tests {
     fn enforce_missing_assertion_is_401() {
         let headers = HeaderMap::new();
         let pubkey = any_pubkey();
-        let outcome = check_nip_fi_http(
+        let outcome = admit_nip_fi_http(
             &headers,
-            &pubkey,
+            || Ok((pubkey, ())),
             None::<&dyn VerifyAssertion>,
             NipFiMode::Enforce,
             &AlwaysAdmitStubDenyMap,
         );
         // Missing header → MissingEvidence before verifier check.
         match outcome {
-            NipFiHttpOutcome::Denied(resp) => {
+            Err(resp) => {
                 assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
                 assert_eq!(body_bytes(resp), b"authentication required\n");
             }
@@ -582,9 +676,9 @@ mod tests {
         }
     }
 
-    // ── check_nip_fi_http — enforce, no verifier (startup race) ─────────────
+    // ── admit_nip_fi_http — enforce, no verifier (startup race) ─────────────
 
-    // Enforce + valid-looking header but no verifier (startup race) → 503.
+    // Enforce + valid-looking header but no verifier (startup race) → Err(503).
     //
     // Mutation evidence: returning 403 from the None-verifier path makes the
     // status assertion panic.
@@ -596,15 +690,15 @@ mod tests {
             HeaderValue::from_static("Bearer eyJhbGciOiJFUzI1NiJ9.e30.sig"),
         );
         let pubkey = any_pubkey();
-        let outcome = check_nip_fi_http(
+        let outcome = admit_nip_fi_http(
             &headers,
-            &pubkey,
+            || Ok((pubkey, ())),
             None::<&dyn VerifyAssertion>,
             NipFiMode::Enforce,
             &AlwaysAdmitStubDenyMap,
         );
         match outcome {
-            NipFiHttpOutcome::Denied(resp) => {
+            Err(resp) => {
                 assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
                 assert_eq!(body_bytes(resp), b"authorization unavailable\n");
             }
@@ -612,7 +706,72 @@ mod tests {
         }
     }
 
-    // ── check_nip_fi_http — deny map stub admits ─────────────────────────────
+    // ── admit_nip_fi_http — key pairing falsifier ────────────────────────────
+
+    // Enforce mode: valid assertion for key-A + NIP-98 proving key-B → Err(403
+    // authorization_denied).
+    //
+    // This is the **pairing-wiring falsifier** Thufir required (Round 4).
+    // The test uses a mock verifier that returns a VerifiedAssertion whose
+    // asserted_key is key-A, while the NIP-98 closure returns key-B.
+    //
+    // Mutation evidence (pairing branch):
+    //   Remove the `Some(k) if k == proven_pubkey` branch (replace with
+    //   `Some(_)`) → function admits instead of denying → `unwrap_err()` panics.
+    //
+    // [FI-INV-05] [FI-TRACE-ASSERTION-KEY-MISMATCH]
+    #[test]
+    fn enforce_key_mismatch_is_denied() {
+        use buzz_auth::{VerifiedAssertion, VerifyAssertion};
+
+        let key_a = nostr::Keys::generate();
+        let key_b = nostr::Keys::generate();
+        let pubkey_a = key_a.public_key();
+        let pubkey_b = key_b.public_key();
+
+        // Mock verifier: always succeeds, always claims pubkey_a as asserted_key.
+        struct PairingMockVerifier(nostr::PublicKey);
+        impl VerifyAssertion for PairingMockVerifier {
+            fn verify_assertion<'t>(
+                &self,
+                _token: &'t str,
+            ) -> Result<VerifiedAssertion, buzz_auth::VerifierError> {
+                Ok(VerifiedAssertion::new_for_test(self.0))
+            }
+        }
+        let verifier = PairingMockVerifier(pubkey_a);
+
+        // NIP-98 closure returns key-B; assertion claims key-A → mismatch.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CLIENT_ATTACHED_HEADER,
+            HeaderValue::from_static("Bearer any.valid.looking.token"),
+        );
+
+        let outcome = admit_nip_fi_http(
+            &headers,
+            || Ok((pubkey_b, ())),
+            Some(&verifier as &dyn VerifyAssertion),
+            NipFiMode::Enforce,
+            &AlwaysAdmitStubDenyMap,
+        );
+        match outcome {
+            Err(resp) => {
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::FORBIDDEN,
+                    "key mismatch MUST deny with 403 authorization_denied"
+                );
+                assert_eq!(body_bytes(resp), b"authorization denied\n");
+            }
+            Ok(_) => panic!(
+                "assertion-for-A + NIP-98-for-B MUST be denied; \
+                 pairing branch removal would cause this panic"
+            ),
+        }
+    }
+
+    // ── admit_nip_fi_http — deny map stub admits ─────────────────────────────
 
     // The stub deny map always admits (never denies).
     //

@@ -139,26 +139,23 @@ async fn authenticate(
         })?;
 
     let expected_url = bridge::nip98_expected_url(&state.config.relay_url, &tenant, path);
-    let bridge::VerifiedBridgeAuth {
-        pubkey,
-        event_id_bytes,
-        signed_created_at,
-    } = bridge::verify_bridge_auth_with_options(
-        headers,
-        "POST",
-        &expected_url,
-        Some(body),
-        true,
-        true,
-    )
-    .map_err(|e| e.into_response())?;
 
-    // NIP-FI: enforce assertion+NIP-98 pairing. [FI-TRACE-AUTHORITY-UNIFORM]
-    if let crate::nip_fi_http::NipFiHttpOutcome::Denied(resp) =
-        crate::nip_fi_http::check_nip_fi_http_on_state(state, headers, &pubkey)
-    {
-        return Err(resp);
-    }
+    // NIP-FI admission. [FI-TRACE-AUTHORITY-UNIFORM]
+    let admission = crate::nip_fi_http::admit_nip_fi_http_on_state(state, headers, || {
+        bridge::verify_bridge_auth_with_options(
+            headers,
+            "POST",
+            &expected_url,
+            Some(body),
+            true,
+            true,
+        )
+        .map(|auth| (auth.pubkey, (auth.event_id_bytes, auth.signed_created_at)))
+        .map_err(|e| e.into_response())
+    })
+    .map_err(|resp| resp)?;
+    let pubkey = *admission.proven_pubkey();
+    let (event_id_bytes, signed_created_at) = admission.into_extra();
 
     bridge::enforce_http_admission(state, &tenant, &pubkey)
         .await

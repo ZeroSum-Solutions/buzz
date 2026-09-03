@@ -32,23 +32,29 @@ use crate::state::AppState;
 //
 // ## Purpose
 //
-// This middleware is the single authority that makes NIP-FI route
-// classification fail-closed.  It runs *over the entire merged router*: in
-// Enforce or DenyProtected mode, any request whose path does not start with a
-// prefix in `NIP_FI_EXEMPT_PREFIXES` must carry the
-// `Nostr-Federated-Identity: Bearer …` assertion header — or it is denied
-// before reaching the handler.
+// This middleware is the crypto backstop for NIP-FI route classification.
+// It runs *over the entire merged router*: in Enforce or DenyProtected mode,
+// any request whose path does not start with a prefix in
+// `NIP_FI_EXEMPT_PREFIXES` must carry the
+// `Nostr-Federated-Identity: Bearer …` assertion header with a
+// cryptographically valid signature — or it is denied before reaching the
+// handler.
 //
-// A handler that omits its own `check_nip_fi_http_on_state` call therefore
-// cannot admit a client in active NIP-FI mode, because the guard fires first.
-// The per-handler checks (which additionally verify the assertion signature,
-// key pairing, and deny-map) remain in place; this guard is their backstop.
+// The structural admission authority is `admit_nip_fi_http_on_state` in
+// `nip_fi_http.rs`.  Every protected handler calls it via a NIP-98 extraction
+// closure; it runs NIP-98 extraction → assertion verify → pairing → deny-map
+// in a fixed sequence, and returns a `NipFiAdmission` whose private
+// constructor makes bypass impossible at the type level.
+//
+// This guard is the belt; `admit_nip_fi_http_on_state` is the suspenders.
+// A forgotten-gate handler (one that omits `admit_nip_fi_http_on_state`)
+// cannot admit with an invalidly signed assertion because the guard verifies
+// the JWT signature first.
 //
 // ## Adding a new route
 //
-// * **Protected (NIP-98-authenticated):** no action needed here.  The guard
-//   denies the request if the assertion header is absent; add or keep the
-//   per-handler `check_nip_fi_http_on_state` call for full pairing.
+// * **Protected (NIP-98-authenticated):** call `admit_nip_fi_http_on_state`
+//   with a NIP-98 extraction closure.  No action needed here.
 //
 // * **Public / exempt (no NIP-FI requirement):** add the path or prefix to
 //   `NIP_FI_EXEMPT_PREFIXES` below.  Failure to do so will deny the route in
@@ -63,9 +69,7 @@ use crate::state::AppState;
 // ## What this guard checks (and does NOT check)
 //
 // The guard performs the full offline assertion verification (transport
-// extraction + JWT signature + issuer + expiry + claims) using the same
-// `FederatedAssertionVerifier` instance that per-handler calls use.  This
-// means:
+// extraction + JWT signature + issuer + expiry + claims).  This means:
 //
 //   • Absent header                         → 401 MissingEvidence
 //   • Junk / non-Bearer value               → 403 EvidenceRejected
@@ -75,18 +79,11 @@ use crate::state::AppState;
 //   • No verifier yet (startup race)        → 503 AuthorizationUnavailable
 //   • Cryptographically valid assertion     → forward to handler
 //
-// The guard does NOT check key pairing (`asserted_key == proven_pubkey`):
-// that requires the NIP-98 `proven_pubkey` extracted by each handler, which
-// is not available in middleware.  Per-handler `check_nip_fi_http_on_state`
-// calls perform the pairing and deny-map checks on top.
+// The guard does NOT check key pairing or deny-map: those require the NIP-98
+// `proven_pubkey` from each handler's closure, which is not available in
+// middleware.  `admit_nip_fi_http_on_state` performs the full sequence.
 //
-// Fail-closed invariant: a forgotten-gate handler — one that omits its own
-// `check_nip_fi_http_on_state` call — cannot admit with a structurally valid
-// but invalidly signed assertion, because the guard verifies the JWT
-// signature before the handler fires.  Only a cryptographically verified
-// assertion reaches the handler.
-//
-// [FI-TRACE-AUTHORITY-UNIFORM] Both the guard and the per-handler checks
+// [FI-TRACE-AUTHORITY-UNIFORM] Both the guard and `admit_nip_fi_http_on_state`
 // delegate to `nip_fi_http.rs`; the guard fires first.
 
 /// Path prefixes that are exempt from NIP-FI assertion enforcement.
@@ -158,10 +155,11 @@ const NIP_FI_EXEMPT_PREFIXES: &[&str] = &[
 /// - Cryptographically valid     → forward to handler
 ///
 /// A "forgotten gate" handler — one that omits its own
-/// `check_nip_fi_http_on_state` call — cannot admit with an invalidly signed
+/// `admit_nip_fi_http_on_state` call — cannot admit with an invalidly signed
 /// assertion because the guard rejects it here before the handler fires.
 /// Only a cryptographically verified assertion reaches the handler; the
-/// handler then performs the key pairing and deny-map checks on top.
+/// handler then performs the key pairing and deny-map checks via
+/// `admit_nip_fi_http_on_state`.
 ///
 /// In Off mode the middleware is fully transparent.
 async fn nip_fi_assertion_guard(
@@ -208,7 +206,7 @@ async fn nip_fi_assertion_guard(
     // Non-exempt path in Enforce or DenyProtected mode.
     //
     // DenyProtected: unconditional 503 regardless of assertion presence.
-    // (The per-handler checks also do this; the guard is the backstop.)
+    // (`admit_nip_fi_http_on_state` also does this; the guard is the backstop.)
     if matches!(state.config.nip_fi.mode, NipFiMode::DenyProtected) {
         return http_denial(buzz_auth::DenialClass::AuthorizationUnavailable);
     }
@@ -224,12 +222,10 @@ async fn nip_fi_assertion_guard(
     };
 
     // Step 2 — cryptographic: verify signature, issuer, expiry, and claims.
-    // A forgotten-gate handler that omits `check_nip_fi_http_on_state` can
+    // A forgotten-gate handler that omits `admit_nip_fi_http_on_state` can
     // only be reached with a cryptographically valid assertion.  Key pairing
-    // (`asserted_key == proven_pubkey`) is NOT checked here — that requires
-    // the NIP-98 `proven_pubkey` extracted by each handler.  Per-handler
-    // `check_nip_fi_http_on_state` calls add the pairing and deny-map checks.
-    // [FI-TRACE-AUTHORITY-UNIFORM]
+    // and deny-map are performed by `admit_nip_fi_http_on_state` in the
+    // handler, not here.  [FI-TRACE-AUTHORITY-UNIFORM]
     let verifier = match state.nip_fi_verifier.as_deref() {
         Some(v) => v,
         None => {
@@ -1601,15 +1597,16 @@ mod tests {
     //
     // ## What these tests prove
     //
-    // `nip_fi_assertion_guard` is the runtime default-deny layer that makes
-    // NIP-FI route classification fail-closed.  These unit tests directly
-    // verify the exempt-prefix matching logic that determines whether a
-    // request is guarded or not.
+    // `nip_fi_assertion_guard` is the crypto backstop for NIP-FI route
+    // classification.  These unit tests directly verify the exempt-prefix
+    // matching logic that determines whether a request is guarded or not.
     //
     // The key property: a non-exempt path with no assertion header must be
     // denied in Enforce mode, even if the handler does NOT call
-    // `check_nip_fi_http_on_state`.  This is the fail-closed guarantee — a
-    // handler cannot silently bypass NIP-FI by omitting its gate.
+    // `admit_nip_fi_http_on_state`.  This is the belt — a handler cannot
+    // silently bypass NIP-FI by omitting its gate (the guard catches it).
+    // The suspenders are `admit_nip_fi_http_on_state`'s type-level property:
+    // pairing and deny-map mandatory at the handler's call site.
     //
     // ## Dummy-route failure-mode demonstration (for code review)
     //

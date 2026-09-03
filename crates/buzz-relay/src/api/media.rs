@@ -324,15 +324,16 @@ pub async fn upload_blob(
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> axum::response::Response {
-    use crate::nip_fi_http::{check_nip_fi_http_on_state, NipFiHttpOutcome};
+    use crate::nip_fi_http::admit_nip_fi_http_on_state;
 
-    // NIP-FI: enforce assertion+NIP-98 pairing before any body processing.
-    // The auth extractor has already verified Blossom auth and membership;
-    // NIP-FI is the federation-identity layer on top. [FI-TRACE-AUTHORITY-UNIFORM]
-    if let NipFiHttpOutcome::Denied(resp) =
-        check_nip_fi_http_on_state(&state, &headers, &auth.auth_event.pubkey)
-    {
-        return resp;
+    // NIP-FI admission: the Blossom extractor already verified the NIP-98
+    // auth event; the closure supplies the proven pubkey.  The admission
+    // function then runs assertion verify → pair → deny-map in fixed order.
+    // [FI-TRACE-AUTHORITY-UNIFORM]
+    let proven_pubkey = auth.auth_event.pubkey;
+    match admit_nip_fi_http_on_state(&state, &headers, || Ok((proven_pubkey, ()))) {
+        Ok(_) => {}
+        Err(resp) => return resp,
     }
 
     upload_blob_inner(state, auth, headers, body).await
@@ -673,10 +674,10 @@ pub async fn get_blob(
 ) -> Result<Response, MediaError> {
     validate_media_path(&sha256_ext)?;
     let media_auth = authenticate_media_read(&state, &req_headers, &sha256_ext).await?;
-    // NIP-FI: enforce assertion+NIP-98 pairing. [FI-TRACE-AUTHORITY-UNIFORM]
-    use crate::nip_fi_http::{check_nip_fi_http_on_state, NipFiHttpOutcome};
-    if let NipFiHttpOutcome::Denied(resp) =
-        check_nip_fi_http_on_state(&state, &req_headers, &media_auth.pubkey)
+    // NIP-FI admission. [FI-TRACE-AUTHORITY-UNIFORM]
+    use crate::nip_fi_http::admit_nip_fi_http_on_state;
+    let proven_pubkey = media_auth.pubkey;
+    if let Err(resp) = admit_nip_fi_http_on_state(&state, &req_headers, || Ok((proven_pubkey, ())))
     {
         return Ok(resp);
     }
@@ -945,11 +946,10 @@ pub async fn head_blob(
 ) -> Result<Response, MediaError> {
     validate_media_path(&sha256_ext)?;
     let media_auth = authenticate_media_read(&state, &headers, &sha256_ext).await?;
-    // NIP-FI: enforce assertion+NIP-98 pairing. [FI-TRACE-AUTHORITY-UNIFORM]
-    use crate::nip_fi_http::{check_nip_fi_http_on_state, NipFiHttpOutcome};
-    if let NipFiHttpOutcome::Denied(resp) =
-        check_nip_fi_http_on_state(&state, &headers, &media_auth.pubkey)
-    {
+    // NIP-FI admission. [FI-TRACE-AUTHORITY-UNIFORM]
+    use crate::nip_fi_http::admit_nip_fi_http_on_state;
+    let proven_pubkey = media_auth.pubkey;
+    if let Err(resp) = admit_nip_fi_http_on_state(&state, &headers, || Ok((proven_pubkey, ()))) {
         return Ok(resp);
     }
     let tenant = media_auth.tenant;

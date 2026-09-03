@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::handlers::side_effects::{publish_nip43_member_added, publish_nip43_membership_list};
-use crate::nip_fi_http::{check_nip_fi_http_on_state, NipFiHttpOutcome};
+use crate::nip_fi_http::admit_nip_fi_http_on_state;
 use buzz_core::invite::{
     hash_v2_code, validate_v2_code, DEFAULT_INVITE_TTL_SECS, MAX_INVITE_TTL_SECS, MAX_INVITE_USES,
     MIN_INVITE_TTL_SECS, V2_PREFIX,
@@ -299,15 +299,47 @@ async fn mint_invite_checked(
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
-    let (tenant, pubkey) = match authenticate(&state, &headers, "/api/invites", &body).await {
-        Ok(v) => v,
-        Err(e) => return e.into_response(),
+    let raw_host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let tenant = match crate::tenant::bind_community(&state.db, raw_host).await {
+        Ok(t) => t,
+        Err(_) => {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                "relay: no community is configured for this host",
+            )
+            .into_response()
+        }
     };
 
-    // NIP-FI: enforce assertion+NIP-98 pairing before authz checks.
-    // [FI-TRACE-AUTHORITY-UNIFORM]
-    if let NipFiHttpOutcome::Denied(resp) = check_nip_fi_http_on_state(&state, &headers, &pubkey) {
-        return resp;
+    let url = bridge::nip98_expected_url(&state.config.relay_url, &tenant, "/api/invites");
+
+    // NIP-FI admission: NIP-98 extraction runs inside the closure, followed by
+    // assertion verify → pair → deny-map in fixed order. The proven pubkey is
+    // only available through the returned NipFiAdmission. [FI-TRACE-AUTHORITY-UNIFORM]
+    let admission = match admit_nip_fi_http_on_state(&state, &headers, || {
+        bridge::verify_bridge_auth_with_options(
+            &headers,
+            "POST",
+            &url,
+            Some(&body),
+            true, // invites always require NIP-98; no X-Pubkey dev fallback
+            true, // POST bodies must be covered by a payload tag
+        )
+        .map(|auth| (auth.pubkey, auth.event_id_bytes))
+        .map_err(|e| e.into_response())
+    }) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let pubkey = *admission.proven_pubkey();
+    let event_id_bytes = admission.into_extra();
+
+    // Replay detection runs after NIP-98+assertion admission (both proofs verified).
+    if let Err(e) = bridge::check_nip98_replay(&state, &tenant, event_id_bytes).await {
+        return e.into_response();
     }
 
     match mint_invite_inner(&state, body, tenant, pubkey).await {
