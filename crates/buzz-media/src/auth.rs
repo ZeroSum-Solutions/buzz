@@ -96,15 +96,24 @@ pub fn verify_blossom_auth_event_for_verb(
         let kind = tag.kind().to_string();
         match kind.as_str() {
             "t" => {
-                t_count = t_count.saturating_add(1);
-                if strict && t_count > 1 {
-                    return Err(MediaError::DuplicateTag("t"));
-                }
+                // A `t` tag only counts if it has non-empty content equal to
+                // the requested verb.  A valueless/empty tag cannot satisfy
+                // verb binding and is ignored for cardinality purposes — it is
+                // structurally malformed but not an explicit rejection.  This
+                // matches origin/main's `found_t` semantics.
                 if let Some(v) = tag.content() {
-                    if v != verb.as_str() {
+                    if v.is_empty() {
+                        // Empty string value: does not satisfy the requirement.
+                    } else if v != verb.as_str() {
                         return Err(MediaError::InvalidAuthVerb);
+                    } else {
+                        t_count = t_count.saturating_add(1);
+                        if strict && t_count > 1 {
+                            return Err(MediaError::DuplicateTag("t"));
+                        }
                     }
                 }
+                // No content: tag is ignored (not counted, not rejected).
             }
             "expiration" => {
                 exp_count = exp_count.saturating_add(1);
@@ -232,6 +241,28 @@ pub fn verify_blossom_auth_event_for_verb(
         }
     }
 
+    Ok(())
+}
+
+/// Verify only the `x` tag hash match on an already-admitted upload auth event.
+///
+/// This is the post-body hash check: the full auth event verification
+/// (signature, kind, freshness, cardinality, server) was already performed at
+/// the pre-body admission gate.  Re-running the full verifier after streaming
+/// a potentially large body would fail for any upload that takes longer than
+/// the minted token's `expiration` window (typically 60 s in Strict mode).
+///
+/// The ONLY thing that is unknown before the body is transferred is the
+/// content hash (`x` tag).  This function confirms that the body's SHA-256
+/// matches what was declared in the signed proof.
+pub fn verify_upload_hash_only(auth_event: &nostr::Event, sha256: &str) -> Result<(), MediaError> {
+    let has_matching_x = auth_event
+        .tags
+        .iter()
+        .any(|tag| tag.kind().to_string() == "x" && tag.content() == Some(sha256));
+    if !has_matching_x {
+        return Err(MediaError::HashMismatch);
+    }
     Ok(())
 }
 
@@ -1106,5 +1137,132 @@ mod tests {
             verify_blossom_auth_event(&event, Some("relay.example"), BlossomStrictness::Strict),
             Err(MediaError::InvalidAuthEvent)
         ));
+    }
+
+    // ── Finding 3: valueless / empty-string t tag must not satisfy verb binding ──
+
+    /// A `t` tag with no content (`["t"]`) cannot satisfy the verb requirement.
+    /// It is ignored for cardinality purposes; `t_count` stays 0 → MissingTag.
+    #[test]
+    fn test_valueless_t_tag_is_not_counted_strict() {
+        let keys = Keys::generate();
+        let sha256 = "a".repeat(64);
+        let now = Timestamp::now().as_secs();
+        let exp_str = (now + 55).to_string();
+        // ["t"] with no second element — no content, should not satisfy t requirement
+        let tags = vec![
+            Tag::parse(["t"]).unwrap(),
+            Tag::parse(["x", &sha256]).unwrap(),
+            Tag::parse(["expiration", &exp_str]).unwrap(),
+            Tag::parse(["server", "relay.example"]).unwrap(),
+        ];
+        let event = EventBuilder::new(Kind::from(24242), "Upload")
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert!(
+            matches!(
+                verify_blossom_upload_auth(
+                    &event,
+                    &sha256,
+                    Some("relay.example"),
+                    BlossomStrictness::Strict
+                ),
+                Err(MediaError::MissingTag("t"))
+            ),
+            "valueless t tag must not satisfy t requirement in Strict mode"
+        );
+    }
+
+    #[test]
+    fn test_valueless_t_tag_is_not_counted_permissive() {
+        let keys = Keys::generate();
+        let sha256 = "a".repeat(64);
+        let now = Timestamp::now().as_secs();
+        let exp_str = (now + 300).to_string();
+        let tags = vec![
+            Tag::parse(["t"]).unwrap(),
+            Tag::parse(["x", &sha256]).unwrap(),
+            Tag::parse(["expiration", &exp_str]).unwrap(),
+        ];
+        let event = EventBuilder::new(Kind::from(24242), "Upload")
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert!(
+            matches!(
+                verify_blossom_upload_auth(
+                    &event,
+                    &sha256,
+                    Some("relay.example"),
+                    BlossomStrictness::Permissive
+                ),
+                Err(MediaError::MissingTag("t"))
+            ),
+            "valueless t tag must not satisfy t requirement in Permissive mode"
+        );
+    }
+
+    /// A `t` tag with an empty-string value (`["t", ""]`) cannot satisfy the
+    /// verb requirement — empty content does not equal any verb.
+    #[test]
+    fn test_empty_string_t_tag_is_not_counted_strict() {
+        let keys = Keys::generate();
+        let sha256 = "a".repeat(64);
+        let now = Timestamp::now().as_secs();
+        let exp_str = (now + 55).to_string();
+        let tags = vec![
+            Tag::parse(["t", ""]).unwrap(),
+            Tag::parse(["x", &sha256]).unwrap(),
+            Tag::parse(["expiration", &exp_str]).unwrap(),
+            Tag::parse(["server", "relay.example"]).unwrap(),
+        ];
+        let event = EventBuilder::new(Kind::from(24242), "Upload")
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert!(
+            matches!(
+                verify_blossom_upload_auth(
+                    &event,
+                    &sha256,
+                    Some("relay.example"),
+                    BlossomStrictness::Strict
+                ),
+                Err(MediaError::MissingTag("t"))
+            ),
+            "empty-string t tag must not satisfy t requirement in Strict mode"
+        );
+    }
+
+    /// A valueless `x` tag on upload (`["x"]`) does not match any sha256.
+    #[test]
+    fn test_valueless_x_tag_does_not_match_hash() {
+        let keys = Keys::generate();
+        let sha256 = "a".repeat(64);
+        let now = Timestamp::now().as_secs();
+        let exp_str = (now + 55).to_string();
+        let tags = vec![
+            Tag::parse(["t", "upload"]).unwrap(),
+            Tag::parse(["x"]).unwrap(), // no value
+            Tag::parse(["expiration", &exp_str]).unwrap(),
+            Tag::parse(["server", "relay.example"]).unwrap(),
+        ];
+        let event = EventBuilder::new(Kind::from(24242), "Upload")
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert!(
+            matches!(
+                verify_blossom_upload_auth(
+                    &event,
+                    &sha256,
+                    Some("relay.example"),
+                    BlossomStrictness::Strict
+                ),
+                Err(MediaError::HashMismatch)
+            ),
+            "valueless x tag must not satisfy hash requirement"
+        );
     }
 }
