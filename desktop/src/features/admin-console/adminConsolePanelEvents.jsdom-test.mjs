@@ -182,19 +182,31 @@ function mountPanel({
   role = undefined,
   initialTab = undefined,
 }) {
+  const qc = makeQueryClient(pubkey);
+  // StaffingTab calls useUsersBatchQuery which needs a QueryClientProvider.
+  // Provide a default no-op handler so profile lookups resolve without error.
+  if (!ipcHandlers.get("get_users_batch")) {
+    setIpcHandler("get_users_batch", () =>
+      Promise.resolve({ profiles: {}, missing: [] }),
+    );
+  }
   const container = document.createElement("div");
   document.body.appendChild(container);
   const root = createRoot(container);
   const doRender = async ({ origin: o, pubkey: p } = { origin, pubkey }) => {
     await act(async () => {
       root.render(
-        React.createElement(AdminConsolePanel, {
-          canMutate,
-          origin: o,
-          pubkey: p,
-          ...(role !== undefined ? { role } : {}),
-          ...(initialTab !== undefined ? { initialTab } : {}),
-        }),
+        React.createElement(
+          QueryClientProvider,
+          { client: qc },
+          React.createElement(AdminConsolePanel, {
+            canMutate,
+            origin: o,
+            pubkey: p,
+            ...(role !== undefined ? { role } : {}),
+            ...(initialTab !== undefined ? { initialTab } : {}),
+          }),
+        ),
       );
     });
   };
@@ -1656,19 +1668,23 @@ test("contract-dto-mutation-evidence-nested-message: removing message block hide
 
 // ── NIP-11 auto-discovery ─────────────────────────────────────────────────
 
-test("discovery-success: a discovered origin only pre-fills the input — it is never auto-probed", async () => {
-  // Verifies the advertised-origin hardening: when get_admin_origin returns
-  // null, the card calls admin_discover_origin and, on a discovered origin,
-  // seeds the input and opens the Advanced disclosure so the operator can
-  // review it — but it must NOT probe. The advertised value is untrusted relay
-  // input; auto-probing it would send a signed NIP-98 credential to an
-  // attacker-chosen destination. Nothing contacts the origin until Save.
+test("discovery-success: a discovered origin is auto-saved and auto-probed — panel renders without Save", async () => {
+  // Verifies item 1 (render without Save): when get_admin_origin returns null,
+  // the card discovers the relay's admin_api, auto-saves it via set_admin_origin
+  // (same validation path as an explicit Save), then probes it. The panel
+  // renders immediately without the operator clicking Save.
   //
-  // Fails if the mount effect reverts to auto-probing a discovered origin:
-  // admin_probe would fire and the panel would render without operator action.
+  // The relay we are already connected to is a trusted source; the Rust
+  // AdminOrigin::parse gate validates the discovered value before storing or
+  // signing against it. If validation fails, the code falls back to pre-fill
+  // only (tested in discovery-save-fails-falls-back test below).
+  //
+  // Fails if the mount effect reverts to pre-fill-only behavior:
+  // admin_probe would not fire and the panel would not render without Save.
 
   const pubkey = "1".repeat(64);
   const discovered = "http://127.0.0.1:3000";
+  const canonical = discovered;
 
   setIpcHandler("get_admin_origin", () => Promise.resolve(null));
   let discoverCalls = 0;
@@ -1676,10 +1692,19 @@ test("discovery-success: a discovered origin only pre-fills the input — it is 
     discoverCalls += 1;
     return Promise.resolve(discovered);
   });
+  let saveCalls = 0;
+  setIpcHandler("set_admin_origin", (args) => {
+    saveCalls += 1;
+    return Promise.resolve(args?.rawOrigin ?? canonical);
+  });
   const probeOrigins = [];
   setIpcHandler("admin_probe", (args) => {
     probeOrigins.push(args?.origin ?? "(none)");
-    return Promise.resolve({ state: "nip98Authorized" });
+    return Promise.resolve({
+      state: "nip98Authorized",
+      role: "operator",
+      source: "config",
+    });
   });
   setIpcHandler("admin_list_reports", () => Promise.resolve([]));
   setIpcHandler("admin_list_feedback", () => Promise.resolve([]));
@@ -1687,31 +1712,83 @@ test("discovery-success: a discovered origin only pre-fills the input — it is 
   const qc = makeQueryClient(pubkey);
   const { container, doRender, unmount } = mountCard(qc);
   await doRender();
-  await settle(30);
+  await settle(50);
 
   assert.equal(
     discoverCalls,
     1,
     "admin_discover_origin must be called once when no origin is saved",
   );
+  assert.equal(
+    saveCalls,
+    1,
+    "set_admin_origin must be called to persist the discovered origin",
+  );
   assert.deepEqual(
     probeOrigins,
-    [],
-    `a discovered origin must NOT be probed; got: ${JSON.stringify(probeOrigins)}`,
+    [canonical],
+    `the discovered origin must be probed automatically; got: ${JSON.stringify(probeOrigins)}`,
   );
 
   const input = container.querySelector("[data-testid='admin-origin-input']");
   assert.equal(
     input?.value,
-    discovered,
-    `input must be pre-filled with the discovered origin; got: "${input?.value}"`,
+    canonical,
+    `input must show the auto-saved origin; got: "${input?.value}"`,
   );
 
+  const panel = container.querySelector("[data-testid='admin-console-panel']");
+  assert.ok(
+    panel !== null,
+    "admin-console-panel must render after auto-probe without requiring a Save click",
+  );
+
+  await unmount();
+});
+
+test("discovery-save-fails-falls-back: if set_admin_origin rejects for discovered origin, falls back to pre-fill only", async () => {
+  // When AdminOrigin::parse rejects the discovered value (e.g. invalid URL),
+  // set_admin_origin throws. The code must fall back to pre-fill + Advanced
+  // open (the old behavior) rather than surfacing an error or probing.
+  //
+  // Fails if the save-failure path is removed: an invalid discovered origin
+  // would cause an error state instead of a clean manual-entry fallback.
+
+  const pubkey = "5".repeat(64);
+  const discovered = "not-a-valid-origin";
+
+  setIpcHandler("get_admin_origin", () => Promise.resolve(null));
+  setIpcHandler("admin_discover_origin", () => Promise.resolve(discovered));
+  setIpcHandler("set_admin_origin", () =>
+    Promise.reject(new Error("invalid origin format")),
+  );
+  const probeOrigins = [];
+  setIpcHandler("admin_probe", (args) => {
+    probeOrigins.push(args?.origin ?? "(none)");
+    return Promise.resolve({ state: "disabled" });
+  });
+
+  const qc = makeQueryClient(pubkey);
+  const { container, doRender, unmount } = mountCard(qc);
+  await doRender();
+  await settle(30);
+
+  assert.deepEqual(
+    probeOrigins,
+    [],
+    `no probe must fire when discovery save fails; got: ${JSON.stringify(probeOrigins)}`,
+  );
+  const input = container.querySelector("[data-testid='admin-origin-input']");
+  assert.equal(
+    input?.value,
+    discovered,
+    `input must be pre-filled with the discovered origin as fallback; got: "${input?.value}"`,
+  );
   const panel = container.querySelector("[data-testid='admin-console-panel']");
   assert.equal(
     panel,
     null,
-    "admin-console-panel must NOT render — the discovered origin is unprobed until Save",
+    "admin-console-panel must NOT render when discovery save failed",
   );
 
   await unmount();
@@ -4596,17 +4673,22 @@ test("staffing-tab-reset-on-role-downgrade: panel shows reports content after op
   const container = document.createElement("div");
   document.body.appendChild(container);
   const root = createRoot(container);
+  const qc = makeQueryClient(pubkey);
 
   const renderWith = async (role) => {
     await act(async () => {
       root.render(
-        React.createElement(AdminConsolePanel, {
-          canMutate: true,
-          origin,
-          pubkey,
-          role,
-          initialTab: "staffing",
-        }),
+        React.createElement(
+          QueryClientProvider,
+          { client: qc },
+          React.createElement(AdminConsolePanel, {
+            canMutate: true,
+            origin,
+            pubkey,
+            role,
+            initialTab: "staffing",
+          }),
+        ),
       );
     });
   };

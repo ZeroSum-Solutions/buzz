@@ -2,15 +2,24 @@
  * Staffing tab — Operator-only UI for managing relay_operators rows.
  *
  * Source badges distinguish config-backed entries (immutable via API) from
- * DB-managed entries (can be added/removed). 409 conflicts from the server
- * (config-backed key modification attempts) are surfaced with a clear message.
+ * DB-managed entries (can be added/removed/updated). 409 conflicts from the
+ * server (config-backed key modification attempts) are surfaced with a clear
+ * message.
+ *
+ * Display-name resolution follows the same pattern as the Invites surface:
+ * names come from `useUsersBatchQuery`; hovering a name cross-fades to the
+ * truncated npub so the raw identity is always one interaction away.
  */
 
 import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { nip19 } from "nostr-tools";
 import { LoaderCircle, Trash2 } from "lucide-react";
 import { Button } from "@/shared/ui/button";
 import { Badge } from "@/shared/ui/badge";
 import { truncatePubkey } from "@/shared/lib/pubkey";
+import { getUsersBatch } from "@/shared/api/tauriProfiles";
+import type { UserProfileSummary } from "@/shared/api/types";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -33,6 +42,57 @@ import {
   LoadingSpinner,
   useAsyncLoad,
 } from "./AdminConsolePanelHelpers";
+
+// ── Display-name helpers (mirrors CommunityMembersSettingsCard) ───────────
+
+function formatDisplayName(
+  pubkey: string,
+  profile?: UserProfileSummary | null,
+): string {
+  const trimmed = profile?.displayName?.trim();
+  if (trimmed && !trimmed.toLowerCase().startsWith("npub1")) {
+    return trimmed;
+  }
+  return truncatePubkey(pubkey);
+}
+
+function npubFromPubkey(pubkey: string): string | null {
+  try {
+    return nip19.npubEncode(pubkey);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Cross-fades between display name and npub on hover — same animation as the
+ * Invites / CommunityMembersSettingsCard surface so the two feel identical.
+ */
+function HoverStaffingIdentity({
+  pubkey,
+  displayName,
+}: {
+  pubkey: string;
+  displayName: string;
+}) {
+  const npub = npubFromPubkey(pubkey) ?? pubkey;
+  return (
+    <span className="inline-grid min-w-0 max-w-full grid-cols-1" title={npub}>
+      <span
+        className="col-start-1 row-start-1 max-w-40 truncate opacity-100 blur-0 transition-[max-width,opacity,filter] duration-[250ms] ease-in-out group-hover/staffing-row:max-w-0 group-hover/staffing-row:opacity-0 group-hover/staffing-row:blur-[2px] motion-reduce:transition-none"
+        data-testid={`staffing-name-${pubkey}`}
+      >
+        {displayName}
+      </span>
+      <span
+        className="col-start-1 row-start-1 max-w-0 truncate font-mono text-2xs opacity-0 blur-0 transition-[max-width,opacity,filter] duration-[250ms] ease-in-out group-hover/staffing-row:max-w-40 group-hover/staffing-row:opacity-100 group-hover/staffing-row:blur-0 motion-reduce:transition-none"
+        data-testid={`staffing-npub-${pubkey}`}
+      >
+        {truncatePubkey(npub)}
+      </span>
+    </span>
+  );
+}
 
 // ── Source badge ──────────────────────────────────────────────────────────
 
@@ -72,7 +132,7 @@ export function StaffingTab({
   generation: number;
   /**
    * When false (disabled-auth probe), all write affordances are hidden.
-   * The operator list is still readable; only add/remove controls are absent.
+   * The operator list is still readable; only add/remove/edit controls are absent.
    */
   canMutate: boolean;
 }) {
@@ -94,6 +154,18 @@ export function StaffingTab({
     generation + listGen,
   );
 
+  // Resolve display names for all listed pubkeys in one batch request.
+  // Uses a direct getUsersBatch call (no CommunitiesProvider dependency) since
+  // StaffingTab renders inside the settings panel, outside the main app context.
+  const listedPubkeys =
+    listState.status === "ok" ? listState.data.map((op) => op.pubkey) : [];
+  const profilesQuery = useQuery({
+    enabled: listedPubkeys.length > 0,
+    queryKey: ["staffing-profiles", ...listedPubkeys.slice().sort()],
+    queryFn: () => getUsersBatch(listedPubkeys),
+    staleTime: 5 * 60_000,
+  });
+
   const handleAdd = async () => {
     const trimmed = addPubkey.trim().toLowerCase();
     if (!trimmed) return;
@@ -107,7 +179,7 @@ export function StaffingTab({
     const existing = listState.data.find((op) => op.pubkey === trimmed);
     if (existing) {
       setAddError(
-        `Already an operator: ${existing.effectiveRole}. Use Remove to revoke before re-adding with a different role.`,
+        `Already an operator: ${existing.effectiveRole}. Change role with the edit control on their row.`,
       );
       return;
     }
@@ -127,6 +199,28 @@ export function StaffingTab({
       );
     } finally {
       setIsAdding(false);
+    }
+  };
+
+  const handleRoleChange = async (
+    op: AdminOperatorDto,
+    newRole: "operator" | "moderator",
+  ) => {
+    if (newRole === op.effectiveRole) return;
+    setActionError(null);
+    setWorkingPubkey(op.pubkey);
+    try {
+      await putAdminOperator(origin, op.pubkey, newRole);
+      setListGen((g) => g + 1);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setActionError(
+        msg.includes("409")
+          ? `Cannot change ${truncatePubkey(op.pubkey)}: config-backed key.`
+          : msg,
+      );
+    } finally {
+      setWorkingPubkey(null);
     }
   };
 
@@ -267,27 +361,57 @@ export function StaffingTab({
             const isConfigBacked = op.sources.some(
               (s) => s === "config" || s === "owner_fallback",
             );
+            const isWorking = workingPubkey === op.pubkey;
+            const profile = profilesQuery.data?.profiles[op.pubkey];
+            const displayName = formatDisplayName(op.pubkey, profile);
             return (
               <li
-                className="flex items-center gap-2 rounded-md border border-border/60 px-3 py-2"
+                className="group/staffing-row flex items-center gap-2 rounded-md border border-border/60 px-3 py-2"
                 data-testid={`staffing-row-${op.pubkey}`}
                 key={op.pubkey}
               >
                 <div className="flex-1 min-w-0">
-                  <p className="text-xs font-mono truncate">{op.pubkey}</p>
+                  <p className="text-xs truncate">
+                    <HoverStaffingIdentity
+                      pubkey={op.pubkey}
+                      displayName={displayName}
+                    />
+                  </p>
                   <div className="flex flex-wrap gap-1 mt-0.5">
-                    <Badge variant="outline">{op.effectiveRole}</Badge>
                     {op.sources.map((s) => (
                       <SourceBadge key={s} source={s} />
                     ))}
                   </div>
                 </div>
+                {/* In-place role selector — hidden in read-only / config-backed mode */}
+                {canMutate && !isConfigBacked && (
+                  <select
+                    aria-label={`Change role for ${displayName}`}
+                    className="rounded-md border border-border/60 bg-background px-1.5 py-0.5 text-xs"
+                    data-testid={`staffing-role-select-${op.pubkey}`}
+                    disabled={isWorking}
+                    onChange={(e) =>
+                      void handleRoleChange(
+                        op,
+                        e.target.value as "operator" | "moderator",
+                      )
+                    }
+                    value={op.effectiveRole}
+                  >
+                    <option value="moderator">moderator</option>
+                    <option value="operator">operator</option>
+                  </select>
+                )}
+                {/* Config-backed: show role as badge (not editable) */}
+                {isConfigBacked && (
+                  <Badge variant="outline">{op.effectiveRole}</Badge>
+                )}
                 {/* Remove button — hidden in read-only (disabled-auth) mode */}
                 {canMutate && (
                   <Button
-                    aria-label={`Remove ${op.pubkey}`}
+                    aria-label={`Remove ${displayName}`}
                     data-testid={`staffing-remove-btn-${op.pubkey}`}
-                    disabled={isConfigBacked || workingPubkey === op.pubkey}
+                    disabled={isConfigBacked || isWorking}
                     onClick={() => setPendingRemove(op)}
                     size="icon-xs"
                     title={
@@ -298,7 +422,7 @@ export function StaffingTab({
                     type="button"
                     variant="ghost"
                   >
-                    {workingPubkey === op.pubkey ? (
+                    {isWorking ? (
                       <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
                     ) : (
                       <Trash2 className="h-3.5 w-3.5" />

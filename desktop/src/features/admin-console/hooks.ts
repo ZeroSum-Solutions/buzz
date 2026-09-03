@@ -11,15 +11,11 @@ export const moderationNavResolutionQueryKey = (
 ) => ["moderationNavResolution", pubkeyHex, relayOrigin] as const;
 
 /**
- * Resolve the origin source that decides whether the Relay admin nav entry is
+ * Resolve the origin source that decides whether the Admin nav entry is
  * visible. A saved manual origin wins outright; otherwise NIP-11 discovery is
  * attempted and, when it advertises an origin, the entry is shown so the
- * operator can open Relay admin and confirm the pre-filled origin.
- *
- * The advertised origin is deliberately NOT probed here: it is untrusted
- * relay-advertised input, and probing it would send a signed NIP-98 credential
- * to an attacker-chosen destination. Nothing contacts the advertised origin
- * until the operator explicitly saves it inside the settings surface.
+ * operator can open Admin and see the panel (the card will auto-save and
+ * auto-probe the discovered origin on first open).
  *
  * Keyed by pubkey **and the connected relay origin**: NIP-11 discovery is
  * relay-dependent, so a pubkey-only key would serve the previous relay's

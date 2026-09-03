@@ -131,10 +131,11 @@ function ProbeStatusBadge({ uiState }: { uiState: ProbeUiState }) {
     );
   }
   if (uiState.kind === "authorized") {
+    const roleLabel = uiState.role ?? "operator";
     return (
       <span className="flex items-center gap-1.5 text-xs text-emerald-600 dark:text-emerald-400">
         <CheckCircle2 className="h-3.5 w-3.5" />
-        Connected
+        Connected as {roleLabel}
       </span>
     );
   }
@@ -217,8 +218,8 @@ export function AdminConsoleSettingsCard() {
       data-testid="settings-admin-console"
     >
       <SettingsSectionHeader
-        title="Relay admin"
-        description="Manage your relay's platform layer: triage cross-community reports, review product feedback, and configure the relay operator roster. Auto-detected from your relay when available — otherwise open Advanced to paste the value of BUZZ_ADMIN_HOST from your relay config."
+        title="Admin"
+        description="Manage your relay's platform layer: triage cross-community reports, review product feedback, and configure the relay operator roster."
       />
       {pubkeyHex ? (
         <AdminConsoleSettingsSession key={pubkeyHex} pubkeyHex={pubkeyHex} />
@@ -288,11 +289,11 @@ function AdminConsoleSettingsSession({ pubkeyHex }: { pubkeyHex: string }) {
   // Load saved origin on mount (runs once per session because the component
   // is keyed by pubkeyHex — re-mount = new pubkey). When nothing is saved,
   // attempt NIP-11 auto-discovery of the admin origin from the connected
-  // relay and PRE-FILL the input with it — but do NOT save or probe it. The
-  // advertised value is untrusted relay input; auto-probing it would send a
-  // signed NIP-98 credential to an attacker-chosen destination. The operator
-  // must explicitly Save to convert the pre-filled value into a manual origin,
-  // at which point the normal save→probe path validates and probes it.
+  // relay. A discovered origin is auto-saved and probed without requiring an
+  // explicit Save — the relay we are already connected to is a trusted source,
+  // and AdminOrigin::parse validates the value on the Rust side before it is
+  // stored or signed against. The operator only needs to interact with the
+  // Advanced disclosure to change or clear the origin.
   // biome-ignore lint/correctness/useExhaustiveDependencies: intentional mount-once effect; identity boundary is the key prop on this component — it unmounts/remounts on pubkey change, so [] is correct.
   useEffect(() => {
     let active = true;
@@ -301,8 +302,8 @@ function AdminConsoleSettingsSession({ pubkeyHex }: { pubkeyHex: string }) {
         const saved = await getAdminOrigin(pubkeyHex);
         if (!active) return;
         if (saved) {
-          // A persisted origin (manual fallback) takes precedence over
-          // discovery — the operator explicitly chose it, so probe it.
+          // A persisted origin (manual fallback or previously auto-saved
+          // discovery) takes precedence — probe it immediately.
           setSavedOrigin(saved);
           setOriginInput(saved);
           runProbe(saved);
@@ -319,9 +320,26 @@ function AdminConsoleSettingsSession({ pubkeyHex }: { pubkeyHex: string }) {
         }
         if (!active) return;
         if (discovered) {
-          // PRE-FILL ONLY: seed the input and open Advanced so the operator
-          // can review and Save. savedOrigin stays null → no panel, no probe,
-          // nothing contacts the advertised origin until an explicit Save.
+          // Auto-save the discovered origin (same path as an explicit Save),
+          // then probe. This lets the panel render immediately on first open
+          // when the relay advertises its admin_api, with no Save required.
+          // The operator still sees the Advanced disclosure if they need to
+          // change or clear the value.
+          try {
+            const canonical = await setAdminOrigin(discovered, pubkeyHex);
+            if (!active) return;
+            if (canonical) {
+              setSavedOrigin(canonical);
+              setOriginInput(canonical);
+              runProbe(canonical);
+              return;
+            }
+          } catch {
+            // Discovery save failed (e.g. invalid origin per AdminOrigin::parse).
+            // Fall through to manual-entry state.
+          }
+          if (!active) return;
+          // Save failed: pre-fill only so the operator can review and Save manually.
           setOriginInput(discovered);
           setAdvancedOpen(true);
         }
@@ -408,7 +426,25 @@ function AdminConsoleSettingsSession({ pubkeyHex }: { pubkeyHex: string }) {
 
   return (
     <>
-      <div className="mb-6 space-y-3">
+      {/* Probe status badge — always shown above the panel/disclosure */}
+      <div className="mb-3 min-h-[1.5rem]">
+        <ProbeStatusBadge uiState={probeUiState} />
+      </div>
+
+      {isPanelVisible && savedOrigin && (
+        <AdminConsolePanel
+          canMutate={probeUiState.kind === "authorized"}
+          origin={savedOrigin}
+          pubkey={pubkeyHex}
+          role={
+            probeUiState.kind === "authorized" ? probeUiState.role : undefined
+          }
+        />
+      )}
+
+      {/* Advanced: admin origin — moved below the action panel; happy path
+          never needs it so it lives at the bottom of the section. */}
+      <div className="mt-6 space-y-3">
         <details
           className="group/advanced rounded-md border border-border/60"
           open={advancedOpen}
@@ -471,27 +507,20 @@ function AdminConsoleSettingsSession({ pubkeyHex }: { pubkeyHex: string }) {
                 </Button>
               )}
             </div>
+            {probeUiState.kind === "authorized" && probeUiState.source && (
+              <p className="text-xs text-muted-foreground">
+                Origin resolved from{" "}
+                {probeUiState.source === "config"
+                  ? "relay config"
+                  : probeUiState.source === "owner_fallback"
+                    ? "relay config (owner fallback)"
+                    : "database"}
+                .
+              </p>
+            )}
           </div>
         </details>
-
-        <div className="min-h-[1.5rem]">
-          <ProbeStatusBadge uiState={probeUiState} />
-        </div>
       </div>
-
-      {isPanelVisible && savedOrigin && (
-        <AdminConsolePanel
-          canMutate={probeUiState.kind === "authorized"}
-          origin={savedOrigin}
-          pubkey={pubkeyHex}
-          role={
-            probeUiState.kind === "authorized" ? probeUiState.role : undefined
-          }
-          source={
-            probeUiState.kind === "authorized" ? probeUiState.source : undefined
-          }
-        />
-      )}
     </>
   );
 }

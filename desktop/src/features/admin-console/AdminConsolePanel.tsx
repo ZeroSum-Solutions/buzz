@@ -27,7 +27,6 @@ import {
   ChevronLeft,
   LoaderCircle,
   MessageSquare,
-  Shield,
   ShieldAlert,
   Users,
 } from "lucide-react";
@@ -42,7 +41,6 @@ import {
   reopenAdminReport,
   resolveAdminReport,
   type AdminPrincipalRole,
-  type AdminPrincipalSource,
   type AdminReportAction,
   type AdminReportDetailDto,
   type AdminReportDto,
@@ -894,7 +892,6 @@ export function AdminConsolePanel({
   origin,
   pubkey,
   role,
-  source,
   initialTab,
 }: {
   /**
@@ -909,8 +906,6 @@ export function AdminConsolePanel({
   pubkey: string;
   /** Principal role from probe — `"operator"` | `"moderator"` | undefined */
   role?: AdminPrincipalRole | null;
-  /** Source from probe — `"config"` | `"owner_fallback"` | `"db"` | undefined */
-  source?: AdminPrincipalSource | null;
   /**
    * Override the initially active tab. Intended for unit tests that need to
    * land on a specific tab without driving click events through MinimalDocument.
@@ -952,15 +947,6 @@ export function AdminConsolePanel({
       className="flex min-h-0 flex-1 flex-col"
       data-testid="admin-console-panel"
     >
-      {role && (
-        <div className="mb-3 flex items-center gap-2 text-xs">
-          <Shield className="h-3.5 w-3.5 text-muted-foreground" />
-          <Badge variant="secondary">{role}</Badge>
-          {source && (
-            <Badge variant="outline">{source.replace("_", " ")}</Badge>
-          )}
-        </div>
-      )}
       <TabBar
         activeTab={activeTab}
         onSelect={setActiveTab}

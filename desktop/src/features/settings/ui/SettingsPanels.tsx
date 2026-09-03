@@ -210,7 +210,7 @@ export const settingsSections: SettingsSectionDescriptor[] = [
   },
   {
     value: "relay-admin",
-    label: "Relay admin",
+    label: "Admin",
     icon: ServerCog,
   },
   {
