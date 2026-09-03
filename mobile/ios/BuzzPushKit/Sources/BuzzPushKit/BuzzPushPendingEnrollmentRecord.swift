@@ -18,6 +18,8 @@ public struct BuzzPushPendingEnrollmentRecord: Codable, Equatable, Sendable {
   public let keyId: String?
   public let attestation: String?
   public let delegationGeneration: Int64
+  /// Durable marker that the journaled delegation revocation completed remotely.
+  public let delegationRevoked: Bool?
 
   public init(
     gatewayOrigin: String,
@@ -33,7 +35,8 @@ public struct BuzzPushPendingEnrollmentRecord: Codable, Equatable, Sendable {
     challenge: String? = nil,
     keyId: String? = nil,
     attestation: String? = nil,
-    delegationGeneration: Int64 = 0
+    delegationGeneration: Int64 = 0,
+    delegationRevoked: Bool? = nil
   ) {
     self.gatewayOrigin = gatewayOrigin
     self.relayOrigin = relayOrigin
@@ -49,6 +52,7 @@ public struct BuzzPushPendingEnrollmentRecord: Codable, Equatable, Sendable {
     self.keyId = keyId
     self.attestation = attestation
     self.delegationGeneration = delegationGeneration
+    self.delegationRevoked = delegationRevoked
   }
 
   func withGatewayInstallationHandle(_ handle: String) -> Self {
@@ -66,7 +70,28 @@ public struct BuzzPushPendingEnrollmentRecord: Codable, Equatable, Sendable {
       challenge: challenge,
       keyId: keyId,
       attestation: attestation,
-      delegationGeneration: delegationGeneration
+      delegationGeneration: delegationGeneration,
+      delegationRevoked: delegationRevoked
+    )
+  }
+
+  func withDelegationRevoked() -> Self {
+    Self(
+      gatewayOrigin: gatewayOrigin,
+      relayOrigin: relayOrigin,
+      relayPubkey: relayPubkey,
+      endpoint: endpoint,
+      endpointHash: endpointHash,
+      appProfile: appProfile,
+      expiresAt: expiresAt,
+      installationId: installationId,
+      gatewayInstallationHandle: gatewayInstallationHandle,
+      challengeId: challengeId,
+      challenge: challenge,
+      keyId: keyId,
+      attestation: attestation,
+      delegationGeneration: delegationGeneration,
+      delegationRevoked: true
     )
   }
 }

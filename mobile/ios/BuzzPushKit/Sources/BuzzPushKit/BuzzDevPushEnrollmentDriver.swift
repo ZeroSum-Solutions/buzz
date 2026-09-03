@@ -488,7 +488,17 @@ public final class BuzzDevPushEnrollmentDriver {
           }
           .max { $0.generation < $1.generation }
       }
-      if let handleText = pending.gatewayInstallationHandle,
+      if pending.delegationRevoked == true,
+        let handleText = pending.gatewayInstallationHandle,
+        let handle = UUID(uuidString: handleText),
+        handleText == handle.uuidString.lowercased()
+      {
+        try store.removeRecords(
+          gatewayOrigin: gatewayOrigin,
+          installationHandle: handleText,
+          relayPubkey: pending.relayPubkey
+        )
+      } else if let handleText = pending.gatewayInstallationHandle,
         let handle = UUID(uuidString: handleText),
         handleText == handle.uuidString.lowercased(),
         let keyId = pending.keyId,
@@ -522,6 +532,7 @@ public final class BuzzDevPushEnrollmentDriver {
         guard revoked else {
           throw BuzzDevPushEnrollmentError.retiredGatewayCleanupIncomplete
         }
+        try store.savePendingEnrollment(pending.withDelegationRevoked())
         try store.removeRecords(
           gatewayOrigin: gatewayOrigin,
           installationHandle: handleText,
@@ -784,7 +795,8 @@ public final class BuzzDevPushEnrollmentDriver {
         challenge: pending.challenge,
         keyId: pending.keyId,
         attestation: pending.attestation,
-        delegationGeneration: pending.delegationGeneration
+        delegationGeneration: pending.delegationGeneration,
+        delegationRevoked: pending.delegationRevoked
       )
       try store.savePendingEnrollment(pending)
     }

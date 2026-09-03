@@ -727,7 +727,8 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     )
     let store = MemoryGrantStore(
       records: [unrelatedHigherGeneration, siblingOrigin, existing],
-      pending: [pending]
+      pending: [pending],
+      pendingRemoveFailuresRemaining: 1
     )
     let driver = try makeDriver(store: store, appAttest: RecordingAppAttest())
     var challengeRequests = 0
@@ -774,6 +775,19 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
         return Self.response(request, status: 500, json: [:])
       }
     }
+
+    do {
+      _ = try await driver.enroll(
+        deviceToken: Data((1...32).map(UInt8.init)),
+        relayURL: Self.relayURL
+      )
+      XCTFail("Expected the injected pending-journal deletion failure")
+    } catch let error as NSError where error.domain == "MemoryGrantStore" && error.code == 3 {
+      // The completed revocation remains journaled for a local-only retry.
+    }
+
+    XCTAssertEqual(store.saved, [unrelatedHigherGeneration])
+    XCTAssertEqual(store.pending.first?.delegationRevoked, true)
 
     do {
       _ = try await driver.enroll(
@@ -2068,17 +2082,20 @@ private final class MemoryGrantStore: BuzzPushEndpointGrantStore {
   var resetOperations: [String] = []
   var grantSaveFailuresRemaining: Int
   var cleanupSaveFailureCalls: Set<Int>
+  var pendingRemoveFailuresRemaining: Int
   private var cleanupSaveCallCount = 0
   init(
     records: [BuzzPushEndpointGrantRecord] = [],
     pending: [BuzzPushPendingEnrollmentRecord] = [],
     grantSaveFailuresRemaining: Int = 0,
-    cleanupSaveFailureCalls: Set<Int> = []
+    cleanupSaveFailureCalls: Set<Int> = [],
+    pendingRemoveFailuresRemaining: Int = 0
   ) {
     saved = records
     self.pending = pending
     self.grantSaveFailuresRemaining = grantSaveFailuresRemaining
     self.cleanupSaveFailureCalls = cleanupSaveFailureCalls
+    self.pendingRemoveFailuresRemaining = pendingRemoveFailuresRemaining
   }
   func reset(forGatewayOrigin gatewayOrigin: String) throws {
     try BuzzPushGatewayStateReset.run(
@@ -2155,6 +2172,10 @@ private final class MemoryGrantStore: BuzzPushEndpointGrantStore {
     relayOrigin: String,
     appProfile: String
   ) throws {
+    if pendingRemoveFailuresRemaining > 0 {
+      pendingRemoveFailuresRemaining -= 1
+      throw NSError(domain: "MemoryGrantStore", code: 3)
+    }
     pending.removeAll {
       $0.gatewayOrigin == gatewayOrigin && $0.relayOrigin == relayOrigin
         && $0.appProfile == appProfile
