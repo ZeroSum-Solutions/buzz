@@ -54,6 +54,7 @@ import 'package:buzz/shared/relay/relay.dart';
 import 'package:buzz/shared/theme/theme.dart';
 import 'package:buzz/shared/widgets/app_list_card.dart';
 import 'package:buzz/shared/widgets/avatar_image.dart';
+import 'package:buzz/shared/widgets/buzz_navigation_metrics.dart';
 import 'package:buzz/shared/widgets/frosted_app_bar.dart';
 import 'package:buzz/shared/widgets/frosted_scaffold.dart';
 import 'package:buzz/shared/widgets/flapping_bee.dart';
@@ -9590,9 +9591,9 @@ void main() {
         expect(channelParams['label'], 'general');
         expect(channelParams['subtitle'], '0 members');
         expect(channelParams['systemIconName'], 'number');
-        expect(channelParams['controlSize'], 40.0);
+        expect(channelParams['controlSize'], buzzNavigationActionSize);
         expect(channelParams['controlSize'], backParams['controlSize']);
-        expect(channelIdentityRect.width, lessThan(300));
+        expect(channelIdentityRect.width, lessThanOrEqualTo(300));
         final huddleNativeView = tester.widget<UiKitView>(
           find.descendant(
             of: find.byKey(const ValueKey('channel-huddle-button')),

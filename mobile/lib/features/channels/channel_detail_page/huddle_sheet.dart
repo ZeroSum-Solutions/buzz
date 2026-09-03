@@ -244,6 +244,7 @@ class _HuddleButton extends ConsumerWidget {
         icon: IosGlassNavigationIcon.headphones,
         semanticLabel: tooltip,
         onPressed: onPressed,
+        controlSize: buzzNavigationActionSize,
         foregroundColor: context.colors.primary,
         nativeViewSuppressed: nativeViewSuppressed,
       );
