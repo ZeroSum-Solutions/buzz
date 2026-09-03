@@ -521,26 +521,28 @@ impl AuthorityStore for PostgresAuthorityStore {
         .execute(&mut *tx)
         .await
         .map_err(db)?;
-        // A parent may become retention-eligible before an otherwise-active
-        // child. Parent eligibility must therefore reap every child first;
-        // otherwise the installation delete violates the delegation FK and
-        // rolls back all cleanup in this transaction.
+        // Revoked rows are idempotency tombstones for cleanup retries, so keep
+        // them for the full authority lifetime. A parent may expire before an
+        // otherwise-active child; reap every child of an expired parent first
+        // so the installation delete cannot violate the delegation FK.
         sqlx::query(
             "DELETE FROM push_gateway_delegations d
              WHERE d.expires_at < $1
-                OR d.revoked_at < $1 - interval '1 day'
                 OR EXISTS (
                     SELECT 1 FROM push_gateway_installations i
                     WHERE i.id = d.installation_id
-                      AND (i.expires_at < $1 OR i.revoked_at < $1 - interval '1 day')
+                      AND i.expires_at < $1
                 )",
         )
         .bind(at(now)?)
         .execute(&mut *tx)
         .await
         .map_err(db)?;
-        sqlx::query("DELETE FROM push_gateway_installations WHERE expires_at < $1 OR revoked_at < $1 - interval '1 day'")
-            .bind(at(now)?).execute(&mut *tx).await.map_err(db)?;
+        sqlx::query("DELETE FROM push_gateway_installations WHERE expires_at < $1")
+            .bind(at(now)?)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
         tx.commit().await.map_err(db)?;
         Ok(())
     }
@@ -643,7 +645,7 @@ mod postgres_tests {
 
     #[tokio::test]
     #[ignore = "requires PostgreSQL"]
-    async fn reaper_deletes_active_child_of_retention_eligible_revoked_installation() {
+    async fn reaper_retains_revocation_tombstones_until_authority_expiry() {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
             .unwrap_or_else(|_| TEST_DB_URL.to_owned());
@@ -683,32 +685,54 @@ mod postgres_tests {
         .expect("create authority retention tables");
 
         let now = Utc::now();
-        let installation_id = Uuid::new_v4();
+        let revoked_installation_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO push_gateway_installations(id, expires_at, revoked_at)
              VALUES ($1, $2, $3)",
         )
-        .bind(installation_id)
+        .bind(revoked_installation_id)
         .bind(now + chrono::Duration::days(30))
         .bind(now - chrono::Duration::days(2))
         .execute(&pool)
         .await
-        .expect("insert retention-eligible revoked installation");
+        .expect("insert revoked installation tombstone");
         sqlx::query(
             "INSERT INTO push_gateway_delegations(id, installation_id, expires_at, revoked_at)
              VALUES ($1, $2, $3, NULL)",
         )
         .bind(Uuid::new_v4())
-        .bind(installation_id)
+        .bind(revoked_installation_id)
         .bind(now + chrono::Duration::days(7))
         .execute(&pool)
         .await
         .expect("insert active future-expiring child delegation");
 
+        let active_installation_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO push_gateway_installations(id, expires_at, revoked_at)
+             VALUES ($1, $2, NULL)",
+        )
+        .bind(active_installation_id)
+        .bind(now + chrono::Duration::days(30))
+        .execute(&pool)
+        .await
+        .expect("insert active installation");
+        sqlx::query(
+            "INSERT INTO push_gateway_delegations(id, installation_id, expires_at, revoked_at)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(active_installation_id)
+        .bind(now + chrono::Duration::days(30))
+        .bind(now - chrono::Duration::days(2))
+        .execute(&pool)
+        .await
+        .expect("insert revoked delegation tombstone");
+
         PostgresAuthorityStore::new(pool.clone())
             .reap_expired(now.timestamp())
             .await
-            .expect("reaper must delete the child before its revoked parent");
+            .expect("reap before authority expiry");
         let delegations: i64 = sqlx::query_scalar("SELECT count(*) FROM push_gateway_delegations")
             .fetch_one(&pool)
             .await
@@ -718,6 +742,22 @@ mod postgres_tests {
                 .fetch_one(&pool)
                 .await
                 .expect("count installations");
+        assert_eq!(delegations, 2);
+        assert_eq!(installations, 2);
+
+        PostgresAuthorityStore::new(pool.clone())
+            .reap_expired((now + chrono::Duration::days(31)).timestamp())
+            .await
+            .expect("reap after authority expiry");
+        let delegations: i64 = sqlx::query_scalar("SELECT count(*) FROM push_gateway_delegations")
+            .fetch_one(&pool)
+            .await
+            .expect("count expired delegations");
+        let installations: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM push_gateway_installations")
+                .fetch_one(&pool)
+                .await
+                .expect("count expired installations");
         assert_eq!(delegations, 0);
         assert_eq!(installations, 0);
 
