@@ -6,6 +6,15 @@ mod admission;
 mod build_info;
 mod rejection;
 
+/// NIP-FI session admission gate — per-connection effect-permit and quiescence barrier.
+pub(crate) mod nip_fi_gate;
+pub(crate) mod nip_fi_session;
+/// NIP-FI test hooks — production barriers for deterministic B1/B2 witnesses.
+#[cfg(test)]
+pub(crate) mod nip_fi_test_hooks;
+/// NIP-FI assertion validation at WebSocket upgrade.
+pub(crate) mod nip_fi_upgrade;
+
 /// REST API route handlers.
 pub mod api;
 /// WebSocket audio relay for huddle voice channels.
@@ -25,6 +34,8 @@ pub mod error;
 pub mod handlers;
 /// Stateless HMAC-signed relay invite tokens (mint/verify).
 pub mod invite_token;
+/// Fixed-schema evidence for the relay's earliest startup steps.
+pub mod lifecycle;
 /// Inter-relay mesh startup wiring (`BUZZ_MESH` seam).
 pub mod mesh_boot;
 /// Prometheus metrics: recorder, upkeep, HTTP middleware.
