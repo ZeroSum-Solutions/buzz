@@ -33,10 +33,10 @@ function NavLink({ to, children }: { to: string; children: ReactNode }) {
   return (
     <Link
       to={to}
-      className="block rounded-md px-3 py-1.5 text-sm text-secondary transition-colors hover:bg-hover hover:text-primary"
+      className="block rounded-lg px-3 py-2 text-label text-secondary transition-colors hover:bg-hover hover:text-primary"
       activeProps={{
         className:
-          "block rounded-md px-3 py-1.5 text-sm bg-accent-tint text-primary font-medium",
+          "block rounded-lg px-3 py-2 text-label bg-accent-tint text-accent",
       }}
     >
       {children}
@@ -48,37 +48,44 @@ export function DesignSystemLayout() {
   const { scheme, toggle } = useColorScheme();
 
   return (
-    <div className="flex min-h-screen">
+    /* Narrow: the nav stacks above the content as a wrapped list, because a
+       256px column beside a reading column leaves neither enough room. From lg
+       it becomes the sticky side rail. */
+    <div className="flex min-h-screen flex-col bg-panel lg:flex-row">
       <nav
         aria-label="Design system"
-        className="sticky top-0 flex h-screen w-60 shrink-0 flex-col gap-6 overflow-y-auto border-r border-secondary bg-panel px-4 py-6"
+        className="flex shrink-0 flex-col gap-8 px-4 py-8 lg:sticky lg:top-0 lg:h-screen lg:w-64 lg:overflow-y-auto"
       >
         <div className="px-3">
-          <Link to="/design" className="text-sm font-semibold text-primary">
+          <Link to="/design" className="text-label text-primary">
             Buzz Design System
           </Link>
-          <p className="mt-1 text-xs text-tertiary">
+          <p className="mt-1 text-caption text-tertiary">
             Rendered from the tokens themselves
           </p>
         </div>
 
-        <div className="flex flex-1 flex-col gap-5">
+        <div className="flex flex-1 flex-col gap-6 lg:gap-7">
           {SECTIONS.map((section) => (
-            <div key={section.heading} className="flex flex-col gap-0.5">
-              <h2 className="px-3 pb-1 text-xs font-semibold uppercase tracking-wide text-tertiary">
+            <div key={section.heading} className="flex flex-col gap-1">
+              <h2 className="px-3 pb-1.5 text-meta text-tertiary">
                 {section.heading}
               </h2>
               {section.items.length === 0 ? (
-                <p className="px-3 py-1 text-xs text-tertiary">
+                <p className="max-w-prose px-3 py-1 text-caption text-tertiary">
                   None yet — the primitive layer gets built one component at a
                   time, as the product repeats something.
                 </p>
               ) : (
-                section.items.map(([label, to]) => (
-                  <NavLink key={to} to={to}>
-                    {label}
-                  </NavLink>
-                ))
+                /* Narrow: links wrap as a row so the nav costs a few lines
+                   instead of a screen. From lg they return to a column. */
+                <div className="flex flex-wrap gap-1 lg:flex-col">
+                  {section.items.map(([label, to]) => (
+                    <NavLink key={to} to={to}>
+                      {label}
+                    </NavLink>
+                  ))}
+                </div>
               )}
             </div>
           ))}
@@ -88,14 +95,14 @@ export function DesignSystemLayout() {
           type="button"
           onClick={toggle}
           aria-label={`Switch to ${scheme === "light" ? "dark" : "light"} mode`}
-          className="mx-3 rounded-md border border-primary bg-panel px-3 py-1.5 text-xs text-secondary transition-colors hover:bg-hover hover:text-primary"
+          className="mx-3 self-start rounded-lg bg-inset px-3 py-2 text-label text-secondary transition-colors hover:bg-hover hover:text-primary"
         >
           {scheme === "light" ? "Dark mode" : "Light mode"}
         </button>
       </nav>
 
-      <main className="min-w-0 flex-1 px-10 py-10">
-        <div className="mx-auto max-w-4xl">
+      <main className="min-w-0 flex-1 px-6 py-10 sm:px-10 lg:px-16">
+        <div className="mx-auto max-w-3xl">
           <Outlet />
         </div>
       </main>

@@ -48,15 +48,13 @@ export function GrowthPage() {
         title="The procedure"
         description="Runs per change, by whoever needs the value. Nothing here needs permission, and every addition arrives in the same change that needed it, carrying its values, its description, and its owner."
       >
-        <ol className="flex flex-col gap-2 rounded-lg border border-secondary bg-panel px-5 py-4">
+        <ol className="flex flex-col gap-2 rounded-xl bg-inset px-5 py-4">
           {GROWTH_PROCEDURE.map((step, index) => (
             <li key={step} className="flex gap-3">
-              <span className="w-4 shrink-0 text-sm font-semibold text-accent">
+              <span className="w-4 shrink-0 text-label text-accent">
                 {index + 1}
               </span>
-              <span className="text-sm leading-relaxed text-secondary">
-                {step}
-              </span>
+              <span className="text-body text-secondary">{step}</span>
             </li>
           ))}
         </ol>
@@ -66,14 +64,16 @@ export function GrowthPage() {
         title="The audit"
         description="Runs on a schedule rather than per change. It reports rather than silently rewrites, except where the fix is unambiguous. Growth without pruning is how a system accumulates thirteen transparencies of one colour."
       >
-        <div className="rounded-lg border border-secondary bg-panel px-5">
+        <div className="rounded-xl bg-inset px-5">
           {AUDIT.map(([check, action]) => (
             <div
               key={check}
               className="flex flex-col gap-1 border-b border-tertiary py-3 last:border-b-0 sm:flex-row sm:gap-4"
             >
-              <span className="flex-1 text-xs text-primary">{check}</span>
-              <span className="flex-1 text-xs text-secondary">{action}</span>
+              <span className="flex-1 text-caption text-primary">{check}</span>
+              <span className="flex-1 text-caption text-secondary">
+                {action}
+              </span>
             </div>
           ))}
         </div>

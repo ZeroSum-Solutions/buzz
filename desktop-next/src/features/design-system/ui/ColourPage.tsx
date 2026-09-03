@@ -11,23 +11,23 @@ function RoleRow({ role }: { role: Role }) {
   return (
     <div className="flex items-start gap-4 border-b border-tertiary py-3 last:border-b-0">
       <div
-        className="mt-0.5 h-9 w-16 shrink-0 rounded-md border border-secondary"
+        className="mt-0.5 h-9 w-16 shrink-0 rounded-md border border-tertiary"
         style={{ background: `var(${role.variable})` }}
       />
       <div className="flex min-w-0 flex-1 flex-col gap-1">
         <div className="flex flex-wrap items-center gap-2">
-          <code className="text-sm font-medium text-primary">{role.token}</code>
-          <span className="text-xs text-tertiary">{role.pointsAt}</span>
+          <code className="text-label text-primary">{role.token}</code>
+          <span className="text-caption text-tertiary">{role.pointsAt}</span>
           {role.status !== "core" ? (
-            <span className="rounded-full bg-warning-tint px-2 py-0.5 text-xs font-medium text-warning">
+            <span className="rounded-full bg-warning-tint px-2 py-0.5 text-meta text-warning">
               {role.status}
               {role.owner ? ` · ${role.owner}` : ""}
             </span>
           ) : null}
         </div>
-        <p className="text-xs leading-relaxed text-secondary">{role.use}</p>
+        <p className="text-caption text-secondary">{role.use}</p>
         {role.exception ? (
-          <p className="text-xs leading-relaxed text-tertiary">
+          <p className="text-caption text-tertiary">
             Exception: {role.exception}
           </p>
         ) : null}
@@ -52,10 +52,8 @@ export function ColourPage() {
           {RAMPS.map((ramp) => (
             <div key={ramp.id} className="flex flex-col gap-3">
               <div className="flex flex-col gap-1">
-                <h3 className="text-sm font-semibold text-primary">
-                  {ramp.name}
-                </h3>
-                <p className="max-w-2xl text-xs leading-relaxed text-secondary">
+                <h3 className="text-label text-primary">{ramp.name}</h3>
+                <p className="max-w-2xl text-caption text-secondary">
                   {ramp.description}
                 </p>
               </div>
@@ -89,14 +87,12 @@ export function ColourPage() {
           {ROLE_GROUPS.map((group) => (
             <div key={group.id} className="flex flex-col gap-2">
               <div className="flex flex-col gap-1">
-                <h3 className="text-sm font-semibold text-primary">
-                  {group.name}
-                </h3>
-                <p className="max-w-2xl text-xs leading-relaxed text-secondary">
+                <h3 className="text-label text-primary">{group.name}</h3>
+                <p className="max-w-2xl text-caption text-secondary">
                   {group.description}
                 </p>
               </div>
-              <div className="rounded-lg border border-secondary bg-panel px-4">
+              <div className="rounded-xl bg-inset px-5">
                 {group.roles.map((role) => (
                   <RoleRow key={role.token} role={role} />
                 ))}
@@ -112,14 +108,9 @@ export function ColourPage() {
       >
         <div className="flex flex-col gap-3">
           {EXCEPTIONS.map((exception) => (
-            <div
-              key={exception.name}
-              className="rounded-lg border border-secondary bg-inset px-4 py-3"
-            >
-              <code className="text-xs font-medium text-primary">
-                {exception.name}
-              </code>
-              <p className="mt-1 text-xs leading-relaxed text-secondary">
+            <div key={exception.name} className="rounded-xl bg-inset px-5 py-4">
+              <code className="text-meta text-primary">{exception.name}</code>
+              <p className="mt-1 text-caption text-secondary">
                 {exception.why}
               </p>
             </div>

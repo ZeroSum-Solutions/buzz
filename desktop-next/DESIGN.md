@@ -11,7 +11,9 @@ Buzz is a place where people build together and bring their agents into the room
 ## Surface and depth
 
 - **Panels sit on the backdrop; the backdrop is a gradient.** Everything else is a panel in a different place. The navigation column is not a special kind of surface.
-- **Depth comes from hairline borders and near-invisible shadows, not from many surface colours.** Reach for a border before reaching for a new fill.
+- **A region is separated by a soft fill, not by an outline.** Reach for `bg-inset` before reaching for a border. A bordered box announces its own edges; a filled one lets the content sit in a place. Grouping is the common case, so the quiet treatment is the default one.
+- **A border is for a genuine boundary, and never above `border-secondary`.** A hairline that reads as a line — rather than as the edge where two surfaces meet — is too strong. Text and borders share the emphasis names but not their values: text lives at the dark end of the neutral ramp, borders at the light end. If a divider looks like text, it is pointed at the wrong role.
+- **No page-wide gradient behind documentation or dense reading.** The gradient is the product's backdrop for chrome and panels. Behind a column of prose it fights the text and makes contrast position-dependent — such surfaces sit on `bg-panel`.
 - **Shadows stay at the threshold of perception.** If a shadow is obvious, it is too strong. The two elevation values are the whole vocabulary.
 - **Elevation is carried by shadow in light mode and by lightness in dark mode.** On a near-black background there is nothing darker for a shadow to cast, so a floating surface becomes a step lighter instead. Never reach for a stronger shadow to make something float in dark mode.
 - **On a translucent surface, elevation reads as less translucency, not as a lighter colour.** A glass container with a fully opaque child looks layered; the same container with a merely brighter child looks unchanged.
@@ -35,6 +37,15 @@ Buzz is a place where people build together and bring their agents into the room
 - **Two text colours do most of the work.** Treat the third level as genuinely for metadata.
 - **Borders use the same three levels, and they mean the same thing.** Learn the ramp once.
 - **Weight and size carry hierarchy before colour does.** Reaching for a louder colour to fix hierarchy usually means the size relationship is wrong.
+
+## Type
+
+- **A type role carries its whole setting.** Size, line height, letter spacing, and weight are one decision, not four. `text-body` alone produces correctly set text — never pair a size role with a separate weight or leading utility, because that is how two supposedly identical labels drift apart.
+- **Roles are named for the job the text does, never for its size.** `text-title`, not `text-28`. A size name is a value in disguise and goes stale the moment the ramp moves.
+- **Never all-caps, and never tracked-out labels.** A capitalised label is harder to read than its sentence-case version and reads as enterprise chrome. A quiet label earns its quietness from size and colour — `text-meta` on `text-tertiary` — rather than from being shouted. There is deliberately no uppercase utility in this system.
+- **Every size is relative.** Nothing may be expressed in px: fixed pixel text freezes against keyboard zoom and ignores the person's font-size preference. The existing client shipped a regression from exactly this.
+- **Tracking is an optical correction, not a style.** Inter needs progressively tighter spacing as it grows. The ramp already applies it per step; do not add tracking by hand.
+- **Code is one step below body.** At equal size a monospace face reads larger than Inter and pulls the eye off the sentence.
 
 ## Both modes
 

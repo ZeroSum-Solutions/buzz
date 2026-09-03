@@ -32,9 +32,15 @@ Port 1430, so it can run alongside the existing client on 1420.
 
 ```bash
 pnpm typecheck      # tsc --noEmit
-pnpm check          # biome
+pnpm check          # biome + the type-system guard
+pnpm check:type     # the type-system guard alone
 pnpm biome check --write .   # auto-fix
 ```
+
+`scripts/check-type.mjs` enforces four things the type system cannot express as
+a token: no arbitrary text sizes (px **or** rem), no `uppercase`, no
+hand-applied `tracking-*`, and no size role paired with a weight or leading
+utility. Each one is a defect the existing client already paid for.
 
 ---
 
@@ -51,6 +57,53 @@ Astryx is a **reference** for token architecture and the agent-docs idea. Not a
 dependency.
 
 ---
+
+## The type system
+
+Same three layers as colour, and the same rule: only roles are used when
+building a screen.
+
+```
+LAYER 1   --type-size-1…9  --type-leading-*  --type-tracking-*  --type-weight-*
+LAYER 2   --text-body: var(--type-size-4)   + its line height, tracking, weight
+LAYER 3   text-body
+```
+
+**A role carries its whole typographic setting**, using Tailwind v4's
+`--text-<name>--<property>` convention. So `text-body` sets size, line height,
+letter spacing, and weight together — never pair a size role with a separate
+`font-medium` or `leading-*`, because that is how two supposedly identical labels
+drift apart.
+
+Ten roles: `text-display`, `text-title`, `text-heading`, `text-subheading`,
+`text-body-lg`, `text-body`, `text-label`, `text-caption`, `text-meta`,
+`text-code`. Two faces: `font-sans` (Inter Variable) and `font-mono`
+(JetBrains Mono) — both already shipped in every current Buzz client.
+
+Hard rules:
+
+- **Never a px size.** Everything derives from one virtual rem, so keyboard zoom
+  and the font-size preference both work by construction. A px literal breaks
+  both, which the existing client learned by shipping the regression.
+- **No `uppercase`, no hand-applied `tracking-*`.** All-caps labels are less
+  legible and read as enterprise chrome; tracking is already corrected per step.
+- **Size roles and colour roles never collide.** Colour registers in
+  Tailwind's `--color-*` namespace and is named for emphasis (`text-primary`);
+  size registers in `--text-*` and is named for an editorial job (`text-body`).
+  So `text-primary text-body` is one colour plus one setting, and no name ever
+  means both.
+
+### Borders register in their own namespace
+
+`--color-*` is a single namespace, and text and borders share the emphasis names
+`primary` / `secondary` / `tertiary` while holding different values — text at the
+dark end of the neutral ramp, borders at the light end. Border roles therefore
+register as `--border-color-*`, not `--color-border-*`.
+
+Get this wrong and there is no error: `border-primary` silently resolves to the
+*text* colour and every hairline in the product draws at near-black. That is not
+hypothetical — it shipped, and it is why the first design system site had black
+dividers while the tokens said `#d4d4d4`.
 
 ## The colour system
 
@@ -134,8 +187,9 @@ time as the product repeats something — see DESIGN.md § Components.
 
 Deliberately, so nobody assumes it was forgotten:
 
-- **Typography, spacing, radius, and motion tokens.** Their `/design` pages state
-  what is still to decide rather than pretending to a system. Typography is next.
+- **Spacing, radius, and motion tokens.** Their `/design` pages state what is
+  still to decide rather than pretending to a system. Typography has landed;
+  spacing is next.
 - **Any product component.** No Button, no Dialog, no input layer.
 - **Tauri.** This is a web app for now; the native shell comes with the app shell.
 - **Relay, auth, event handling.** None of it. When it arrives it comes from the

@@ -30,7 +30,7 @@ export function MotionPage() {
             "Never animate blur. Re-blurring a large surface every frame is expensive enough to feel. Animate opacity instead.",
             "Motion explains a change; it does not decorate one. If removing an animation loses no information, remove it.",
           ].map((rule) => (
-            <li key={rule} className="text-sm leading-relaxed text-secondary">
+            <li key={rule} className="text-body text-secondary">
               {rule}
             </li>
           ))}

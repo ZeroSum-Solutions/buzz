@@ -1,13 +1,10 @@
 @import "tailwindcss";
 @import "@fontsource-variable/inter";
+@import "@fontsource/jetbrains-mono";
 @import "./tokens.css";
+@import "./typography.css";
 
 @layer base {
-  html {
-    font-family: "Inter Variable", Inter, system-ui, sans-serif;
-    -webkit-font-smoothing: antialiased;
-  }
-
   body {
     margin: 0;
     background: var(--bg-app);

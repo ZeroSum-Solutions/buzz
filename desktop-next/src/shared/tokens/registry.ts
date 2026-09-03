@@ -467,6 +467,187 @@ export const GROWTH_PROCEDURE = [
   "Never write a raw value. If nothing above applies, say so rather than reaching for a literal.",
 ];
 
+/* ============================================================
+   TYPOGRAPHY
+   ============================================================ */
+
+/** A public type role. Carries its whole setting, because size, line height,
+ *  tracking, and weight are one decision rather than four. */
+export interface TypeRole {
+  /** The Tailwind class, e.g. `text-body`. */
+  token: string;
+  /** Step on the size ramp this points at, for display. */
+  pointsAt: string;
+  /** Rendered size at the default preference and zoom, for display only —
+   *  never a value a component may use. */
+  size: string;
+  lineHeight: string;
+  tracking: string;
+  weight: string;
+  /** One sentence: when to use this. */
+  use: string;
+  status: TokenStatus;
+  /** Set when the role renders in the mono face. */
+  mono?: boolean;
+}
+
+/** Ordered loudest to quietest, which is also the order they are chosen in. */
+export const TYPE_ROLES: TypeRole[] = [
+  {
+    token: "text-display",
+    pointsAt: "size 9",
+    size: "36px",
+    lineHeight: "1.2",
+    tracking: "-0.022em",
+    weight: "600",
+    use: "One per page at most, and many pages need none. The only step allowed to be decorative.",
+    status: "core",
+  },
+  {
+    token: "text-title",
+    pointsAt: "size 8",
+    size: "28px",
+    lineHeight: "1.2",
+    tracking: "-0.019em",
+    weight: "600",
+    use: "The name of the thing you are looking at.",
+    status: "core",
+  },
+  {
+    token: "text-heading",
+    pointsAt: "size 7",
+    size: "22px",
+    lineHeight: "1.35",
+    tracking: "-0.017em",
+    weight: "600",
+    use: "A section within a page.",
+    status: "core",
+  },
+  {
+    token: "text-subheading",
+    pointsAt: "size 6",
+    size: "18px",
+    lineHeight: "1.35",
+    tracking: "-0.014em",
+    weight: "600",
+    use: "A group within a section.",
+    status: "core",
+  },
+  {
+    token: "text-body-lg",
+    pointsAt: "size 5",
+    size: "16px",
+    lineHeight: "1.6",
+    tracking: "-0.011em",
+    weight: "400",
+    use: "Introductions and reading columns, where a paragraph is the point rather than a description of something else.",
+    status: "core",
+  },
+  {
+    token: "text-body",
+    pointsAt: "size 4",
+    size: "14px",
+    lineHeight: "1.5",
+    tracking: "-0.006em",
+    weight: "400",
+    use: "The default. If you are unsure, this is it.",
+    status: "core",
+  },
+  {
+    token: "text-label",
+    pointsAt: "size 3",
+    size: "13px",
+    lineHeight: "1.35",
+    tracking: "-0.003em",
+    weight: "500",
+    use: "Interface text that is acted on rather than read: buttons, tabs, menu items, form labels, table headers.",
+    status: "core",
+  },
+  {
+    token: "text-caption",
+    pointsAt: "size 2",
+    size: "12px",
+    lineHeight: "1.5",
+    tracking: "0em",
+    weight: "400",
+    use: "A sentence about something else: help text, descriptions, empty-state detail.",
+    status: "core",
+  },
+  {
+    token: "text-meta",
+    pointsAt: "size 1",
+    size: "11px",
+    lineHeight: "1",
+    tracking: "0.005em",
+    weight: "500",
+    use: "Timestamps, counts, tracking labels. Flat line height so a single-line value cannot grow its own row.",
+    status: "core",
+  },
+  {
+    token: "text-code",
+    pointsAt: "size 3",
+    size: "13px",
+    lineHeight: "1.5",
+    tracking: "0em",
+    weight: "400",
+    use: "Inline code and code blocks. One step below body, because at equal size a monospace face reads larger than Inter and pulls the eye off the sentence.",
+    status: "core",
+    mono: true,
+  },
+];
+
+/** The two faces. Both already shipped in every current Buzz client. */
+export const TYPE_FAMILIES = [
+  {
+    token: "font-sans",
+    name: "Inter Variable",
+    use: "Everything. Drawn for interface text at small sizes, and already the sans in desktop, web, and mobile.",
+  },
+  {
+    token: "font-mono",
+    name: "JetBrains Mono",
+    use: "Code, keys, and identifiers. Already the mono in the existing client's terminal.",
+  },
+];
+
+/** The private ramps a type role points at. Components never reference these. */
+export const TYPE_RAMPS = [
+  {
+    id: "size",
+    name: "Size",
+    description:
+      "Nine steps, each step an editorial job. Tight and frequent through the working sizes where real interface text lives, opening up at the display end where a step needs to be a visible jump rather than a near-miss. Every value derives from a virtual rem, so the whole ramp follows the person's font-size preference and keyboard zoom.",
+    steps: [
+      { step: 1, job: "meta", value: "11px" },
+      { step: 2, job: "caption", value: "12px" },
+      { step: 3, job: "label, code", value: "13px" },
+      { step: 4, job: "body", value: "14px" },
+      { step: 5, job: "body large", value: "16px" },
+      { step: 6, job: "subheading", value: "18px" },
+      { step: 7, job: "heading", value: "22px" },
+      { step: 8, job: "title", value: "28px" },
+      { step: 9, job: "display", value: "36px" },
+    ],
+  },
+  {
+    id: "tracking",
+    name: "Tracking",
+    description:
+      "An optical correction, not a style. Inter needs progressively tighter spacing as it grows — tracking that looks correct at 14px looks loose at 36px — so the ramp mirrors the size ramp and the correction is applied per step rather than guessed. It turns slightly positive at meta sizes, where letters need air to stay legible.",
+    steps: [
+      { step: 9, job: "display", value: "-0.022em" },
+      { step: 8, job: "title", value: "-0.019em" },
+      { step: 7, job: "heading", value: "-0.017em" },
+      { step: 6, job: "subheading", value: "-0.014em" },
+      { step: 5, job: "body large", value: "-0.011em" },
+      { step: 4, job: "body", value: "-0.006em" },
+      { step: 3, job: "label", value: "-0.003em" },
+      { step: 2, job: "caption", value: "0em" },
+      { step: 1, job: "meta", value: "0.005em" },
+    ],
+  },
+];
+
 export const ELEVATION = [
   {
     token: "shadow-xs",

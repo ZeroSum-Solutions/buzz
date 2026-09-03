@@ -301,6 +301,17 @@
   --color-tertiary: var(--text-tertiary);
   --color-disabled: var(--text-disabled);
 
+  /* Borders register in their OWN namespace, not `--color-*`.
+     Text and borders share the emphasis names — primary, secondary, tertiary —
+     but hold different values: text is the dark end of the neutral ramp
+     (12/10/9), borders the light end (7/6/5). `--color-*` is a single namespace,
+     so registering borders there would make `border-primary` resolve to the text
+     colour and draw every hairline at near-black. It did exactly that until
+     these three lines existed. */
+  --border-color-primary: var(--border-primary);
+  --border-color-secondary: var(--border-secondary);
+  --border-color-tertiary: var(--border-tertiary);
+
   --color-accent: var(--bg-accent);
   --color-accent-tint: var(--bg-accent-tint);
   --color-accent-tint-hover: var(--bg-accent-tint-hover);

@@ -1,40 +1,141 @@
-import { PageHeader, Section, Stub } from "./primitives";
+import {
+  TYPE_FAMILIES,
+  TYPE_RAMPS,
+  TYPE_ROLES,
+  type TypeRole,
+} from "@/shared/tokens/registry";
+
+import { Note, PageHeader, Row, Rows, Section } from "./primitives";
+
+/**
+ * Every specimen below is set in the role it documents, so the page is the
+ * system rather than a description of it. A role that reads badly here reads
+ * badly in the product.
+ */
+function RoleSpecimen({ role }: { role: TypeRole }) {
+  return (
+    <Row>
+      <div className="flex flex-col gap-2">
+        <p
+          className={`${role.token} ${role.mono ? "font-mono" : ""} text-primary`}
+        >
+          {role.mono ? "createChannel(name, members)" : "Bring your agents in"}
+        </p>
+        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+          <code className="text-code text-accent">{role.token}</code>
+          <span className="text-meta text-tertiary">{role.pointsAt}</span>
+          <span className="text-meta text-tertiary">
+            {role.size} / {role.lineHeight} / {role.tracking} / {role.weight}
+          </span>
+        </div>
+        <p className="max-w-xl text-caption text-secondary">{role.use}</p>
+      </div>
+    </Row>
+  );
+}
 
 export function TypographyPage() {
   return (
     <>
       <PageHeader
         title="Typography"
-        status="not started"
-        intro="The next system to define. The starting point is the type stack every current Buzz client already shares — Inter for interface text, a monospace for code — and the decision to make is whether the redesign keeps it."
+        intro="Nine sizes, ten roles, two faces. A role carries its whole setting — size, line height, letter spacing, weight — because those four are one decision rather than four, so text-body alone produces correctly set text and there is nothing left to get wrong."
       />
 
-      <Section title="What this page will hold">
-        <Stub
-          what="A named size ramp where each step says what it is for, plus weight, line height, letter spacing, and the semantic text roles that sit on top of them."
-          decide={[
-            "Whether Inter stays, or the redesign wants its own face",
-            "The size ramp: how many steps, and what each one is for",
-            "Which sizes are named roles (conversation text, metadata) rather than raw steps",
-            "Weight and line-height pairings per step",
-            "How the relative-unit contract is enforced, so text follows the person's font-size preference and keyboard zoom",
-          ]}
-        />
+      <Section
+        title="The faces"
+        description="Both already ship in every current Buzz client, so this is a decision to keep rather than to make. Inter is drawn for interface text at small sizes, which is most of this product."
+      >
+        <Rows>
+          {TYPE_FAMILIES.map((family) => (
+            <Row key={family.token}>
+              <div className="flex flex-col gap-1.5">
+                <p
+                  className={`text-subheading text-primary ${
+                    family.token === "font-mono" ? "font-mono" : "font-sans"
+                  }`}
+                >
+                  {family.name}
+                </p>
+                <code className="text-code text-accent">{family.token}</code>
+                <p className="max-w-xl text-caption text-secondary">
+                  {family.use}
+                </p>
+              </div>
+            </Row>
+          ))}
+        </Rows>
       </Section>
 
       <Section
-        title="The one rule that already exists"
-        description="Anything readable uses relative units. The current client learned this the hard way: hardcoded pixel sizes freeze against zoom, and a CI guard now rejects them. Whatever ramp this becomes, it inherits that contract."
+        title="The roles"
+        description="Named for the job the text does, never for its size. text-title, not text-28 — a size name is a value in disguise and goes stale the moment the ramp moves. Each specimen is set in the role it documents."
       >
-        <div className="rounded-lg border border-secondary bg-inset px-4 py-3">
-          <p className="text-xs leading-relaxed text-secondary">
-            The Cash Sans and BlockUI type variables that appear in the design
-            exploration are contamination from another Figma library linked into
-            that file. They exist nowhere in any Buzz codebase and need no
-            cleanup — only a decision not to inherit them.
-          </p>
-        </div>
+        <Rows>
+          {TYPE_ROLES.map((role) => (
+            <RoleSpecimen key={role.token} role={role} />
+          ))}
+        </Rows>
       </Section>
+
+      {TYPE_RAMPS.map((ramp) => (
+        <Section key={ramp.id} title={ramp.name} description={ramp.description}>
+          <Rows>
+            {ramp.steps.map((step) => (
+              <Row key={`${ramp.id}-${step.step}`}>
+                <div className="flex flex-wrap items-baseline gap-x-4">
+                  <code className="w-28 shrink-0 text-code text-primary">
+                    {ramp.id} {step.step}
+                  </code>
+                  <span className="w-20 shrink-0 text-caption text-secondary">
+                    {step.value}
+                  </span>
+                  <span className="text-caption text-tertiary">{step.job}</span>
+                </div>
+              </Row>
+            ))}
+          </Rows>
+        </Section>
+      ))}
+
+      <Section
+        title="Two rules"
+        description="Both are inherited rather than invented — the existing client learned each of them the expensive way."
+      >
+        <Rows>
+          <Row>
+            <p className="text-label text-primary">
+              Every size is relative. Never px.
+            </p>
+            <p className="mt-1.5 max-w-xl text-caption text-secondary">
+              Fixed pixel text freezes against keyboard zoom and ignores the
+              person's font-size preference. The current client shipped a
+              message-timeline regression from exactly this and now has a CI
+              guard rejecting arbitrary size literals. This ramp derives
+              entirely from one virtual rem, so both dials work by construction.
+            </p>
+          </Row>
+          <Row>
+            <p className="text-label text-primary">
+              No all-caps, and no tracked-out labels.
+            </p>
+            <p className="mt-1.5 max-w-xl text-caption text-secondary">
+              A capitalised label is harder to read than the sentence-case
+              version and reads as enterprise chrome. Section labels earn their
+              quietness from size and colour — text-meta on text-tertiary —
+              rather than from being shouted. There is no uppercase utility in
+              this system.
+            </p>
+          </Row>
+        </Rows>
+      </Section>
+
+      <Note>
+        The Cash Sans and BlockUI type variables that appear in the design
+        exploration are contamination from another Figma library linked into
+        that file. They exist nowhere in any Buzz codebase and need no cleanup —
+        only a decision not to inherit them.
+      </Note>
     </>
   );
 }
