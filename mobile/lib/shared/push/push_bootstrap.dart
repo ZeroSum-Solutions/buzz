@@ -144,6 +144,15 @@ bool buzzPushGatewayMigrationAttemptIsCurrent({
     setEquals(replacementRelayOrigins, liveReplacementRelayOrigins) &&
     replacementGeneration == liveReplacementGeneration;
 
+@visibleForTesting
+Future<bool> markBuzzPushGatewayMigrationAcceptedIfCurrent({
+  required bool Function() attemptIsCurrent,
+  required Future<bool> Function() markAccepted,
+}) {
+  if (!attemptIsCurrent()) return Future.value(false);
+  return markAccepted();
+}
+
 typedef BuzzPushGatewayMigrationTarget = ({
   Community community,
   String relayOrigin,
@@ -561,6 +570,7 @@ class BuzzPushBootstrap extends HookConsumerWidget {
                     descriptor: target.descriptor,
                     forceDelegationRenewal:
                         queuedOrigins.isNotEmpty && index == 0,
+                    attemptIsCurrent: attemptIsCurrent,
                   );
                 }
                 if (queuedOrigins.isEmpty) return false;
@@ -770,6 +780,7 @@ class BuzzPushBootstrap extends HookConsumerWidget {
     String targetGatewayOrigin, {
     required BuzzPushLeaseDescriptor descriptor,
     bool forceDelegationRenewal = false,
+    required bool Function() attemptIsCurrent,
   }) async {
     final config = RelayConfig(
       baseUrl: community.relayUrl,
@@ -810,12 +821,16 @@ class BuzzPushBootstrap extends HookConsumerWidget {
               createdAt: createdAt,
             ),
       ),
-      markAccepted: (generation) => notifier.markPushLeaseAccepted(
-        community.id,
-        subscriptions: community.pushSubscriptionState.desired,
-        generation: generation,
-        gatewayOrigin: targetGatewayOrigin,
-      ),
+      markAccepted: (generation) =>
+          markBuzzPushGatewayMigrationAcceptedIfCurrent(
+            attemptIsCurrent: attemptIsCurrent,
+            markAccepted: () => notifier.markPushLeaseAccepted(
+              community.id,
+              subscriptions: community.pushSubscriptionState.desired,
+              generation: generation,
+              gatewayOrigin: targetGatewayOrigin,
+            ),
+          ),
     );
     return grant;
   }

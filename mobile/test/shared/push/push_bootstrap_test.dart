@@ -267,6 +267,25 @@ void main() {
     );
   });
 
+  test(
+    'gateway migration rejects a stale APNs token before acceptance',
+    () async {
+      var accepted = false;
+
+      expect(
+        await markBuzzPushGatewayMigrationAcceptedIfCurrent(
+          attemptIsCurrent: () => false,
+          markAccepted: () async {
+            accepted = true;
+            return true;
+          },
+        ),
+        isFalse,
+      );
+      expect(accepted, isFalse);
+    },
+  );
+
   test('queued origins sharing delegation authority migrate atomically', () {
     final first = Community.create(
       name: 'First',
