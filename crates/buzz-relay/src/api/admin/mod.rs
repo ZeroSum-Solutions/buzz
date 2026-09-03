@@ -1990,7 +1990,6 @@ mod postgres_tests {
             .await
             .expect("connect test database");
         let db = buzz_db::Db::from_pool(pool.clone());
-        db.migrate().await.expect("migrate test database");
 
         // Create an isolated community so the test doesn't clash with other rows.
         let community_uuid = Uuid::new_v4();
@@ -2031,7 +2030,6 @@ mod postgres_tests {
             .await
             .expect("connect test database");
         let db = buzz_db::Db::from_pool(pool.clone());
-        db.migrate().await.expect("migrate test database");
 
         let community_uuid = Uuid::new_v4();
         let host = format!("untimeout-test-{}.example", community_uuid.simple());
@@ -2119,7 +2117,6 @@ mod postgres_tests {
             .await
             .expect("connect test database");
         let db = buzz_db::Db::from_pool(pool.clone());
-        db.migrate().await.expect("migrate test database");
 
         let community_uuid = Uuid::new_v4();
         let host = format!("list-restrictions-{}.example", community_uuid.simple());
@@ -2209,7 +2206,6 @@ mod postgres_tests {
             .await
             .expect("connect test database");
         let db = buzz_db::Db::from_pool(pool.clone());
-        db.migrate().await.expect("migrate test database");
 
         let community_uuid = Uuid::new_v4();
         let host = format!("unban-success-{}.example", community_uuid.simple());
@@ -2277,7 +2273,7 @@ mod postgres_tests {
             .await
             .expect("read ban after unban");
         assert!(
-            ban.as_ref().map_or(true, |r| !r.banned),
+            ban.as_ref().is_none_or(|r| !r.banned),
             "ban must be cleared after successful unban"
         );
 
@@ -2287,7 +2283,7 @@ mod postgres_tests {
         assert!(
             ban.as_ref()
                 .and_then(|r| r.muted_until)
-                .map_or(false, |t| t > chrono::Utc::now()),
+                .is_some_and(|t| t > chrono::Utc::now()),
             "unban must not clear the co-existing active timeout"
         );
 
@@ -2320,7 +2316,7 @@ mod postgres_tests {
             .await
             .expect("read other community ban");
         assert!(
-            other_ban.map_or(false, |r| r.banned),
+            other_ban.is_some_and(|r| r.banned),
             "unban must not affect the same pubkey in another community"
         );
     }
@@ -2332,7 +2328,6 @@ mod postgres_tests {
             .await
             .expect("connect test database");
         let db = buzz_db::Db::from_pool(pool.clone());
-        db.migrate().await.expect("migrate test database");
 
         let community_uuid = Uuid::new_v4();
         let host = format!("untimeout-success-{}.example", community_uuid.simple());
@@ -2405,9 +2400,9 @@ mod postgres_tests {
             .await
             .expect("read ban after untimeout");
         assert!(
-            restriction.as_ref().map_or(true, |r| r
-                .muted_until
-                .map_or(true, |t| t <= chrono::Utc::now())),
+            restriction
+                .as_ref()
+                .is_none_or(|r| r.muted_until.is_none_or(|t| t <= chrono::Utc::now())),
             "timeout must be cleared after successful untimeout"
         );
 
@@ -2415,7 +2410,7 @@ mod postgres_tests {
         // A regression that widened the untimeout UPDATE to also clear banned
         // would fail this assertion.
         assert!(
-            restriction.as_ref().map_or(false, |r| r.banned),
+            restriction.as_ref().is_some_and(|r| r.banned),
             "untimeout must not clear the co-existing active ban"
         );
 
@@ -2430,7 +2425,7 @@ mod postgres_tests {
             other_restriction
                 .as_ref()
                 .and_then(|r| r.muted_until)
-                .map_or(false, |t| t > chrono::Utc::now()),
+                .is_some_and(|t| t > chrono::Utc::now()),
             "untimeout must not affect the same pubkey's timeout in another community"
         );
 
@@ -2468,7 +2463,6 @@ mod postgres_tests {
             .await
             .expect("connect test database");
         let db = buzz_db::Db::from_pool(pool.clone());
-        db.migrate().await.expect("migrate test database");
 
         let community_uuid = Uuid::new_v4();
         let host = format!("unban-expired-{}.example", community_uuid.simple());
