@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, Query, RawQuery, State},
+    extract::{Path, RawQuery, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
 };
@@ -139,9 +139,8 @@ pub async fn workflow_runs(
     Path(workflow_id): Path<Uuid>,
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
-    Query(query): Query<RunsQuery>,
 ) -> Response {
-    workflow_runs_inner(state, workflow_id, headers, raw_query, query)
+    workflow_runs_inner(state, workflow_id, headers, raw_query)
         .await
         .into_response()
 }
@@ -151,14 +150,21 @@ async fn workflow_runs_inner(
     workflow_id: Uuid,
     headers: HeaderMap,
     raw_query: Option<String>,
-    query: RunsQuery,
 ) -> Result<Json<Value>, Response> {
     // Admission first: NIP-98 + NIP-FI must fire before any application-level
-    // validation so the denial contract wins over request-validation errors.
-    // [FI-TRACE-HTTP-INGRESS]
+    // validation — including query-string parsing — so the denial contract wins
+    // over request-validation errors. [FI-TRACE-HTTP-INGRESS]
+    // Raw query is preserved here; parsing happens after admission.
     let path = format!("/workflows/{workflow_id}/runs");
     let tenant =
         authorize_workflow_read(&state, &headers, &path, raw_query.as_deref(), workflow_id).await?;
+
+    // Parse query string after admission so malformed params (e.g. ?limit=abc)
+    // cannot 400 before the NIP-FI gate fires.
+    let query: RunsQuery = raw_query
+        .as_deref()
+        .and_then(|q| serde_urlencoded::from_str(q).ok())
+        .unwrap_or_default();
 
     if query.before.is_some() != query.before_id.is_some() {
         return Err(api_error(

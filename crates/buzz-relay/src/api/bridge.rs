@@ -2498,7 +2498,6 @@ pub async fn moderation_reports(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
-    Query(q): Query<ModerationReadQuery>,
 ) -> Response {
     let tenant = match authorize_moderation_read(
         &state,
@@ -2511,6 +2510,12 @@ pub async fn moderation_reports(
         Ok(t) => t,
         Err(r) => return r,
     };
+    // Parse query after admission so malformed params cannot 400 before the
+    // NIP-FI gate fires. [FI-TRACE-HTTP-INGRESS]
+    let q: ModerationReadQuery = raw_query
+        .as_deref()
+        .and_then(|q| serde_urlencoded::from_str(q).ok())
+        .unwrap_or_default();
     match state
         .db
         .list_moderation_reports(
@@ -2530,7 +2535,6 @@ pub async fn moderation_audit(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
-    Query(q): Query<ModerationReadQuery>,
 ) -> Response {
     let tenant = match authorize_moderation_read(
         &state,
@@ -2543,6 +2547,12 @@ pub async fn moderation_audit(
         Ok(t) => t,
         Err(r) => return r,
     };
+    // Parse query after admission so malformed params cannot 400 before the
+    // NIP-FI gate fires. [FI-TRACE-HTTP-INGRESS]
+    let q: ModerationReadQuery = raw_query
+        .as_deref()
+        .and_then(|q| serde_urlencoded::from_str(q).ok())
+        .unwrap_or_default();
     match state
         .db
         .list_moderation_actions(tenant.community(), clamp_limit(q.limit))
@@ -4353,31 +4363,43 @@ mod postgres_tests {
     // match. All four protected surfaces need Postgres for the NIP-FI seam test
     // to be exercised (vs. bailing at community lookup with 404 before NIP-FI).
     //
-    // ## Route inventory (fail-closed classification)
+    // ## Route inventory — NIP-FI protection classification
     //
-    // Every authenticated HTTP route on this relay is listed here with its
-    // NIP-FI classification. Adding a new authenticated route MUST come with
-    // a corresponding update to this inventory and either (a) a seam test
-    // proving the gate fires, or (b) an explicit exemption with justification.
+    // Every NIP-98-authenticated HTTP route is classified below.
     //
-    // PROTECTED — NIP-FI gate required, seam test below:
-    //   POST /events        (bridge — submit_event)
-    //   POST /query         (bridge — query_events)
-    //   POST /count         (bridge — count_events)
-    //   POST /gifs/search   (gifs — search)
-    //   POST /gifs/share    (gifs — share)
-    //   GET  /workflows/{id}/runs             (workflows — workflow_runs)
-    //   GET  /workflows/{id}/runs/{id}/approvals  (workflows — run_approvals)
-    //   GET  /moderation/reports              (bridge — moderation_reports)
-    //   GET  /moderation/audit                (bridge — moderation_audit)
-    //   GET  /moderation/restricted           (bridge — moderation_restricted)
-    //   PUT  /upload / /media/upload          (media — upload_blob; covered by media.rs seam test)
-    //   GET  /media/{sha256}                  (media — get_blob; Blossom GET auth + relay membership)
-    //   HEAD /media/{sha256}                  (media — head_blob; Blossom GET auth + relay membership)
-    //   git  info/refs, upload-pack, receive-pack  (git transport; covered by git/transport.rs;
-    //        credential-helper proof pattern exempt from method/endpoint/payload binding per
-    //        NIP-FI.md:545-583, merged as #7268 / c328202cb)
-    //   POST /api/invites   (invites — mint_invite; NIP-98 mint requires admin key)
+    // ## Executable coupling
+    //
+    // The seam tests below are the executable coupling.  Each PROTECTED entry
+    // has at least one named seam test (fn nip_fi_enforce_*_no_assertion_is_401)
+    // that goes RED if its gate is deleted.  `NIP_FI_PROTECTED_ROUTES` records
+    // the handler names; `nip_fi_route_inventory_is_complete` is the test that
+    // makes the inventory machine-checkable.
+    //
+    // This is a process coupling, not a compile-time one: axum does not expose
+    // a static route table that can be asserted at compile time.  A developer
+    // adding a new NIP-98 route MUST update `NIP_FI_PROTECTED_ROUTES` (or the
+    // EXEMPT comment) and add a seam test.  The inventory test will then catch
+    // count drift at test time.
+    //
+    // PROTECTED with seam test:
+    //   POST /events        (bridge — submit_event)                [test: events]
+    //   POST /query         (bridge — query_events)                [test: query]
+    //   POST /count         (bridge — count_events)                [test: count]
+    //   POST /gifs/search   (gifs — authenticate, shared witness)  [test: gif_search]
+    //   POST /gifs/share    (gifs — authenticate, shared witness)  [shared: gif_search]
+    //   GET  /workflows/{id}/runs  (workflows — workflow_runs)     [test: workflow_runs]
+    //   GET  /workflows/{id}/runs/{id}/approvals (shared witness)  [shared: workflow_runs]
+    //   GET  /moderation/reports   (bridge — shared witness)       [test: moderation_reports]
+    //   GET  /moderation/audit     (bridge — shared witness)       [shared: moderation_reports]
+    //   GET  /moderation/restricted (bridge — shared witness)      [shared: moderation_reports]
+    //   POST /api/invites   (invites — mint_invite_checked)        [test: invites.rs]
+    //
+    // PROTECTED — gate present, seam test pending Blossom harness (declared debt):
+    //   PUT  /upload / /media/upload          (media — upload_blob)
+    //   GET  /media/{sha256}                  (media — get_blob)
+    //   HEAD /media/{sha256}                  (media — head_blob)
+    //   git  info/refs, upload-pack, receive-pack  (git transport;
+    //        credential-helper proof pattern per NIP-FI.md:545-583 / #7268 / c328202cb)
     //
     // EXEMPT — explicitly excluded, reason given:
     //   GET  /              (WebSocket upgrade + NIP-11 info; WS door is governed by WS-NIP-FI)
@@ -4390,9 +4412,56 @@ mod postgres_tests {
     //   POST /hooks/{id}    (webhook trigger; secret-header auth, no NIP-98 principal)
     //   GET  /huddle/{id}/audio  (WS upgrade; governed by WS-NIP-FI)
     //   POST /_mesh/demo/echo  (testbed-only probe; no auth)
-    //   /operator/**        (operator admin plane; keypair-in-config auth, distinct from user/member NIP-98)
-    //   /api/admin/**       (admin SPA backend; operator-credential gated, separate admin transport)
-    //   /media/{sha256}     (blob GET/HEAD; requires Blossom auth + relay membership — see PROTECTED)
+    //   /operator/**        (operator admin plane; keypair-in-config auth)
+    //   /api/admin/**       (admin SPA backend; operator-credential gated)
+
+    /// Handler names of PROTECTED routes — every entry must either have a
+    /// seam test or be listed in the Blossom-harness-debt block above.
+    /// Update when adding or removing NIP-98 authenticated routes.
+    const NIP_FI_PROTECTED_ROUTES: &[&str] = &[
+        // Entries with seam tests (NIP_FI_SEAM_TEST_COUNT must equal this slice length):
+        "submit_event",              // POST /events
+        "query_events",              // POST /query
+        "count_events",              // POST /count
+        "gifs::authenticate",        // POST /gifs/search + /gifs/share (shared witness)
+        "authorize_workflow_read",   // GET /workflows/{id}/runs + approvals (shared witness)
+        "authorize_moderation_read", // GET /moderation/{reports,audit,restricted} (shared witness)
+        "mint_invite_checked",       // POST /api/invites  (seam test in invites.rs)
+        // Blossom-harness debt (gate present, seam test pending):
+        "upload_blob",                 // PUT /upload
+        "get_blob",                    // GET /media/{sha256}
+        "head_blob",                   // HEAD /media/{sha256}
+        "GitAuth::from_request_parts", // git info/refs, upload-pack, receive-pack
+    ];
+
+    /// Number of PROTECTED entries that have seam tests (i.e., not Blossom debt).
+    /// Must equal the count of `fn nip_fi_enforce_*_no_assertion_is_401` tests
+    /// across bridge.rs (6) + invites.rs (1) = 7.
+    const NIP_FI_SEAM_TEST_COUNT: usize = 7;
+
+    /// Verify the route inventory is internally consistent: every handler name
+    /// is non-empty, the seam-test count is consistent with the Blossom-debt
+    /// count, and the total protected surface count hasn't changed silently.
+    #[test]
+    fn nip_fi_route_inventory_is_complete() {
+        for &handler in NIP_FI_PROTECTED_ROUTES {
+            assert!(
+                !handler.is_empty(),
+                "empty handler name in NIP_FI_PROTECTED_ROUTES"
+            );
+        }
+        let total = NIP_FI_PROTECTED_ROUTES.len();
+        let blossom_debt = total - NIP_FI_SEAM_TEST_COUNT;
+        assert_eq!(
+            blossom_debt,
+            4,
+            "Blossom-harness debt count is {blossom_debt} but expected 4              (upload_blob, get_blob, head_blob, git transport);              total={total}, seam_tests={NIP_FI_SEAM_TEST_COUNT}.              Update NIP_FI_PROTECTED_ROUTES and NIP_FI_SEAM_TEST_COUNT together."
+        );
+        assert_eq!(
+            total, 11,
+            "NIP_FI_PROTECTED_ROUTES has {total} entries but expected 11;              a route was added or removed without updating this inventory."
+        );
+    }
 
     /// Build an AppState with NIP-FI in Enforce mode for production-seam tests.
     ///

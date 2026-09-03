@@ -1847,4 +1847,65 @@ mod postgres_tests {
         let response = get_page(state, "/api/join-policy/privacy").await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
+
+    // ── NIP-FI production-seam test: POST /api/invites ────────────────────────
+    //
+    // Gate under test: `check_nip_fi_http_on_state` called in `mint_invite_checked`
+    // (invites.rs:309).  Seam test: valid NIP-98 + no assertion → 401 in Enforce
+    // mode.
+    //
+    // Falsifying mutation: delete the `check_nip_fi_http_on_state` call from
+    // `mint_invite_checked`.  Without the gate the request proceeds to authz
+    // and returns 403 (not an owner/admin) or another non-401 status — the
+    // assert_eq! fails.
+    //
+    // Infrastructure: same `#[ignore = "requires Postgres"]` + tokio::test.
+    // The invites harness already has Postgres support (`invite_test_state`);
+    // NIP-FI enforce mode is enabled by patching the config after state
+    // construction so we can reuse the existing community setup.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn nip_fi_enforce_mint_invite_no_assertion_is_401() {
+        let host = format!("nip-fi-invites-seam-{}.local", Uuid::new_v4().simple());
+        let Some(state_base) = invite_test_state(&host).await else {
+            return;
+        };
+
+        // Clone AppState and patch config to enable NIP-FI Enforce mode.
+        // nip_fi_verifier = None (no issuers configured) is correct: the seam
+        // test fires at the missing-assertion check before any verifier lookup.
+        let mut state_inner = (*state_base).clone();
+        let mut config = (*state_inner.config).clone();
+        config.require_auth_token = true;
+        config.nip_fi.mode = buzz_auth::NipFiMode::Enforce;
+        state_inner.config = Arc::new(config);
+        let state = Arc::new(state_inner);
+
+        let keys = Keys::generate();
+        let url = format!("https://{host}/api/invites");
+        // Valid NIP-98 event with payload tag; no Nostr-Federated-Identity header.
+        let auth = nip98_auth_header(&keys, &url, b"{}");
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/invites")
+                    .header(header::HOST, &host)
+                    .header(header::AUTHORIZATION, auth)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "NIP-FI enforce mode: POST /api/invites with valid NIP-98 + no assertion MUST deny \
+             401 [FI-TRACE-HTTP-INGRESS]; if this fails the check_nip_fi_http_on_state gate was \
+             removed from mint_invite_checked"
+        );
+    }
 }
