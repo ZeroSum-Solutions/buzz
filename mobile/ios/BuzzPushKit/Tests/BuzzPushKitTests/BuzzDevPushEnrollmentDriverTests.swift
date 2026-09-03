@@ -698,8 +698,8 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     let unrelatedHigherGeneration = BuzzPushEndpointGrantRecord(
       gatewayOrigin: Self.gatewayOrigin,
       relayOrigin: "wss://other-relay.example",
-      relayPubkey: newRelayPubkey,
-      relayMetadataPubkey: newRelayPubkey,
+      relayPubkey: String(repeating: "c", count: 64),
+      relayMetadataPubkey: String(repeating: "c", count: 64),
       gatewayInstallationHandle: Self.installationHandle,
       appAttestKeyId: Self.keyId,
       installationId: "101112131415161718191a1b1c1d1e1f",
@@ -710,8 +710,23 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
       generation: 7,
       expiresAt: Self.expiresAt
     )
+    let siblingOrigin = BuzzPushEndpointGrantRecord(
+      gatewayOrigin: Self.gatewayOrigin,
+      relayOrigin: "wss://sibling-relay.example",
+      relayPubkey: Self.relayPubkey,
+      relayMetadataPubkey: Self.relayPubkey,
+      gatewayInstallationHandle: Self.installationHandle,
+      appAttestKeyId: Self.keyId,
+      installationId: "303132333435363738393a3b3c3d3e3f",
+      endpointGrant: "sibling-origin-grant",
+      endpointHash: endpointHash,
+      appProfile: "buzz-ios-dogfood",
+      endpointEpoch: 1,
+      generation: 1,
+      expiresAt: Self.expiresAt
+    )
     let store = MemoryGrantStore(
-      records: [unrelatedHigherGeneration, existing],
+      records: [unrelatedHigherGeneration, siblingOrigin, existing],
       pending: [pending]
     )
     let driver = try makeDriver(store: store, appAttest: RecordingAppAttest())
@@ -773,7 +788,7 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     }
 
     XCTAssertEqual(revokedGenerations, [2, 1])
-    XCTAssertEqual(store.saved, [unrelatedHigherGeneration, existing])
+    XCTAssertEqual(store.saved, [unrelatedHigherGeneration])
     XCTAssertEqual(store.pending.count, 1)
     XCTAssertEqual(store.pending.first?.relayPubkey, newRelayPubkey)
     XCTAssertEqual(store.pending.first?.gatewayInstallationHandle, Self.installationHandle)
@@ -2105,6 +2120,17 @@ private final class MemoryGrantStore: BuzzPushEndpointGrantStore {
     saved.removeAll {
       $0.gatewayOrigin == gatewayOrigin
         && $0.gatewayInstallationHandle == installationHandle
+    }
+  }
+  func removeRecords(
+    gatewayOrigin: String,
+    installationHandle: String,
+    relayPubkey: String
+  ) throws {
+    saved.removeAll {
+      $0.gatewayOrigin == gatewayOrigin
+        && $0.gatewayInstallationHandle == installationHandle
+        && $0.relayPubkey == relayPubkey
     }
   }
   func pendingEnrollment(

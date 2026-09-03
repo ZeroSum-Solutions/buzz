@@ -99,6 +99,12 @@ public protocol BuzzPushEndpointGrantStore {
   func save(_ record: BuzzPushEndpointGrantRecord) throws
   /// Atomically removes every active grant backed by one installation.
   func removeRecords(gatewayOrigin: String, installationHandle: String) throws
+  /// Atomically removes every active grant backed by one delegation.
+  func removeRecords(
+    gatewayOrigin: String,
+    installationHandle: String,
+    relayPubkey: String
+  ) throws
   func pendingEnrollment(
     gatewayOrigin: String,
     relayOrigin: String,
@@ -516,6 +522,11 @@ public final class BuzzDevPushEnrollmentDriver {
         guard revoked else {
           throw BuzzDevPushEnrollmentError.retiredGatewayCleanupIncomplete
         }
+        try store.removeRecords(
+          gatewayOrigin: gatewayOrigin,
+          installationHandle: handleText,
+          relayPubkey: pending.relayPubkey
+        )
       } else {
         var cleanupState = try store.gatewayCleanupStates().first {
           $0.gatewayOrigin == gatewayOrigin

@@ -76,6 +76,20 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
     try replace(all, account: Self.recordsAccount)
   }
 
+  func removeRecords(
+    gatewayOrigin: String,
+    installationHandle: String,
+    relayPubkey: String
+  ) throws {
+    var all = try records()
+    all.removeAll {
+      $0.gatewayOrigin == gatewayOrigin
+        && $0.gatewayInstallationHandle == installationHandle
+        && $0.relayPubkey == relayPubkey
+    }
+    try replace(all, account: Self.recordsAccount)
+  }
+
   func pendingEnrollment(
     gatewayOrigin: String,
     relayOrigin: String,
