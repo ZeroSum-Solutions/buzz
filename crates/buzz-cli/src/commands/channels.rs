@@ -460,36 +460,74 @@ pub async fn cmd_restore_canvas(
 
     // If the relay returned a conflict-shaped error the submit may still have
     // persisted: a prior attempt stored A(expected=H), the response was lost,
-    // a concurrent B(expected=A) then became the live head, and the retry of
-    // identical A bytes sees RevisionMismatch — a persisted restore presented
-    // as a rejected write. Reconcile on the CLI side: attempt a writer-pinned
-    // ancestry walk; if A is reachable through the head's expected-revision
-    // chain it committed, so treat this as a post-write supersession (same as
-    // a clean submit followed by a concurrent write). If A is absent the
-    // conflict is genuine. If the ancestry read itself fails, surface an
-    // explicit unknown-outcome error naming `our_id` rather than reporting a
-    // false rejection.
+    // and the retry of identical A bytes sees RevisionMismatch — a persisted
+    // restore presented as a rejected write. Two concurrent-write shapes arise:
+    //
+    // - A tagged write B(expected=A) becomes head: `canvas_write_survived`
+    //   returns true; A committed and is an accepted ancestor → success.
+    // - An unconditional (legacy) write B(no expected-revision) becomes head:
+    //   `canvas_write_survived` returns false because B carries no ancestry link
+    //   to A, yet A may still be durably in the stream. A bounded ancestry walk
+    //   alone cannot distinguish "A is absent" from "A is present but not an
+    //   ancestor of head."
+    //
+    // Fix: establish A's persistence via a separate writer-pinned IDs lookup,
+    // then feed the four-way classification:
+    //   - survived (ancestor of head)         → accepted JSON, exit 0
+    //   - persisted but head unrelated to A   → supersession naming A
+    //   - genuinely absent                    → original 409 rejection
+    //   - either reconciliation read fails    → DeliveryUnknown naming A
     let resp = match submit_result {
         Ok(resp) => resp,
         Err(e @ CliError::Relay { status: 409, .. }) if matches!(&e, CliError::Relay { body, .. } if body.contains("canvas changed")) =>
         {
-            match fetch_canvas_ancestry(client, channel_id).await {
-                Ok(stream) => {
-                    if buzz_sdk::canvas_write_survived(&our_id, &stream) {
-                        // A committed; a later write built on it. Report as a
-                        // post-write supersession so the caller knows A is
-                        // durable in history even though it is not the head.
-                        return Err(CliError::Conflict(format!(
-                            "canvas restore {our_id} was superseded by a concurrent write; it is preserved in history — re-run restore against the current head if you still want it"
-                        )));
-                    }
+            // Both reads use strong consistency so read-replica lag cannot
+            // report a just-stored event as absent.
+            let stream = match fetch_canvas_ancestry(client, channel_id).await {
+                Ok(s) => s,
+                Err(_) => {
+                    return Err(CliError::DeliveryUnknown(format!(
+                        "canvas restore {our_id}: submit returned a conflict and the post-submit ancestry read failed; outcome unknown — check `buzz canvas history` before retrying"
+                    )));
+                }
+            };
+            if buzz_sdk::canvas_write_survived(&our_id, &stream) {
+                // A is an ancestor of the live head: it committed and a later
+                // write built on it. This is the same committed state the
+                // normal accepted-submit path treats as success — return
+                // accepted JSON so the caller is not prompted to re-restore.
+                // The relay's 409 response body is not an accepted response;
+                // synthesize one from the event ID we know committed.
+                let accepted_json = serde_json::json!({
+                    "event_id": our_id,
+                    "accepted": true,
+                    "message": "",
+                })
+                .to_string();
+                let _ = writeln!(out, "{accepted_json}");
+                return Ok(());
+            }
+            // A is not a reachable ancestor. Distinguish absence from presence
+            // with a separate writer-pinned IDs lookup (an unconditional legacy
+            // write can become head without linking back to A, so the bounded
+            // ancestry stream alone cannot confirm A exists).
+            match fetch_canvas_event_exists(client, channel_id, &our_id).await {
+                Ok(true) => {
+                    // A committed but is no longer an ancestor of the current
+                    // head: an unconditional write superseded it. Surface as a
+                    // post-write supersession so the caller knows A is durable.
+                    return Err(CliError::Conflict(format!(
+                        "canvas restore {our_id} was superseded by a concurrent write; it is preserved in history — re-run restore against the current head if you still want it"
+                    )));
+                }
+                Ok(false) => {
                     // A is genuinely absent: return the original relay error unchanged.
                     return Err(e);
                 }
                 Err(_) => {
                     // Cannot confirm or deny whether A was stored.
                     return Err(CliError::DeliveryUnknown(format!(
-                        "canvas restore {our_id}: submit returned a conflict and the post-submit ancestry read failed; outcome unknown — check `buzz canvas history` before retrying"
+                        "canvas restore {our_id}: submit returned a conflict and the post-submit existence check failed; outcome unknown — check `buzz canvas history` before retrying"
                     )));
                 }
             }
@@ -563,6 +601,35 @@ async fn fetch_canvas_ancestry(
             Some((id, extract_head_expected_revision(event)))
         })
         .collect())
+}
+
+/// Whether a canvas event with `event_id` exists in this channel's history,
+/// using a writer-pinned (strong-consistency) read so the caller is not
+/// reporting a truly-persisted event as absent due to read-replica lag.
+///
+/// Used by the 409-reconciliation branch to establish persistence independently
+/// of ancestry position: an unconditional ("legacy") write can become head
+/// without building an `expected-revision` link to the event being checked,
+/// so a bounded ancestry walk alone cannot confirm presence.
+async fn fetch_canvas_event_exists(
+    client: &BuzzClient,
+    channel_id: &str,
+    event_id: &str,
+) -> Result<bool, CliError> {
+    let filter = serde_json::json!({
+        "ids": [event_id],
+        "kinds": [40100],
+        "#h": [channel_id],
+        "limit": 1,
+        "consistency": "strong",
+    });
+    let resp = client.query(&filter).await?;
+    let events: Vec<serde_json::Value> = serde_json::from_str(&resp).map_err(|e| {
+        CliError::Other(format!(
+            "malformed relay response checking canvas event existence: {e}"
+        ))
+    })?;
+    Ok(!events.is_empty())
 }
 
 /// The head's own `["expected-revision", …]` tag value (the id it built on), or
@@ -3905,22 +3972,33 @@ mod restore_canvas_tests {
     /// 1. Attempt 1 — POST /events: A is persisted on the relay; the relay then
     ///    returns HTTP 503 (a retryable status), so `with_retry_body` retries
     ///    with the same bytes.
-    /// 2. A concurrent writer B (built on A) arrives and becomes the new head
-    ///    with `expected-revision = A`.
+    /// 2. A concurrent writer arrives and becomes the new head.
     /// 3. Attempt 2 — POST /events: returns the canonical 409 conflict body
-    ///    because B is now the head. `cmd_restore_canvas` enters the reconciliation
-    ///    branch.
-    /// 4. Ancestry walk — POST /query (post-submit): returns a stream whose
-    ///    shape depends on `event_reachable`:
-    ///    - `Some(true)` → B(exp=A) is head, A is in the chain → reachable →
-    ///      `CliError::Conflict` (superseded, preserved in history).
-    ///    - `Some(false)` → only a stranger, A absent → genuine conflict →
-    ///      original `CliError::Relay { 409, .. }` returned unchanged.
-    ///    - `None` → ancestry read fails (HTTP 500) →
-    ///      `CliError::DeliveryUnknown`.
+    ///    because the concurrent write is now the head. `cmd_restore_canvas`
+    ///    enters the reconciliation branch.
+    /// 4. Ancestry walk — POST /query: returns a stream shaped by `scenario`.
+    /// 5. IDs existence check — POST /query (only for `GenuinelyAbsent`): the
+    ///    ancestry walk returns `canvas_write_survived` = false, so the command
+    ///    follows up with a writer-pinned IDs lookup for our event.
     ///
     /// The event ID is captured so tests can assert it appears in error messages.
-    async fn conflict_relay(event_reachable: Option<bool>) -> (String, Arc<Mutex<Option<Value>>>) {
+    #[derive(Clone, Copy)]
+    enum ConflictScenario {
+        /// B(expected=A) is head, A is a reachable ancestor → `canvas_write_survived`
+        /// true → accepted JSON, exit 0 (same as accepted-submit success path).
+        ReachableAncestor,
+        /// B(no expected-revision) is head, A exists in the stream but is not
+        /// an ancestor → `canvas_write_survived` false, IDs lookup finds A →
+        /// supersession naming A.
+        LegacySupersession,
+        /// A is absent (only a stranger, no A in stream or IDs lookup) → genuine
+        /// conflict → original `CliError::Relay { 409, .. }` returned unchanged.
+        GenuinelyAbsent,
+        /// Ancestry read fails (HTTP 500) → `CliError::DeliveryUnknown`.
+        ReadFails,
+    }
+
+    async fn conflict_relay(scenario: ConflictScenario) -> (String, Arc<Mutex<Option<Value>>>) {
         use std::sync::atomic::{AtomicU32, Ordering};
 
         let submitted: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
@@ -3928,7 +4006,6 @@ mod restore_canvas_tests {
         let submitted_ev = submitted.clone();
         let events_attempt: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
         let events_attempt2 = events_attempt.clone();
-        let reachable = event_reachable;
 
         let app = Router::new()
             .route(
@@ -3937,18 +4014,8 @@ mod restore_canvas_tests {
                     let sub = submitted_q.clone();
                     async move {
                         use axum::http::StatusCode;
-                        let is_ids_query = std::str::from_utf8(&body)
-                            .map(|b| b.contains("\"ids\""))
-                            .unwrap_or(false);
-                        if is_ids_query {
-                            // Revision content fetch — always succeeds.
-                            return (
-                                StatusCode::OK,
-                                json!([canvas_event(REVISION, 1_000, None)]).to_string(),
-                            );
-                        }
-                        // Distinguish pre-submit (no event captured yet) from
-                        // post-conflict ancestry walk.
+                        let body_str = std::str::from_utf8(&body).unwrap_or("");
+                        let is_ids_query = body_str.contains("\"ids\"");
                         let our_id_opt = sub
                             .lock()
                             .unwrap()
@@ -3956,6 +4023,13 @@ mod restore_canvas_tests {
                             .and_then(|e| e.get("id"))
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string());
+                        if is_ids_query && our_id_opt.is_none() {
+                            // Pre-submit revision content fetch — always succeeds.
+                            return (
+                                StatusCode::OK,
+                                json!([canvas_event(REVISION, 1_000, None)]).to_string(),
+                            );
+                        }
                         if our_id_opt.is_none() {
                             // Pre-submit head read — REVISION ≠ HEAD so command proceeds.
                             return (
@@ -3963,10 +4037,40 @@ mod restore_canvas_tests {
                                 json!([canvas_event(HEAD, 2_000, None)]).to_string(),
                             );
                         }
-                        // Post-conflict ancestry walk: shape per test scenario.
-                        match reachable {
-                            None => (StatusCode::INTERNAL_SERVER_ERROR, String::new()),
-                            Some(false) => {
+                        let our_id = our_id_opt.unwrap();
+                        if is_ids_query {
+                            // Post-conflict writer-pinned IDs existence check for our_id.
+                            // Only reached when canvas_write_survived is false (i.e.
+                            // LegacySupersession and GenuinelyAbsent scenarios).
+                            return match scenario {
+                                ConflictScenario::LegacySupersession => {
+                                    // A is in the relay — return it so the existence
+                                    // check confirms persistence.
+                                    (
+                                        StatusCode::OK,
+                                        json!([canvas_event(&our_id, 2_001, Some(HEAD))])
+                                            .to_string(),
+                                    )
+                                }
+                                ConflictScenario::GenuinelyAbsent => {
+                                    // A was never stored — empty response.
+                                    (StatusCode::OK, json!([]).to_string())
+                                }
+                                // ReachableAncestor: canvas_write_survived = true,
+                                // never reaches the existence check.
+                                // ReadFails: ancestry read returns 500,
+                                // never reaches the existence check.
+                                _ => unreachable!(
+                                    "existence check only reached for LegacySupersession/GenuinelyAbsent"
+                                ),
+                            };
+                        }
+                        // Post-conflict ancestry walk: shape per scenario.
+                        match scenario {
+                            ConflictScenario::ReadFails => {
+                                (StatusCode::INTERNAL_SERVER_ERROR, String::new())
+                            }
+                            ConflictScenario::GenuinelyAbsent => {
                                 // A is absent — genuine conflict. Stream contains
                                 // only an unrelated stranger (no A, no B).
                                 (
@@ -3974,16 +4078,28 @@ mod restore_canvas_tests {
                                     json!([canvas_event(STRANGER, 2_002, None)]).to_string(),
                                 )
                             }
-                            Some(true) => {
-                                let our_id = our_id_opt.unwrap();
-                                // B built on A: B is head with expected-revision=A,
-                                // A is in the stream → A is reachable. This models
-                                // the concurrent write that arrived after A was
-                                // stored but before the 409 response.
+                            ConflictScenario::ReachableAncestor => {
+                                // B(expected=A) is head: B built on A, A is in the
+                                // ancestry chain → canvas_write_survived = true →
+                                // command returns accepted JSON (exit 0).
                                 (
                                     StatusCode::OK,
                                     json!([
                                         canvas_event(STRANGER, 2_002, Some(&our_id)),
+                                        canvas_event(&our_id, 2_001, Some(HEAD)),
+                                    ])
+                                    .to_string(),
+                                )
+                            }
+                            ConflictScenario::LegacySupersession => {
+                                // B(no expected-revision) is head: B does not link
+                                // to A, so canvas_write_survived = false, but A is
+                                // in the stream (not at head). The IDs existence
+                                // check follows and confirms A is stored.
+                                (
+                                    StatusCode::OK,
+                                    json!([
+                                        canvas_event(STRANGER, 2_002, None),
                                         canvas_event(&our_id, 2_001, Some(HEAD)),
                                     ])
                                     .to_string(),
@@ -4131,25 +4247,64 @@ mod restore_canvas_tests {
         );
     }
 
-    /// A conflict-shaped submit where the ancestry walk reveals our event IS
-    /// reachable: the restore committed before the 409 response was lost, and a
-    /// concurrent write then built on it. The command must return
-    /// `CliError::Conflict` (exit 5) — superseded, preserved in history — NOT a
-    /// false `CliError::Relay` that would tell the caller the restore was rejected.
+    /// A conflict-shaped submit where `canvas_write_survived` is true (B(expected=A)
+    /// is head, A is a reachable ancestor): A committed before the 409 response was
+    /// lost. The command must return accepted JSON (exit 0) — identical to a clean
+    /// accepted submit — NOT `CliError::Conflict`, which would incorrectly prompt
+    /// the caller to re-restore over B.
     ///
     /// Mutation oracle: removing the conflict-reconciliation block from
-    /// `cmd_restore_canvas` (i.e. restoring `client.submit_event(event).await?`)
-    /// makes this return `CliError::Relay` instead of `CliError::Conflict`.
+    /// `cmd_restore_canvas` (restoring `client.submit_event(event).await?`) makes
+    /// this return `CliError::Relay` instead of `Ok(())`.
     #[tokio::test]
-    async fn conflict_shaped_submit_reconciled_as_supersession_when_our_event_reachable() {
-        let (url, submitted) = conflict_relay(Some(true)).await;
+    async fn conflict_shaped_submit_succeeds_when_our_event_is_reachable_ancestor() {
+        let (url, submitted) = conflict_relay(ConflictScenario::ReachableAncestor).await;
+        let mut out = vec![];
+        cmd_restore_canvas(&client(&url), CHANNEL, REVISION, &mut out)
+            .await
+            .expect("a conflict where A is a reachable ancestor must succeed (exit 0)");
+        assert!(
+            submitted.lock().unwrap().is_some(),
+            "the restore must have submitted before the 409"
+        );
+        // Must emit the same accepted JSON as a clean submit.
+        let json: serde_json::Value =
+            serde_json::from_slice(&out).expect("stdout must be valid JSON");
+        assert!(
+            json.get("event_id").is_some(),
+            "stdout JSON must contain event_id: {json}"
+        );
+        assert!(
+            json.get("accepted").is_some(),
+            "stdout JSON must contain accepted: {json}"
+        );
+        assert!(
+            json.get("message").is_some(),
+            "stdout JSON must contain message: {json}"
+        );
+    }
+
+    /// A conflict-shaped submit where an unconditional (legacy, no `expected-revision`)
+    /// write B is head and our event A is present in the stream but not an ancestor:
+    /// `canvas_write_survived` is false, but the writer-pinned IDs lookup confirms A
+    /// exists. The command must return `CliError::Conflict` naming A — superseded,
+    /// preserved in history — NOT the original 409 relay error that would wrongly
+    /// tell the caller the restore was rejected.
+    ///
+    /// Mutation oracle: removing the IDs existence check (returning the original
+    /// 409 relay error whenever `canvas_write_survived` is false) makes this return
+    /// `CliError::Relay` instead of `CliError::Conflict`.
+    #[tokio::test]
+    async fn conflict_shaped_submit_superseded_by_legacy_write_when_event_exists_but_not_ancestor()
+    {
+        let (url, submitted) = conflict_relay(ConflictScenario::LegacySupersession).await;
         let err = cmd_restore_canvas(&client(&url), CHANNEL, REVISION, &mut vec![])
             .await
-            .expect_err("a conflict with our event reachable must error");
+            .expect_err("a conflict where A exists but is not an ancestor must be a supersession");
 
         assert!(
             matches!(err, CliError::Conflict(_)),
-            "expected Conflict (exit 5 — superseded, preserved), got {err:?}"
+            "expected Conflict (exit 5 — superseded by legacy write, preserved), got {err:?}"
         );
         let our_id = submitted
             .lock()
@@ -4181,7 +4336,7 @@ mod restore_canvas_tests {
     /// instead of `CliError::Relay`.
     #[tokio::test]
     async fn conflict_shaped_submit_stays_relay_error_when_our_event_absent() {
-        let (url, _) = conflict_relay(Some(false)).await;
+        let (url, _) = conflict_relay(ConflictScenario::GenuinelyAbsent).await;
         let err = cmd_restore_canvas(&client(&url), CHANNEL, REVISION, &mut vec![])
             .await
             .expect_err("a genuine conflict must error");
@@ -4214,7 +4369,7 @@ mod restore_canvas_tests {
     /// fails makes this return `Conflict` instead of `DeliveryUnknown`.
     #[tokio::test]
     async fn conflict_shaped_submit_with_failed_ancestry_read_returns_unknown_outcome() {
-        let (url, submitted) = conflict_relay(None).await;
+        let (url, submitted) = conflict_relay(ConflictScenario::ReadFails).await;
         let err = cmd_restore_canvas(&client(&url), CHANNEL, REVISION, &mut vec![])
             .await
             .expect_err("unknown outcome must error");
