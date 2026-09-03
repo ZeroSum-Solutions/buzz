@@ -58,6 +58,8 @@ Buzz is a place where people build together and bring their agents into the room
 ## Density and rhythm
 
 - **Dense data renders as rows with dividers, edge to edge.** Wrapping every list item in its own card is the most common way a functional surface becomes a marketing page.
+- **Content that separates itself needs no divider, and no container.** A divider is for uniform rows where the eye needs a line to track along. When each entry already carries a visible difference — a colour swatch, a type specimen, an avatar — the content is the separator, and adding a rule or a card on top is redundant structure. Space alone is enough.
+- **Never judge a value against a surface it will not be used on.** A swatch on a grey fill, or a type specimen in a tinted box, is being evaluated in a context the product will never reproduce. Samples sit on the page. The one exception is a value that needs a backdrop to exist at all — translucency needs something behind it, and a white surface swatch needs a hairline or it renders as nothing.
 - **Cards are for widgets, galleries, and settings groups.** A card is a bordered, padded region on the page, not a different depth.
 - **Pick the frame before the content.** Decide what the surface is — a list, a reading column, a workspace — before filling it.
 - **Whitespace is generous by default.** Crowding reads as a different product.

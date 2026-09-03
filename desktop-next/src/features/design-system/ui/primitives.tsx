@@ -88,22 +88,37 @@ export function Stub({ what, decide }: { what: string; decide: string[] }) {
 }
 
 /**
- * A group of rows that reads as one region.
+ * A list of uniform rows — the tabular case, where every row looks alike and the
+ * eye needs a line to track along. Dividers, no container: the section heading
+ * already says these belong together, so a fill behind them adds a box without
+ * adding meaning. See DESIGN.md § Density and rhythm.
  *
- * The fill does the separating, so the container needs no outline. Rows inside
- * are divided by the lightest hairline in the system, because dense data wants
- * an edge-to-edge divider rather than a card each — see DESIGN.md § Density.
+ * If the rows carry their own visual difference — a swatch, a type specimen — use
+ * `Specimens` instead. Content that separates itself needs no divider.
  */
 export function Rows({ children }: { children: ReactNode }) {
-  return <div className="rounded-xl bg-inset px-5">{children}</div>;
+  return <div className="flex flex-col">{children}</div>;
 }
 
 export function Row({ children }: { children: ReactNode }) {
   return (
-    <div className="border-tertiary border-b py-4 last:border-b-0">
+    <div className="border-tertiary border-b py-3 last:border-b-0">
       {children}
     </div>
   );
+}
+
+/**
+ * A list whose entries are visibly different from each other — colour swatches,
+ * type specimens, elevation samples.
+ *
+ * No container and no dividers. The specimen is its own separator, and two
+ * things a colour system must never do are judge a swatch against a fill it
+ * will never sit on, or set a type specimen in a box that changes its contrast.
+ * Separation comes from space alone.
+ */
+export function Specimens({ children }: { children: ReactNode }) {
+  return <div className="flex flex-col gap-7">{children}</div>;
 }
 
 /** Renders a live swatch of whatever a CSS custom property currently holds. */

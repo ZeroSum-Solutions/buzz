@@ -5,7 +5,7 @@ import {
   type TypeRole,
 } from "@/shared/tokens/registry";
 
-import { Note, PageHeader, Row, Rows, Section } from "./primitives";
+import { Note, PageHeader, Row, Rows, Section, Specimens } from "./primitives";
 
 /**
  * Every specimen below is set in the role it documents, so the page is the
@@ -14,23 +14,21 @@ import { Note, PageHeader, Row, Rows, Section } from "./primitives";
  */
 function RoleSpecimen({ role }: { role: TypeRole }) {
   return (
-    <Row>
-      <div className="flex flex-col gap-2">
-        <p
-          className={`${role.token} ${role.mono ? "font-mono" : ""} text-primary`}
-        >
-          {role.mono ? "createChannel(name, members)" : "Bring your agents in"}
-        </p>
-        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-          <code className="text-code text-accent">{role.token}</code>
-          <span className="text-meta text-tertiary">{role.pointsAt}</span>
-          <span className="text-meta text-tertiary">
-            {role.size} / {role.lineHeight} / {role.tracking} / {role.weight}
-          </span>
-        </div>
-        <p className="max-w-xl text-caption text-secondary">{role.use}</p>
+    <div className="flex flex-col gap-2">
+      <p
+        className={`${role.token} ${role.mono ? "font-mono" : ""} text-primary`}
+      >
+        {role.mono ? "createChannel(name, members)" : "Bring your agents in"}
+      </p>
+      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+        <code className="text-code text-accent">{role.token}</code>
+        <span className="text-meta text-tertiary">{role.pointsAt}</span>
+        <span className="text-meta text-tertiary">
+          {role.size} / {role.lineHeight} / {role.tracking} / {role.weight}
+        </span>
       </div>
-    </Row>
+      <p className="max-w-xl text-caption text-secondary">{role.use}</p>
+    </div>
   );
 }
 
@@ -46,36 +44,34 @@ export function TypographyPage() {
         title="The faces"
         description="Both already ship in every current Buzz client, so this is a decision to keep rather than to make. Inter is drawn for interface text at small sizes, which is most of this product."
       >
-        <Rows>
+        <Specimens>
           {TYPE_FAMILIES.map((family) => (
-            <Row key={family.token}>
-              <div className="flex flex-col gap-1.5">
-                <p
-                  className={`text-subheading text-primary ${
-                    family.token === "font-mono" ? "font-mono" : "font-sans"
-                  }`}
-                >
-                  {family.name}
-                </p>
-                <code className="text-code text-accent">{family.token}</code>
-                <p className="max-w-xl text-caption text-secondary">
-                  {family.use}
-                </p>
-              </div>
-            </Row>
+            <div key={family.token} className="flex flex-col gap-1.5">
+              <p
+                className={`text-subheading text-primary ${
+                  family.token === "font-mono" ? "font-mono" : "font-sans"
+                }`}
+              >
+                {family.name}
+              </p>
+              <code className="text-code text-accent">{family.token}</code>
+              <p className="max-w-xl text-caption text-secondary">
+                {family.use}
+              </p>
+            </div>
           ))}
-        </Rows>
+        </Specimens>
       </Section>
 
       <Section
         title="The roles"
         description="Named for the job the text does, never for its size. text-title, not text-28 — a size name is a value in disguise and goes stale the moment the ramp moves. Each specimen is set in the role it documents."
       >
-        <Rows>
+        <Specimens>
           {TYPE_ROLES.map((role) => (
             <RoleSpecimen key={role.token} role={role} />
           ))}
-        </Rows>
+        </Specimens>
       </Section>
 
       {TYPE_RAMPS.map((ramp) => (

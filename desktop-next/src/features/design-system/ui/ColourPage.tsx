@@ -7,9 +7,18 @@ import {
 
 import { Note, PageHeader, Section, Swatch } from "./primitives";
 
+/**
+ * A role, sitting directly on the page.
+ *
+ * No card and no divider: the swatch is its own separator, and a colour judged
+ * on a grey card is not being judged on the surface it will actually be used on.
+ * The hairline stays on the swatch itself — `bg-panel` is white on a white page,
+ * so without it the most-used role in the system renders as nothing. That is a
+ * genuine boundary rather than decoration.
+ */
 function RoleRow({ role }: { role: Role }) {
   return (
-    <div className="flex items-start gap-4 border-b border-tertiary py-3 last:border-b-0">
+    <div className="flex items-start gap-4 py-2.5">
       <div
         className="mt-0.5 h-9 w-16 shrink-0 rounded-md border border-tertiary"
         style={{ background: `var(${role.variable})` }}
@@ -92,7 +101,7 @@ export function ColourPage() {
                   {group.description}
                 </p>
               </div>
-              <div className="rounded-xl bg-inset px-5">
+              <div className="mt-1 flex flex-col">
                 {group.roles.map((role) => (
                   <RoleRow key={role.token} role={role} />
                 ))}
@@ -106,11 +115,14 @@ export function ColourPage() {
         title="Deliberate exceptions"
         description="Literal values exist only in the ramps, and nothing above a ramp holds one — except these. The list is short and complete on purpose: a vague exception policy is how a layered system quietly erodes."
       >
-        <div className="flex flex-col gap-3">
+        {/* No swatch here to do the separating, so these entries keep a little
+            structure — the token name leads and the spacing groups it with its
+            reason. Still no card: this is prose, not data. */}
+        <div className="flex flex-col gap-5">
           {EXCEPTIONS.map((exception) => (
-            <div key={exception.name} className="rounded-xl bg-inset px-5 py-4">
-              <code className="text-meta text-primary">{exception.name}</code>
-              <p className="mt-1 text-caption text-secondary">
+            <div key={exception.name} className="flex flex-col gap-1">
+              <code className="text-code text-accent">{exception.name}</code>
+              <p className="max-w-2xl text-caption text-secondary">
                 {exception.why}
               </p>
             </div>
