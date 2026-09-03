@@ -17,7 +17,19 @@ import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
 /** `mockDisplayNames` maps this to "John Smith"; it joins no mock channel. */
 const JOHN_SMITH_PUBKEY =
   "7c1f2ad0b4e93856a1d0c2f4e6b8093a5d7f1c3e5a79b1d3f5072a4c6e80931b";
+/**
+ * A second account this community also names "John Smith".
+ *
+ * Seeded per-test, and no more forged than the first: two people really can
+ * share a display name, so a paste of one is not evidence about the other.
+ */
+const NAMESAKE_PUBKEY =
+  "5e2c9b710f4a836d2b5c0e7d8a1f4c63b9d0725e1a8c3f6407d9b2e5c8a1f403";
+const MENTION_LABEL = "John Smith";
+const MENTION_SIGIL = `@${MENTION_LABEL}`;
 const MESSAGE_BODY = "@John Smith fixed the bug";
+/** A second copied sentence naming the same person, appended to the first. */
+const SECOND_MENTION_BODY = " and @John Smith agrees";
 const FORUM_REPLY_BODY = "Agreed, @John Smith should confirm";
 /** The mock `general` channel — a feed item needs its UUID, not its name. */
 const GENERAL_CHANNEL_ID = "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50";
@@ -324,6 +336,70 @@ async function pasteIntoComposer(
       }),
     );
   }, flavors);
+}
+
+/** Paste at the end of whatever the composer already holds. */
+async function pasteAfterComposerText(
+  page: Page,
+  flavors: { html: string; text: string },
+) {
+  const input = page.getByTestId("message-input");
+  await input.click();
+  // A click lands the caret wherever it hit; the append is the point here.
+  await input.press("End");
+  await input.evaluate((element, { html, text }) => {
+    const clipboardData = new DataTransfer();
+    clipboardData.setData("text/plain", text);
+    clipboardData.setData("text/html", html);
+    element.dispatchEvent(
+      new ClipboardEvent("paste", {
+        bubbles: true,
+        cancelable: true,
+        clipboardData,
+      }),
+    );
+  }, flavors);
+}
+
+/** The flavors a Buzz copy of `body` writes for a "John Smith" chip. */
+function mentionFlavors(pubkey: string, body: string) {
+  const at = body.indexOf(MENTION_SIGIL);
+  if (at < 0) throw new Error(`Body names nobody: ${body}`);
+  return {
+    html:
+      '<span data-buzz-copy="markdown">' +
+      body.slice(0, at) +
+      `<span data-mention="" data-mention-pubkey="${pubkey}" ` +
+      `data-mention-label="${MENTION_LABEL}">${MENTION_SIGIL}</span>` +
+      body.slice(at + MENTION_SIGIL.length) +
+      "</span>",
+    text: body,
+  };
+}
+
+/**
+ * Pin every relay profile lookup open, or let the held ones through.
+ *
+ * The identity check behind a pasted mention is exactly such a lookup when the
+ * person is not a member of the channel being pasted into — the case the
+ * feature exists for. Holding it is what makes "the paste is still deciding" a
+ * state a test can act inside rather than race.
+ */
+async function holdRelayProfileLookups(page: Page, hold: boolean) {
+  return page.evaluate(
+    (next) => window.__BUZZ_E2E_HOLD_USERS_BATCH__?.(next) ?? 0,
+    hold,
+  );
+}
+
+/** Wait until a lookup naming `pubkey` is provably pinned open. */
+async function waitForHeldProfileLookup(page: Page, pubkey: string) {
+  await expect.poll(() => askedRelayAboutProfile(page, pubkey)).toBe(true);
+  await expect
+    .poll(() =>
+      page.evaluate(() => window.__BUZZ_E2E_USERS_BATCH_PENDING__?.() ?? 0),
+    )
+    .toBeGreaterThan(0);
 }
 
 /**
@@ -875,4 +951,130 @@ test("a boundary-crossing default copy pastes its chip fragment without a sigil"
   const input = page.getByTestId("message-input");
   await expect(input).toHaveText("Smith fixed the");
   await expect(input.locator(".mention-chip")).toHaveCount(0);
+});
+
+test("sending on top of a paste still being verified keeps its identity", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-bob-tyler").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("bob-tyler");
+
+  // Paste and send immediately — the whole verification happens inside the
+  // window between the two, which is a window the user can genuinely hit: the
+  // lookup crosses the network and the pasted words are already on screen.
+  await holdRelayProfileLookups(page, true);
+  await pasteIntoComposer(
+    page,
+    mentionFlavors(JOHN_SMITH_PUBKEY, MESSAGE_BODY),
+  );
+  const input = page.getByTestId("message-input");
+  await expect(input).toHaveText(MESSAGE_BODY);
+  await waitForHeldProfileLookup(page, JOHN_SMITH_PUBKEY);
+  // Nothing has bound yet, so a send that read the map now would tag nobody.
+  await expect(input.locator(".mention-chip")).toHaveCount(0);
+
+  await page.getByTestId("send-message").click();
+  // The send waits on the answer instead of publishing without it: the words
+  // are still in the composer, and nothing has gone out.
+  await expect(input).toHaveText(MESSAGE_BODY);
+  expect(await readSentMentionPubkeys(page, MESSAGE_BODY)).toBeNull();
+
+  expect(await holdRelayProfileLookups(page, false)).toBeGreaterThan(0);
+  await expect(input).toHaveText("");
+  await expect
+    .poll(() => readSentMentionPubkeys(page, MESSAGE_BODY))
+    .toContain(JOHN_SMITH_PUBKEY);
+});
+
+test("a slow paste settling last does not take a newer paste's name", async ({
+  page,
+}) => {
+  // Two accounts share "John Smith", so the label alone cannot say which key
+  // owns it. The namesake is seeded per-test, which needs its own install:
+  // `mock` comes from the newest init script rather than merging.
+  await installMockBridge(page, {
+    searchProfiles: [{ pubkey: NAMESAKE_PUBKEY, displayName: MENTION_LABEL }],
+  });
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+  await waitForMockLiveSubscription(page, "general");
+  // Rendering his chip here resolves the first John Smith's profile, so a
+  // paste of *that* key verifies from what this client already holds.
+  await emitMentionMessage(page, "general");
+
+  await page.getByTestId("channel-bob-tyler").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("bob-tyler");
+  const input = page.getByTestId("message-input");
+
+  // The namesake is nobody this client has looked up, so his paste has to ask
+  // the relay — and that question stays open for the rest of the test.
+  await holdRelayProfileLookups(page, true);
+  await pasteIntoComposer(page, mentionFlavors(NAMESAKE_PUBKEY, MESSAGE_BODY));
+  await expect(input).toHaveText(MESSAGE_BODY);
+  await waitForHeldProfileLookup(page, NAMESAKE_PUBKEY);
+
+  // The second paste of the same label answers from cache while the first is
+  // still deciding — both chips light, and the name is now the newer key's.
+  await pasteAfterComposerText(
+    page,
+    mentionFlavors(JOHN_SMITH_PUBKEY, SECOND_MENTION_BODY),
+  );
+  const wholeBody = MESSAGE_BODY + SECOND_MENTION_BODY;
+  await expect(input).toHaveText(wholeBody);
+  await expect(input.locator(".mention-chip")).toHaveCount(2);
+
+  // Now let the older answer land. It is a true answer — the relay really does
+  // name that key "John Smith" — and the label really is still on screen. What
+  // it is not is the newest thing the user said about the name.
+  expect(await holdRelayProfileLookups(page, false)).toBeGreaterThan(0);
+
+  await page.getByTestId("send-message").click();
+  await expect(input).toHaveText("");
+  await expect
+    .poll(() => readSentMentionPubkeys(page, wholeBody))
+    .toContain(JOHN_SMITH_PUBKEY);
+  expect(await readSentMentionPubkeys(page, wholeBody)).not.toContain(
+    NAMESAKE_PUBKEY,
+  );
+});
+
+test("a deleted paste binds nothing to the same name typed after it", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-bob-tyler").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("bob-tyler");
+
+  await holdRelayProfileLookups(page, true);
+  await pasteIntoComposer(
+    page,
+    mentionFlavors(JOHN_SMITH_PUBKEY, MESSAGE_BODY),
+  );
+  const input = page.getByTestId("message-input");
+  await expect(input).toHaveText(MESSAGE_BODY);
+  await waitForHeldProfileLookup(page, JOHN_SMITH_PUBKEY);
+
+  // Second thoughts, mid-lookup: the paste goes away and the same sentence is
+  // written out by hand. Character for character the composer reads as it did,
+  // so "is this label somewhere in the composer?" still says yes — but not one
+  // word of it came off the clipboard, and its identity claim is over.
+  await input.press("ControlOrMeta+a");
+  await input.press("Backspace");
+  await expect(input).toHaveText("");
+  await pasteIntoComposer(page, { html: "", text: MESSAGE_BODY });
+  await expect(input).toHaveText(MESSAGE_BODY);
+
+  expect(await holdRelayProfileLookups(page, false)).toBeGreaterThan(0);
+  await expect(input.locator(".mention-chip")).toHaveCount(0);
+
+  await page.getByTestId("send-message").click();
+  await expect(input).toHaveText("");
+  await expect
+    .poll(() => readSentMentionPubkeys(page, MESSAGE_BODY))
+    .not.toBeNull();
+  expect(await readSentMentionPubkeys(page, MESSAGE_BODY)).not.toContain(
+    JOHN_SMITH_PUBKEY,
+  );
 });

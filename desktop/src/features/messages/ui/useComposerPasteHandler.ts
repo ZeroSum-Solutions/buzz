@@ -3,19 +3,17 @@ import type { Editor } from "@tiptap/react";
 import { handleAgentSnapshotPaste } from "@/features/messages/lib/agentSnapshotClipboard";
 import type { BlobDescriptor } from "@/shared/api/tauri";
 import { hasMentionClipboardHtml } from "@/features/messages/lib/normalizeMentionClipboard";
-import {
-  handleMentionClipboardPaste,
-  type RegisterMentionPubkey,
-} from "@/features/messages/lib/mentionClipboardPaste";
-import type { VerifyMentionIdentities } from "@/features/messages/lib/mentionClipboard";
+import { handleMentionClipboardPaste } from "@/features/messages/lib/mentionClipboardPaste";
+import type { BindPastedMentionIdentities } from "@/features/messages/lib/mentionPasteBinding";
 import { getBuzzCodeBlockClipboardText } from "@/shared/lib/codeBlockClipboard";
 
 export function useComposerPasteHandler(options: {
   editor: Editor | null;
-  /** Teaches the composer each `name → pubkey` pair a Buzz copy carried. */
-  registerMentionPubkey?: RegisterMentionPubkey;
-  /** Confirms a carried pair against trusted state; without it none bind. */
-  verifyMentionIdentities?: VerifyMentionIdentities;
+  /**
+   * Teaches the composer each `name → pubkey` pair a Buzz copy carried, once
+   * trusted state vouches for it. Without it, a paste binds nothing.
+   */
+  bindMentionIdentities?: BindPastedMentionIdentities;
   scrollToBottom: () => void;
   setPendingImeta: (
     update: (current: BlobDescriptor[]) => BlobDescriptor[],
@@ -24,12 +22,8 @@ export function useComposerPasteHandler(options: {
 }) {
   const uploadFileRef = React.useRef(options.uploadFile);
   uploadFileRef.current = options.uploadFile;
-  const registerMentionPubkeyRef = React.useRef(options.registerMentionPubkey);
-  registerMentionPubkeyRef.current = options.registerMentionPubkey;
-  const verifyMentionIdentitiesRef = React.useRef(
-    options.verifyMentionIdentities,
-  );
-  verifyMentionIdentitiesRef.current = options.verifyMentionIdentities;
+  const bindMentionIdentitiesRef = React.useRef(options.bindMentionIdentities);
+  bindMentionIdentitiesRef.current = options.bindMentionIdentities;
   React.useEffect(() => {
     const editor = options.editor;
     if (!editor) return;
@@ -76,10 +70,9 @@ export function useComposerPasteHandler(options: {
               options.scrollToBottom();
             }
             return handleMentionClipboardPaste({
+              bindMentionIdentities: bindMentionIdentitiesRef.current,
               clipboardData,
               preventDefault: () => event.preventDefault(),
-              registerMentionPubkey: registerMentionPubkeyRef.current,
-              verifyMentionIdentities: verifyMentionIdentitiesRef.current,
               view,
             });
           }

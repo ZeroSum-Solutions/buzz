@@ -241,6 +241,9 @@ export function ForumComposer({
       channelLinks.clearChannels();
       setIsEmojiPickerOpen(false);
       try {
+        // A pasted mention's identity check can still be in flight; extracting
+        // first would publish the label with no `p` tag. Bounded internally.
+        await mentions.settlePendingMentionBindings();
         const pubkeys = await mentions.revalidateMentionPubkeys(
           mentions.extractMentionPubkeys(trimmed),
         );
@@ -291,6 +294,7 @@ export function ForumComposer({
       mentions.cancelMentionAutocomplete,
       mentions.extractMentionPubkeys,
       mentions.revalidateMentionPubkeys,
+      mentions.settlePendingMentionBindings,
       mentions.clearMentions,
       channelLinks.clearChannels,
       richText.clearContent,
@@ -358,12 +362,10 @@ export function ForumComposer({
   // ── Media paste ─────────────────────────────────────────────────────
   const uploadFileRef = React.useRef(media.uploadFile);
   uploadFileRef.current = media.uploadFile;
-  const registerMentionPubkeyRef = React.useRef(mentions.registerMentionPubkey);
-  registerMentionPubkeyRef.current = mentions.registerMentionPubkey;
-  const verifyMentionIdentitiesRef = React.useRef(
-    mentions.verifyMentionIdentities,
+  const bindMentionIdentitiesRef = React.useRef(
+    mentions.bindPastedMentionIdentities,
   );
-  verifyMentionIdentitiesRef.current = mentions.verifyMentionIdentities;
+  bindMentionIdentitiesRef.current = mentions.bindPastedMentionIdentities;
 
   React.useEffect(() => {
     if (!richText.editor) return;
@@ -388,10 +390,9 @@ export function ForumComposer({
           const html = clipboardData?.getData("text/html");
           if (clipboardData && html && hasMentionClipboardHtml(html)) {
             return handleMentionClipboardPaste({
+              bindMentionIdentities: bindMentionIdentitiesRef.current,
               clipboardData,
               preventDefault: () => event.preventDefault(),
-              registerMentionPubkey: registerMentionPubkeyRef.current,
-              verifyMentionIdentities: verifyMentionIdentitiesRef.current,
               view: _view,
             });
           }

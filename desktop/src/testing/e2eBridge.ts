@@ -1581,6 +1581,12 @@ declare global {
     /** Number of `get_thread_replies` calls currently held by
      *  `deferThreadReplies`. */
     __BUZZ_E2E_THREAD_REPLIES_PENDING__?: () => number;
+    /** Start or stop holding `get_users_batch` responses. Turning the hold off
+     *  flushes everything held; either call returns the number released, so a
+     *  spec can prove a relay identity lookup was genuinely pinned open. */
+    __BUZZ_E2E_HOLD_USERS_BATCH__?: (hold: boolean) => number;
+    /** Number of `get_users_batch` calls currently held. */
+    __BUZZ_E2E_USERS_BATCH_PENDING__?: () => number;
     /** Uploads that passed mock-native registration and began relay work. */
     __BUZZ_E2E_LINK_PREVIEW_UPLOAD_STARTS__?: number;
     /** Hold renderer-owned media fetches until their cancellation command. */
@@ -1702,6 +1708,14 @@ let deferredGetEventQueue: DeferredGetEvent[] = [];
 let deferredLinkPreviewMetadataQueue: Array<() => void> = [];
 let deferredLinkPreviewUploadQueue: Array<() => void> = [];
 let deferredThreadRepliesQueue: Array<() => void> = [];
+// ── get_users_batch hold seam ───────────────────────────────────────────────
+// Toggled at runtime by `__BUZZ_E2E_HOLD_USERS_BATCH__(hold)` rather than fixed
+// at boot by a mock-config flag, because a mention-identity spec needs both
+// sides of the hold in one page: profiles resolved normally first (so one paste
+// verifies instantly from local state), then the relay lookup pinned open (so a
+// second paste of the same label is provably still deciding).
+let holdUsersBatch = false;
+let heldUsersBatchReleases: Array<() => void> = [];
 // Starts currently held behind `startManagedAgentDelayMs`, releasable early
 // via `__BUZZ_E2E_RELEASE_MANAGED_AGENT_STARTS__()`: a spec that holds a
 // start across a community round-trip needs the hold long enough to be
@@ -6902,6 +6916,11 @@ async function handleGetUsersBatch(
       window.setTimeout(resolve, usersBatchDelayMs);
     });
   }
+  if (holdUsersBatch) {
+    await new Promise<void>((resolve) => {
+      heldUsersBatchReleases.push(resolve);
+    });
+  }
 
   const identity = getIdentity(config);
   if (!identity) {
@@ -11292,6 +11311,8 @@ export function maybeInstallE2eTauriMocks() {
   deferredLinkPreviewMetadataQueue = [];
   deferredLinkPreviewUploadQueue = [];
   deferredThreadRepliesQueue = [];
+  holdUsersBatch = false;
+  heldUsersBatchReleases = [];
   cancelledMediaUploadIds = new Set<string>();
   for (const controller of mockMediaFetchControllers.values()) {
     controller.abort();
@@ -11317,6 +11338,15 @@ export function maybeInstallE2eTauriMocks() {
   };
   window.__BUZZ_E2E_THREAD_REPLIES_PENDING__ = () =>
     deferredThreadRepliesQueue.length;
+  window.__BUZZ_E2E_HOLD_USERS_BATCH__ = (hold: boolean) => {
+    holdUsersBatch = hold;
+    // Releasing on the way out of the hold, not on the way in, is what lets a
+    // spec keep one lookup pinned while another resolves from local state.
+    const queued = hold ? [] : heldUsersBatchReleases.splice(0);
+    for (const release of queued) release();
+    return queued.length;
+  };
+  window.__BUZZ_E2E_USERS_BATCH_PENDING__ = () => heldUsersBatchReleases.length;
   mockGlobalAgentConfig = config.mock?.globalAgentConfig
     ? { ...config.mock.globalAgentConfig }
     : null;

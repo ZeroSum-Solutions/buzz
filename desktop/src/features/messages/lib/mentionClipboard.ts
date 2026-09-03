@@ -363,6 +363,24 @@ function mentionIdentityKey(identity: MentionIdentity): string {
 }
 
 /**
+ * Narrow already-visible records to the pairs the verifier vouches for.
+ *
+ * The result is filtered back down to what was asked about, so the verifier
+ * stays a seam rather than an authority: a bug or a future implementation that
+ * answers with a pair nobody copied cannot widen the paste.
+ */
+export async function selectVouchedMentionIdentities(
+  visible: readonly MentionIdentity[],
+  verifyMentionIdentities: VerifyMentionIdentities,
+): Promise<MentionIdentity[]> {
+  if (visible.length === 0) return [];
+  const vouched = new Set(
+    (await verifyMentionIdentities(visible)).map(mentionIdentityKey),
+  );
+  return visible.filter((record) => vouched.has(mentionIdentityKey(record)));
+}
+
+/**
  * The identities a paste is allowed to bind.
  *
  * Three conditions, all necessary. The clipboard has to *carry* the record;
@@ -375,6 +393,10 @@ function mentionIdentityKey(identity: MentionIdentity): string {
  * decorations *and* to the send-time extractor — so the chip re-lights and
  * the original pubkey survives the round trip. Everything dropped here stays
  * readable text that tags nobody.
+ *
+ * The two halves are separately exported because the binder needs the first
+ * one *synchronously*, at paste time, to claim each label it is about to
+ * verify — see `useMentionPasteBinding`.
  */
 export async function selectBindableMentionIdentities({
   html,
@@ -387,13 +409,8 @@ export async function selectBindableMentionIdentities({
   text: string;
   verifyMentionIdentities: VerifyMentionIdentities;
 }): Promise<MentionIdentity[]> {
-  const visible = selectVisibleMentionIdentities(
-    parseMentionClipboardRecords(html),
-    text,
+  return selectVouchedMentionIdentities(
+    selectVisibleMentionIdentities(parseMentionClipboardRecords(html), text),
+    verifyMentionIdentities,
   );
-  if (visible.length === 0) return [];
-  const vouched = new Set(
-    (await verifyMentionIdentities(visible)).map(mentionIdentityKey),
-  );
-  return visible.filter((record) => vouched.has(mentionIdentityKey(record)));
 }

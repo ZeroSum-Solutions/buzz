@@ -28,6 +28,7 @@ import {
   syncMentionHighlightFromProps,
 } from "./mentionHighlightExtension";
 import { handleComposerMentionCopy } from "./composerMentionCopy";
+import { PastedMentionOccurrencesExtension } from "./pastedMentionOccurrences";
 import {
   hardBreakLineBounds,
   MacEmacsTextShortcuts,
@@ -329,6 +330,9 @@ export function useRichTextEditor({
         CodeBlockAfterHardBreak,
         SpoilerMark,
         MentionHighlightExtension,
+        // Lets a pasted mention's identity check, which can outlive the paste,
+        // tell the text it inserted from whatever the user typed next.
+        PastedMentionOccurrencesExtension,
         customEmojiWiring.extension,
         messageLinkWiring.extension,
         Placeholder.configure({

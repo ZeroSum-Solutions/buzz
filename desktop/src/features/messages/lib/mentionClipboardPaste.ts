@@ -1,86 +1,23 @@
 import type { EditorView } from "@tiptap/pm/view";
 
-import {
-  getBuzzCopyKind,
-  selectBindableMentionIdentities,
-  selectVisibleMentionIdentities,
-  type VerifyMentionIdentities,
-} from "./mentionClipboard";
+import { getBuzzCopyKind } from "./mentionClipboard";
+import type { BindPastedMentionIdentities } from "./mentionPasteBinding";
 import { normalizeMentionClipboardContent } from "./normalizeMentionClipboard";
-
-export type RegisterMentionPubkey = (
-  displayName: string,
-  pubkey: string,
-  options?: { isAgent?: boolean },
-) => void;
+import { trackPastedMentionOccurrence } from "./pastedMentionOccurrences";
 
 /**
  * Insert `text` through ProseMirror's plain-text paste pipeline.
  *
  * `view.pasteText` re-enters `handlePaste` with the original event, so the
  * clipboard data is rebuilt with only the plain flavor — otherwise the HTML
- * branch would claim the paste again, forever.
+ * branch would claim the paste again, forever. That re-entry also means this
+ * function's own call carries no identity records, so it cannot double-track
+ * the occurrence its caller is about to claim.
  */
 function pastePlainText(view: EditorView, text: string): void {
   const clipboardData = new DataTransfer();
   clipboardData.setData("text/plain", text);
   view.pasteText(text, new ClipboardEvent("paste", { clipboardData }));
-}
-
-/** Everything the composer currently holds, as the mention matchers read it. */
-function readComposerText(view: EditorView): string {
-  const { doc } = view.state;
-  return doc.textBetween(0, doc.content.size, "\n", "\n");
-}
-
-/**
- * Bind the identities this paste is entitled to, once they check out.
- *
- * Verification can need a relay round trip, so it lands after the insertion.
- * That is safe in both directions: a binding only matters at send time, and
- * nothing is bound until it has been vouched for.
- *
- * The visibility gate runs a second time against what the composer holds when
- * the answer arrives — an in-flight verification whose paste the user has
- * since deleted or replaced must not bind a name nothing on screen shows.
- */
-function bindVerifiedIdentities({
-  html,
-  insertedText,
-  registerMentionPubkey,
-  verifyMentionIdentities,
-  view,
-}: {
-  html: string;
-  insertedText: string;
-  registerMentionPubkey?: RegisterMentionPubkey;
-  verifyMentionIdentities?: VerifyMentionIdentities;
-  view: EditorView;
-}): void {
-  // No verifier, no bindings: an unchecked pair is exactly what must not
-  // become a `p` tag, so a composer that cannot check pastes readable text.
-  if (!registerMentionPubkey || !verifyMentionIdentities) return;
-  void selectBindableMentionIdentities({
-    html,
-    text: insertedText,
-    verifyMentionIdentities,
-  })
-    .then((identities) => {
-      for (const record of selectVisibleMentionIdentities(
-        identities,
-        readComposerText(view),
-      )) {
-        registerMentionPubkey(record.label, record.pubkey, {
-          isAgent: record.isAgent,
-        });
-      }
-    })
-    .catch((error) => {
-      // Nothing is orphaned by giving up here — the pasted words are already
-      // in the composer and simply stay plain. Retrying an identity lookup the
-      // user never asked for would be the surprising behaviour.
-      console.warn("Could not verify pasted mention identities", error);
-    });
 }
 
 /**
@@ -98,33 +35,41 @@ function bindVerifiedIdentities({
  * name known to the composer, so its chip re-lights and the send path recovers
  * the original pubkey. Each branch is judged against the content *it* inserts
  * — the plain flavor is not evidence for what the HTML branch shows, and vice
- * versa — and then against trusted Buzz state, so neither a record the user
- * never sees nor a pair this community cannot confirm binds anything.
+ * versa — and the range it inserted into is tracked, so a verification that
+ * lands later can tell this paste's text from whatever the user typed next.
+ * `bindPastedMentionIdentities` owns the rest; a composer that passes no
+ * binder inserts readable text and binds nothing.
  */
 export function handleMentionClipboardPaste({
+  bindMentionIdentities,
   clipboardData,
   preventDefault,
-  registerMentionPubkey,
-  verifyMentionIdentities,
   view,
 }: {
+  bindMentionIdentities?: BindPastedMentionIdentities;
   clipboardData: DataTransfer;
   preventDefault: () => void;
-  registerMentionPubkey?: RegisterMentionPubkey;
-  verifyMentionIdentities?: VerifyMentionIdentities;
   view: EditorView;
 }): boolean {
   const html = clipboardData.getData("text/html");
   if (!html) return false;
 
-  const bind = (insertedText: string) =>
-    bindVerifiedIdentities({
+  // Captured before the insertion; `pasteText`/`pasteHTML` dispatch
+  // synchronously, so the caret afterwards closes the range this paste owns.
+  const insertedFrom = view.state.selection.from;
+  const bind = (insertedText: string) => {
+    if (!bindMentionIdentities) return;
+    bindMentionIdentities({
       html,
       insertedText,
-      registerMentionPubkey,
-      verifyMentionIdentities,
+      occurrenceId: trackPastedMentionOccurrence(
+        view,
+        insertedFrom,
+        view.state.selection.to,
+      ),
       view,
     });
+  };
 
   const text = clipboardData.getData("text/plain");
   if (getBuzzCopyKind(html) === "markdown" && text) {
