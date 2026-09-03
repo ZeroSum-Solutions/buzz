@@ -2401,7 +2401,7 @@ async fn promote_co_owner(url: &str, channel_id: &str, owner: &Keys, co_owner: &
 /// historical result can only come from the pre-storage relay validator.
 #[tokio::test]
 #[ignore]
-async fn test_nip29_kind_9001_sole_owner_departure_rejected_at_wire() {
+async fn test_nip29_departure_wire_kind_9001_sole_owner_rejected() {
     let url = relay_url();
     let owner = Keys::generate();
     let channel_id = create_test_channel(&owner).await;
@@ -2418,7 +2418,7 @@ async fn test_nip29_kind_9001_sole_owner_departure_rejected_at_wire() {
 /// private channel would be rejected earlier by the generic membership gate.
 #[tokio::test]
 #[ignore]
-async fn test_nip29_kind_9001_nonmember_departure_rejected_at_wire() {
+async fn test_nip29_departure_wire_kind_9001_nonmember_rejected() {
     let url = relay_url();
     let owner = Keys::generate();
     let nonmember = Keys::generate();
@@ -2434,7 +2434,7 @@ async fn test_nip29_kind_9001_nonmember_departure_rejected_at_wire() {
 
 #[tokio::test]
 #[ignore]
-async fn test_nip29_kind_9001_co_owner_departure_allowed_at_wire() {
+async fn test_nip29_departure_wire_kind_9001_co_owner_allowed() {
     let url = relay_url();
     let owner = Keys::generate();
     let co_owner = Keys::generate();
@@ -2450,7 +2450,7 @@ async fn test_nip29_kind_9001_co_owner_departure_allowed_at_wire() {
 /// same historical WebSocket rejection contract as self-removal.
 #[tokio::test]
 #[ignore]
-async fn test_nip29_kind_9022_sole_owner_departure_rejected_at_wire() {
+async fn test_nip29_departure_wire_kind_9022_sole_owner_rejected() {
     let url = relay_url();
     let owner = Keys::generate();
     let channel_id = create_test_channel(&owner).await;
@@ -2465,7 +2465,7 @@ async fn test_nip29_kind_9022_sole_owner_departure_rejected_at_wire() {
 
 #[tokio::test]
 #[ignore]
-async fn test_nip29_kind_9022_nonmember_departure_rejected_at_wire() {
+async fn test_nip29_departure_wire_kind_9022_nonmember_rejected() {
     let url = relay_url();
     let owner = Keys::generate();
     let nonmember = Keys::generate();
@@ -2481,7 +2481,7 @@ async fn test_nip29_kind_9022_nonmember_departure_rejected_at_wire() {
 
 #[tokio::test]
 #[ignore]
-async fn test_nip29_kind_9022_co_owner_departure_allowed_at_wire() {
+async fn test_nip29_departure_wire_kind_9022_co_owner_allowed() {
     let url = relay_url();
     let owner = Keys::generate();
     let co_owner = Keys::generate();
