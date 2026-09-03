@@ -1186,4 +1186,115 @@ mod tests {
             "retry with same jti after slot freed must succeed — 503 must NOT burn the jti"
         );
     }
+
+    // ── Signed fractional verify_at witness ──────────────────────────────────
+    //
+    // Proves that a real ES256-signed command JWT whose `until` NumericDate is
+    // fractional (whole seconds + 0.5) passes through CommandVerifier::verify_at
+    // with the fractional deadline intact in CommandResult.until, and that the
+    // inserted deny entry correctly honours the sub-second boundary.
+    //
+    // Mandatory reds:
+    //  - truncating/zeroing fractional `until` in parse_numeric_date → returned
+    //    deadline loses nanos; boundary assertions fail
+    //  - bypassing verify_at with a synthetic CommandResult → this test goes
+    //    through the real verifier path and the boundary assertions still fail
+    //    when the map is queried with the wrong deadline
+
+    #[test]
+    fn fractional_until_survives_verify_at_and_preserves_boundary() {
+        use chrono::TimeZone;
+
+        let cv = test_command_verifier();
+        let target = target_key();
+
+        // Construct a command JWT with until = T + 0.5s expressed as a fractional
+        // NumericDate float.  The test key's maximum_assertion_age is 3600s so
+        // any `until` within now+3600+skew passes the ceiling check.
+        let now = Utc::now();
+
+        // Pick a whole-second base that is within the assertion-age ceiling.
+        let t_whole_secs = now.timestamp() + 300; // 5 min from now
+        let t_frac_secs: f64 = t_whole_secs as f64 + 0.5; // T + 500ms
+
+        let claims = serde_json::json!({
+            "iss": ISS,
+            "aud": AUD,
+            "sub": PRINCIPAL,
+            "iat": now.timestamp(),
+            "exp": now.timestamp() + 55,
+            "jti": uuid::Uuid::new_v4().to_string(),
+            "method": METHOD,
+            "path": PATH,
+            "cmd": "disconnect",
+            "target_pubkey": target.to_hex(),
+            "until": t_frac_secs,
+        });
+        // Ensure `until` is encoded as a JSON number (float), not a string.
+        assert!(
+            claims["until"].is_f64(),
+            "until must be a JSON number for this test to exercise the fractional path"
+        );
+
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+        header.kid = Some(TEST_KID.to_owned());
+        header.typ = Some(COMMAND_JWT_TYP.to_owned());
+        let key = jsonwebtoken::EncodingKey::from_ec_pem(TEST_EC_PKCS8_PEM.as_bytes())
+            .expect("valid EC PEM");
+        let token = jsonwebtoken::encode(&header, &claims, &key).expect("sign");
+
+        // verify_at with `now` as the controlled clock.
+        let result = cv.verify_at(&token, METHOD, PATH, &target, now);
+        assert!(
+            result.is_ok(),
+            "fractional verify_at must succeed: {result:?}"
+        );
+        let cmd = result.unwrap();
+
+        // The returned CommandResult.until must preserve the fractional nanos.
+        let expected_until = chrono::Utc
+            .timestamp_opt(t_whole_secs, 500_000_000)
+            .single()
+            .expect("representable timestamp");
+        assert_eq!(
+            cmd.until, expected_until,
+            "CommandResult.until must retain the 500ms fractional nanos from the signed JWT"
+        );
+
+        // The deny entry inserted by verify_at must respect the sub-second boundary.
+        let deny_map = cv.deny_map();
+
+        // Denied immediately after T (T+1ns, well inside T+500ms).
+        let now_after_t = chrono::Utc.timestamp_opt(t_whole_secs, 1).single().unwrap();
+        assert!(
+            deny_map.is_denied(ISS, &target, now_after_t),
+            "must be denied at T+1ns (deadline is T+500ms)"
+        );
+
+        // Denied at T+499_999_999ns (just before the boundary).
+        let now_before_boundary = chrono::Utc
+            .timestamp_opt(t_whole_secs, 499_999_999)
+            .single()
+            .unwrap();
+        assert!(
+            deny_map.is_denied(ISS, &target, now_before_boundary),
+            "must be denied at deadline - 1ns"
+        );
+
+        // Admitted at exact equality (now == until): `now < until` is false at equality.
+        assert!(
+            !deny_map.is_denied(ISS, &target, expected_until),
+            "must be admitted at exact equality with the fractional deadline"
+        );
+
+        // Also admitted past the deadline.
+        let now_past = chrono::Utc
+            .timestamp_opt(t_whole_secs + 1, 0)
+            .single()
+            .unwrap();
+        assert!(
+            !deny_map.is_denied(ISS, &target, now_past),
+            "must be admitted past the fractional deadline"
+        );
+    }
 }

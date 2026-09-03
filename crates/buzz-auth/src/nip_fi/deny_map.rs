@@ -18,6 +18,11 @@
 //!   the spec requires `503` here and neither the jti nor the deny entry is
 //!   recorded. [FI-TRACE-DENY-SET]
 //! * **Cross-issuer isolation**: capacity of issuer A MUST NOT affect issuer B.
+//! * **Cross-pod capacity miss**: `merge_cross_pod_deny` returning `CapacityExceeded`
+//!   preserves the existing shard contents; the caller closes the delivered
+//!   target's sessions and reports/metrics the outcome.  No issuer-wide denial
+//!   is synthesized.  Async propagation loss with issuer re-push is the
+//!   sanctioned recovery. [NIP-FI.md:306-336]
 //! * **jti reservation** and **deny-entry insertion** are performed atomically
 //!   in one lock scope (both or neither). [VerifyCommandJwt step 7]
 //! * **Issuer-global scope**: the deny applies across all communities served
@@ -30,11 +35,6 @@ use dashmap::DashMap;
 use nostr::PublicKey;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-
-// Test-only type alias for the pre-lock hook, silencing the `clippy::type_complexity`
-// lint that fires on the raw trait-object form under `#[cfg(test)] -D warnings`.
-#[cfg(test)]
-type PreLockHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -53,14 +53,6 @@ pub struct DenySetFull;
 ///
 /// The shard mutex is acquired once per `AtomicReserveJtiAndDenyEntry` call
 /// so both mutations happen under the same lock (both-or-neither atomicity).
-///
-/// ## Fail-closed blocked bit
-///
-/// `blocked` is set by `merge_cross_pod_deny` when `remote_merge` returns
-/// `CapacityExceeded` or the mutex is poisoned.  Once set it is never cleared
-/// (only restart recovers).  `is_denied` evaluates `blocked` first, while
-/// holding the same mutex, giving one linearization point: an admission that
-/// acquires the shard lock after the transition observes `blocked = true`.
 struct IssuerShard {
     /// Active deny entries: hex-encoded pubkey → until.
     entries: HashMap<String, DateTime<Utc>>,
@@ -75,12 +67,6 @@ struct IssuerShard {
     /// Set to `capacity * 2` at construction for O(capacity) memory with
     /// headroom for in-flight update commands on already-denied keys.
     max_jti_count: usize,
-    /// Fail-closed block flag.
-    ///
-    /// Set when a cross-pod merge hits capacity or the shard mutex is poisoned.
-    /// Once `true`, every admission for this issuer returns `true` regardless
-    /// of shard contents.  Only pod restart clears it.  [NIP-FI.md:328-336]
-    blocked: bool,
 }
 
 impl IssuerShard {
@@ -94,7 +80,6 @@ impl IssuerShard {
             // one in-flight update command per already-denied key without
             // blocking normal operation.  Still O(capacity) memory.
             max_jti_count: capacity.saturating_mul(2).max(1),
-            blocked: false,
         }
     }
 
@@ -110,12 +95,6 @@ impl IssuerShard {
             .get(pubkey_hex)
             .map(|until| now < *until)
             .unwrap_or(false)
-    }
-
-    /// True if `blocked || entry active`. Checks blocked first so the single
-    /// lock call covers both the block state and the entry lookup atomically.
-    fn is_denied_or_blocked(&self, pubkey_hex: &str, now: DateTime<Utc>) -> bool {
-        self.blocked || self.is_denied(pubkey_hex, now)
     }
 
     /// Attempt the atomic jti-reservation + deny-entry insertion.
@@ -225,7 +204,9 @@ pub enum CrossPodMergeResult {
     Merged,
     /// Issuer is not locally configured; message rejected.
     UnknownIssuer,
-    /// Per-issuer capacity ceiling reached; issuer is fail-closed.
+    /// Per-issuer capacity ceiling reached; the missed entry was not recorded.
+    /// The caller should close any sessions matching the delivered target despite
+    /// the capacity miss, and report/metric the outcome.
     CapacityExceeded,
     /// Shard mutex is poisoned; issuer is fail-closed.
     ShardPoisoned,
@@ -247,19 +228,6 @@ pub struct NipFiDenyMap {
     shards: Arc<DashMap<String, Mutex<IssuerShard>>>,
     /// Default per-issuer capacity, used when no issuer-specific override exists.
     default_capacity: usize,
-    /// Optional test-only hook invoked by `is_denied` after resolving the shard
-    /// and immediately before acquiring the shard lock.
-    ///
-    /// Used by `remote_capacity_transition_linearizes_before_waiting_admission`
-    /// to park admission between its shard-resolve and the lock, allowing
-    /// a concurrent capacity-exhaustion transition to race against a real
-    /// `is_denied` call.  Inert in production — the field is `None` unless set
-    /// by a test via `set_pre_lock_hook_for_test`.
-    ///
-    /// The hook receives the issuer string so it can selectively park only the
-    /// target issuer's admission, leaving other issuers unaffected.
-    #[cfg(test)]
-    pre_lock_hook: Option<PreLockHook>,
 }
 
 /// A per-issuer capacity override supplied at construction time.
@@ -287,8 +255,6 @@ impl NipFiDenyMap {
         Self {
             shards: Arc::new(shards),
             default_capacity,
-            #[cfg(test)]
-            pre_lock_hook: None,
         }
     }
 
@@ -299,33 +265,13 @@ impl NipFiDenyMap {
     ///
     /// Fails **closed**: a poisoned shard lock returns `true` (deny) so that a
     /// damaged shard cannot silently admit a denied pubkey.
-    ///
-    /// Also fails closed for issuers whose shard has `blocked = true` —
-    /// set when a cross-pod merge hits capacity or the shard mutex is poisoned.
-    /// Every key under a blocked issuer is denied until restart.
-    /// [NIP-FI.md:328-336]
-    ///
-    /// ## Linearization
-    ///
-    /// The `blocked` bit is evaluated while holding the shard lock, giving one
-    /// linearization point shared with `merge_cross_pod_deny`: an admission
-    /// ordered before the capacity transition acquires the lock may observe
-    /// `blocked = false` (and admit or deny based on the entry alone); an
-    /// admission that acquires the lock after the transition must observe
-    /// `blocked = true`.
     pub fn is_denied(&self, issuer: &str, pubkey: &PublicKey, now: DateTime<Utc>) -> bool {
         let pubkey_hex = pubkey.to_hex();
         match self.shards.get(issuer) {
-            Some(shard) => {
-                #[cfg(test)]
-                if let Some(hook) = &self.pre_lock_hook {
-                    hook(issuer);
-                }
-                shard
-                    .lock()
-                    .map(|guard| guard.is_denied_or_blocked(&pubkey_hex, now))
-                    .unwrap_or(true) // poisoned shard → fail closed (deny)
-            }
+            Some(shard) => shard
+                .lock()
+                .map(|guard| guard.is_denied(&pubkey_hex, now))
+                .unwrap_or(true), // poisoned shard → fail closed (deny)
             None => false,
         }
     }
@@ -373,11 +319,10 @@ impl NipFiDenyMap {
     /// issuer returns [`CrossPodMergeResult::UnknownIssuer`] so the consumer
     /// can reject without allocating state.
     ///
-    /// Capacity exhaustion and shard poisoning both return fail-closed results
-    /// **and** set `shard.blocked = true` under the same lock.  Once blocked,
-    /// `is_denied` returns `true` for every key under that issuer — the pod
-    /// cannot safely admit any key when it cannot record the deny entry.
-    /// The blocked state persists until restart.  [NIP-FI.md:328-336]
+    /// On capacity exhaustion, returns [`CrossPodMergeResult::CapacityExceeded`]
+    /// without altering the shard.  The caller is responsible for closing the
+    /// delivered target's sessions and reporting/metricing the outcome; no
+    /// issuer-wide denial is synthesized.  [NIP-FI.md:306-336]
     pub fn merge_cross_pod_deny(
         &self,
         issuer: &str,
@@ -391,20 +336,20 @@ impl NipFiDenyMap {
             None => CrossPodMergeResult::UnknownIssuer,
             Some(shard) => match shard.lock() {
                 Err(_) => {
-                    // Shard is poisoned — we cannot obtain the lock to set the
-                    // blocked bit inside the shard.  A poisoned mutex already
-                    // causes `is_denied` to return `true` (the `unwrap_or(true)`
-                    // path), so the issuer is implicitly fail-closed without
-                    // needing an explicit `blocked` write.  [NIP-FI.md:328-336]
+                    // Shard is poisoned — we cannot obtain the lock.  A poisoned
+                    // mutex already causes `is_denied` to return `true` (the
+                    // `unwrap_or(true)` path), so the issuer is implicitly
+                    // fail-closed without any explicit write.
                     CrossPodMergeResult::ShardPoisoned
                 }
                 Ok(mut guard) => match guard.remote_merge(&pubkey_hex, until, now) {
                     Ok(()) => CrossPodMergeResult::Merged,
                     Err(ReserveError::CapacityExceeded) => {
-                        // Cannot record the deny entry — set the shard's blocked
-                        // bit under the same lock so admission reads it atomically.
-                        // [NIP-FI.md:328-336]
-                        guard.blocked = true;
+                        // Cannot record the deny entry — return the outcome so
+                        // the caller can close the delivered target's sessions
+                        // and report/metric the capacity miss.  No issuer-wide
+                        // denial is synthesized; active entries are preserved.
+                        // [NIP-FI.md:306-336]
                         CrossPodMergeResult::CapacityExceeded
                     }
                     Err(ReserveError::JtiAlreadyReserved) => {
@@ -422,23 +367,6 @@ impl NipFiDenyMap {
     /// Returns the pubkey_hex for downstream use.
     pub fn pubkey_hex(pubkey: &PublicKey) -> String {
         pubkey.to_hex()
-    }
-
-    /// Install a test-only hook that is called by `is_denied` after resolving
-    /// the issuer shard and immediately before acquiring the shard lock.
-    ///
-    /// Use this in concurrency tests to park admission at a specific point in
-    /// its execution so a concurrent capacity-exhaustion merge can race against
-    /// it.  The hook is invoked with the issuer string so tests can selectively
-    /// target one issuer.
-    ///
-    /// This method is only available in test builds (`#[cfg(test)]`).
-    #[cfg(test)]
-    pub fn set_pre_lock_hook_for_test<F>(&mut self, hook: F)
-    where
-        F: Fn(&str) + Send + Sync + 'static,
-    {
-        self.pre_lock_hook = Some(Arc::new(hook));
     }
 }
 
@@ -886,86 +814,123 @@ mod tests {
         );
     }
 
-    #[test]
-    fn remote_merge_capacity_exceeded_marks_issuer_blocked_and_denies_all_keys() {
-        // Capacity = 1, two distinct keys.  After capacity exhaustion the issuer
-        // is blocked: is_denied returns true for ALL keys under that issuer,
-        // not just the target.  This satisfies NIP-FI.md:328-336: every serving
-        // process must receive the deny entry; when the shard is full the only
-        // fail-closed posture is to block the issuer.
-        let m = NipFiDenyMap::new(
-            1,
-            vec![IssuerCapacity {
-                issuer: iss().to_owned(),
-                capacity: 1,
-            }],
-        );
-        let now = Utc::now();
-        let until = now + Duration::seconds(300);
-        let k1 = key();
-        let k2 = key();
-        let k_unrelated = key(); // a key that was never targeted
-
-        assert_eq!(
-            m.merge_cross_pod_deny(iss(), &k1, until, now),
-            CrossPodMergeResult::Merged
-        );
-        assert_eq!(
-            m.merge_cross_pod_deny(iss(), &k2, until, now),
-            CrossPodMergeResult::CapacityExceeded,
-            "second key with cap=1 must return CapacityExceeded"
-        );
-        // k2 was NOT inserted — but the issuer is now blocked.
-        assert!(
-            !m.shards
-                .get(iss())
-                .unwrap()
-                .lock()
-                .unwrap()
-                .is_denied(&k2.to_hex(), now),
-            "k2 has no deny entry in the shard (entry was not inserted)"
-        );
-        // is_denied returns true for k2 via the issuer-level block.
-        assert!(
-            m.is_denied(iss(), &k2, now),
-            "k2 must be denied via issuer-level block after CapacityExceeded"
-        );
-        // is_denied returns true for an unrelated key too — whole issuer is blocked.
-        assert!(
-            m.is_denied(iss(), &k_unrelated, now),
-            "unrelated key must also be denied under blocked issuer"
-        );
-    }
+    // ── remote_merge: capacity oracle (two-pod divergent model) ──────────────
+    //
+    // Verifies that ordinary remote capacity exhaustion leaves active entries
+    // intact, returns the capacity outcome, and does NOT synthesize issuer-wide
+    // denial or unrelated-key denial.  Uses two capacity-1 maps modeling
+    // divergent pods with the same issuer.
+    //
+    // Mandatory reds:
+    //  (a) guard/evict the active entry on capacity → original k1 entry gone;
+    //      entry-retention assertion fails
+    //  (b) synthesize issuer-wide denial (set blocked) → missed-target and
+    //      unrelated-key is_denied assertions fail
+    //  (c) admit at exact equality (use <= instead of <) → equality assertion fails
 
     #[test]
-    fn remote_merge_capacity_exceeded_returns_correct_result() {
-        // Capacity = 1, two distinct keys.
-        let m = NipFiDenyMap::new(
-            1,
-            vec![IssuerCapacity {
-                issuer: iss().to_owned(),
-                capacity: 1,
-            }],
-        );
+    fn remote_merge_capacity_exceeded_preserves_active_entry_and_does_not_deny_missed_or_unrelated()
+    {
+        // Two capacity-1 maps modeling divergent pods (pod A, pod B).
+        // Pod A locally contains target k_a; pod B locally contains target k_b.
+        // Both have the same finite TTL.
         let now = Utc::now();
         let until = now + Duration::seconds(300);
-        let k1 = key();
-        let k2 = key();
+        let k_a = key();
+        let k_b = key();
+        let k_unrelated = key();
 
+        let make_map = |local_key: &PublicKey| {
+            let m = NipFiDenyMap::new(
+                1,
+                vec![IssuerCapacity {
+                    issuer: iss().to_owned(),
+                    capacity: 1,
+                }],
+            );
+            // Pre-fill with the local target.
+            m.atomic_reserve_and_insert(iss(), "jti-local", until, local_key, until, now)
+                .expect("local pre-fill must succeed");
+            m
+        };
+
+        // Pod A map: has k_a, receives k_b cross-pod.
+        let map_a = make_map(&k_a);
+        let result_a = map_a.merge_cross_pod_deny(iss(), &k_b, until, now);
         assert_eq!(
-            m.merge_cross_pod_deny(iss(), &k1, until, now),
-            CrossPodMergeResult::Merged
-        );
-        assert_eq!(
-            m.merge_cross_pod_deny(iss(), &k2, until, now),
+            result_a,
             CrossPodMergeResult::CapacityExceeded,
-            "second key with cap=1 must return CapacityExceeded"
+            "cross-delivery of k_b to pod A (capacity=1, already holds k_a) must return CapacityExceeded"
         );
-        // k2's shard entry was NOT inserted (capacity guard held), but is_denied
-        // returns true because the issuer-level block was set.
+        // Pod A still has its original k_a entry — capacity miss must not evict.
         assert!(
-            m.is_denied(iss(), &k2, now),
-            "k2 must be denied after CapacityExceeded (issuer-level block)"
+            map_a.is_denied(iss(), &k_a, now),
+            "pod A must still deny k_a after capacity miss"
+        );
+        // Pod A must NOT deny the missed k_b via issuer-wide block.
+        assert!(
+            !map_a.is_denied(iss(), &k_b, now),
+            "pod A must NOT deny missed target k_b — no issuer-wide denial on capacity miss"
+        );
+        // Pod A must NOT deny an unrelated key.
+        assert!(
+            !map_a.is_denied(iss(), &k_unrelated, now),
+            "pod A must NOT deny unrelated key after capacity miss"
+        );
+
+        // Pod B map: has k_b, receives k_a cross-pod.
+        let map_b = make_map(&k_b);
+        let result_b = map_b.merge_cross_pod_deny(iss(), &k_a, until, now);
+        assert_eq!(
+            result_b,
+            CrossPodMergeResult::CapacityExceeded,
+            "cross-delivery of k_a to pod B (capacity=1, already holds k_b) must return CapacityExceeded"
+        );
+        assert!(
+            map_b.is_denied(iss(), &k_b, now),
+            "pod B must still deny k_b after capacity miss"
+        );
+        assert!(
+            !map_b.is_denied(iss(), &k_a, now),
+            "pod B must NOT deny missed target k_a"
+        );
+
+        // At exact equality with the TTL both entries are admitted (now < until fails).
+        assert!(
+            !map_a.is_denied(iss(), &k_a, until),
+            "k_a must be admitted at exact equality with TTL"
+        );
+        assert!(
+            !map_b.is_denied(iss(), &k_b, until),
+            "k_b must be admitted at exact equality with TTL"
+        );
+
+        // Delayed already-expired remote entry: may return capacity outcome but
+        // must not alter the live entry or deny the expired target / unrelated key.
+        let expired_until = now - Duration::seconds(1);
+        let map_c = make_map(&k_a); // pre-filled with k_a active
+        let result_c = map_c.merge_cross_pod_deny(iss(), &k_b, expired_until, now);
+        // Expired remote entry is treated as a new (already-expired) entry; since
+        // the shard is at capacity the remote_merge returns CapacityExceeded.
+        // The live k_a entry must remain; k_b and k_unrelated must not be denied.
+        assert!(
+            map_c.is_denied(iss(), &k_a, now),
+            "live k_a must survive a capacity-miss with expired remote target"
+        );
+        assert!(
+            !map_c.is_denied(iss(), &k_b, now),
+            "expired k_b must not be map-denied after capacity miss"
+        );
+        assert!(
+            !map_c.is_denied(iss(), &k_unrelated, now),
+            "unrelated key must not be denied after capacity miss with expired remote"
+        );
+        // Confirm the result is CapacityExceeded (expired entry still counts as
+        // new against a full shard — it has no active existing entry).
+        assert_eq!(
+            result_c,
+            CrossPodMergeResult::CapacityExceeded,
+            "expired remote against full shard must return CapacityExceeded"
         );
     }
 
@@ -995,149 +960,6 @@ mod tests {
             m.merge_cross_pod_deny(iss, &k, until, Utc::now()),
             CrossPodMergeResult::ShardPoisoned,
             "poisoned shard must return ShardPoisoned"
-        );
-    }
-
-    // ── Blocker 1: linearizable fail-closed transition oracle ─────────────────
-    //
-    // Verifies that an admission that has passed the shard-resolve step but has
-    // not yet acquired the shard lock MUST observe `blocked = true` after a
-    // concurrent capacity-exhaustion merge sets it.
-    //
-    // Mechanism: a test-only hook in the real `is_denied()` fires after shard
-    // resolve and before `shard.lock()`.  Two barriers synchronize a parked
-    // admission thread and the test-thread merge so the ordering is deterministic.
-    //
-    // Red mutations:
-    //  - move blocked check before the mutex (outside the lock) → race window reopens
-    //  - omit `guard.blocked = true` in merge_cross_pod_deny → blocked never set
-    //  - use `is_denied(...)` instead of `is_denied_or_blocked(...)` → blocked ignored
-
-    #[test]
-    fn remote_capacity_transition_linearizes_before_waiting_admission() {
-        use std::sync::Barrier;
-
-        let iss_str = "https://linearize.example.com";
-        // Capacity = 1 so the first merge succeeds and the second hits capacity.
-        let mut m = NipFiDenyMap::new(
-            1,
-            vec![IssuerCapacity {
-                issuer: iss_str.to_owned(),
-                capacity: 1,
-            }],
-        );
-        let now = Utc::now();
-        let until = now + Duration::seconds(300);
-        let k_a = key(); // first merge fills the shard
-        let k_b = key(); // second merge exhausts capacity → sets blocked
-
-        // Fill the one available slot with key A.
-        assert_eq!(
-            m.merge_cross_pod_deny(iss_str, &k_a, until, now),
-            CrossPodMergeResult::Merged,
-            "first merge must succeed"
-        );
-
-        // Two barriers:
-        //  barrier_before_lock: test-thread waits until admission is parked at the hook
-        //  barrier_release:     test-thread signals admission to continue after merge
-        let barrier_before_lock = Arc::new(Barrier::new(2));
-        let barrier_release = Arc::new(Barrier::new(2));
-
-        let b1 = Arc::clone(&barrier_before_lock);
-        let b2 = Arc::clone(&barrier_release);
-
-        // Install the hook: signals test-thread then parks until released.
-        m.set_pre_lock_hook_for_test(move |_issuer| {
-            b1.wait(); // signal: "I am before the lock"
-            b2.wait(); // park: wait for test-thread to complete the merge
-        });
-
-        let m_arc = Arc::new(m);
-        let m_for_admission = Arc::clone(&m_arc);
-
-        // Spawn admission for key B.  The hook will park it between shard-resolve
-        // and lock acquisition, then the main thread will exhaust capacity and
-        // set blocked, then release admission.  Admission must return true.
-        let admission_handle =
-            std::thread::spawn(move || m_for_admission.is_denied(iss_str, &k_b, now));
-
-        // Wait until the admission thread is parked at the hook (before the lock).
-        barrier_before_lock.wait();
-
-        // Now merge key B from the test thread.  Capacity is 1, already holds key A
-        // — this sets blocked = true under the lock.
-        assert_eq!(
-            m_arc.merge_cross_pod_deny(iss_str, &k_b, until, now),
-            CrossPodMergeResult::CapacityExceeded,
-            "second merge must hit capacity and set blocked"
-        );
-
-        // Release the parked admission.  It now acquires the lock and must see
-        // blocked = true — returning true (denied), not false (admitted).
-        barrier_release.wait();
-
-        let result = admission_handle
-            .join()
-            .expect("admission thread must not panic");
-        assert!(
-            result,
-            "admission after capacity transition must return true (fail closed, linearized)"
-        );
-    }
-
-    // ── Blocker 1: consumer capacity oracle ───────────────────────────────────
-    //
-    // Verifies that the consumer application seam (apply_nip_fi_disconnect, added
-    // in section 3) propagates capacity exhaustion through merge_cross_pod_deny
-    // and that is_denied returns true for both the targeted key and an unrelated
-    // key after the transition.  Uses the map interface directly (the full seam
-    // test lives in nip_fi.rs; this map-level oracle confirms the contract holds
-    // at the map layer independently).
-
-    #[test]
-    fn capacity_exhaustion_blocks_targeted_and_unrelated_keys() {
-        let m = NipFiDenyMap::new(
-            1,
-            vec![IssuerCapacity {
-                issuer: iss().to_owned(),
-                capacity: 1,
-            }],
-        );
-        let now = Utc::now();
-        let until = now + Duration::seconds(300);
-        let k_a = key();
-        let k_b = key();
-        let k_unrelated = key();
-
-        // Fill slot with key A.
-        assert_eq!(
-            m.merge_cross_pod_deny(iss(), &k_a, until, now),
-            CrossPodMergeResult::Merged
-        );
-        // Key B exhausts capacity → sets blocked.
-        assert_eq!(
-            m.merge_cross_pod_deny(iss(), &k_b, until, now),
-            CrossPodMergeResult::CapacityExceeded
-        );
-        // k_b has no deny entry in the shard (remote_merge was not applied).
-        assert!(
-            !m.shards
-                .get(iss())
-                .unwrap()
-                .lock()
-                .unwrap()
-                .is_denied(&k_b.to_hex(), now),
-            "k_b has no shard entry — only the blocked bit gates it"
-        );
-        // is_denied checks blocked inside the lock → both keys denied.
-        assert!(
-            m.is_denied(iss(), &k_b, now),
-            "targeted key must be denied via blocked bit"
-        );
-        assert!(
-            m.is_denied(iss(), &k_unrelated, now),
-            "unrelated key must also be denied under blocked issuer"
         );
     }
 

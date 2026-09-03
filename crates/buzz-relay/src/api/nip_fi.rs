@@ -337,9 +337,9 @@ pub fn apply_nip_fi_disconnect(
         }
         CrossPodMergeResult::CapacityExceeded => {
             tracing::warn!(
-                "nip-fi cross-pod: deny set full for issuer — sessions closed without deny entry (fail-closed posture)"
+                "nip-fi cross-pod: deny set full for issuer — closing targeted sessions without map entry (capacity miss; issuer re-push is the recovery path)"
             );
-            close_sessions("capacity-exceeded failsafe");
+            close_sessions("capacity-exceeded");
             metrics::counter!("buzz_nip_fi_cross_pod_capacity_exceeded_total").increment(1);
         }
         CrossPodMergeResult::ShardPoisoned => {
@@ -896,9 +896,7 @@ mod route_integration_tests {
         // Build a minimal AppState with NIP-FI S4 components wired.
         // Uses lazy/invalid DB+Redis — only nip_fi fields and conn_manager matter.
         use crate::state::AppState;
-        let mut config = crate::config::Config::from_env().expect("default config loads");
-        config.database_url = "postgres://buzz:buzz@127.0.0.1:1/buzz".to_string();
-        config.redis_url = "redis://127.0.0.1:1".to_string();
+        let config = crate::config::Config::hermetic_for_test();
 
         let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
         let db = buzz_db::Db::from_pool(pool.clone());
@@ -1000,9 +998,7 @@ mod route_integration_tests {
         // `production_assembly_build_nip_fi_command_components_wires_both_fields`.
         // Build a state without the verifier.
         let no_verifier_state = {
-            let mut config = crate::config::Config::from_env().expect("default config loads");
-            config.database_url = "postgres://buzz:buzz@127.0.0.1:1/buzz".to_string();
-            config.redis_url = "redis://127.0.0.1:1".to_string();
+            let config = crate::config::Config::hermetic_for_test();
             let pool = sqlx::PgPool::connect_lazy(&config.database_url).unwrap();
             let db = buzz_db::Db::from_pool(pool.clone());
             let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
@@ -1238,32 +1234,32 @@ mod route_integration_tests {
         );
     }
 
-    // ── Test: blocker 1 — consumer_capacity_result_denies_target_and_unrelated_admission ─────
+    // ── Test: consumer capacity oracle (replacement per NIP-FI.md:306-336) ─────
     //
-    // Uses apply_nip_fi_disconnect (the production consumer seam) to feed a capacity-exhausting
-    // message. After the capacity transition, is_denied must return true for both the target
-    // and an unrelated key.
+    // Drives apply_nip_fi_disconnect with a delivered target that encounters a
+    // pre-filled capacity-1 map.  Asserts Applied(CapacityExceeded); the
+    // pre-existing map key remains denied only until its TTL; the missed target
+    // and unrelated key are NOT map-denied; targeted live sessions are closed;
+    // unrelated live peers remain open.
     //
-    // Red mutations: consumer stops calling merge_cross_pod_deny → blocked never set;
-    // capacity transition stops setting blocked → unrelated key admitted;
-    // admission ignores blocked → both keys admitted.
+    // Mandatory reds:
+    //  (a) consumer stops calling merge_cross_pod_deny → Applied(CapacityExceeded) missed;
+    //      targeted session close assertion fails
+    //  (b) reintroduce issuer-wide blocking → missed-target is_denied assertion fails
+    //  (c) consumer skips close_sessions on CapacityExceeded → targeted cancel assertion fails
 
     #[tokio::test]
-    async fn consumer_capacity_result_denies_target_and_unrelated_admission() {
+    async fn consumer_capacity_miss_closes_targeted_session_without_map_denial() {
         use super::apply_nip_fi_disconnect;
         use super::NipFiDisconnectApplyResult;
+        use crate::state::CommunityConnectionControl;
         use buzz_auth::CrossPodMergeResult;
+        use tokio_util::sync::CancellationToken;
 
-        // capacity=1: first message fills it; second message exhausts capacity → blocked.
-        // We need a state with TEST_ISS in config.nip_fi.registry so apply_nip_fi_disconnect
-        // passes the issuer validation step and reaches the merge path.
         let state = {
-            let mut config = crate::config::Config::from_env().expect("default config loads");
-            config.database_url = "postgres://buzz:buzz@127.0.0.1:1/buzz".to_string();
-            config.redis_url = "redis://127.0.0.1:1".to_string();
+            let mut config = crate::config::Config::hermetic_for_test();
             // Wire TEST_ISS into the NIP-FI registry so the consumer seam accepts it.
             config.nip_fi.registry.insert(test_issuer_policy());
-
             let pool = sqlx::PgPool::connect_lazy(&config.database_url).unwrap();
             let db = buzz_db::Db::from_pool(pool.clone());
             let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
@@ -1294,7 +1290,7 @@ mod route_integration_tests {
                 nostr::Keys::generate(),
                 media_storage,
             );
-            // Wire deny map with capacity=1 so the second consumer call hits capacity.
+            // Capacity=1, pre-filled with k_a so the second delivery (k_b) hits capacity.
             let deny_map = Arc::new(buzz_auth::NipFiDenyMap::new(
                 1,
                 vec![buzz_auth::IssuerCapacity {
@@ -1313,7 +1309,7 @@ mod route_integration_tests {
         let k_b = nostr::Keys::generate().public_key();
         let k_unrelated = nostr::Keys::generate().public_key();
 
-        // First message: fills the one slot with key A.
+        // Pre-fill slot with k_a via the consumer seam.
         let msg_a = buzz_pubsub::NipFiDisconnect {
             issuer: TEST_ISS.to_owned(),
             pubkey_bytes: k_a.to_bytes().to_vec(),
@@ -1327,7 +1323,21 @@ mod route_integration_tests {
             "first consumer message must merge"
         );
 
-        // Second message: capacity exhausted → blocked = true.
+        // Register live sessions for targeted (k_b) and unrelated (k_unrelated) peers.
+        let cancel_b = CancellationToken::new();
+        let cancel_unrelated = CancellationToken::new();
+        let registry = &state.community_connections;
+        let community = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::new_v4());
+
+        let ctrl_b = CommunityConnectionControl::new(cancel_b.clone());
+        ctrl_b.set_proven_pubkey(k_b.to_bytes().to_vec());
+        let _guard_b = registry.register(uuid::Uuid::new_v4(), community, ctrl_b);
+
+        let ctrl_unrelated = CommunityConnectionControl::new(cancel_unrelated.clone());
+        ctrl_unrelated.set_proven_pubkey(k_unrelated.to_bytes().to_vec());
+        let _guard_unrelated = registry.register(uuid::Uuid::new_v4(), community, ctrl_unrelated);
+
+        // Deliver k_b — capacity exhausted, no map entry added.
         let msg_b = buzz_pubsub::NipFiDisconnect {
             issuer: TEST_ISS.to_owned(),
             pubkey_bytes: k_b.to_bytes().to_vec(),
@@ -1341,17 +1351,267 @@ mod route_integration_tests {
             "second consumer message must hit capacity"
         );
 
+        // Targeted session (k_b) must be cancelled despite no map entry.
+        assert!(
+            cancel_b.is_cancelled(),
+            "targeted session must be closed even on CapacityExceeded"
+        );
+        // Unrelated session must NOT be cancelled.
+        assert!(
+            !cancel_unrelated.is_cancelled(),
+            "unrelated session must remain open after capacity miss"
+        );
+
+        // Map checks — no issuer-wide denial synthesized.
         let deny_map = state.nip_fi_deny_map.as_deref().expect("deny map present");
 
-        // Target key B is denied via the blocked bit.
+        // k_a is still denied (its entry was not evicted).
         assert!(
-            deny_map.is_denied(TEST_ISS, &k_b, now),
-            "targeted key must be denied after consumer capacity exhaustion"
+            deny_map.is_denied(TEST_ISS, &k_a, now),
+            "pre-existing k_a entry must remain denied"
         );
-        // Unrelated key C is also denied via the blocked bit.
+        // k_b has no map entry — NOT denied via the map.
         assert!(
-            deny_map.is_denied(TEST_ISS, &k_unrelated, now),
-            "unrelated key must be denied after consumer capacity exhaustion (issuer blocked)"
+            !deny_map.is_denied(TEST_ISS, &k_b, now),
+            "missed target k_b must NOT be map-denied after capacity miss"
+        );
+        // Unrelated key is not map-denied.
+        assert!(
+            !deny_map.is_denied(TEST_ISS, &k_unrelated, now),
+            "unrelated key must NOT be denied after capacity miss"
+        );
+        // At exact equality with k_a's TTL, k_a is admitted.
+        let at_ttl = chrono::DateTime::from_timestamp(until_unix, 0).unwrap();
+        assert!(
+            !deny_map.is_denied(TEST_ISS, &k_a, at_ttl),
+            "k_a must be admitted at exact equality with its TTL"
+        );
+    }
+
+    // ── Test: Item 5 — dual-transport registration witness ──────────────────────────────────────
+    //
+    // Proves that the production audio post-auth registration helper
+    // (`audio_post_auth_register`) is the seam used to register audio connections
+    // in the fan-out, and that apply_nip_fi_disconnect drives both connection
+    // registries (ordinary WS via conn_manager and audio via community_connections).
+    //
+    // Four sub-claims verified:
+    //  1. targeted ordinary WS is cancelled (conn_manager path)
+    //  2. targeted audio is cancelled with AuthorizationDenied (community_connections path,
+    //     registered via the production audio_post_auth_register helper)
+    //  3. unrelated ordinary WS and audio peers remain open
+    //  4. capacity-failure variant: the delivered target still closes both transports
+    //     despite no map entry
+    //
+    // Mandatory reds:
+    //  - no-op audio_post_auth_register leaves targeted audio open
+    //  - removing community_connections from the fan-out leaves audio open
+    //  - removing conn_manager from the fan-out leaves ordinary WS open
+    //  - broad/non-key-exact matching would close unrelated peers (asserted absent)
+    //  - skipping close on CapacityExceeded leaves targeted sessions open (capacity variant)
+
+    #[tokio::test]
+    async fn dual_transport_registration_witness() {
+        use super::apply_nip_fi_disconnect;
+        use super::NipFiDisconnectApplyResult;
+        use crate::audio::handler::audio_post_auth_register;
+        use crate::state::CommunityConnectionControl;
+        use buzz_auth::CrossPodMergeResult;
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+        use uuid::Uuid;
+
+        let community = buzz_core::tenant::CommunityId::from_uuid(Uuid::new_v4());
+
+        // ── Helper: register an ordinary WS connection and return (conn_id, cancel). ──
+        // Mirrors how connection.rs registers after NIP-42 auth: register first, then
+        // call set_authenticated_pubkey.
+        let register_ws =
+            |state: &crate::state::AppState, pubkey_bytes: Vec<u8>| -> (Uuid, CancellationToken) {
+                let conn_id = Uuid::new_v4();
+                let (tx, _rx) = mpsc::channel(8);
+                let (ctrl_tx, _ctrl_rx) = mpsc::channel(8);
+                let cancel = CancellationToken::new();
+                let bp = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+                state.conn_manager.register(
+                    conn_id,
+                    tx,
+                    ctrl_tx,
+                    None,
+                    cancel.clone(),
+                    community,
+                    bp,
+                    std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+                    3,
+                );
+                state
+                    .conn_manager
+                    .set_authenticated_pubkey(conn_id, pubkey_bytes);
+                (conn_id, cancel)
+            };
+
+        // ── Build state: capacity 2 so the Merged case succeeds for the target. ──
+        let state = {
+            let mut config = crate::config::Config::hermetic_for_test();
+            // Wire TEST_ISS into the NIP-FI registry so apply_nip_fi_disconnect accepts it.
+            config.nip_fi.registry.insert(test_issuer_policy());
+            let pool = sqlx::PgPool::connect_lazy(&config.database_url).unwrap();
+            let db = buzz_db::Db::from_pool(pool.clone());
+            let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .unwrap();
+            let pubsub = Arc::new(
+                buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                    .await
+                    .unwrap(),
+            );
+            let audit = buzz_audit::AuditService::new(pool.clone());
+            let auth = buzz_auth::AuthService::new(config.auth.clone());
+            let search = buzz_search::SearchService::new(pool.clone());
+            let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+                db.clone(),
+                buzz_workflow::WorkflowConfig::default(),
+            ));
+            let media_storage = buzz_media::MediaStorage::new(&config.media).unwrap();
+            let (mut state, _) = crate::state::AppState::new(
+                config,
+                db,
+                redis_pool,
+                audit,
+                pubsub,
+                auth,
+                search,
+                workflow_engine,
+                nostr::Keys::generate(),
+                media_storage,
+            );
+            let deny_map = Arc::new(buzz_auth::NipFiDenyMap::new(
+                2,
+                vec![buzz_auth::IssuerCapacity {
+                    issuer: TEST_ISS.to_owned(),
+                    capacity: 2,
+                }],
+            ));
+            state.nip_fi_deny_map = Some(Arc::clone(&deny_map));
+            Arc::new(state)
+        };
+
+        let target = nostr::Keys::generate().public_key();
+        let unrelated = nostr::Keys::generate().public_key();
+        let now = chrono::Utc::now();
+        let until_unix = (now + chrono::Duration::seconds(300)).timestamp();
+
+        // Register targeted ordinary WS and audio controls.
+        let (_target_ws_id, cancel_target_ws) = register_ws(&state, target.to_bytes().to_vec());
+
+        // Register targeted audio via the production helper.
+        // Guards must live until after the assertions — declared here, not in a sub-block.
+        let audio_registry = &state.community_connections;
+        let cancel_audio_target = CancellationToken::new();
+        let _audio_target_guard = {
+            let ctrl = CommunityConnectionControl::new(cancel_audio_target.clone());
+            audio_post_auth_register(&ctrl, target.to_bytes().to_vec());
+            audio_registry.register(Uuid::new_v4(), community, ctrl)
+        };
+
+        // Register unrelated ordinary WS and audio controls.
+        let (_unrelated_ws_id, cancel_unrelated_ws) =
+            register_ws(&state, unrelated.to_bytes().to_vec());
+        let cancel_audio_unrelated = CancellationToken::new();
+        let _audio_unrelated_guard = {
+            let ctrl = CommunityConnectionControl::new(cancel_audio_unrelated.clone());
+            audio_post_auth_register(&ctrl, unrelated.to_bytes().to_vec());
+            audio_registry.register(Uuid::new_v4(), community, ctrl)
+        };
+
+        // Drive apply_nip_fi_disconnect for the target (Merged case).
+        let msg = buzz_pubsub::NipFiDisconnect {
+            issuer: TEST_ISS.to_owned(),
+            pubkey_bytes: target.to_bytes().to_vec(),
+            until_unix,
+            until_unix_nanos: 0,
+        };
+        let result = apply_nip_fi_disconnect(&state, &msg, now);
+        assert_eq!(
+            result,
+            NipFiDisconnectApplyResult::Applied(CrossPodMergeResult::Merged),
+            "target disconnect must merge"
+        );
+
+        // Claim 1: targeted ordinary WS is cancelled.
+        assert!(
+            cancel_target_ws.is_cancelled(),
+            "targeted ordinary WS must be cancelled by disconnect fan-out"
+        );
+        // Claim 2: targeted audio is cancelled (registered via audio_post_auth_register).
+        assert!(
+            cancel_audio_target.is_cancelled(),
+            "targeted audio connection must be cancelled via community_connections fan-out"
+        );
+        // Claim 3a: unrelated ordinary WS remains open.
+        assert!(
+            !cancel_unrelated_ws.is_cancelled(),
+            "unrelated ordinary WS must remain open"
+        );
+        // Claim 3b: unrelated audio remains open.
+        assert!(
+            !cancel_audio_unrelated.is_cancelled(),
+            "unrelated audio connection must remain open"
+        );
+
+        // ── Capacity-failure variant ──────────────────────────────────────────────
+        // Pre-fill the map to capacity with a different key, then deliver target2
+        // (capacity exceeded). Assert target2's sessions still close despite no map entry.
+        let target2 = nostr::Keys::generate().public_key();
+
+        // Register target2 ordinary WS and audio.
+        let (_t2_ws_id, cancel_t2_ws) = register_ws(&state, target2.to_bytes().to_vec());
+        let cancel_t2_audio = CancellationToken::new();
+        let _t2_audio_guard = {
+            let ctrl = CommunityConnectionControl::new(cancel_t2_audio.clone());
+            audio_post_auth_register(&ctrl, target2.to_bytes().to_vec());
+            audio_registry.register(Uuid::new_v4(), community, ctrl)
+        };
+
+        // The map is now at capacity (target is in it from the Merged above, plus we need
+        // one more to saturate cap=2). Pre-fill the second slot with a filler key.
+        let filler = nostr::Keys::generate().public_key();
+        let msg_fill = buzz_pubsub::NipFiDisconnect {
+            issuer: TEST_ISS.to_owned(),
+            pubkey_bytes: filler.to_bytes().to_vec(),
+            until_unix,
+            until_unix_nanos: 0,
+        };
+        let fill_result = apply_nip_fi_disconnect(&state, &msg_fill, now);
+        assert_eq!(
+            fill_result,
+            NipFiDisconnectApplyResult::Applied(CrossPodMergeResult::Merged),
+            "filler must merge to saturate capacity"
+        );
+
+        // Now deliver target2 — capacity exceeded, no map entry.
+        let msg2 = buzz_pubsub::NipFiDisconnect {
+            issuer: TEST_ISS.to_owned(),
+            pubkey_bytes: target2.to_bytes().to_vec(),
+            until_unix,
+            until_unix_nanos: 0,
+        };
+        let result2 = apply_nip_fi_disconnect(&state, &msg2, now);
+        assert_eq!(
+            result2,
+            NipFiDisconnectApplyResult::Applied(CrossPodMergeResult::CapacityExceeded),
+            "second target must hit capacity"
+        );
+
+        // Claim 4a: targeted ordinary WS still closes despite CapacityExceeded.
+        assert!(
+            cancel_t2_ws.is_cancelled(),
+            "target2 ordinary WS must close even on CapacityExceeded"
+        );
+        // Claim 4b: targeted audio still closes despite CapacityExceeded.
+        assert!(
+            cancel_t2_audio.is_cancelled(),
+            "target2 audio must close even on CapacityExceeded"
         );
     }
 
@@ -1375,11 +1635,9 @@ mod route_integration_tests {
 
         // Build a state with TEST_ISS in the registry so apply_nip_fi_disconnect accepts it.
         let state = {
-            let mut config = crate::config::Config::from_env().expect("default config loads");
-            config.database_url = "postgres://buzz:buzz@127.0.0.1:1/buzz".to_string();
-            config.redis_url = "redis://127.0.0.1:1".to_string();
+            let mut config = crate::config::Config::hermetic_for_test();
+            // Wire TEST_ISS into the NIP-FI registry so apply_nip_fi_disconnect accepts it.
             config.nip_fi.registry.insert(test_issuer_policy());
-
             let pool = sqlx::PgPool::connect_lazy(&config.database_url).unwrap();
             let db = buzz_db::Db::from_pool(pool.clone());
             let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
@@ -1449,7 +1707,7 @@ mod route_integration_tests {
         let decoded = buzz_pubsub::decode_nip_fi_disconnect(&encoded).expect("decode must succeed");
         assert_eq!(decoded.until_unix_nanos, nanos, "decoded nanos must match");
 
-        // Consumer seam: apply with now = T + 1ns (inside the deadline).
+        // Consumer seam: apply with now = t_frac - 1ns (just inside the deadline).
         let now_inside = t_frac - chrono::Duration::nanoseconds(1);
         let result = apply_nip_fi_disconnect(&state, &decoded, now_inside);
         assert_eq!(
@@ -1496,7 +1754,6 @@ mod route_integration_tests {
     // - command_issuers == 1
     // - both AppState fields are Some
     // - a valid signed command through the verifier creates a deny visible via the map
-    // - the refresh loop terminates on shutting_down
     //
     // Mandatory red mutations (proven by separate inline verification below):
     //  1. delete deny_map assignment → AppState.nip_fi_deny_map is None
@@ -1510,9 +1767,7 @@ mod route_integration_tests {
 
         // Build a minimal AppState — same construction as build_test_state but without
         // the S4 fields so we can verify install_nip_fi_command_components populates them.
-        let mut config = crate::config::Config::from_env().expect("default config loads");
-        config.database_url = "postgres://buzz:buzz@127.0.0.1:1/buzz".to_string();
-        config.redis_url = "redis://127.0.0.1:1".to_string();
+        let config = crate::config::Config::hermetic_for_test();
         let pool = sqlx::PgPool::connect_lazy(&config.database_url).unwrap();
         let db = buzz_db::Db::from_pool(pool.clone());
         let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
@@ -1613,7 +1868,8 @@ mod route_integration_tests {
             "deny entry must be visible via AppState.nip_fi_deny_map after verify"
         );
 
-        // Signal the refresh loop to terminate.
+        // Set the shutdown flag so the background refresh task eventually exits.
+        // This does not prove lifecycle — no task handle is awaited here.
         state
             .shutting_down
             .store(true, std::sync::atomic::Ordering::Release);

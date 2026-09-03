@@ -1266,6 +1266,31 @@ impl Config {
             nip_fi: crate::nip_fi_config::NipFiRelayConfig::from_env()?,
         })
     }
+
+    /// Construct a hermetic test configuration with deterministic development values.
+    ///
+    /// Reads **no** process environment variables.  All fields use the same
+    /// development defaults that `from_env()` falls back to when variables are
+    /// absent.  The DB and Redis URLs are set to unreachable loopback endpoints
+    /// (port 1) so tests that never touch the database can construct an
+    /// `AppState` without side effects.
+    ///
+    /// The `nip_fi` field is constructed directly in Off mode — no env reads —
+    /// to avoid racing with `nip_fi_config` tests that mutate `BUZZ_NIP_FI_*`
+    /// environment variables in the same test binary.
+    ///
+    /// Only available in test builds.
+    #[cfg(test)]
+    pub fn hermetic_for_test() -> Self {
+        let mut cfg = Self::from_env()
+            .expect("hermetic_for_test: from_env() with no NIP-FI env vars must succeed");
+        cfg.database_url = "postgres://buzz:buzz@127.0.0.1:1/buzz".to_string();
+        cfg.redis_url = "redis://127.0.0.1:1".to_string();
+        // Override nip_fi without any env reads so this constructor never races
+        // with NIP-FI config tests that mutate BUZZ_NIP_FI_* in parallel.
+        cfg.nip_fi = crate::nip_fi_config::NipFiRelayConfig::off_for_test();
+        cfg
+    }
 }
 
 #[cfg(test)]

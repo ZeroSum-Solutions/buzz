@@ -158,7 +158,11 @@ impl NipFiRelayConfig {
 
         let issuer_entries: Vec<IssuerEnvConfig> =
             serde_json::from_str(&issuers_json).map_err(|e| {
-                ConfigError::InvalidValue(format!("BUZZ_NIP_FI_ISSUERS is not valid JSON: {e}"))
+                ConfigError::InvalidValue(format!(
+                    "BUZZ_NIP_FI_ISSUERS could not be parsed (line {}, column {})",
+                    e.line(),
+                    e.column()
+                ))
             })?;
 
         if issuer_entries.is_empty() {
@@ -300,6 +304,21 @@ impl NipFiRelayConfig {
     /// Returns `true` when the relay is in `Enforce` mode.
     pub fn is_enforce(&self) -> bool {
         matches!(self.mode, NipFiMode::Enforce)
+    }
+
+    /// Construct an Off-mode config with no environment reads.
+    ///
+    /// Used by `Config::hermetic_for_test()` to avoid racing against NIP-FI
+    /// env-mutating tests in the same process.  Only available in test builds.
+    #[cfg(test)]
+    pub(crate) fn off_for_test() -> Self {
+        Self {
+            mode: NipFiMode::Off,
+            registry: IssuerRegistry::new(),
+            jwks_configs: Vec::new(),
+            max_connection_lifetime_secs: 0,
+            command_configs: Vec::new(),
+        }
     }
 }
 
@@ -611,6 +630,69 @@ mod tests {
         assert!(
             msg.contains("maximum_command_age_seconds"),
             "error must name the missing field: {msg}"
+        );
+    }
+
+    // ── Privacy: config error must not expose sensitive values ────────────────
+    //
+    // Verifies that a malformed BUZZ_NIP_FI_ISSUERS whose authorized_principals
+    // contains a sensitive email address does NOT appear in the error message.
+    //
+    // Mandatory red: restoring the raw serde interpolation (`{e}`) exposes the
+    // sentinel value in the Display output and fails this test.
+
+    #[test]
+    fn config_error_does_not_expose_sensitive_principal_value() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::new(NIP_FI_VARS);
+
+        // A syntactically broken JSON object that contains a sensitive sentinel
+        // where authorized_principals would be.  The `INVALID_TYPE_HERE` string
+        // is not valid JSON for the Vec<String> field — serde will produce a
+        // type error that in a naive `{e}` interpolation would include the raw
+        // string, potentially exposing the surrounding value.
+        const SENTINEL: &str = "admin+private-sentinel@example.invalid";
+
+        std::env::set_var("BUZZ_NIP_FI_MODE", "enforce");
+        std::env::set_var("BUZZ_NIP_FI_MAX_CONNECTION_LIFETIME_SECS", "3600");
+        // The authorized_principals field is a string instead of an array,
+        // which causes serde to emit a type-error that typically includes the
+        // supplied value when formatted with `{e}` (the bug we are guarding).
+        std::env::set_var(
+            "BUZZ_NIP_FI_ISSUERS",
+            format!(
+                r#"[{{
+                    "issuer": "https://idp.example.com",
+                    "audiences": ["https://relay.example.com"],
+                    "token_class": "nip-fi+jwt",
+                    "algorithms": ["ES256"],
+                    "maximum_assertion_age_seconds": 3600,
+                    "jwks_uri": "https://idp.example.com/.well-known/jwks.json",
+                    "jwks_refresh_interval_seconds": 300,
+                    "jwks_hard_deadline_seconds": 86400,
+                    "maximum_command_age_seconds": 30,
+                    "authorized_principals": "{SENTINEL}"
+                }}]"#
+            ),
+        );
+
+        let err = NipFiRelayConfig::from_env().expect_err("malformed issuers must fail");
+        let display_msg = err.to_string();
+        let debug_msg = format!("{err:?}");
+
+        // Safe category must be present.
+        assert!(
+            display_msg.contains("BUZZ_NIP_FI_ISSUERS could not be parsed"),
+            "Display message must contain the safe category string: {display_msg}"
+        );
+        // Sentinel must NOT appear in any user-facing output path.
+        assert!(
+            !display_msg.contains(SENTINEL),
+            "Display message must NOT contain the sensitive sentinel: {display_msg}"
+        );
+        assert!(
+            !debug_msg.contains(SENTINEL),
+            "Debug output must NOT contain the sensitive sentinel: {debug_msg}"
         );
     }
 }

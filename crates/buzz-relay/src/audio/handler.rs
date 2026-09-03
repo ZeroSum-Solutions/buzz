@@ -167,6 +167,19 @@ async fn handle_audio_connection(
     .await;
 }
 
+/// Records the NIP-42-proven pubkey on an audio control after successful auth
+/// so the NIP-FI disconnect scan can reach audio sockets alongside relay peers.
+///
+/// Extracted from `handle_active_audio_connection` so tests can register audio
+/// connections through the same production seam without spinning up full audio
+/// infrastructure.
+pub(crate) fn audio_post_auth_register(
+    control: &CommunityConnectionControl,
+    pubkey_bytes: Vec<u8>,
+) {
+    control.set_proven_pubkey(pubkey_bytes);
+}
+
 async fn handle_active_audio_connection(
     socket: WebSocket,
     state: Arc<AppState>,
@@ -249,7 +262,7 @@ async fn handle_active_audio_connection(
 
     // Register the proven pubkey with the registry so that a NIP-FI targeted
     // disconnect can reach this audio socket alongside its Nostr relay peers.
-    control.set_proven_pubkey(pubkey_bytes.clone());
+    audio_post_auth_register(&control, pubkey_bytes.clone());
 
     if crate::api::relay_members::enforce_relay_membership(
         &state,
