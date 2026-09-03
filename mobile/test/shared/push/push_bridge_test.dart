@@ -109,11 +109,16 @@ void main() {
           expect(call.arguments, {
             'relayOrigin': 'wss://done.example',
             'generation': 7,
+            'deviceToken': 'device-token',
           });
           return true;
         });
 
-    await checkpointBuzzPushGatewayReplacement('wss://done.example', 7);
+    await checkpointBuzzPushGatewayReplacement(
+      'wss://done.example',
+      7,
+      'device-token',
+    );
 
     expect(replacementBuzzPushRelayOrigins.value, {'wss://pending.example'});
   });
@@ -128,12 +133,17 @@ void main() {
           expect(call.arguments, {
             'relayOrigin': 'wss://pending.example',
             'generation': 7,
+            'deviceToken': 'stale-token',
           });
           return false;
         });
 
     await expectLater(
-      checkpointBuzzPushGatewayReplacement('wss://pending.example', 7),
+      checkpointBuzzPushGatewayReplacement(
+        'wss://pending.example',
+        7,
+        'stale-token',
+      ),
       throwsStateError,
     );
 
@@ -297,6 +307,7 @@ void main() {
       final secondGrant = await enrollBuzzPush(
         'wss://relay.example/',
         'https://gateway-two.example/',
+        forceDelegationRenewal: true,
         communitiesForSnapshotRefresh: [
           Community(
             id: 'community-id',
@@ -318,10 +329,12 @@ void main() {
         {
           'relayUrl': 'wss://relay.example/',
           'gatewayUrl': 'https://gateway-one.example/',
+          'forceDelegationRenewal': false,
         },
         {
           'relayUrl': 'wss://relay.example/',
           'gatewayUrl': 'https://gateway-two.example/',
+          'forceDelegationRenewal': true,
         },
       ]);
       expect(methods, [

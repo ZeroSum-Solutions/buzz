@@ -184,12 +184,17 @@ Future<void> completeBuzzPushGatewayMigration() async {
 Future<void> checkpointBuzzPushGatewayReplacement(
   String relayOrigin,
   int generation,
+  String deviceToken,
 ) async {
   if (defaultTargetPlatform != TargetPlatform.iOS) return;
   try {
     final checkpointed = await _channel.invokeMethod<bool>(
       'checkpointGatewayReplacement',
-      {'relayOrigin': relayOrigin, 'generation': generation},
+      {
+        'relayOrigin': relayOrigin,
+        'generation': generation,
+        'deviceToken': deviceToken,
+      },
     );
     if (checkpointed != true) {
       throw StateError('Push replacement inventory changed before checkpoint.');
@@ -280,10 +285,12 @@ Future<BuzzPushEndpointGrant> enrollBuzzPush(
   String relayUrl,
   String gatewayUrl, {
   List<Community>? communitiesForSnapshotRefresh,
+  bool forceDelegationRenewal = false,
 }) async {
   final raw = await _channel.invokeMapMethod<dynamic, dynamic>('enrollPush', {
     'relayUrl': relayUrl,
     'gatewayUrl': gatewayUrl,
+    'forceDelegationRenewal': forceDelegationRenewal,
   });
   if (raw == null) {
     throw StateError('Native push enrollment returned no grant.');

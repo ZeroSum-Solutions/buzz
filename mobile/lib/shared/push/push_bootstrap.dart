@@ -126,6 +126,24 @@ List<Community> buzzPushCommunitiesRequiringGatewayMigration({
     )
     .toList();
 
+@visibleForTesting
+bool buzzPushGatewayMigrationAttemptIsCurrent({
+  required bool attemptIsCurrent,
+  required String token,
+  required String? liveToken,
+  required Set<String> retiredRelayOrigins,
+  required Set<String> liveRetiredRelayOrigins,
+  required Set<String> replacementRelayOrigins,
+  required Set<String> liveReplacementRelayOrigins,
+  required int replacementGeneration,
+  required int liveReplacementGeneration,
+}) =>
+    attemptIsCurrent &&
+    token == liveToken &&
+    setEquals(retiredRelayOrigins, liveRetiredRelayOrigins) &&
+    setEquals(replacementRelayOrigins, liveReplacementRelayOrigins) &&
+    replacementGeneration == liveReplacementGeneration;
+
 /// Owns the APNs-registration side effect so migration-triggered registration
 /// is exercised through the same production boundary as active-community
 /// registration.
@@ -388,6 +406,18 @@ class BuzzPushBootstrap extends HookConsumerWidget {
         if (!gatewayMigrationAttempt.tryBegin(attempt)) return null;
         unawaited(() async {
           try {
+            bool attemptIsCurrent() => buzzPushGatewayMigrationAttemptIsCurrent(
+              attemptIsCurrent: gatewayMigrationAttempt.isCurrent(attempt),
+              token: token,
+              liveToken: apnsDeviceToken.value,
+              retiredRelayOrigins: retiredRelayOrigins,
+              liveRetiredRelayOrigins: retiredBuzzPushRelayOrigins.value,
+              replacementRelayOrigins: replacementRelayOrigins,
+              liveReplacementRelayOrigins:
+                  replacementBuzzPushRelayOrigins.value,
+              replacementGeneration: replacementGeneration,
+              liveReplacementGeneration: replacementBuzzPushGeneration.value,
+            );
             final candidates = buzzPushCommunitiesRequiringGatewayMigration(
               communities: communities,
               retiredRelayOrigins: migrationRelayOrigins,
@@ -404,22 +434,30 @@ class BuzzPushBootstrap extends HookConsumerWidget {
                     .toList()
                   ..sort();
             for (final relayOrigin in candidateOrigins) {
-              for (final candidate in candidates.where(
-                (candidate) =>
-                    buzzPushRelayWebSocketOrigin(candidate.relayUrl) ==
-                    relayOrigin,
-              )) {
+              final originCandidates = candidates
+                  .where(
+                    (candidate) =>
+                        buzzPushRelayWebSocketOrigin(candidate.relayUrl) ==
+                        relayOrigin,
+                  )
+                  .toList();
+              for (var index = 0; index < originCandidates.length; index += 1) {
                 await _publishCommunityReplacement(
                   ref,
-                  candidate,
+                  originCandidates[index],
                   communities,
                   targetGatewayOrigin,
+                  forceDelegationRenewal:
+                      replacementRelayOrigins.contains(relayOrigin) &&
+                      index == 0,
                 );
               }
               if (replacementRelayOrigins.contains(relayOrigin)) {
+                if (!attemptIsCurrent()) return;
                 await checkpointBuzzPushGatewayReplacement(
                   relayOrigin,
                   replacementGeneration,
+                  token,
                 );
                 // The checkpoint updates the listenable replacement inventory.
                 // Let the resulting rebuild own the next origin so two attempts
@@ -427,19 +465,7 @@ class BuzzPushBootstrap extends HookConsumerWidget {
                 return;
               }
             }
-            final latestRetiredRelayOrigins = retiredBuzzPushRelayOrigins.value;
-            final latestReplacementRelayOrigins =
-                replacementBuzzPushRelayOrigins.value;
-            if (!gatewayMigrationAttempt.isCurrent(attempt) ||
-                token != apnsDeviceToken.value ||
-                !setEquals(retiredRelayOrigins, latestRetiredRelayOrigins) ||
-                !setEquals(
-                  replacementRelayOrigins,
-                  latestReplacementRelayOrigins,
-                ) ||
-                replacementGeneration != replacementBuzzPushGeneration.value) {
-              return;
-            }
+            if (!attemptIsCurrent()) return;
             await completeBuzzPushGatewayMigration();
             gatewayMigrationFailures.value = 0;
             gatewayMigrationAttempt.complete(attempt);
@@ -629,8 +655,9 @@ class BuzzPushBootstrap extends HookConsumerWidget {
     WidgetRef ref,
     Community community,
     List<Community> communities,
-    String targetGatewayOrigin,
-  ) async {
+    String targetGatewayOrigin, {
+    bool forceDelegationRenewal = false,
+  }) async {
     final config = RelayConfig(
       baseUrl: community.relayUrl,
       nsec: community.nsec,
@@ -647,6 +674,7 @@ class BuzzPushBootstrap extends HookConsumerWidget {
       config.wsUrl,
       Env.pushGatewayUrl,
       communitiesForSnapshotRefresh: communities,
+      forceDelegationRenewal: forceDelegationRenewal,
     );
     final notifier = ref.read(communityListProvider.notifier);
     await publishBuzzPushLeaseRecoverably(

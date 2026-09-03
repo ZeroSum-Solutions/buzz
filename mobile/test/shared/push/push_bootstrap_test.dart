@@ -250,6 +250,23 @@ void main() {
     );
   });
 
+  test('gateway migration rejects a stale APNs token before checkpoint', () {
+    expect(
+      buzzPushGatewayMigrationAttemptIsCurrent(
+        attemptIsCurrent: true,
+        token: 'old-token',
+        liveToken: 'new-token',
+        retiredRelayOrigins: const {'wss://relay.example'},
+        liveRetiredRelayOrigins: const {'wss://relay.example'},
+        replacementRelayOrigins: const {'wss://relay.example'},
+        liveReplacementRelayOrigins: const {'wss://relay.example'},
+        replacementGeneration: 7,
+        liveReplacementGeneration: 7,
+      ),
+      isFalse,
+    );
+  });
+
   test('pending opt-out tombstone keeps active push lifecycle disabled', () {
     final subscription = BuzzPushSubscription(
       filter: BuzzPushFilter(kinds: const [9], pTags: [_hex('a')]),

@@ -412,7 +412,9 @@ import os.log
       guard let arguments = call.arguments as? [String: Any],
         let relayOrigin = arguments["relayOrigin"] as? String,
         !relayOrigin.isEmpty,
-        let generation = (arguments["generation"] as? NSNumber)?.int64Value
+        let generation = (arguments["generation"] as? NSNumber)?.int64Value,
+        let expectedDeviceToken = arguments["deviceToken"] as? String,
+        !expectedDeviceToken.isEmpty
       else {
         result(
           FlutterError(
@@ -421,6 +423,13 @@ import os.log
             details: nil
           )
         )
+        return
+      }
+      guard
+        apnsDeviceToken?.map({ String(format: "%02x", $0) }).joined()
+          == expectedDeviceToken
+      else {
+        result(false)
         return
       }
       do {
@@ -602,6 +611,7 @@ import os.log
       )
       return
     }
+    let forceDelegationRenewal = arguments["forceDelegationRenewal"] as? Bool ?? false
 
     do {
       let driver = try BuzzDevPushEnrollmentDriver(
@@ -616,7 +626,8 @@ import os.log
         do {
           let record = try await driver.enroll(
             deviceToken: deviceToken,
-            relayURL: relayURL
+            relayURL: relayURL,
+            forceDelegationRenewal: forceDelegationRenewal
           )
           var arguments = record.flutterArguments
           if let inventory = try self?.pushGatewayMigrationInventory() {

@@ -465,9 +465,14 @@ public final class BuzzDevPushEnrollmentDriver {
   /// delegates to that key, and durably saves the resulting opaque grant.
   public func enroll(
     deviceToken: Data,
-    relayURL: URL
+    relayURL: URL,
+    forceDelegationRenewal: Bool = false
   ) async throws -> BuzzPushEndpointGrantRecord {
-    return try await enrollCurrent(deviceToken: deviceToken, relayURL: relayURL)
+    return try await enrollCurrent(
+      deviceToken: deviceToken,
+      relayURL: relayURL,
+      forceDelegationRenewal: forceDelegationRenewal
+    )
   }
 
   /// Revokes durable installations from gateways that are no longer configured.
@@ -478,7 +483,8 @@ public final class BuzzDevPushEnrollmentDriver {
 
   private func enrollCurrent(
     deviceToken: Data,
-    relayURL: URL
+    relayURL: URL,
+    forceDelegationRenewal: Bool
   ) async throws -> BuzzPushEndpointGrantRecord {
     precondition(!deviceToken.isEmpty, "The APNs device token must not be empty")
     let relayOrigin = try Self.relayOrigin(relayURL)
@@ -645,10 +651,15 @@ public final class BuzzDevPushEnrollmentDriver {
       )
       pendingEnrollment = nil
       if revokedInstallation {
-        return try await enrollCurrent(deviceToken: deviceToken, relayURL: relayURL)
+        return try await enrollCurrent(
+          deviceToken: deviceToken,
+          relayURL: relayURL,
+          forceDelegationRenewal: forceDelegationRenewal
+        )
       }
     }
-    if let current = storedForOrigin,
+    if !forceDelegationRenewal,
+      let current = storedForOrigin,
       current.relayPubkey == relayPubkey,
       current.endpointHash == endpointHash,
       current.endpointEpoch == Self.endpointEpoch,
@@ -840,7 +851,11 @@ public final class BuzzDevPushEnrollmentDriver {
           relayOrigin: relayOrigin.text,
           appProfile: Self.appProfile
         )
-        return try await enrollCurrent(deviceToken: deviceToken, relayURL: relayURL)
+        return try await enrollCurrent(
+          deviceToken: deviceToken,
+          relayURL: relayURL,
+          forceDelegationRenewal: forceDelegationRenewal
+        )
       } catch let error as BuzzDevPushEnrollmentError {
         guard
           case .unexpectedStatus(
@@ -863,7 +878,11 @@ public final class BuzzDevPushEnrollmentDriver {
           relayOrigin: relayOrigin.text,
           appProfile: Self.appProfile
         )
-        return try await enrollCurrent(deviceToken: deviceToken, relayURL: relayURL)
+        return try await enrollCurrent(
+          deviceToken: deviceToken,
+          relayURL: relayURL,
+          forceDelegationRenewal: forceDelegationRenewal
+        )
       }
       pending = BuzzPushPendingEnrollmentRecord(
         gatewayOrigin: gatewayOrigin,
