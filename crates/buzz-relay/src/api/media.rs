@@ -42,6 +42,10 @@ pub(crate) struct AuthenticatedUpload {
     /// door in `bridge.rs`. Server-resolved, never client-supplied.
     tenant: TenantContext,
     route_mode: UploadRouteMode,
+    /// NIP-FI strictness derived at extraction time.  Carried to the handler so
+    /// post-body auth failures (hash-binding, x-tag mismatches) produce the same
+    /// mode-aware denial shape as pre-body failures.
+    strictness: BlossomStrictness,
     _upload_permit: UploadPermit,
 }
 
@@ -247,7 +251,7 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
         let claimed_hash = headers
             .get("x-sha-256")
             .and_then(|v| v.to_str().ok())
-            .ok_or(MediaError::MissingTag("x-sha-256"))?;
+            .ok_or_else(|| media_denial(MediaError::MissingTag("x-sha-256"), strictness))?;
 
         // Validate format: exactly 64 lowercase hex characters
         if claimed_hash.len() != 64
@@ -255,7 +259,7 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
                 .chars()
                 .all(|c| matches!(c, '0'..='9' | 'a'..='f'))
         {
-            return Err(MediaError::HashMismatch.into());
+            return Err(media_denial(MediaError::HashMismatch, strictness));
         }
 
         // 4. Validate X-SHA-256 matches at least one x tag in the auth event
@@ -264,7 +268,7 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
             .iter()
             .any(|tag| tag.kind().to_string() == "x" && (tag.content() == Some(claimed_hash)));
         if !has_matching_x {
-            return Err(MediaError::HashMismatch.into());
+            return Err(media_denial(MediaError::HashMismatch, strictness));
         }
 
         // 5. Relay membership gate (NIP-43). Blossom auth proves the signer
@@ -301,6 +305,7 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
             auth_event,
             tenant,
             route_mode,
+            strictness,
             _upload_permit: upload_permit,
         })
     }
@@ -389,13 +394,15 @@ pub async fn upload_blob(
     auth: AuthenticatedUpload,
     headers: HeaderMap,
     body: axum::body::Body,
-) -> Result<Json<BlobDescriptor>, MediaError> {
+) -> Result<Json<BlobDescriptor>, MediaDenial> {
+    let strictness = auth.strictness;
     let attribution = upload_attribution(&state, &auth, &headers).await;
 
     let serving_write =
         buzz_deletion::acquire_serving_write(&state.db, auth.tenant.community(), "media_upload")
             .await
-            .map_err(serving_write_error)?;
+            .map_err(serving_write_error)
+            .map_err(MediaDenial::from)?;
 
     if auth.route_mode == UploadRouteMode::LegacyMedia {
         metrics::counter!("buzz_media_legacy_upload_route_total").increment(1);
@@ -416,13 +423,19 @@ pub async fn upload_blob(
                 sniff.extend_from_slice(&chunk[..chunk.len().min(needed)]);
                 replay_chunks.push(chunk);
             }
-            Some(Err(error)) => return Err(MediaError::Io(error.to_string())),
+            Some(Err(error)) => {
+                return Err(media_denial(MediaError::Io(error.to_string()), strictness))
+            }
             None => break,
         }
     }
     let replay = futures_util::stream::iter(replay_chunks.into_iter().map(Ok)).chain(source);
 
-    serving_write.verify().await.map_err(serving_lease_lost)?;
+    serving_write
+        .verify()
+        .await
+        .map_err(serving_lease_lost)
+        .map_err(MediaDenial::from)?;
 
     let mut descriptor = serving_write
         .protect(async {
@@ -501,7 +514,15 @@ pub async fn upload_blob(
                     Err(_) => MediaError::Internal,
                 }
             }
-        })??;
+        })
+        // The outer anyhow→MediaError map above captures lease-loss and
+        // protect-layer failures. Apply media_denial so Strict produces
+        // byte-exact NIP-FI responses for those errors.
+        .map_err(|e| media_denial(e, strictness))?
+        // The inner Result captures failures from the async body (process_*,
+        // hash mismatches). Wrap through media_denial so post-body auth errors
+        // get the same NIP-FI shape as pre-body ones.
+        .map_err(|e| media_denial(e, strictness))?;
 
     rewrite_descriptor_urls_for_tenant(
         &mut descriptor,
@@ -1270,6 +1291,106 @@ mod tests {
             let denial = MediaDenial(MediaError::Internal, strictness);
             assert!(denial.into_response().status().is_server_error());
         }
+    }
+
+    // ── Extractor hash-check denial sites (sites 1+2 per Paul's spot-check) ──
+    // These pins cover the missing-X-SHA-256 header (MissingTag) and the
+    // malformed/unmatched hash (HashMismatch) cases that previously bypassed
+    // the strictness split via `From<MediaError> for MediaDenial` (Permissive).
+
+    #[tokio::test]
+    async fn strict_missing_x_sha256_header_produces_nip_fi_403() {
+        let denial = MediaDenial(
+            MediaError::MissingTag("x-sha-256"),
+            BlossomStrictness::Strict,
+        );
+        let resp = denial.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "missing x-sha-256 header must be 403 in Strict mode"
+        );
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("text/plain"),
+            "expected text/plain CT, got: {ct}"
+        );
+        assert!(
+            resp.headers().get("www-authenticate").is_none(),
+            "403 must not have WWW-Authenticate"
+        );
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"evidence rejected\n");
+    }
+
+    #[tokio::test]
+    async fn strict_hash_mismatch_produces_nip_fi_403() {
+        let denial = MediaDenial(MediaError::HashMismatch, BlossomStrictness::Strict);
+        let resp = denial.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "hash mismatch must be 403 in Strict mode"
+        );
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.contains("text/plain"), "expected text/plain, got: {ct}");
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"evidence rejected\n");
+    }
+
+    #[tokio::test]
+    async fn permissive_missing_x_sha256_header_keeps_legacy_json_401() {
+        let denial = MediaDenial(
+            MediaError::MissingTag("x-sha-256"),
+            BlossomStrictness::Permissive,
+        );
+        let resp = denial.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "Permissive must keep legacy 401 for MissingTag"
+        );
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("application/json"),
+            "Permissive must keep JSON CT, got: {ct}"
+        );
+        assert!(
+            resp.headers().get("www-authenticate").is_none(),
+            "Permissive must not add WWW-Authenticate"
+        );
+    }
+
+    #[tokio::test]
+    async fn permissive_hash_mismatch_keeps_legacy_json_401() {
+        let denial = MediaDenial(MediaError::HashMismatch, BlossomStrictness::Permissive);
+        let resp = denial.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "Permissive must keep legacy 401 for HashMismatch"
+        );
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("application/json"),
+            "Permissive must keep JSON CT, got: {ct}"
+        );
     }
 
     #[test]
