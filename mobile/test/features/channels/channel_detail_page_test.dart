@@ -9310,10 +9310,14 @@ void main() {
         find.descendant(
           of: back,
           matching: find.byKey(
-            const ValueKey('ios-glass-navigation-flutter-fallback'),
+            const ValueKey('ios-glass-navigation-route-placeholder'),
           ),
         ),
         findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey('ios-glass-navigation-flutter-fallback')),
+        findsNothing,
       );
 
       await tester.pumpAndSettle();
@@ -9553,19 +9557,11 @@ void main() {
           matching: find.byType(UiKitView),
         );
         final nativeView = tester.widget<UiKitView>(nativeViewFinder);
+        final backParams = nativeView.creationParams as Map<String, Object>;
         expect(nativeView.viewType, 'buzz/navigation_glass');
-        expect(
-          (nativeView.creationParams as Map<String, Object>)['icon'],
-          'back',
-        );
-        expect(
-          (nativeView.creationParams as Map<String, Object>)['brightness'],
-          'light',
-        );
-        expect(
-          (nativeView.creationParams as Map<String, Object>)['buttonCenterX'],
-          38.0,
-        );
+        expect(backParams['icon'], 'back');
+        expect(backParams['brightness'], 'light');
+        expect(backParams['buttonCenterX'], 38.0);
         final backButtonRect = tester.getRect(
           find.byKey(const ValueKey('channel-ios-glass-back')),
         );
@@ -9594,6 +9590,18 @@ void main() {
         expect(channelParams['label'], 'general');
         expect(channelParams['subtitle'], '0 members');
         expect(channelParams['systemIconName'], 'number');
+        expect(channelParams['controlSize'], 40.0);
+        expect(channelParams['controlSize'], backParams['controlSize']);
+        expect(channelIdentityRect.width, lessThan(300));
+        final huddleNativeView = tester.widget<UiKitView>(
+          find.descendant(
+            of: find.byKey(const ValueKey('channel-huddle-button')),
+            matching: find.byType(UiKitView),
+          ),
+        );
+        final huddleParams =
+            huddleNativeView.creationParams as Map<String, Object>;
+        expect(channelParams['controlSize'], huddleParams['controlSize']);
         expect(tester.takeException(), isNull);
         debugDefaultTargetPlatformOverride = null;
       },

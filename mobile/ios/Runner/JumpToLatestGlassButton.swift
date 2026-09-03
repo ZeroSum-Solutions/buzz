@@ -171,6 +171,8 @@ final class NavigationGlassButtonFactory: NSObject, FlutterPlatformViewFactory {
 final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
   private static let shutterIconRatio: CGFloat = 80.0 / 115.0
   private static let shutterInsetRatio: CGFloat = 20.0 / 115.0
+  private static let channelIconSize: CGFloat = 16
+  private static let menuAvatarSize: CGFloat = 28
   private let containerView: UIView
   private let channel: FlutterMethodChannel
   private let button = NavigationGlassButton(type: .system)
@@ -457,7 +459,10 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
         avatarImageURL = nil
         buttonImage = UIImage(
           systemName: buttonIconName,
-          withConfiguration: UIImage.SymbolConfiguration(pointSize: 18, weight: .semibold)
+          withConfiguration: UIImage.SymbolConfiguration(
+            pointSize: Self.channelIconSize,
+            weight: .semibold
+          )
         )
         button.configuration?.subtitleTextAttributesTransformer =
           UIConfigurationTextAttributesTransformer { incoming in
@@ -613,11 +618,17 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
       let fallback = item["avatarFallback"] as? String
       let systemIconName = item["systemIconName"] as? String
       let image = imageURL.flatMap { menuAvatarImages[$0] }
-        ?? fallback.map { Self.avatarFallbackImage(text: $0) }
+        ?? fallback.map {
+          Self.avatarFallbackImage(text: $0, size: Self.menuAvatarSize)
+        }
         ?? systemIconName.flatMap { UIImage(systemName: $0) }
       let selected = item["selected"] as? Bool == true
+      let keepsSingleLine = item["keepsSingleLine"] as? Bool == true
+      let title = keepsSingleLine
+        ? label.replacingOccurrences(of: " ", with: "\u{00A0}")
+        : label
       return UIAction(
-        title: selected ? "\(label)   ✓" : label,
+        title: selected ? "\(title)   ✓" : title,
         image: image,
         attributes: attributes,
         state: .off
@@ -631,7 +642,10 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
     if let comma = imageURL.firstIndex(of: ","), imageURL.hasPrefix("data:image") {
       let encoded = String(imageURL[imageURL.index(after: comma)...])
       if let data = Data(base64Encoded: encoded), let image = UIImage(data: data) {
-        menuAvatarImages[imageURL] = Self.circularAvatarImage(image)
+        menuAvatarImages[imageURL] = Self.circularAvatarImage(
+          image,
+          size: Self.menuAvatarSize
+        )
         rebuildMenu()
       }
       return
@@ -641,7 +655,10 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
       guard let data, let image = UIImage(data: data) else { return }
       DispatchQueue.main.async {
         guard self?.menuAvatarLoadTasks[imageURL] != nil else { return }
-        self?.menuAvatarImages[imageURL] = Self.circularAvatarImage(image)
+        self?.menuAvatarImages[imageURL] = Self.circularAvatarImage(
+          image,
+          size: Self.menuAvatarSize
+        )
         self?.menuAvatarLoadTasks[imageURL] = nil
         self?.rebuildMenu()
       }
@@ -650,8 +667,11 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
     task.resume()
   }
 
-  private static func circularAvatarImage(_ image: UIImage) -> UIImage {
-    let size = CGSize(width: 36, height: 36)
+  private static func circularAvatarImage(
+    _ image: UIImage,
+    size dimension: CGFloat = 36
+  ) -> UIImage {
+    let size = CGSize(width: dimension, height: dimension)
     return UIGraphicsImageRenderer(size: size).image { _ in
       UIBezierPath(ovalIn: CGRect(origin: .zero, size: size)).addClip()
       let scale = max(size.width / image.size.width, size.height / image.size.height)
@@ -665,14 +685,20 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
     }.withRenderingMode(.alwaysOriginal)
   }
 
-  private static func avatarFallbackImage(text: String) -> UIImage {
-    let size = CGSize(width: 36, height: 36)
+  private static func avatarFallbackImage(
+    text: String,
+    size dimension: CGFloat = 36
+  ) -> UIImage {
+    let size = CGSize(width: dimension, height: dimension)
     return UIGraphicsImageRenderer(size: size).image { context in
       UIColor.tertiarySystemFill.setFill()
       context.cgContext.fillEllipse(in: CGRect(origin: .zero, size: size))
       let value = String(text.prefix(1)).uppercased() as NSString
       let attributes: [NSAttributedString.Key: Any] = [
-        .font: UIFont.systemFont(ofSize: 15, weight: .semibold),
+        .font: UIFont.systemFont(
+          ofSize: dimension == Self.menuAvatarSize ? 13 : 15,
+          weight: .semibold
+        ),
         .foregroundColor: UIColor.label,
       ]
       let textSize = value.size(withAttributes: attributes)

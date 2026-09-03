@@ -41,6 +41,7 @@ class IosGlassNavigationMenuItem {
     this.avatarImageUrl,
     this.avatarFallback,
     this.systemIconName,
+    this.keepsSingleLine = false,
   });
 
   final String id;
@@ -50,6 +51,7 @@ class IosGlassNavigationMenuItem {
   final String? avatarImageUrl;
   final String? avatarFallback;
   final String? systemIconName;
+  final bool keepsSingleLine;
 
   Map<String, Object> toJson() {
     final json = <String, Object>{
@@ -57,6 +59,7 @@ class IosGlassNavigationMenuItem {
       'label': label,
       'selected': selected,
       'destructive': destructive,
+      'keepsSingleLine': keepsSingleLine,
     };
     if (avatarImageUrl != null) json['avatarImageUrl'] = avatarImageUrl!;
     if (avatarFallback != null) json['avatarFallback'] = avatarFallback!;
@@ -198,7 +201,7 @@ class IosGlassNavigationButton extends HookWidget {
           (item) =>
               '${item.id}:${item.label}:${item.selected}:${item.destructive}:'
               '${item.avatarImageUrl}:${item.avatarFallback}:'
-              '${item.systemIconName}',
+              '${item.systemIconName}:${item.keepsSingleLine}',
         )
         .join('|');
 
@@ -282,8 +285,16 @@ class IosGlassNavigationButton extends HookWidget {
       ],
     );
 
-    Widget buildControl({required bool suppressNativeView}) {
+    Widget buildControl({
+      required bool suppressNativeView,
+      required bool hideDuringRouteTransition,
+    }) {
       if (suppressNativeView) {
+        if (hideDuringRouteTransition) {
+          return const SizedBox.expand(
+            key: ValueKey('ios-glass-navigation-route-placeholder'),
+          );
+        }
         final resolvedButtonCenterX = buttonCenterX ?? width / 2;
         final isLeadingContent =
             icon == IosGlassNavigationIcon.avatar ||
@@ -491,12 +502,16 @@ class IosGlassNavigationButton extends HookWidget {
         width: width,
         height: height,
         child: nativeViewSuppressed == null
-            ? buildControl(suppressNativeView: routeIsTransitioning.value)
+            ? buildControl(
+                suppressNativeView: routeIsTransitioning.value,
+                hideDuringRouteTransition: routeIsTransitioning.value,
+              )
             : ValueListenableBuilder<bool>(
                 valueListenable: nativeViewSuppressed!,
                 builder: (context, suppressNativeView, _) => buildControl(
                   suppressNativeView:
                       suppressNativeView || routeIsTransitioning.value,
+                  hideDuringRouteTransition: routeIsTransitioning.value,
                 ),
               ),
       ),

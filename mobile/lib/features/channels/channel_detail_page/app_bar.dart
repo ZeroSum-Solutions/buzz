@@ -2,6 +2,10 @@ part of '../channel_detail_page.dart';
 
 const _dmHeaderAvatarSize = 32.0;
 const _channelHeaderAvatarSize = 40.0;
+const _iosChannelHeaderControlHeight = 40.0;
+const _iosChannelHeaderIconSize = 16.0;
+const _iosChannelHeaderHorizontalInset = 8.0;
+const _iosChannelHeaderIconSpacing = 8.0;
 const _dmPresenceDotRatio = 8 / 14;
 
 bool _showsMembersAction(Channel channel) {
@@ -63,28 +67,48 @@ class _ChannelAppBarTitle extends ConsumerWidget {
           : 'number';
       return LayoutBuilder(
         builder: (context, constraints) {
-          final contentHeight = _twoLineAppBarTitleContentHeight(
-            context,
-            isDm: false,
+          double measure(String text, TextStyle? style) {
+            final painter = TextPainter(
+              text: TextSpan(text: text, style: style),
+              maxLines: 1,
+              textDirection: Directionality.of(context),
+              textScaler: MediaQuery.textScalerOf(context),
+            )..layout();
+            return painter.width;
+          }
+
+          final textWidth = max(
+            measure(
+              channel.name,
+              context.textTheme.titleSmall?.copyWith(
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            measure(memberLabel, context.textTheme.bodySmall),
           );
-          final controlHeight = min(
-            max(contentHeight, 48.0),
-            constraints.maxHeight,
-          );
-          return IosGlassNavigationButton(
-            key: const ValueKey('channel-header-settings-trigger'),
-            icon: IosGlassNavigationIcon.channel,
-            label: channel.name,
-            subtitle: memberLabel,
-            systemIconName: systemIconName,
-            semanticLabel: 'Open settings for ${channel.name}, $memberLabel',
-            onPressed: onTap,
-            width: constraints.maxWidth,
-            height: constraints.maxHeight,
-            controlSize: controlHeight,
-            fillWidth: true,
-            foregroundColor: context.colors.primary,
-            nativeViewSuppressed: nativeViewSuppressed,
+          final naturalWidth =
+              (_iosChannelHeaderHorizontalInset * 2) +
+              _iosChannelHeaderIconSize +
+              _iosChannelHeaderIconSpacing +
+              textWidth;
+          final controlWidth = min(naturalWidth, constraints.maxWidth);
+          return Align(
+            alignment: Alignment.centerLeft,
+            child: IosGlassNavigationButton(
+              key: const ValueKey('channel-header-settings-trigger'),
+              icon: IosGlassNavigationIcon.channel,
+              label: channel.name,
+              subtitle: memberLabel,
+              systemIconName: systemIconName,
+              semanticLabel: 'Open settings for ${channel.name}, $memberLabel',
+              onPressed: onTap,
+              width: controlWidth,
+              height: constraints.maxHeight,
+              controlSize: _iosChannelHeaderControlHeight,
+              fillWidth: true,
+              foregroundColor: context.colors.primary,
+              nativeViewSuppressed: nativeViewSuppressed,
+            ),
           );
         },
       );
