@@ -1272,9 +1272,10 @@ impl Config {
     /// Makes **zero** direct or transitive calls to `Config::from_env()` and
     /// performs **zero** process-environment reads.  Every field is assigned a
     /// hard-coded development default — the same value `from_env()` selects
-    /// when the corresponding variable is absent — so the configuration is
-    /// identical to a clean dev environment regardless of what the test process
-    /// has in its environment.
+    /// when the corresponding variable is absent, except for
+    /// `git_hook_hmac_secret` which uses a fixed test-only 64-hex literal
+    /// instead of the random value that `from_env()` generates — so two calls
+    /// always produce an identical [`Config`].
     ///
     /// The DB and Redis URLs use unreachable loopback endpoints (port 1) so
     /// tests that never touch external services can construct an `AppState`
@@ -1371,9 +1372,11 @@ impl Config {
             git_pack_cache_max_concurrent_populations: 2,
             git_max_repos_per_pubkey: 100,
             git_max_concurrent_ops: 20,
-            // Random 32-byte secret encoded as hex — same as the from_env()
-            // fallback when BUZZ_GIT_HOOK_HMAC_SECRET is absent.
-            git_hook_hmac_secret: hex::encode(rand::random::<[u8; 32]>()),
+            // Fixed test-only 64-hex secret.  The value is non-sensitive and
+            // intentionally constant so two calls to this constructor always
+            // produce an identical Config.
+            git_hook_hmac_secret:
+                "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
             push_enabled: false,
             push_executor_key_id: "relay-v1".to_string(),
             push_gateway_delivery_url: Some(
@@ -1403,6 +1406,28 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("private-klipy-key"));
+    }
+
+    #[test]
+    fn hermetic_for_test_is_deterministic() {
+        // Two calls must produce identical configs — no random or env-sourced
+        // fields may differ.  This is the mandatory-red regression for the
+        // fixed HMAC secret: restoring the rand::random expression causes the
+        // two secrets to diverge and this assertion fails.
+        let a = Config::hermetic_for_test();
+        let b = Config::hermetic_for_test();
+        assert_eq!(
+            a.git_hook_hmac_secret, b.git_hook_hmac_secret,
+            "hermetic_for_test() must return identical git_hook_hmac_secret across calls"
+        );
+        // The secret must be the fixed test-only value (non-empty, 64 hex chars).
+        assert_eq!(a.git_hook_hmac_secret.len(), 64);
+        assert!(
+            a.git_hook_hmac_secret
+                .chars()
+                .all(|c| c.is_ascii_hexdigit()),
+            "git_hook_hmac_secret must be 64 lowercase hex characters"
+        );
     }
 
     // Mutex to serialize tests that mutate environment variables.
