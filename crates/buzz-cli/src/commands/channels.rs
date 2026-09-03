@@ -518,7 +518,7 @@ pub async fn cmd_restore_canvas(
             eprintln!(
                 "warning: canvas restore {our_id} was published but its post-write verification read failed; the restore is preserved in history — check `buzz canvas history` if a concurrent edit may have landed"
             );
-            println!("{}", normalize_write_response(&resp));
+            let _ = writeln!(out, "{}", normalize_write_response(&resp));
             return Ok(());
         }
     };
@@ -3819,12 +3819,27 @@ mod restore_canvas_tests {
     #[tokio::test]
     async fn restore_succeeds_when_verification_read_fails() {
         let (url, submitted, _) = relay(PostHead::ReadFails).await;
-        cmd_restore_canvas(&client(&url), CHANNEL, REVISION, &mut vec![])
+        let mut out = vec![];
+        cmd_restore_canvas(&client(&url), CHANNEL, REVISION, &mut out)
             .await
             .expect("an accepted restore whose verification read fails still succeeds");
         assert!(
             submitted.lock().unwrap().is_some(),
             "the restore did publish before the verification read failed"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&out)
+            .expect("stdout must be valid JSON even when verification read fails");
+        assert!(
+            json.get("event_id").is_some(),
+            "stdout JSON must contain event_id"
+        );
+        assert!(
+            json.get("accepted").is_some(),
+            "stdout JSON must contain accepted"
+        );
+        assert!(
+            json.get("message").is_some(),
+            "stdout JSON must contain message"
         );
     }
 
@@ -3888,8 +3903,8 @@ mod restore_canvas_tests {
     /// seam in `submit_stored_event`:
     ///
     /// 1. Attempt 1 — POST /events: A is persisted on the relay; the relay then
-    ///    drops the TCP connection (no response body) so `with_retry_body` sees a
-    ///    network/body error and retries with the same bytes.
+    ///    returns HTTP 503 (a retryable status), so `with_retry_body` retries
+    ///    with the same bytes.
     /// 2. A concurrent writer B (built on A) arrives and becomes the new head
     ///    with `expected-revision = A`.
     /// 3. Attempt 2 — POST /events: returns the canonical 409 conflict body

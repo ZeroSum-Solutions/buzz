@@ -12,7 +12,8 @@
  *    the originating row, and `set_canvas` was called exactly once.
  * 3. **No spurious second dispatch**: attempting another restore while the
  *    mutation is pending (before the rejection settles) does not fire a second
- *    `set_canvas` call — the Restore button also carries `disabled` while pending.
+ *    `set_canvas` call — the row expand buttons also carry `disabled` while
+ *    pending, preventing `reset()` from being called mid-flight.
  *
  * Revert-causality: removing `disabled={restoreMutation.isPending}` from the
  * row button un-disables the row during the pending phase. In that case the
@@ -65,7 +66,7 @@ let CommunitiesProvider;
 let CanvasHistoryPanel;
 
 // Controls the IPC: null means the test has not triggered set_canvas yet.
-let deferredResolve = null;
+let _deferredResolve = null;
 let deferredReject = null;
 let setCanvasCalls = 0;
 
@@ -101,7 +102,7 @@ before(async () => {
       if (cmd === "set_canvas") {
         setCanvasCalls += 1;
         return new Promise((resolve, reject) => {
-          deferredResolve = resolve;
+          _deferredResolve = resolve;
           deferredReject = reject;
         });
       }
@@ -162,15 +163,15 @@ async function settle(iterations = 8) {
 /**
  * Full pending-guard contract:
  *
- * 1. Row buttons are disabled while restoreMutation.isPending is true.
+ * 1. Row expand buttons are disabled while restoreMutation.isPending is true.
  * 2. Rejecting the IPC makes the error visible under the originating row;
  *    set_canvas remains at exactly 1 call (no reset() fired mid-flight).
- * 3. Clicking the Restore button while pending does not fire a second IPC
- *    (the Restore button also carries disabled={restoreMutation.isPending}).
+ * 3. Clicking another row's expand button while pending does not fire a second
+ *    IPC (disabled prevents reset() from being called mid-flight).
  */
 test("pending-guard: row disabled, rejection visible, no second dispatch", async () => {
   setCanvasCalls = 0;
-  deferredResolve = null;
+  _deferredResolve = null;
   deferredReject = null;
 
   const client = new QueryClient({
@@ -254,8 +255,10 @@ test("pending-guard: row disabled, rejection visible, no second dispatch", async
   });
   await settle(12);
 
-  // After rejection the error must render under the OLDER_A row.
-  const errorEl = container.querySelector("[role='alert']");
+  // After rejection the error must render under the OLDER_A row (the
+  // originating row — OLDER_A was selected when set_canvas was dispatched).
+  const olderALi = items[1]?.closest("li");
+  const errorEl = olderALi?.querySelector("[role='alert']") ?? null;
   const errorVisible = errorEl !== null;
   const errorText = errorEl?.textContent ?? "";
 
@@ -283,6 +286,10 @@ test("pending-guard: row disabled, rejection visible, no second dispatch", async
     assert.ok(
       errorVisible,
       "rejecting the IPC must render an error under the originating row",
+    );
+    assert.ok(
+      errorText.includes(rejectionMessage),
+      `error text must contain the rejection message; got: "${errorText}"`,
     );
     assert.equal(
       finalCallCount,
