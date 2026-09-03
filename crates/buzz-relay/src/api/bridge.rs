@@ -4926,6 +4926,91 @@ mod postgres_tests {
         );
     }
 
+    // ── T2-seam: admitted malformed query through real handler → 400 ─────────
+    //
+    // Thufir's required seam test: one admitted malformed-query request through
+    // a real affected handler (`moderation_reports`) asserting 400.
+    //
+    // ## What this proves
+    //
+    // With the old `.ok().unwrap_or_default()` behavior: `?status=open&limit=abc`
+    // silently discarded ALL query fields (the entire `ModerationReadQuery`
+    // became `Default`) and the handler returned 200 with all reports.
+    // With `parse_query_or_400`: the handler returns 400 after admission.
+    //
+    // The test would fail against the old code because the handler would return
+    // 200 (list all reports) rather than 400.
+    //
+    // ## Setup
+    //
+    // NIP-FI Off mode + `require_auth_token = false` allows X-Pubkey dev-mode
+    // auth to bypass NIP-98 and NIP-FI gates, admitting the request to the
+    // application layer.  The actor is seeded as community "owner" so the
+    // moderation authz check passes without requiring real relay member rows.
+    //
+    // ## Falsifying mutation
+    //
+    // Revert `parse_query_or_400` to `.ok().unwrap_or_default()` in
+    // `moderation_reports`.  The handler returns 200 (all reports for the
+    // freshly created community — an empty array `[]`) instead of 400.
+    // The `assert_eq!(status, BAD_REQUEST)` assertion panics.
+    #[test]
+    #[ignore = "requires Postgres"]
+    fn t2_admitted_malformed_query_through_moderation_reports_is_400() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current_thread runtime");
+
+        // Off mode: NIP-FI gate is transparent; require_auth_token=false allows
+        // X-Pubkey dev-mode auth to admit the request.
+        let Some(state) = rt.block_on(nip_fi_off_test_state()) else {
+            panic!("local Postgres not reachable");
+        };
+
+        let host = format!("t2-seam-{}.local", uuid::Uuid::new_v4().simple());
+        let community = rt
+            .block_on(state.db.ensure_configured_community(&host))
+            .expect("ensure community");
+
+        // Seed the test actor as "owner" so moderation authz passes.
+        let actor_keys = Keys::generate();
+        let actor_hex = actor_keys.public_key().to_hex();
+        rt.block_on(
+            state
+                .db
+                .add_relay_member(community.id, &actor_hex, "owner", None),
+        )
+        .expect("seed actor as owner");
+
+        // Build headers: X-Pubkey dev-mode admission (require_auth_token=false).
+        // No Nostr-Federated-Identity header — NIP-FI is Off, so the guard is
+        // transparent and the per-handler check admits unconditionally.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-pubkey", actor_hex.parse().expect("valid header"));
+
+        // Malformed query: `status=open` is valid but `limit=abc` is not.
+        // Old behavior: `.ok().unwrap_or_default()` → status=None, limit=None
+        //   (all fields dropped), handler returns 200.
+        // New behavior: `parse_query_or_400` → 400 BAD_REQUEST.
+        let status = rt.block_on(oneshot_request(
+            state,
+            "GET",
+            "/moderation/reports?status=open&limit=abc",
+            &host,
+            headers,
+            b"",
+        ));
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "T2 seam: GET /moderation/reports?status=open&limit=abc after admission MUST \
+             return 400; if this returns 200 the handler is still using .ok().unwrap_or_default() \
+             which silently discards all query fields on parse error [FI-TRACE-HTTP-INGRESS T2]"
+        );
+    }
+
     // ── F4: bridge POST /query — deny_protected mode → 503 ──────────────────
     //
     // DenyProtected fires the gate unconditionally before any NIP-98 check,

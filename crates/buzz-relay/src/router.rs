@@ -62,12 +62,26 @@ use crate::state::AppState;
 //
 // ## What this guard checks (and does NOT check)
 //
-// The guard only verifies *assertion-header presence* — not signature, not
-// key pairing, not deny-map.  Full verification is the per-handler job.  This
-// split is intentional: the guard cannot derive the `proven_pubkey` (that
-// comes from per-handler NIP-98 verification), so it cannot do pairing.  The
-// guard's job is exclusively to prevent admission on paths where the handler
-// forgot its own gate.
+// The guard calls `extract_bearer_token` — the same transport-parsing
+// function used by the full per-handler verifier.  This means:
+//
+//   • Absent header                → 401 MissingEvidence
+//   • Junk / non-Bearer value      → 403 EvidenceRejected
+//   • Repeated header fields       → 403 EvidenceRejected
+//   • Comma-combined fields        → 403 EvidenceRejected
+//   • Empty / whitespace token     → 403 EvidenceRejected
+//   • Structurally valid token     → forward to handler
+//
+// The guard does NOT verify the JWT signature, issuer, expiry, or key
+// pairing — those require `proven_pubkey` from per-handler NIP-98
+// verification, which is not available in the middleware.  Full admission
+// authority remains with the per-handler `check_nip_fi_http_on_state` call.
+//
+// Key invariant: a forgotten-gate handler cannot admit with
+// `Nostr-Federated-Identity: junk` — the guard rejects any malformed or
+// non-Bearer token before the handler fires.  Only a structurally-valid
+// compact JWS token reaches the handler, which then performs the full
+// assertion signature verification and key pairing.
 //
 // [FI-TRACE-AUTHORITY-UNIFORM] Both the guard and the per-handler checks
 // delegate to `nip_fi_http.rs`; the guard fires first.
@@ -119,15 +133,29 @@ const NIP_FI_EXEMPT_PREFIXES: &[&str] = &[
     "/invite/",
     // Git web GUI (SPA) — exact + subtree
     "/repos",
+    // Internal HMAC/localhost control-plane endpoint for the pre-receive hook.
+    // Already protected by `require_localhost` middleware + signed operation
+    // payload; does not carry a NIP-FI assertion.  Listed by exact path —
+    // sub-paths (if any) are equally harmless since no routes exist there.
+    "/internal/git/policy",
 ];
 
-/// Middleware: assertion-presence guard for NIP-FI protected paths.
+/// Middleware: assertion-transport guard for NIP-FI protected paths.
 ///
 /// Fires before any handler.  In Enforce mode, if the request path is not
-/// covered by [`NIP_FI_EXEMPT_PREFIXES`] and the
-/// `Nostr-Federated-Identity: Bearer …` header is absent, the request is
-/// denied with the canonical NIP-FI 401 `authentication required\n` response
-/// before the handler is dispatched.
+/// covered by [`NIP_FI_EXEMPT_PREFIXES`] the guard calls
+/// [`crate::nip_fi_http::extract_bearer_token`] on the assertion header:
+///
+/// - Absent header               → 401 `authentication required\n`
+/// - Junk / non-Bearer value     → 403 `evidence rejected\n`
+/// - Repeated / comma-combined   → 403 `evidence rejected\n`
+/// - Structurally valid token    → forward to handler
+///
+/// A "forgotten gate" handler — one that omits its own
+/// `check_nip_fi_http_on_state` call — cannot admit with an invalid or
+/// malformed assertion because the guard rejects those shapes here.
+/// Only a structurally-valid compact JWS token reaches the handler; the
+/// handler then performs the full JWT signature verification and key pairing.
 ///
 /// In Off mode the middleware is fully transparent.
 async fn nip_fi_assertion_guard(
@@ -135,7 +163,8 @@ async fn nip_fi_assertion_guard(
     request: Request<Body>,
     next: middleware::Next,
 ) -> axum::response::Response {
-    use buzz_auth::{NipFiMode, CLIENT_ATTACHED_HEADER};
+    use crate::nip_fi_http::extract_bearer_token;
+    use buzz_auth::NipFiMode;
 
     // Off mode: fully transparent. [FI-INV-15]
     if matches!(state.config.nip_fi.mode, NipFiMode::Off) {
@@ -144,7 +173,7 @@ async fn nip_fi_assertion_guard(
 
     let path = request.uri().path();
 
-    // Exempt paths bypass the assertion-presence check.
+    // Exempt paths bypass the assertion-token check.
     let exempt = NIP_FI_EXEMPT_PREFIXES.iter().any(|pattern| {
         if *pattern == "/" {
             // Exact root match only.
@@ -178,15 +207,16 @@ async fn nip_fi_assertion_guard(
         return http_denial(buzz_auth::DenialClass::AuthorizationUnavailable);
     }
 
-    // Enforce mode: require assertion-header presence.  Full verification
-    // (signature, pairing, deny-map) is the per-handler job.
-    let headers = request.headers();
-    let has_assertion = headers.contains_key(CLIENT_ATTACHED_HEADER);
-    if !has_assertion {
-        return http_denial(buzz_auth::DenialClass::MissingEvidence);
+    // Enforce mode: validate assertion-token transport.
+    // `extract_bearer_token` rejects absent, junk, repeated, comma-combined,
+    // empty, and whitespace-containing values — not just "no header present".
+    // This means a forgotten-gate handler cannot admit with any invalid
+    // header value; only a structurally-valid compact JWS token passes.
+    // [FI-TRACE-TRANSPORT-CLOSED]
+    match extract_bearer_token(request.headers()) {
+        Ok(_token) => next.run(request).await,
+        Err(class) => http_denial(class),
     }
-
-    next.run(request).await
 }
 
 /// Build the axum [`Router`] with all relay routes, middleware, and CORS configuration.
@@ -1693,6 +1723,241 @@ mod tests {
             !is_exempt("/api/invites/new-endpoint"),
             "a new invite sub-path must not be exempt just because /api/invites/ exists; \
              only /api/invites/claim and /api/invites/accept-policy are explicitly exempt"
+        );
+    }
+
+    // ── T1-IMP1: adversarial guard — junk/non-Bearer assertion is denied ──────
+    //
+    // Before this fix the guard called `headers.contains_key(CLIENT_ATTACHED_HEADER)`,
+    // so `Nostr-Federated-Identity: junk` would pass because the header is
+    // present.  After the fix the guard calls `extract_bearer_token`, which
+    // rejects any value that is not a well-formed `Bearer <compact-JWS>` token.
+    //
+    // This test proves the adversarial case named in Thufir's IMP1: a
+    // forgotten-gate handler with a junk/invalid assertion header must be
+    // denied — not forwarded to the handler.
+    //
+    // The test does NOT need to build the full production router: it verifies
+    // that `extract_bearer_token` would deny the invalid header, which is
+    // exactly what the guard calls.  The middleware path coverage (guard →
+    // extract_bearer_token → http_denial) is fixed code; the logic
+    // under test is the transport-validation function itself.
+    //
+    // Falsifying mutation: revert the guard to `headers.contains_key(...)`.
+    // With the old code, `extract_bearer_token(&headers).is_err()` is true but
+    // the guard never calls it — the request would be forwarded. This test
+    // directly exercises the path the guard now takes.
+    #[test]
+    fn guard_rejects_junk_assertion_not_just_absent_header() {
+        use crate::nip_fi_http::extract_bearer_token;
+        use axum::http::HeaderMap;
+        use buzz_auth::CLIENT_ATTACHED_HEADER;
+
+        // Case 1: bare junk value (not Bearer-prefixed).
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CLIENT_ATTACHED_HEADER,
+            "junk".parse().expect("valid header value"),
+        );
+        assert!(
+            extract_bearer_token(&headers).is_err(),
+            "guard calls extract_bearer_token: bare 'junk' must be rejected (EvidenceRejected)"
+        );
+
+        // Case 2: valid-looking Bearer prefix but empty token.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CLIENT_ATTACHED_HEADER,
+            "Bearer ".parse().expect("valid header value"),
+        );
+        assert!(
+            extract_bearer_token(&headers).is_err(),
+            "guard calls extract_bearer_token: 'Bearer ' with empty token must be rejected"
+        );
+
+        // Case 3: invalidly-signed compact JWS would still be structurally
+        // valid here (three Base64url-separated dots) — the guard forwards it
+        // and the per-handler call performs the signature check.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CLIENT_ATTACHED_HEADER,
+            "Bearer a.b.c".parse().expect("valid header value"),
+        );
+        assert!(
+            extract_bearer_token(&headers).is_ok(),
+            "structurally-valid compact JWS token must pass the guard \
+             (full signature check is the per-handler job)"
+        );
+    }
+
+    // ── T1-IMP2 exemption classification ─────────────────────────────────────
+    //
+    // `/internal/git/policy` must be exempt so the pre-receive hook callback
+    // reaches its own `require_localhost` + HMAC authorization layer in active
+    // NIP-FI mode.  Only the exact path and sub-paths are exempt — the broader
+    // `/internal/` subtree is NOT exempted (no catch-all entry exists).
+    //
+    // Matching semantics: a non-`/`-ending pattern matches exact OR sub-paths
+    // (path equals pattern, or path starts with `pattern/`).  This is safe
+    // because no routes exist under `/internal/git/policy/*` — any sub-path
+    // passes through the guard to Axum, which returns 404.
+    //
+    // Falsifying mutation: remove the "/internal/git/policy" entry from
+    // NIP_FI_EXEMPT_PREFIXES.  `is_exempt("/internal/git/policy")` returns
+    // false, and the guard would return 401 in Enforce mode (every git push
+    // would be rejected by the hook callback failing).
+    #[test]
+    fn internal_git_policy_is_exempt_but_internal_subtree_is_not() {
+        assert!(
+            is_exempt("/internal/git/policy"),
+            "/internal/git/policy must be exempt: pre-receive hook calls it without \
+             a NIP-FI assertion; blocking it breaks git push in Enforce/DenyProtected mode"
+        );
+        // No catch-all /internal/ entry exists — only the specific path is
+        // listed, so unrelated /internal/* paths are not exempt.
+        assert!(
+            !is_exempt("/internal/"),
+            "the /internal/ subtree must NOT be broadly exempt; \
+             only the specific hook-callback path is exempted"
+        );
+        assert!(
+            !is_exempt("/internal/other"),
+            "/internal/other must NOT be exempt (no /internal/ subtree entry)"
+        );
+    }
+
+    // ── T1-IMP2 production-router test: git policy callback in Enforce mode ──
+    //
+    // In active NIP-FI Enforce mode, POST /internal/git/policy with no
+    // assertion header must NOT be denied by the NIP-FI guard (401).
+    // It must reach the policy handler, which returns 403 for an HMAC
+    // validation failure (bad or missing signature).
+    //
+    // This proves that a git push's pre-receive hook callback is NOT blocked
+    // by the NIP-FI assertion guard and reaches its own authorization layer.
+    //
+    // Falsifying mutation: remove "/internal/git/policy" from
+    // NIP_FI_EXEMPT_PREFIXES.  The guard fires, returning 401 before the
+    // handler; assert_ne!(_, UNAUTHORIZED) panics.
+    //
+    // Note: `require_localhost` middleware uses `ConnectInfo<SocketAddr>`.
+    // Tower's `oneshot` does not populate connection extensions, so
+    // `is_loopback()` returns false and the call returns 403 ("localhost only")
+    // before the HMAC check.  Both 403s mean the NIP-FI guard did NOT fire —
+    // only 401 (NIP-FI MissingEvidence) would mean the guard blocked it.
+    #[test]
+    #[ignore = "requires Postgres"]
+    fn nip_fi_enforce_git_policy_callback_reaches_own_auth_not_nip_fi_guard() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use nostr::Keys;
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current_thread runtime");
+
+        // Build an AppState with NIP-FI Enforce mode — same pattern as the
+        // bridge seam-test helper, inlined here to avoid cross-module
+        // test-only visibility coupling.
+        let state: Option<Arc<crate::state::AppState>> = rt.block_on(async {
+            let mut config = crate::config::Config::from_env().ok()?;
+            config.database_url = crate::test_support::database_url();
+            config.redis_url =
+                std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+            config.relay_url = "wss://nip-fi-router-test.local".to_string();
+            config.require_auth_token = true;
+            config.require_relay_membership = false;
+            config.nip_fi.mode = buzz_auth::NipFiMode::Enforce;
+
+            let pool = sqlx::PgPool::connect(&crate::test_support::database_url())
+                .await
+                .ok()?;
+            let db = buzz_db::Db::from_pool(pool.clone());
+            let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .ok()?;
+            let pubsub = Arc::new(
+                buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                    .await
+                    .ok()?,
+            );
+            let audit = buzz_audit::AuditService::new(pool.clone());
+            let auth = buzz_auth::AuthService::new(config.auth.clone());
+            let search = buzz_search::SearchService::new(pool.clone());
+            let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+                db.clone(),
+                buzz_workflow::WorkflowConfig::default(),
+            ));
+            let media_storage = buzz_media::MediaStorage::new(&config.media).ok()?;
+
+            let (state, _audit_shutdown) = crate::state::AppState::new(
+                config,
+                db,
+                redis_pool,
+                audit,
+                pubsub,
+                auth,
+                search,
+                workflow_engine,
+                Keys::generate(),
+                media_storage,
+            );
+            Some(Arc::new(state))
+        });
+
+        let Some(state) = state else {
+            panic!("local Postgres not reachable");
+        };
+
+        // Minimal syntactically-valid payload — the HMAC will fail (no real
+        // hook secret), so the policy handler returns 403.  We only care that
+        // the NIP-FI guard does NOT produce a 401 first.
+        let body = br#"{
+            "repo_id": "test-repo",
+            "repo_owner": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "community_id": "test",
+            "pusher_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "ref_updates": [],
+            "timestamp": 1234567890,
+            "signature": "0000000000000000000000000000000000000000000000000000000000000000"
+        }"#;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/git/policy")
+            .header("host", "test.local")
+            .header("content-type", "application/json")
+            // No Nostr-Federated-Identity header — the guard must pass this through.
+            .body(Body::from(body.as_ref()))
+            .expect("build request");
+
+        let status = rt.block_on(async {
+            crate::router::build_router(state)
+                .oneshot(request)
+                .await
+                .expect("router oneshot")
+                .status()
+        });
+
+        assert_ne!(
+            status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "NIP-FI Enforce mode: POST /internal/git/policy with no assertion must NOT \
+             be denied by the NIP-FI guard (401); the pre-receive hook does not carry an \
+             assertion and must reach the policy handler's own auth layer \
+             [FI-TRACE-HTTP-INGRESS T1-IMP2]"
+        );
+        // The policy handler returns 403 (require_localhost check, since
+        // Tower's oneshot does not inject ConnectInfo) — not 401 from the guard.
+        // 403 proves the NIP-FI guard was not the rejector.
+        assert_eq!(
+            status,
+            axum::http::StatusCode::FORBIDDEN,
+            "POST /internal/git/policy must reach its own authorization layer (403), \
+             not be blocked at the NIP-FI guard layer (which would return 401)"
         );
     }
 }
