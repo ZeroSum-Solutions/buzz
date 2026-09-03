@@ -7,6 +7,7 @@ pub(super) async fn start_local_agent_with_preflight(
     allow_fresh_create_start: bool,
     expected_relay_url: Option<&str>,
     expected_signer_pubkey: Option<&str>,
+    replay_floor_unix: Option<u64>,
 ) -> Result<ManagedAgentSummary, String> {
     let (record_snapshot, start_scope) = {
         let _store_guard = state
@@ -120,6 +121,7 @@ pub(super) async fn start_local_agent_with_preflight(
         &mut runtimes,
         Some(workspace_owner.as_str()),
         &workspace_relay_url,
+        replay_floor_unix,
     )?;
     // Persist operational lifecycle metadata only. Relay-owned configuration
     // remains an in-memory overlay and is never copied over device-local fields.

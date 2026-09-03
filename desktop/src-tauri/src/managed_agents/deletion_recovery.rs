@@ -1,6 +1,27 @@
 //! Finish only explicitly journaled deletion; relay-only heads are not garbage.
 use super::retention::{active_retention_scope, deletion_intent, open_retention_db};
+use super::{
+    bestie_assignment::{recover_pending_assignment_cleanup, with_agent_assignments_cleared},
+    ManagedAgentRecord,
+};
 use tauri::{AppHandle, Manager};
+
+/// Preserve assignment rollback around the lifecycle-record removal only.
+/// Later key/overlay cleanup is retryable and must not restore deleted assignments.
+/// Caller holds the managed-agent store lock.
+pub(crate) fn run_managed_agent_deletion<T>(
+    base_dir: &std::path::Path,
+    pubkey: &str,
+    records: &mut Vec<ManagedAgentRecord>,
+    delete: impl FnOnce(&mut Vec<ManagedAgentRecord>) -> Result<T, String>,
+) -> Result<T, String> {
+    recover_pending_assignment_cleanup(base_dir, |pending_pubkey| {
+        records
+            .iter()
+            .any(|record| record.pubkey.eq_ignore_ascii_case(pending_pubkey))
+    })?;
+    with_agent_assignments_cleared(base_dir, pubkey, || delete(records))
+}
 
 /// Caller holds transition then store lock. Each completed prefix remains
 /// retryable from the exact journal entry, including failed key deletion.
@@ -43,11 +64,18 @@ fn finish_with_key_cleanup<R: tauri::Runtime>(
         .managed_agent_processes
         .lock()
         .map_err(|error| error.to_string())?;
-    if let Some(record) = records.iter_mut().find(|record| record.pubkey == pubkey) {
-        super::stop_managed_agent_process(app, record, &mut runtimes)?;
-    }
-    records.retain(|record| record.pubkey != pubkey);
-    super::save_managed_agents(app, &records)?;
+    run_managed_agent_deletion(
+        &super::managed_agents_base_dir(app)?,
+        pubkey,
+        &mut records,
+        |records| {
+            if let Some(record) = records.iter_mut().find(|record| record.pubkey == pubkey) {
+                super::stop_managed_agent_process(app, record, &mut runtimes)?;
+            }
+            records.retain(|record| record.pubkey != pubkey);
+            super::save_managed_agents(app, records)
+        },
+    )?;
     state
         .private_managed_agent_overlay
         .lock()

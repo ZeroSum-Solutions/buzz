@@ -161,8 +161,10 @@ export type UserStatus = {
   text: string;
   emoji: string;
   updatedAt: number;
+  /** NIP-01 tie-breaker for replacement events sharing `updatedAt`. */
+  eventId?: string;
+  expiresAt?: number;
 };
-
 export type UserStatusLookup = Record<string, UserStatus | null>;
 
 export type {
@@ -270,7 +272,8 @@ export type RelayAgent = {
   channels: string[];
   channelIds: string[];
   capabilities: string[];
-  status: "online" | "away" | "offline";
+  /** Policy-only discovery has no liveness evidence. */
+  status: "online" | "away" | "offline" | "unknown";
   respondTo: RespondToMode | null;
   respondToAllowlist: string[];
 };

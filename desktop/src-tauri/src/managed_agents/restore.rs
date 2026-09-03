@@ -1,7 +1,8 @@
 mod authority;
 
 use super::{
-    find_managed_agent_mut, kill_stale_tracked_processes, load_managed_agents, load_personas,
+    bestie_assignment::recover_pending_assignment_cleanup, find_managed_agent_mut,
+    kill_stale_tracked_processes, load_managed_agents, load_personas, managed_agents_base_dir,
     save_managed_agents, spawn_agent_child, sync_managed_agent_processes, BackendKind,
     ManagedAgentProcess,
 };
@@ -119,6 +120,11 @@ pub async fn restore_managed_agents_on_launch(
         super::private_config_overlay::require_authority_ready(&state)?;
         restore_scope = super::retention::active_retention_scope(app, &state)?.db_path;
         let mut records = load_managed_agents(app)?;
+        recover_pending_assignment_cleanup(&managed_agents_base_dir(app)?, |pending_pubkey| {
+            records
+                .iter()
+                .any(|record| record.pubkey.eq_ignore_ascii_case(pending_pubkey))
+        })?;
         let mut runtimes = state
             .managed_agent_processes
             .lock()
@@ -345,6 +351,7 @@ pub async fn restore_managed_agents_on_launch(
                                                 &key.relay_url,
                                                 true,
                                                 owner_hex_ref,
+                                                None,
                                             )
                                         }) {
                                         Ok(process) => {

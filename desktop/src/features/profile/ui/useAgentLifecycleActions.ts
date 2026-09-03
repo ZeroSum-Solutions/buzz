@@ -8,16 +8,24 @@ import {
   startManagedAgentWithRules,
   stopManagedAgentWithRules,
 } from "@/features/agents/lib/managedAgentControlActions";
+import { agentPresenceStartBlockReason } from "@/features/agents/lib/useAgentAvailability";
 import { clearActiveTurnsForAgentOnStop } from "@/features/agents/managedAgentRuntimeHooks";
-import type { Channel, ManagedAgent, RelayAgent } from "@/shared/api/types";
+import type {
+  Channel,
+  ManagedAgent,
+  RelayAgent,
+  PresenceStatus,
+} from "@/shared/api/types";
 
 export function useAgentLifecycleActions({
+  availability,
   channels,
   managedAgent,
   relayAgents,
   startManagedAgent,
   stopManagedAgent,
 }: {
+  availability: PresenceStatus | undefined;
   channels: readonly Channel[] | undefined;
   managedAgent: ManagedAgent | undefined;
   relayAgents: readonly RelayAgent[] | undefined;
@@ -45,6 +53,8 @@ export function useAgentLifecycleActions({
         return;
       }
 
+      const blockReason = agentPresenceStartBlockReason(false, availability);
+      if (blockReason) throw new Error(blockReason);
       await startManagedAgentWithRules({
         agent: managedAgent,
         startManagedAgent,
@@ -60,6 +70,7 @@ export function useAgentLifecycleActions({
       );
     }
   }, [
+    availability,
     channels,
     managedAgent,
     relayAgents,
@@ -71,6 +82,11 @@ export function useAgentLifecycleActions({
     if (!managedAgent) return;
 
     try {
+      const blockReason = agentPresenceStartBlockReason(
+        isManagedAgentActive(managedAgent),
+        availability,
+      );
+      if (blockReason) throw new Error(blockReason);
       await respawnManagedAgentWithRules({
         agent: managedAgent,
         startManagedAgent,
@@ -83,7 +99,7 @@ export function useAgentLifecycleActions({
         error instanceof Error ? error.message : "Agent restart failed.",
       );
     }
-  }, [managedAgent, startManagedAgent, stopManagedAgent]);
+  }, [availability, managedAgent, startManagedAgent, stopManagedAgent]);
 
   return { handleAgentPrimaryAction, handleAgentRestart };
 }
