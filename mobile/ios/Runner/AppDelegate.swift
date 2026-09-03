@@ -558,7 +558,9 @@ import os.log
             relayURL: relayURL
           )
           var arguments = record.flutterArguments
-          arguments["migrationRelayOrigins"] = try self?.pushGatewayMigrationRelayOrigins() ?? []
+          if let inventory = try self?.pushGatewayMigrationInventory() {
+            arguments.merge(inventory) { _, latest in latest }
+          }
           await MainActor.run { result(arguments) }
         } catch {
           await MainActor.run {
@@ -613,19 +615,22 @@ import os.log
     pushGatewayURL = gatewayOrigin.url
   }
 
-  private func initializePushGateway(_ gatewayURL: URL) throws -> [String] {
+  private func initializePushGateway(_ gatewayURL: URL) throws -> [String: Any] {
     try configurePushGateway(gatewayURL)
-    return try pushGatewayMigrationRelayOrigins()
+    return try pushGatewayMigrationInventory()
   }
 
-  private func pushGatewayMigrationRelayOrigins() throws -> [String] {
-    return Array(
+  private func pushGatewayMigrationInventory() throws -> [String: Any] {
+    let retiredRelayOrigins = Array(
       Set(
         try endpointGrantStore.gatewayCleanupStates()
           .flatMap { $0.grants.map(\.relayOrigin) + $0.pendingEnrollments.map(\.relayOrigin) }
-          + endpointGrantStore.replacementRelayOrigins()
       )
     ).sorted()
+    return [
+      "retiredRelayOrigins": retiredRelayOrigins,
+      "replacementRelayOrigins": try endpointGrantStore.replacementRelayOrigins(),
+    ]
   }
 
   private func handleMediaUploadMethodCall(

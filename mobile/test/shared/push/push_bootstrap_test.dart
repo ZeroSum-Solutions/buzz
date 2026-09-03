@@ -222,6 +222,32 @@ void main() {
     );
   });
 
+  test('same-gateway rotation forces a durably checkpointed replacement', () {
+    final community =
+        Community.create(
+          name: 'Rotated',
+          relayUrl: 'wss://relay.example',
+        ).copyWith(
+          pushNotificationsEnabled: true,
+          pushSubscriptionState: BuzzPushLeaseSubscriptionState.accepted(
+            desired: const [],
+            acceptedSubscriptions: const [],
+            acceptedGeneration: 2,
+            acceptedGatewayOrigin: 'https://push.example',
+          ),
+        );
+
+    expect(
+      buzzPushCommunitiesRequiringGatewayMigration(
+        communities: [community],
+        retiredRelayOrigins: const {'wss://relay.example'},
+        replacementRelayOrigins: const {'wss://relay.example'},
+        targetGatewayOrigin: 'https://push.example',
+      ),
+      [community],
+    );
+  });
+
   test('pending opt-out tombstone keeps active push lifecycle disabled', () {
     final subscription = BuzzPushSubscription(
       filter: BuzzPushFilter(kinds: const [9], pTags: [_hex('a')]),

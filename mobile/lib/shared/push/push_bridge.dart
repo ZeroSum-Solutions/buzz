@@ -95,6 +95,7 @@ final apnsRegistrationError = ValueNotifier<String?>(null);
 final pushEndpointGrants = ValueNotifier<List<BuzzPushEndpointGrant>>([]);
 final pushEndpointGrantError = ValueNotifier<String?>(null);
 final retiredBuzzPushRelayOrigins = ValueNotifier<Set<String>>(const {});
+final replacementBuzzPushRelayOrigins = ValueNotifier<Set<String>>(const {});
 
 /// The most recent notification response waiting for app navigation.
 ///
@@ -144,13 +145,15 @@ Future<void> syncPendingBuzzPushNotificationResponse() async {
 Future<Set<String>> initializeBuzzPushGateway() async {
   if (defaultTargetPlatform != TargetPlatform.iOS) return const {};
   try {
-    final origins = await _channel.invokeListMethod<String>(
+    final inventory = await _channel.invokeMapMethod<dynamic, dynamic>(
       'initializeGateway',
       {'gatewayUrl': Env.pushGatewayUrl},
     );
-    final pending = origins?.toSet() ?? const <String>{};
-    retiredBuzzPushRelayOrigins.value = pending;
-    return pending;
+    final retired = _relayOriginSet(inventory?['retiredRelayOrigins']);
+    final replacements = _relayOriginSet(inventory?['replacementRelayOrigins']);
+    retiredBuzzPushRelayOrigins.value = retired;
+    replacementBuzzPushRelayOrigins.value = replacements;
+    return retired.union(replacements);
   } on MissingPluginException {
     // Flutter tests and non-Runner embeddings do not install the native bridge.
     return const {};
@@ -166,6 +169,7 @@ Future<void> completeBuzzPushGatewayMigration() async {
       'gatewayUrl': Env.pushGatewayUrl,
     });
     retiredBuzzPushRelayOrigins.value = const {};
+    replacementBuzzPushRelayOrigins.value = const {};
   } on MissingPluginException {
     // Flutter tests and non-Runner embeddings do not install the native bridge.
   }
@@ -257,12 +261,12 @@ Future<BuzzPushEndpointGrant> enrollBuzzPush(
   if (raw == null) {
     throw StateError('Native push enrollment returned no grant.');
   }
-  final migrationRelayOrigins = raw['migrationRelayOrigins'];
-  if (migrationRelayOrigins is List) {
-    retiredBuzzPushRelayOrigins.value = migrationRelayOrigins
-        .cast<String>()
-        .toSet();
-  }
+  retiredBuzzPushRelayOrigins.value = _relayOriginSet(
+    raw['retiredRelayOrigins'],
+  );
+  replacementBuzzPushRelayOrigins.value = _relayOriginSet(
+    raw['replacementRelayOrigins'],
+  );
   final grant = BuzzPushEndpointGrant.fromMap(raw);
   await readBuzzPushEndpointGrants();
   if (communitiesForSnapshotRefresh != null) {
@@ -275,6 +279,9 @@ Future<BuzzPushEndpointGrant> enrollBuzzPush(
   }
   return grant;
 }
+
+Set<String> _relayOriginSet(Object? value) =>
+    value is List ? value.cast<String>().toSet() : const {};
 
 /// Latest failure to export the community snapshot used by the iOS
 /// notification service extension. Snapshot export is push enrichment and must

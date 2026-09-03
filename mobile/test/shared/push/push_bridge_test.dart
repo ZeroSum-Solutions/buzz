@@ -22,6 +22,7 @@ void main() {
     pushEndpointGrants.value = const [];
     pushEndpointGrantError.value = null;
     retiredBuzzPushRelayOrigins.value = const {};
+    replacementBuzzPushRelayOrigins.value = const {};
     pushCommunitySnapshotError.value = null;
     pendingPushNotificationLink.value = null;
     installBuzzPushMethodHandler();
@@ -55,11 +56,20 @@ void main() {
           .setMockMethodCallHandler(_channel, (call) async {
             expect(call.method, 'initializeGateway');
             expect(call.arguments, {'gatewayUrl': Env.pushGatewayUrl});
-            return ['wss://old-relay.example'];
+            return {
+              'retiredRelayOrigins': ['wss://old-relay.example'],
+              'replacementRelayOrigins': ['wss://rotated-relay.example'],
+            };
           });
 
-      expect(await initializeBuzzPushGateway(), {'wss://old-relay.example'});
+      expect(await initializeBuzzPushGateway(), {
+        'wss://old-relay.example',
+        'wss://rotated-relay.example',
+      });
       expect(retiredBuzzPushRelayOrigins.value, {'wss://old-relay.example'});
+      expect(replacementBuzzPushRelayOrigins.value, {
+        'wss://rotated-relay.example',
+      });
     },
   );
 
@@ -78,6 +88,7 @@ void main() {
       await completeBuzzPushGatewayMigration();
 
       expect(retiredBuzzPushRelayOrigins.value, isEmpty);
+      expect(replacementBuzzPushRelayOrigins.value, isEmpty);
     },
   );
 
@@ -215,7 +226,8 @@ void main() {
           enrollmentArguments.add(call.arguments);
           return {
             ..._grantMap('new-grant'),
-            'migrationRelayOrigins': ['wss://sibling.example'],
+            'retiredRelayOrigins': ['wss://retired.example'],
+            'replacementRelayOrigins': ['wss://sibling.example'],
           };
         }
         if (call.method == 'endpointGrants') {
@@ -249,7 +261,8 @@ void main() {
 
       expect(firstGrant.endpointGrant, 'new-grant');
       expect(secondGrant.endpointGrant, 'new-grant');
-      expect(retiredBuzzPushRelayOrigins.value, {'wss://sibling.example'});
+      expect(retiredBuzzPushRelayOrigins.value, {'wss://retired.example'});
+      expect(replacementBuzzPushRelayOrigins.value, {'wss://sibling.example'});
       expect(enrollmentArguments, [
         {
           'relayUrl': 'wss://relay.example/',

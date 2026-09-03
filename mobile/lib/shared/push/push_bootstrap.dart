@@ -106,6 +106,7 @@ bool buzzPushLifecycleEnabled({
 List<Community> buzzPushCommunitiesRequiringGatewayMigration({
   required List<Community> communities,
   required Set<String> retiredRelayOrigins,
+  Set<String> replacementRelayOrigins = const {},
   required String targetGatewayOrigin,
 }) => communities
     .where(
@@ -114,8 +115,11 @@ List<Community> buzzPushCommunitiesRequiringGatewayMigration({
           retiredRelayOrigins.contains(
             buzzPushRelayWebSocketOrigin(community.relayUrl),
           ) &&
-          community.pushSubscriptionState.acceptedGatewayOrigin !=
-              targetGatewayOrigin,
+          (replacementRelayOrigins.contains(
+                buzzPushRelayWebSocketOrigin(community.relayUrl),
+              ) ||
+              community.pushSubscriptionState.acceptedGatewayOrigin !=
+                  targetGatewayOrigin),
     )
     .toList();
 
@@ -199,6 +203,7 @@ class BuzzPushBootstrap extends HookConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     useListenable(apnsDeviceToken);
     useListenable(retiredBuzzPushRelayOrigins);
+    useListenable(replacementBuzzPushRelayOrigins);
     final gatewayInitializationAttempt = useMemoized(BuzzPushAttemptGate.new);
     final publicationAttempt = useMemoized(BuzzPushAttemptGate.new);
     final gatewayMigrationAttempt = useMemoized(BuzzPushAttemptGate.new);
@@ -219,10 +224,15 @@ class BuzzPushBootstrap extends HookConsumerWidget {
     final descriptor = ref.watch(currentRelayPushDescriptorProvider).value;
     final token = apnsDeviceToken.value;
     final retiredRelayOrigins = retiredBuzzPushRelayOrigins.value;
+    final replacementRelayOrigins = replacementBuzzPushRelayOrigins.value;
+    final migrationRelayOrigins = retiredRelayOrigins.union(
+      replacementRelayOrigins,
+    );
     final targetGatewayOrigin = buzzPushGatewayOrigin(Env.pushGatewayUrl);
     final migrationCommunities = buzzPushCommunitiesRequiringGatewayMigration(
       communities: communities,
-      retiredRelayOrigins: retiredRelayOrigins,
+      retiredRelayOrigins: migrationRelayOrigins,
+      replacementRelayOrigins: replacementRelayOrigins,
       targetGatewayOrigin: targetGatewayOrigin,
     );
     final activeLifecycleReady =
@@ -353,19 +363,20 @@ class BuzzPushBootstrap extends HookConsumerWidget {
         community != null &&
         buzzPushCommunitiesRequiringGatewayMigration(
           communities: [community],
-          retiredRelayOrigins: retiredRelayOrigins,
+          retiredRelayOrigins: migrationRelayOrigins,
+          replacementRelayOrigins: replacementRelayOrigins,
           targetGatewayOrigin: targetGatewayOrigin,
         ).isNotEmpty;
     useEffect(
       () {
         if (token == null ||
-            retiredRelayOrigins.isEmpty ||
+            migrationRelayOrigins.isEmpty ||
             !communitiesAsync.hasValue) {
           return null;
         }
         final attempt = [
           token,
-          ...retiredRelayOrigins.toList()..sort(),
+          ...migrationRelayOrigins.toList()..sort(),
         ].join('|');
         if (!gatewayMigrationAttempt.tryBegin(attempt)) return null;
         unawaited(() async {
@@ -373,7 +384,8 @@ class BuzzPushBootstrap extends HookConsumerWidget {
             for (final candidate
                 in buzzPushCommunitiesRequiringGatewayMigration(
                   communities: communities,
-                  retiredRelayOrigins: retiredRelayOrigins,
+                  retiredRelayOrigins: migrationRelayOrigins,
+                  replacementRelayOrigins: replacementRelayOrigins,
                   targetGatewayOrigin: targetGatewayOrigin,
                 )) {
               await _publishCommunityReplacement(
@@ -415,7 +427,8 @@ class BuzzPushBootstrap extends HookConsumerWidget {
       },
       [
         token,
-        retiredRelayOrigins,
+        migrationRelayOrigins,
+        replacementRelayOrigins,
         communitiesAsync.hasValue,
         communities,
         gatewayMigrationRetry.value,
