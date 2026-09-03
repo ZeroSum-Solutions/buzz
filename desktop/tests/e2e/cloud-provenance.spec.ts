@@ -163,7 +163,17 @@ for (const agentListDelayMs of [0, 6_000]) {
         .getByTestId(`channel-agent-provenance-${dm.id}`)
         .locator("svg.lucide-cloud"),
     ).toBeVisible();
-    await page.locator(`[data-channel-id="${dm.id}"]`).click();
+    const dmRow = page.locator(`[data-channel-id="${dm.id}"]`);
+    const dmNameAdornments = dmRow.locator("[data-sidebar-row-label]");
+    await expect(
+      dmNameAdornments.getByTestId(`channel-agent-provenance-${dm.id}`),
+    ).toBeVisible();
+    await expect(
+      dmRow.locator(
+        `:scope > [data-testid="channel-agent-provenance-${dm.id}"]`,
+      ),
+    ).toHaveCount(0);
+    await dmRow.click();
     await expect(
       page
         .getByTestId("chat-header-agent-provenance")

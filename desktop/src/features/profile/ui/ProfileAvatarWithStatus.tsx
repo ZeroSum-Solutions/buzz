@@ -50,6 +50,21 @@ export function scaleProfileAvatarStatusGeometry(
   };
 }
 
+const SQUIRCLE_STATUS_INSET_RATIO = 0.05;
+
+export function insetProfileAvatarStatusGeometry(
+  geometry: ProfileAvatarStatusGeometry,
+  size: number,
+): ProfileAvatarStatusGeometry {
+  const inset = size * SQUIRCLE_STATUS_INSET_RATIO;
+
+  return {
+    ...geometry,
+    centerX: geometry.centerX - inset,
+    centerY: geometry.centerY - inset,
+  };
+}
+
 export function ProfileAvatarWithStatus({
   avatarClassName,
   avatarUrl,
@@ -63,20 +78,24 @@ export function ProfileAvatarWithStatus({
   statusTestId,
   testId,
 }: ProfileAvatarWithStatusProps) {
+  const resolvedGeometry =
+    shape === "squircle"
+      ? insetProfileAvatarStatusGeometry(geometry, size)
+      : geometry;
   const statusLabel = status ? getPresenceLabel(status) : null;
   const cutout = status
     ? {
-        cx: geometry.centerX,
-        cy: geometry.centerY,
-        r: geometry.cutoutSize / 2,
+        cx: resolvedGeometry.centerX,
+        cy: resolvedGeometry.centerY,
+        r: resolvedGeometry.cutoutSize / 2,
       }
     : undefined;
   const badgeBox = status
     ? {
-        bottom: size - geometry.centerY - geometry.dotSize / 2,
-        height: geometry.dotSize,
-        right: size - geometry.centerX - geometry.dotSize / 2,
-        width: geometry.dotSize,
+        bottom: size - resolvedGeometry.centerY - resolvedGeometry.dotSize / 2,
+        height: resolvedGeometry.dotSize,
+        right: size - resolvedGeometry.centerX - resolvedGeometry.dotSize / 2,
+        width: resolvedGeometry.dotSize,
       }
     : undefined;
 

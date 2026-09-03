@@ -1351,6 +1351,20 @@ test("shows capped participant stack in group direct message header", async ({
   await expect(
     page.getByTestId("message-dm-intro-avatar-stack-more"),
   ).toHaveText("+1");
+  for (const stack of [
+    page.getByTestId("chat-header-dm-avatar-stack"),
+    page.getByTestId("message-dm-intro-avatar-stack"),
+  ]) {
+    const participants = stack.locator(
+      '[data-testid$="avatar-stack-participant"]',
+    );
+    await expect(participants.first()).not.toHaveCSS("mask-image", "none");
+    await expect(participants.last()).not.toHaveCSS("mask-image", "none");
+    await expect(stack.locator('[data-testid$="avatar-stack-more"]')).toHaveCSS(
+      "mask-image",
+      "none",
+    );
+  }
 });
 
 test("create stream with name and description", async ({ page }) => {
