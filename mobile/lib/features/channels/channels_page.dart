@@ -165,6 +165,7 @@ class ChannelsPage extends HookConsumerWidget {
     required this.settingsPageBuilder,
     required this.onSettingsTransitionProgress,
     this.tabReselection,
+    this.isActive = true,
     super.key,
   });
 
@@ -176,6 +177,9 @@ class ChannelsPage extends HookConsumerWidget {
 
   /// Notifies this page when its already-selected tab is tapped again.
   final ValueListenable<int>? tabReselection;
+
+  /// Whether Home is the currently visible tab.
+  final bool isActive;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -328,6 +332,8 @@ class ChannelsPage extends HookConsumerWidget {
     final usesPinnedGradient = topSectionGradient != null;
 
     return FrostedScaffold(
+      statusBarScrollController: channelsScrollController,
+      statusBarScrollToTopEnabled: isActive,
       backgroundColor: usesPinnedGradient
           ? Colors.transparent
           : context.colors.surface,

@@ -253,6 +253,7 @@ class ChannelDetailsPage extends HookConsumerWidget {
         Navigator.canPop(context) &&
         Theme.of(context).platform == TargetPlatform.iOS;
     return FrostedScaffold(
+      statusBarScrollController: scrollController,
       useUtilitySurfaceTheme: true,
       appBar: FrostedAppBar(
         horizontalInset: Theme.of(context).platform == TargetPlatform.iOS
