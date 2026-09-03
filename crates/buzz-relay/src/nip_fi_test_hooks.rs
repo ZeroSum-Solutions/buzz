@@ -45,6 +45,17 @@
 //! | **W10** (concurrent committers, different pubkeys) | same as W9 | Delete `before_participant_commit(...)` call | `arrived_rx` times out — test panics |
 //! | **W10** (concurrent committers, different pubkeys) | same | Remove `acquire_effect()` from `commit_participant_join` | second task commits too — two rows present — row-count assertion panics |
 //! | **W10-reaffirm** (same pubkey twice) | same as W9 | Delete `before_participant_commit(...)` call | `arrived_rx` times out — test panics |
+//! | **CW5** (AutoAddRequired joint-tx rollback) | `audio/handler.rs` — `before_participant_commit` fires after BOTH membership insert AND 48101 insert are in the uncommitted tx | Delete `before_participant_commit(...)` call | `arrived_rx` times out — test panics |
+//! | **CW5** (AutoAddRequired joint-tx rollback) | same | Remove `acquire_effect()` from `commit_participant_join` | both rows committed — membership row-count assertion panics |
+//! | **CW5** (AutoAddRequired joint-tx rollback) | same | Change `membership_admission` to `Existing` | auto-add path never entered; membership seam not covered — test fails at isolation |
+//! | **CW5-variant** (concurrent external membership add) | `audio/handler.rs` — `before_membership_lock` fires inside the `AutoAddRequired` branch immediately before the channel membership lock | Delete `before_membership_lock(...)` call | `arrived_rx` times out — test panics |
+//! | **CW5-variant** (concurrent external membership add) | same | Remove the `still_absent` re-read and always insert | external membership may be double-written (ON CONFLICT behaviour) — re-read path is the contract seam; removing it bypasses the contract |
+//! | **CW5-variant** (concurrent external membership add) | same | Remove the `if still_absent { insert }` guard | same as above — auto-add fires unconditionally alongside the external row |
+//! | **CW8** (post-add_peer cancel → cleanup) | `audio/handler.rs` — `after_add_peer` fires immediately after `room.add_peer` succeeds and before `check_cancel!(cleanup:...)` | Delete `after_add_peer(...)` call | `arrived_rx` times out — test panics |
+//! | **CW8** (post-add_peer cancel → cleanup) | same | Delete `room.remove_peer(peer_id)` from cleanup block | room is non-empty — `room.is_empty()` assertion panics |
+//! | **CW8** (post-add_peer cancel → cleanup) | same | Move `after_add_peer` hook to before `room.add_peer` | cancel fires before add_peer — check_cancel! exits without cleanup arm — room empty but hook fired at wrong seam |
+//! | **CW10** (commit-won/quiescence: expiry blocked at barrier) | `audio/handler.rs` — `after_participant_fanout` fires after `tx.commit()` + fan-out, before `_permit` drops | Delete `after_participant_fanout(...)` call | `arrived_rx` times out — test panics |
+//! | **CW10** (commit-won/quiescence: expiry blocked at barrier) | same | Remove `acquire_effect()` from `commit_participant_join` | permit never held — expiry completes before hook fires — `expire_done` is true before check — "expiry must be blocked" assertion panics |
 //!
 //! # Teardown ordering (quiescence citations)
 //!
@@ -132,10 +143,30 @@ make_hook!(count_query_hook, before_count_query);
 // DB read inside `check_membership_for_admission`. Arms expiry here → proves
 // that a cancellation before membership check produces zero DB side effects.
 //
+// `before_membership_lock`: fires inside the AutoAddRequired branch of
+// `commit_participant_join`, immediately before
+// `acquire_channel_membership_lock_in_transaction`. Arms an external
+// membership insert here → proves that a concurrent add is observed by the
+// re-read and the auto-add insert is skipped, leaving membership preserved.
+//
 // `before_participant_commit`: fires between the 48101 insert and the
 // `acquire_effect()` + `tx.commit()` inside `commit_participant_join`. Arms
 // expiry here → proves that a cancellation before the permit acquisition
 // rolls back the transaction and produces zero post-expiry 48101/membership
 // writes.
+//
+// `after_participant_fanout`: fires inside `commit_participant_join` after the
+// 48101 is committed AND fan-out is complete but BEFORE `_permit` drops.
+// Used by CW10: arms expiry here → proves expiry is blocked at the write
+// guard while the permit is held; releasing the hook drops the permit and
+// unblocks expiry.
+//
+// `after_add_peer`: fires in `handle_active_audio_connection` immediately
+// after a successful `room.add_peer` call and before the subsequent
+// `check_cancel!` fence. Arms cancel here → proves the cleanup branch
+// (`room.remove_peer` + `cleanup_if_empty`) runs before the handler returns.
 make_hook!(audio_membership_check_hook, before_membership_check);
+make_hook!(audio_membership_lock_hook, before_membership_lock);
 make_hook!(audio_participant_commit_hook, before_participant_commit);
+make_hook!(audio_participant_fanout_hook, after_participant_fanout);
+make_hook!(audio_add_peer_hook, after_add_peer);
