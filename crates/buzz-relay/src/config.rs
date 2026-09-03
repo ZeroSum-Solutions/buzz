@@ -455,6 +455,7 @@ fn parse_push_gateway_delivery_url(raw: &str) -> Result<url::Url, ConfigError> {
     })?;
     if url.scheme() != "https"
         || url.host().is_none()
+        || url.port().is_some()
         || !url.username().is_empty()
         || url.password().is_some()
         || url.path() != "/v1/deliveries/apns"
@@ -462,7 +463,7 @@ fn parse_push_gateway_delivery_url(raw: &str) -> Result<url::Url, ConfigError> {
         || url.fragment().is_some()
     {
         return Err(ConfigError::InvalidValue(
-            "BUZZ_PUSH_GATEWAY_DELIVERY_URL must be an exact HTTPS /v1/deliveries/apns URL without credentials, query, or fragment"
+            "BUZZ_PUSH_GATEWAY_DELIVERY_URL must be an exact HTTPS /v1/deliveries/apns URL without an explicit port, credentials, query, or fragment"
                 .to_string(),
         ));
     }
@@ -2260,6 +2261,7 @@ mod tests {
         assert!(parse_push_gateway_delivery_url("https://push.example/v1/deliveries/apns").is_ok());
         for invalid in [
             "http://push.example/v1/deliveries/apns",
+            "https://push.example:8443/v1/deliveries/apns",
             "https://push.example/v1/deliveries/apns/",
             "https://push.example/v1/deliveries/apns?token=x",
             "https://user@push.example/v1/deliveries/apns",
