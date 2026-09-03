@@ -275,7 +275,9 @@ mod tests {
             grace_limit: 3,
             nip_fi_assertion: Some(assertion),
             session_deadline: None,
-            nip_fi_gate: None,
+            nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(
+                CancellationToken::new(),
+            ),
         });
 
         // Use a different key as the proven pubkey → forced mismatch.

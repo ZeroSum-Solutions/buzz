@@ -273,16 +273,17 @@ pub async fn handle_req(
     // mutation. The permit is held through map insert, sub_registry registration,
     // topic retain, historical delivery, and EOSE. Off-mode: proceed
     // unconditionally. [FI-TRACE-LEASE-BOUND, B2 seam: REQ registration]
-    let _req_permit = if let Some(gate) = conn.nip_fi_gate.as_ref() {
-        match gate.acquire_effect().await {
-            Ok(permit) => Some(permit),
-            Err(crate::nip_fi_gate::SessionExpired) => {
-                conn.send(RelayMessage::closed(&sub_id, "restricted: session expired"));
-                return;
-            }
+    //
+    // Test hook: fires immediately before acquire_effect.
+    // [nip_fi_test_hooks::req_registration_hook]
+    #[cfg(test)]
+    crate::nip_fi_test_hooks::before_req_registration(conn.tenant.community()).await;
+    let _req_permit = match conn.nip_fi_gate.acquire_effect().await {
+        Ok(permit) => permit,
+        Err(crate::nip_fi_gate::SessionExpired) => {
+            conn.send(RelayMessage::closed(&sub_id, "restricted: session expired"));
+            return;
         }
-    } else {
-        None
     };
 
     {
@@ -2388,22 +2389,27 @@ mod tests {
         assert!(!result_gated_count_safe_for_pushdown(&f, &owner));
     }
 
-    // ── W3: B2 REQ gate — expired session cannot register a subscription ──────
+    // ── W3: B2 REQ gate — barrier expiry mid-flight blocks subscription registration
     //
-    // The REQ handler acquires an effect permit before the first subscription-map
-    // mutation. When the gate's cancellation token is pre-cancelled, `acquire_effect`
-    // returns `Err(SessionExpired)` and the handler sends CLOSED without modifying
-    // the subscription map.
+    // Arms `before_req_registration` — the hook immediately before `acquire_effect()`
+    // in the REQ registration path. Dispatches `handle_req` with a live (not-yet-
+    // cancelled) gate, waits for the hook to signal the handler reached the permit
+    // boundary, fires expiry (cancel), then releases the hook. The handler tries
+    // `acquire_effect()` and gets `SessionExpired`, sends CLOSED without inserting
+    // the subscription.
+    //
+    // Hook location: `handlers/req.rs`, immediately before `acquire_effect()`.
     //
     // Mutation evidence:
-    //   A) Remove the `acquire_effect` call from the REQ handler → the handler
-    //      inserts the subscription even on a cancelled gate → the `subs.len()`
-    //      assertion panics.
-    //   B) Change `nip_fi_gate` from `None` to a live gate → the permit succeeds
-    //      → the subscription IS inserted → the opposite assertion panics.
+    //   A) Delete `#[cfg(test)] before_req_registration(...)` from req.rs →
+    //      hook never fires → `arrived_rx` times out → test panics.
+    //   B) Remove `acquire_effect()` from req.rs → handler inserts the subscription
+    //      despite the cancelled gate → `subs.is_empty()` assertion panics.
+    //   C) Change gate to `off_mode` → `acquire_effect()` succeeds after cancel
+    //      → subscription IS inserted → `subs.is_empty()` assertion panics.
 
     #[tokio::test]
-    async fn w3_b2_expired_gate_prevents_req_subscription_registration() {
+    async fn w3_b2_req_barrier_expiry_mid_flight_blocks_subscription_registration() {
         use nostr::{Filter, Keys};
         use std::collections::HashMap;
         use std::sync::Arc;
@@ -2412,12 +2418,13 @@ mod tests {
         use uuid::Uuid;
 
         let keys = Keys::generate();
+        let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
 
-        // Build a gate whose cancel token is already cancelled.
+        // Live gate — NOT pre-cancelled. acquire_effect succeeds unless we fire expiry.
         let cancel = CancellationToken::new();
-        cancel.cancel();
-        let far_future = chrono::Utc::now() + chrono::Duration::hours(1);
-        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(far_future, cancel.clone());
+        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel.clone());
+
+        let community = buzz_core::tenant::CommunityId::from_uuid(Uuid::nil());
 
         let (send_tx, mut send_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
         let (ctrl_tx, _ctrl_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
@@ -2426,10 +2433,7 @@ mod tests {
 
         let conn = Arc::new(crate::connection::ConnectionState {
             conn_id: Uuid::new_v4(),
-            tenant: buzz_core::tenant::TenantContext::resolved(
-                buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
-                "test.local".to_string(),
-            ),
+            tenant: buzz_core::tenant::TenantContext::resolved(community, "test.local".to_string()),
             remote_addr: "127.0.0.1:1234".parse().unwrap(),
             auth_state: RwLock::new(crate::connection::AuthState::Authenticated(
                 buzz_auth::AuthContext {
@@ -2448,38 +2452,60 @@ mod tests {
             backpressure_count: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             grace_limit: 3,
             nip_fi_assertion: None,
-            session_deadline: None,
-            nip_fi_gate: Some(gate),
+            session_deadline: Some(deadline),
+            nip_fi_gate: gate,
         });
 
         let state = crate::state::tests::test_state().await;
-        let sub_id = "w3-b2-test".to_string();
-        // Use kind:1 (TextNote) — not a p-gated kind — so the filter passes all
-        // pre-gate authorization checks and reaches the gate boundary.
+        let sub_id = "w3-barrier-test".to_string();
+        // Kind:1 (TextNote) — not p-gated — so the filter clears all pre-gate
+        // authorization checks and reaches the `before_req_registration` hook.
         let filters = vec![Filter::new().kind(nostr::Kind::TextNote).limit(1)];
 
-        handle_req(sub_id, filters, Arc::clone(&conn), state).await;
+        // Arm the barrier: fires when handle_req reaches before_req_registration.
+        let (arrived_rx, release) = crate::nip_fi_test_hooks::req_registration_hook::arm(community);
+
+        let conn2 = Arc::clone(&conn);
+        let state2 = Arc::clone(&state);
+        let handle = tokio::spawn(async move { handle_req(sub_id, filters, conn2, state2).await });
+
+        // Wait for the handler to reach the permit boundary.
+        tokio::time::timeout(std::time::Duration::from_secs(5), arrived_rx)
+            .await
+            .expect("W3: handler must reach before_req_registration within 5s")
+            .expect("arrived channel closed");
+
+        // Fire expiry: cancel so acquire_effect returns SessionExpired.
+        cancel.cancel();
+
+        // Release — handler resumes, calls acquire_effect(), gets SessionExpired.
+        release.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("W3: handle_req must return within 5s after hook release")
+            .expect("handle_req task must not panic");
 
         // The subscription map must be empty — the gate blocked the handler
         // before any map insertion.
         let subs = subscriptions.lock().await;
         assert!(
             subs.is_empty(),
-            "W3/B2: expired gate must prevent subscription registration; subs = {subs:?}"
+            "W3: expired gate must prevent subscription registration; subs = {subs:?}"
         );
 
-        // A CLOSED frame must have been sent to send_tx with the session-expired message.
+        // A CLOSED frame must have been sent with the session-expired message.
         let frame = send_rx
             .try_recv()
-            .expect("W3/B2: handler must send CLOSED on expired gate");
+            .expect("W3: handler must send CLOSED on expired gate");
         match frame {
             axum::extract::ws::Message::Text(t) => {
                 assert!(
                     t.contains("session expired"),
-                    "W3/B2: CLOSED message must contain 'session expired'; got: {t}"
+                    "W3: CLOSED message must contain 'session expired'; got: {t}"
                 );
             }
-            other => panic!("W3/B2: expected Text CLOSED frame, got {other:?}"),
+            other => panic!("W3: expected Text CLOSED frame, got {other:?}"),
         }
     }
 }

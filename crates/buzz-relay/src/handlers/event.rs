@@ -732,22 +732,17 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
         }
         // B2: acquire effect permit immediately before the irreversible
         // ephemeral publication (Redis/local fan-out or presence mutation).
-        // Off-mode (no gate): proceed unconditionally.
         // [FI-TRACE-LEASE-BOUND, B2 seam: ephemeral EVENT]
-        let _event_permit = if let Some(gate) = conn.nip_fi_gate.as_ref() {
-            match gate.acquire_effect().await {
-                Ok(permit) => Some(permit),
-                Err(crate::nip_fi_gate::SessionExpired) => {
-                    conn.send(RelayMessage::ok(
-                        &event_id_hex,
-                        false,
-                        "restricted: session expired",
-                    ));
-                    return;
-                }
+        let _event_permit = match conn.nip_fi_gate.acquire_effect().await {
+            Ok(permit) => permit,
+            Err(crate::nip_fi_gate::SessionExpired) => {
+                conn.send(RelayMessage::ok(
+                    &event_id_hex,
+                    false,
+                    "restricted: session expired",
+                ));
+                return;
             }
-        } else {
-            None
         };
         match handle_ephemeral_event(
             event,
@@ -779,22 +774,24 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
 
     // B2: acquire effect permit immediately before the persistent ingest call.
     // The permit is held through ingest_event() (DB write + side effects +
-    // fan-out) and the OK send. Off-mode: proceed unconditionally.
+    // fan-out) and the OK send.
     // [FI-TRACE-LEASE-BOUND, B2 seam: persistent EVENT]
-    let _event_permit = if let Some(gate) = conn.nip_fi_gate.as_ref() {
-        match gate.acquire_effect().await {
-            Ok(permit) => Some(permit),
-            Err(crate::nip_fi_gate::SessionExpired) => {
-                conn.send(RelayMessage::ok(
-                    &event_id_hex,
-                    false,
-                    "restricted: session expired",
-                ));
-                return;
-            }
+    //
+    // Test hook: fires immediately before acquire_effect so a test can arm
+    // expiry in the async gap between handler dispatch and permit acquisition.
+    // [nip_fi_test_hooks::event_ingest_hook]
+    #[cfg(test)]
+    crate::nip_fi_test_hooks::before_event_ingest(conn.tenant.community()).await;
+    let _event_permit = match conn.nip_fi_gate.acquire_effect().await {
+        Ok(permit) => permit,
+        Err(crate::nip_fi_gate::SessionExpired) => {
+            conn.send(RelayMessage::ok(
+                &event_id_hex,
+                false,
+                "restricted: session expired",
+            ));
+            return;
         }
-    } else {
-        None
     };
 
     match super::ingest::ingest_event(&state, &conn.tenant, event, ingest_auth).await {
@@ -1453,7 +1450,9 @@ mod tests {
             grace_limit: 3,
             nip_fi_assertion: None,
             session_deadline: None,
-            nip_fi_gate: None,
+            nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(
+                CancellationToken::new(),
+            ),
         });
 
         super::handle_agent_observer_event(
@@ -2536,5 +2535,126 @@ mod tests {
                  must not receive a community-B event. Got: {out:?}"
             );
         }
+    }
+
+    // ── W2 (event barrier): expiry fired mid-flight blocks persistent EVENT ingest ──
+    //
+    // Arms `before_event_ingest` — the hook immediately before `acquire_effect()`
+    // in the persistent EVENT path. Dispatches `handle_event` with a live gate,
+    // waits for the hook to signal the handler reached the permit boundary,
+    // fires the gate expiry (cancel), then releases the hook. The handler tries
+    // `acquire_effect()` and gets `SessionExpired`, returns without calling
+    // `ingest_event()` (no DB write, no fan-out).
+    //
+    // The mutation evidence proves the permit sits at the ingest boundary:
+    //   A) Delete `before_event_ingest(...)` from event.rs → handler never
+    //      stalls at the hook → cancel fires before acquire_effect (race).
+    //      Without the hook the test is non-deterministic.
+    //   B) Remove `acquire_effect()` from event.rs → handler calls `ingest_event`
+    //      despite the cancel → DB write is attempted → `send_rx` gets OK(true)
+    //      or a DB error response, NOT a "session expired" OK(false) → assertion panics.
+    //   C) Swap the gate to off_mode → acquire_effect always succeeds after cancel
+    //      → same as (B), assertion panics.
+    //
+    // This is DB-free after the hook fires: `ingest_event` is never called
+    // because `acquire_effect` returns SessionExpired before it.
+    #[tokio::test]
+    async fn w2_event_ingest_barrier_expiry_mid_flight_blocks_persistence() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::{mpsc, RwLock};
+        use tokio_util::sync::CancellationToken;
+        use uuid::Uuid;
+
+        let key = nostr::Keys::generate();
+        let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        let cancel = CancellationToken::new();
+        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel.clone());
+
+        let community = buzz_core::tenant::CommunityId::from_uuid(Uuid::nil());
+
+        let (send_tx, mut send_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = mpsc::channel::<axum::extract::ws::Message>(1);
+
+        let conn = Arc::new(crate::connection::ConnectionState {
+            conn_id: Uuid::new_v4(),
+            tenant: buzz_core::tenant::TenantContext::resolved(community, "test.local".to_string()),
+            remote_addr: "127.0.0.1:1234".parse().unwrap(),
+            auth_state: RwLock::new(crate::connection::AuthState::Authenticated(
+                buzz_auth::AuthContext {
+                    pubkey: key.public_key(),
+                    scopes: vec![],
+                    channel_ids: None,
+                    auth_method: buzz_auth::AuthMethod::Nip42,
+                    agent_owner_pubkey: None,
+                },
+            )),
+            subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            send_tx,
+            ctrl_tx,
+            terminal_ctrl_tx,
+            cancel: cancel.clone(),
+            backpressure_count: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            grace_limit: 3,
+            nip_fi_assertion: None,
+            session_deadline: Some(deadline),
+            nip_fi_gate: gate,
+        });
+
+        // Kind:1 TextNote with no #h tag — no DB calls before before_event_ingest.
+        let event = nostr::EventBuilder::new(nostr::Kind::TextNote, "w2 barrier test")
+            .sign_with_keys(&key)
+            .unwrap();
+
+        let state = crate::state::tests::test_state().await;
+
+        // Arm the barrier at the persistent EVENT seam.
+        let (arrived_rx, release) = crate::nip_fi_test_hooks::event_ingest_hook::arm(community);
+
+        let conn2 = Arc::clone(&conn);
+        let state2 = Arc::clone(&state);
+        let handle = tokio::spawn(async move {
+            super::handle_event(event, conn2, state2).await;
+        });
+
+        // Wait for the handler to reach before_event_ingest.
+        tokio::time::timeout(std::time::Duration::from_secs(5), arrived_rx)
+            .await
+            .expect("W2: handler must reach before_event_ingest within 5s")
+            .expect("arrived channel closed");
+
+        // Fire expiry: cancel so acquire_effect returns SessionExpired.
+        cancel.cancel();
+
+        // Release — handler resumes, calls acquire_effect(), gets SessionExpired.
+        release.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("W2: handle_event must return within 5s")
+            .expect("handle_event task must not panic");
+
+        // The send channel must contain an OK(false, "session expired") —
+        // no ingest_event call was made (no DB write attempted).
+        let frame = send_rx
+            .try_recv()
+            .expect("W2: a 'session expired' OK(false) must be sent on gate denial");
+        match frame {
+            axum::extract::ws::Message::Text(t) => {
+                assert!(
+                    t.contains("session expired"),
+                    "W2: frame must contain 'session expired'; got: {t}"
+                );
+                assert!(t.contains("false"), "W2: frame must be OK(false); got: {t}");
+            }
+            other => panic!("W2: expected Text frame, got {other:?}"),
+        }
+        // No additional frames — no DB write, no fan-out.
+        assert!(
+            send_rx.try_recv().is_err(),
+            "W2: no additional frames must be sent after session-expired denial"
+        );
     }
 }

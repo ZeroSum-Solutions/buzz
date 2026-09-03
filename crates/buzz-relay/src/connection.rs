@@ -111,16 +111,22 @@ pub struct ConnectionState {
     /// [FI-TRACE-LEASE-BOUND]
     pub session_deadline: Option<chrono::DateTime<chrono::Utc>>,
 
-    /// The NIP-FI session admission gate, present only in enforce mode.
+    /// The NIP-FI session admission gate. Every WS connection has exactly one
+    /// gate — this is the [one-gate-per-connection] invariant.
+    ///
+    /// In enforce mode (assertion presented at upgrade), the gate has a
+    /// deadline and the expiry task calls `gate.expire()` at that deadline.
+    /// In off-mode (no assertion), the gate has no deadline and never
+    /// self-expires — `acquire_effect()` always succeeds unless the outer
+    /// cancel token fires.
     ///
     /// Handlers that perform irreversible side effects (AUTH state commit,
     /// EVENT persistence, REQ subscription registration, COUNT query) must
     /// call `gate.acquire_effect()` at the irreversible seam. The gate's
     /// quiescence barrier ensures connection teardown (subscription removal,
     /// peer cleanup) cannot start until all pre-expiry effects finish their
-    /// bounded commits. `None` in off-mode (no assertion presented at upgrade).
-    /// [FI-TRACE-LEASE-BOUND]
-    pub(crate) nip_fi_gate: Option<std::sync::Arc<crate::nip_fi_gate::SessionAdmissionGate>>,
+    /// bounded commits. [FI-TRACE-LEASE-BOUND, one-gate-per-connection]
+    pub(crate) nip_fi_gate: std::sync::Arc<crate::nip_fi_gate::SessionAdmissionGate>,
 }
 
 impl ConnectionState {
@@ -302,12 +308,19 @@ async fn handle_active_connection(
     // Create the NIP-FI session admission gate when in enforce mode.
     //
     // The gate is the lifetime authority for this connection: handlers acquire
-    // an effect permit at each irreversible seam, and the expiry task uses
-    // gate.expire() so the quiescence barrier (write lock) prevents teardown
-    // from starting until all pre-expiry effects finish their bounded commits.
-    // Off-mode (no assertion) → None, with zero overhead. [FI-TRACE-LEASE-BOUND]
-    let nip_fi_gate = session_deadline
-        .map(|deadline| crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel.clone()));
+    // Create the NIP-FI session admission gate. Every WS connection gets
+    // exactly one gate — the [one-gate-per-connection] invariant.
+    //
+    // Enforce mode (assertion + deadline): gate has a deadline; the expiry
+    // task calls gate.expire() at the deadline.
+    // Off-mode (no assertion): gate has no deadline and never self-expires;
+    // acquire_effect() always succeeds unless the outer cancel token fires.
+    // [FI-TRACE-LEASE-BOUND, one-gate-per-connection]
+    let nip_fi_gate = if let Some(deadline) = session_deadline {
+        crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel.clone())
+    } else {
+        crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone())
+    };
 
     let conn = Arc::new(ConnectionState {
         conn_id,
@@ -414,7 +427,7 @@ async fn handle_active_connection(
     let nip_fi_expiry_task = conn.session_deadline.map(|deadline| {
         crate::nip_fi_session::spawn_nip_fi_expiry_task(
             deadline,
-            nip_fi_gate.expect("gate is Some when session_deadline is Some"),
+            Arc::clone(&nip_fi_gate),
             conn.terminal_ctrl_tx.clone(),
             crate::nip_fi_session::NipFiWsRoute::Root,
         )
@@ -841,6 +854,7 @@ pub(crate) mod tests {
         let (send_tx, send_rx) = mpsc::channel(4);
         let (ctrl_tx, _ctrl_rx) = mpsc::channel(4);
         let (terminal_ctrl_tx, _terminal_ctrl_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
         let conn = ConnectionState {
             conn_id: Uuid::new_v4(),
             tenant: TenantContext::resolved(
@@ -853,12 +867,12 @@ pub(crate) mod tests {
             send_tx,
             ctrl_tx,
             terminal_ctrl_tx,
-            cancel: CancellationToken::new(),
+            cancel: cancel.clone(),
             backpressure_count: Arc::new(AtomicU8::new(0)),
             grace_limit: 3,
             nip_fi_assertion: None,
             session_deadline: None,
-            nip_fi_gate: None,
+            nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone()),
         };
         (Arc::new(conn), send_rx)
     }
@@ -1505,7 +1519,7 @@ pub(crate) mod tests {
             grace_limit: 3,
             nip_fi_assertion: None,
             session_deadline: None,
-            nip_fi_gate: None,
+            nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone()),
         });
 
         let state = crate::state::tests::test_state().await;
