@@ -311,6 +311,7 @@ class IosGlassNavigationButton extends HookWidget {
         final isLeadingContent =
             icon == IosGlassNavigationIcon.avatar ||
             icon == IosGlassNavigationIcon.channel;
+        final isAvatarContent = icon == IosGlassNavigationIcon.avatar;
         final fallbackIcon = switch (icon) {
           IosGlassNavigationIcon.back => Icons.arrow_back_ios_new_rounded,
           IosGlassNavigationIcon.close => Icons.close_rounded,
@@ -396,13 +397,20 @@ class IosGlassNavigationButton extends HookWidget {
                                   (label != null ||
                                       icon == IosGlassNavigationIcon.avatar)
                             ? Padding(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 6,
+                                padding: EdgeInsetsDirectional.only(
+                                  start: isAvatarContent ? 6 : 12,
+                                  end: isAvatarContent ? 8 : 16,
                                 ),
                                 child: Row(
+                                  key: const ValueKey(
+                                    'ios-glass-navigation-leading-content',
+                                  ),
                                   children: [
-                                    if (icon == IosGlassNavigationIcon.avatar)
+                                    if (isAvatarContent)
                                       AvatarImage(
+                                        key: const ValueKey(
+                                          'ios-glass-navigation-leading-image',
+                                        ),
                                         imageUrl: avatarImageUrl,
                                         radius: (controlSize - 12) / 2,
                                         backgroundColor:
@@ -420,7 +428,10 @@ class IosGlassNavigationButton extends HookWidget {
                                       )
                                     else
                                       SizedBox.square(
-                                        dimension: controlSize - 12,
+                                        key: const ValueKey(
+                                          'ios-glass-navigation-leading-image',
+                                        ),
+                                        dimension: 12,
                                         child: Icon(
                                           fallbackIcon,
                                           size: 12,
@@ -428,9 +439,12 @@ class IosGlassNavigationButton extends HookWidget {
                                         ),
                                       ),
                                     if (label != null) ...[
-                                      const SizedBox(width: Grid.xs),
+                                      const SizedBox(width: Grid.xxs),
                                       Expanded(
                                         child: Column(
+                                          key: const ValueKey(
+                                            'ios-glass-navigation-leading-text',
+                                          ),
                                           mainAxisAlignment:
                                               MainAxisAlignment.center,
                                           crossAxisAlignment:

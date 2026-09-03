@@ -670,6 +670,39 @@ void main() {
         tester.getSize(titleControl).width,
         moreOrLessEquals(expectedTitleWidth),
       );
+      final fallbackContent = find.descendant(
+        of: titleControl,
+        matching: find.byKey(
+          const ValueKey('ios-glass-navigation-leading-content'),
+        ),
+      );
+      final fallbackImage = find.descendant(
+        of: titleControl,
+        matching: find.byKey(
+          const ValueKey('ios-glass-navigation-leading-image'),
+        ),
+      );
+      final fallbackText = find.descendant(
+        of: titleControl,
+        matching: find.byKey(
+          const ValueKey('ios-glass-navigation-leading-text'),
+        ),
+      );
+      expect(
+        tester.getRect(fallbackContent).left -
+            tester.getRect(titleControl).left,
+        6,
+      );
+      expect(tester.getSize(fallbackImage).width, 32);
+      expect(
+        tester.getRect(fallbackText).left - tester.getRect(fallbackImage).right,
+        Grid.xxs,
+      );
+      expect(
+        tester.getRect(titleControl).right -
+            tester.getRect(fallbackContent).right,
+        8,
+      );
       expect(
         nativeParams(const ValueKey('channel-huddle-button'))['icon'],
         'headphones',
@@ -9434,6 +9467,37 @@ void main() {
           findsOneWidget,
         );
       }
+      final fallbackContent = find.descendant(
+        of: identity,
+        matching: find.byKey(
+          const ValueKey('ios-glass-navigation-leading-content'),
+        ),
+      );
+      final fallbackImage = find.descendant(
+        of: identity,
+        matching: find.byKey(
+          const ValueKey('ios-glass-navigation-leading-image'),
+        ),
+      );
+      final fallbackText = find.descendant(
+        of: identity,
+        matching: find.byKey(
+          const ValueKey('ios-glass-navigation-leading-text'),
+        ),
+      );
+      expect(
+        tester.getRect(fallbackContent).left - tester.getRect(identity).left,
+        12,
+      );
+      expect(tester.getSize(fallbackImage).width, 12);
+      expect(
+        tester.getRect(fallbackText).left - tester.getRect(fallbackImage).right,
+        Grid.xxs,
+      );
+      expect(
+        tester.getRect(identity).right - tester.getRect(fallbackContent).right,
+        16,
+      );
 
       await tester.pumpAndSettle();
 
