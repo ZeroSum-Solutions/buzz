@@ -661,6 +661,10 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     XCTAssertTrue(store.saved.isEmpty)
     XCTAssertTrue(store.pending.isEmpty)
     XCTAssertTrue(store.cleanup.isEmpty)
+    XCTAssertEqual(
+      store.replacementOrigins,
+      ["wss://relay.example", "wss://shared-relay.example"]
+    )
   }
 
   func testRelayRotationRevokesKnownCommittedGenerationWhenReservedGenerationDidNotCommit()
@@ -2239,6 +2243,7 @@ private final class MemoryGrantStore: BuzzPushEndpointGrantStore {
   var saved: [BuzzPushEndpointGrantRecord]
   var pending: [BuzzPushPendingEnrollmentRecord] = []
   var cleanup: [BuzzPushGatewayCleanupState] = []
+  var replacementOrigins: [String] = []
   var resetOperations: [String] = []
   var grantSaveFailuresRemaining: Int
   var cleanupSaveFailureCalls: Set<Int>
@@ -2359,6 +2364,11 @@ private final class MemoryGrantStore: BuzzPushEndpointGrantStore {
   func removeGatewayCleanupState(gatewayOrigin: String) throws {
     cleanup.removeAll { $0.gatewayOrigin == gatewayOrigin }
   }
+  func replacementRelayOrigins() throws -> [String] { replacementOrigins }
+  func queueReplacementRelayOrigins(_ relayOrigins: [String]) throws {
+    replacementOrigins = Array(Set(replacementOrigins + relayOrigins)).sorted()
+  }
+  func clearReplacementRelayOrigins() throws { replacementOrigins = [] }
 }
 
 private final class RecordingAppAttest: BuzzDevAppAttesting {

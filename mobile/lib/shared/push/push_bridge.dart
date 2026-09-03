@@ -257,6 +257,12 @@ Future<BuzzPushEndpointGrant> enrollBuzzPush(
   if (raw == null) {
     throw StateError('Native push enrollment returned no grant.');
   }
+  final migrationRelayOrigins = raw['migrationRelayOrigins'];
+  if (migrationRelayOrigins is List) {
+    retiredBuzzPushRelayOrigins.value = migrationRelayOrigins
+        .cast<String>()
+        .toSet();
+  }
   final grant = BuzzPushEndpointGrant.fromMap(raw);
   await readBuzzPushEndpointGrants();
   if (communitiesForSnapshotRefresh != null) {

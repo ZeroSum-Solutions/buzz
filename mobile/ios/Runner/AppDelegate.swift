@@ -376,6 +376,7 @@ import os.log
           if let cleanupTask = try retiredGatewayCleanupTask() {
             try await cleanupTask.value
           }
+          try endpointGrantStore.clearReplacementRelayOrigins()
           result(nil)
         } catch {
           result(
@@ -556,7 +557,9 @@ import os.log
             deviceToken: deviceToken,
             relayURL: relayURL
           )
-          await MainActor.run { result(record.flutterArguments) }
+          var arguments = record.flutterArguments
+          arguments["migrationRelayOrigins"] = try self?.pushGatewayMigrationRelayOrigins() ?? []
+          await MainActor.run { result(arguments) }
         } catch {
           await MainActor.run {
             result(
@@ -612,10 +615,15 @@ import os.log
 
   private func initializePushGateway(_ gatewayURL: URL) throws -> [String] {
     try configurePushGateway(gatewayURL)
+    return try pushGatewayMigrationRelayOrigins()
+  }
+
+  private func pushGatewayMigrationRelayOrigins() throws -> [String] {
     return Array(
       Set(
         try endpointGrantStore.gatewayCleanupStates()
           .flatMap { $0.grants.map(\.relayOrigin) + $0.pendingEnrollments.map(\.relayOrigin) }
+          + endpointGrantStore.replacementRelayOrigins()
       )
     ).sorted()
   }

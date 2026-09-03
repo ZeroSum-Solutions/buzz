@@ -11,6 +11,7 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
   private static let recordsAccount = "v2"
   private static let pendingAccount = "pending-v2"
   private static let cleanupAccount = "gateway-cleanup-v1"
+  private static let replacementRelaysAccount = "replacement-relays-v1"
 
   private let accessGroup: String?
 
@@ -163,6 +164,20 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
     var states = try gatewayCleanupStates()
     states.removeAll { $0.gatewayOrigin == gatewayOrigin }
     try replace(states, account: Self.cleanupAccount)
+  }
+
+  func replacementRelayOrigins() throws -> [String] {
+    guard let data = try data(account: Self.replacementRelaysAccount) else { return [] }
+    return try JSONDecoder().decode([String].self, from: data)
+  }
+
+  func queueReplacementRelayOrigins(_ relayOrigins: [String]) throws {
+    let merged = Array(Set(try replacementRelayOrigins() + relayOrigins)).sorted()
+    try replace(merged, account: Self.replacementRelaysAccount)
+  }
+
+  func clearReplacementRelayOrigins() throws {
+    try replace([String](), account: Self.replacementRelaysAccount)
   }
 
   private func pendingEnrollments() throws -> [BuzzPushPendingEnrollmentRecord] {

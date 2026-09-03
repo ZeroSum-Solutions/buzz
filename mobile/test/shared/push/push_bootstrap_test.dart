@@ -2,6 +2,7 @@ import 'package:buzz/shared/push/dev_push_lease.dart';
 import 'package:buzz/shared/community/community.dart';
 import 'package:buzz/shared/push/push_bootstrap.dart';
 import 'package:buzz/shared/push/push_subscription.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
@@ -165,6 +166,36 @@ void main() {
       ['Active', 'Inactive'],
     );
   });
+
+  testWidgets(
+    'inactive migration work starts APNs registration through production boundary',
+    (tester) async {
+      final inactive = Community.create(
+        name: 'Inactive',
+        relayUrl: 'wss://inactive.example',
+      ).copyWith(pushNotificationsEnabled: true);
+      final migrationCommunities = buzzPushCommunitiesRequiringGatewayMigration(
+        communities: [inactive],
+        retiredRelayOrigins: const {'wss://inactive.example'},
+        targetGatewayOrigin: 'https://push.example',
+      );
+      var registrations = 0;
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: BuzzPushRegistrationBootstrap(
+            shouldRegister: migrationCommunities.isNotEmpty,
+            attemptKey: 'migration:${inactive.id}',
+            startRegistration: () async => registrations += 1,
+            child: const SizedBox(),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      expect(registrations, 1);
+    },
+  );
 
   test('gateway migration skips a durably checkpointed replacement', () {
     final community =

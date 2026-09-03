@@ -213,7 +213,10 @@ void main() {
         methods.add(call.method);
         if (call.method == 'enrollPush') {
           enrollmentArguments.add(call.arguments);
-          return _grantMap('new-grant');
+          return {
+            ..._grantMap('new-grant'),
+            'migrationRelayOrigins': ['wss://sibling.example'],
+          };
         }
         if (call.method == 'endpointGrants') {
           return [_grantMap('new-grant')];
@@ -246,6 +249,7 @@ void main() {
 
       expect(firstGrant.endpointGrant, 'new-grant');
       expect(secondGrant.endpointGrant, 'new-grant');
+      expect(retiredBuzzPushRelayOrigins.value, {'wss://sibling.example'});
       expect(enrollmentArguments, [
         {
           'relayUrl': 'wss://relay.example/',

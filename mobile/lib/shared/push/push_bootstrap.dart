@@ -119,6 +119,51 @@ List<Community> buzzPushCommunitiesRequiringGatewayMigration({
     )
     .toList();
 
+/// Owns the APNs-registration side effect so migration-triggered registration
+/// is exercised through the same production boundary as active-community
+/// registration.
+@visibleForTesting
+class BuzzPushRegistrationBootstrap extends HookWidget {
+  const BuzzPushRegistrationBootstrap({
+    required this.shouldRegister,
+    required this.attemptKey,
+    required this.child,
+    this.startRegistration = startBuzzPushRegistration,
+    super.key,
+  });
+
+  final bool shouldRegister;
+  final String attemptKey;
+  final Widget child;
+  final Future<void> Function() startRegistration;
+
+  @override
+  Widget build(BuildContext context) {
+    final attemptGate = useMemoized(BuzzPushAttemptGate.new);
+    final retry = useState(0);
+    useEffect(() => attemptGate.dispose, const []);
+    useEffect(() {
+      if (!shouldRegister || !attemptGate.tryBegin(attemptKey)) return null;
+      unawaited(() async {
+        try {
+          await startRegistration();
+        } catch (error, stack) {
+          attemptGate.failed(
+            attemptKey,
+            retry: () {
+              if (context.mounted) retry.value += 1;
+            },
+          );
+          debugPrint('Push registration bootstrap failed: $error');
+          debugPrintStack(stackTrace: stack);
+        }
+      }());
+      return null;
+    }, [shouldRegister, attemptKey, retry.value]);
+    return child;
+  }
+}
+
 @visibleForTesting
 String buzzPushRelayWebSocketOrigin(String relayUrl) {
   final uri = Uri.parse(RelayConfig(baseUrl: relayUrl).wsUrl);
@@ -154,12 +199,10 @@ class BuzzPushBootstrap extends HookConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     useListenable(apnsDeviceToken);
     useListenable(retiredBuzzPushRelayOrigins);
-    final registrationAttempt = useMemoized(BuzzPushAttemptGate.new);
     final gatewayInitializationAttempt = useMemoized(BuzzPushAttemptGate.new);
     final publicationAttempt = useMemoized(BuzzPushAttemptGate.new);
     final gatewayMigrationAttempt = useMemoized(BuzzPushAttemptGate.new);
     final tombstoneAttempt = useMemoized(BuzzPushAttemptGate.new);
-    final registrationRetry = useState(0);
     final gatewayInitializationRetry = useState(0);
     final gatewayInitializationFailures = useRef(0);
     final publicationRetry = useState(0);
@@ -174,6 +217,17 @@ class BuzzPushBootstrap extends HookConsumerWidget {
     final community = ref.watch(activeCommunityProvider).value;
     final memberPubkey = ref.watch(myPubkeyProvider);
     final descriptor = ref.watch(currentRelayPushDescriptorProvider).value;
+    final token = apnsDeviceToken.value;
+    final retiredRelayOrigins = retiredBuzzPushRelayOrigins.value;
+    final targetGatewayOrigin = buzzPushGatewayOrigin(Env.pushGatewayUrl);
+    final migrationCommunities = buzzPushCommunitiesRequiringGatewayMigration(
+      communities: communities,
+      retiredRelayOrigins: retiredRelayOrigins,
+      targetGatewayOrigin: targetGatewayOrigin,
+    );
+    final activeLifecycleReady =
+        _ready(session, config, community, memberPubkey) &&
+        buzzPushLifecycleEnabled(community: community, descriptor: descriptor);
 
     useEffect(() {
       final listener = AppLifecycleListener(
@@ -228,7 +282,6 @@ class BuzzPushBootstrap extends HookConsumerWidget {
 
     useEffect(
       () => () {
-        registrationAttempt.dispose();
         gatewayInitializationAttempt.dispose();
         publicationAttempt.dispose();
         gatewayMigrationAttempt.dispose();
@@ -296,51 +349,6 @@ class BuzzPushBootstrap extends HookConsumerWidget {
       ],
     );
 
-    useEffect(
-      () {
-        if (!_ready(session, config, community, memberPubkey) ||
-            !buzzPushLifecycleEnabled(
-              community: community,
-              descriptor: descriptor,
-            )) {
-          return null;
-        }
-        final activeCommunity = community!;
-        final activeDescriptor = descriptor!;
-        final attempt = '${activeCommunity.id}|${config.baseUrl}';
-        if (!registrationAttempt.tryBegin(attempt)) return null;
-        unawaited(() async {
-          try {
-            await startBuzzPushRegistrationIfCapable(
-              activeDescriptor,
-              startRegistration: startBuzzPushRegistration,
-            );
-          } catch (error, stack) {
-            registrationAttempt.failed(
-              attempt,
-              retry: () {
-                if (context.mounted) registrationRetry.value += 1;
-              },
-            );
-            debugPrint('Push registration bootstrap failed: $error');
-            debugPrintStack(stackTrace: stack);
-          }
-        }());
-        return null;
-      },
-      [
-        session.status,
-        config.baseUrl,
-        community?.id,
-        memberPubkey,
-        descriptor,
-        registrationRetry.value,
-      ],
-    );
-
-    final token = apnsDeviceToken.value;
-    final retiredRelayOrigins = retiredBuzzPushRelayOrigins.value;
-    final targetGatewayOrigin = buzzPushGatewayOrigin(Env.pushGatewayUrl);
     final activeCommunityAwaitingGatewayMigration =
         community != null &&
         buzzPushCommunitiesRequiringGatewayMigration(
@@ -491,7 +499,15 @@ class BuzzPushBootstrap extends HookConsumerWidget {
       ],
     );
 
-    return child;
+    return BuzzPushRegistrationBootstrap(
+      shouldRegister: activeLifecycleReady || migrationCommunities.isNotEmpty,
+      attemptKey: [
+        if (activeLifecycleReady) 'active:${community!.id}|${config.baseUrl}',
+        if (migrationCommunities.isNotEmpty)
+          'migration:${migrationCommunities.map((candidate) => candidate.id).join(',')}',
+      ].join('|'),
+      child: child,
+    );
   }
 
   static bool _ready(

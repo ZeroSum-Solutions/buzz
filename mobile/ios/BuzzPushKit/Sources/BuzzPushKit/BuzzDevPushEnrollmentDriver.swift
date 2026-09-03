@@ -124,6 +124,13 @@ public protocol BuzzPushEndpointGrantStore {
   func saveGatewayCleanupState(_ state: BuzzPushGatewayCleanupState) throws
   /// Deletes a cleanup snapshot only after its installations are terminal.
   func removeGatewayCleanupState(gatewayOrigin: String) throws
+  /// Relay origins whose leases must be republished after shared installation
+  /// authority was revoked. The queue is persisted before the remote mutation.
+  func replacementRelayOrigins() throws -> [String]
+  /// Atomically merges relay origins into the durable replacement queue.
+  func queueReplacementRelayOrigins(_ relayOrigins: [String]) throws
+  /// Clears the queue only after replacement publication has completed.
+  func clearReplacementRelayOrigins() throws
 }
 
 public enum BuzzDevPushEnrollmentError: Error, LocalizedError, Equatable {
@@ -559,6 +566,16 @@ public final class BuzzDevPushEnrollmentDriver {
           )
         }
       } else {
+        let replacementRelayOrigins: [String] = storedRecords.compactMap { record in
+          guard record.gatewayOrigin == gatewayOrigin,
+            record.gatewayInstallationHandle == pending.gatewayInstallationHandle
+          else { return nil }
+          return record.relayOrigin
+        }
+        // Revoking an installation invalidates every lease backed by its
+        // grants. Queue those relay origins before either local or remote
+        // authority is removed so a crash cannot strand sibling communities.
+        try store.queueReplacementRelayOrigins(replacementRelayOrigins)
         var cleanupState =
           try store.gatewayCleanupStates().first {
             $0.gatewayOrigin == gatewayOrigin
