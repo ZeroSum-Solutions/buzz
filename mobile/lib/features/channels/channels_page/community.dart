@@ -490,7 +490,7 @@ class _CommunityHeaderControl extends ConsumerWidget {
         ),
       const IosGlassNavigationMenuItem(
         id: 'manage',
-        label: 'Manage Communities',
+        label: 'Manage',
         systemIconName: 'gearshape',
         keepsSingleLine: true,
       ),
@@ -575,7 +575,7 @@ class _CommunityHeaderControl extends ConsumerWidget {
                       SizedBox(width: Grid.xs),
                       Expanded(
                         child: Text(
-                          'Manage Communities…',
+                          'Manage',
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                         ),

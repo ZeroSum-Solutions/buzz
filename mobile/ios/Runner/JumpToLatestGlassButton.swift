@@ -184,7 +184,7 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
   private var contentIcon = "back"
   private var buttonImage: UIImage?
   private var isBusy = false
-  private var controlSize: CGFloat = 40
+  private var controlSize: CGFloat = 44
   private var avatarImageURL: String?
   private var avatarFallback = "?"
   private var avatarLoadTask: URLSessionDataTask?
@@ -217,7 +217,7 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
     let controlWidth =
       (arguments?["controlWidth"] as? NSNumber)?.doubleValue ?? 40
     controlSize =
-      (arguments?["controlSize"] as? NSNumber)?.doubleValue ?? 40
+      (arguments?["controlSize"] as? NSNumber)?.doubleValue ?? 44
     let fillWidth = arguments?["fillWidth"] as? Bool ?? false
 
     var configuration: UIButton.Configuration
@@ -501,15 +501,17 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
       avatarImageURL = nil
       button.configuration?.titleTextAttributesTransformer = nil
       button.configuration?.subtitleTextAttributesTransformer = nil
-      let iconInset: CGFloat = icon == "shutter"
-        ? controlSize * Self.shutterInsetRatio
-        : 8
-      button.configuration?.contentInsets = NSDirectionalEdgeInsets(
-        top: iconInset,
-        leading: iconInset,
-        bottom: iconInset,
-        trailing: iconInset
-      )
+      if icon == "shutter" {
+        let iconInset = controlSize * Self.shutterInsetRatio
+        button.configuration?.contentInsets = NSDirectionalEdgeInsets(
+          top: iconInset,
+          leading: iconInset,
+          bottom: iconInset,
+          trailing: iconInset
+        )
+      } else {
+        button.configuration?.setDefaultContentInsets()
+      }
       let pointSize: CGFloat = icon == "shutter"
         ? controlSize * Self.shutterIconRatio
         : 17

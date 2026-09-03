@@ -8,6 +8,7 @@ import 'package:flutter_hooks/flutter_hooks.dart';
 
 import '../theme/theme.dart';
 import 'avatar_image.dart';
+import 'buzz_navigation_metrics.dart';
 
 /// The navigation glyph displayed by [IosGlassNavigationButton].
 enum IosGlassNavigationIcon {
@@ -91,7 +92,7 @@ class IosGlassNavigationButton extends HookWidget {
     this.subtitle,
     this.width = 48,
     this.height = 48,
-    this.controlSize = 40,
+    this.controlSize = buzzNavigationActionSize,
     this.fillWidth = false,
     this.buttonCenterX,
     this.foregroundColor,
@@ -285,16 +286,8 @@ class IosGlassNavigationButton extends HookWidget {
       ],
     );
 
-    Widget buildControl({
-      required bool suppressNativeView,
-      required bool hideDuringRouteTransition,
-    }) {
+    Widget buildControl({required bool suppressNativeView}) {
       if (suppressNativeView) {
-        if (hideDuringRouteTransition) {
-          return const SizedBox.expand(
-            key: ValueKey('ios-glass-navigation-route-placeholder'),
-          );
-        }
         final resolvedButtonCenterX = buttonCenterX ?? width / 2;
         final isLeadingContent =
             icon == IosGlassNavigationIcon.avatar ||
@@ -399,7 +392,7 @@ class IosGlassNavigationButton extends HookWidget {
                                     dimension: controlSize - 12,
                                     child: Icon(
                                       fallbackIcon,
-                                      size: 20,
+                                      size: 12,
                                       color: effectiveForeground,
                                     ),
                                   ),
@@ -414,18 +407,29 @@ class IosGlassNavigationButton extends HookWidget {
                                         label!,
                                         maxLines: 1,
                                         overflow: TextOverflow.ellipsis,
-                                        style: context.textTheme.labelMedium
-                                            ?.copyWith(
-                                              color: effectiveForeground,
-                                              fontWeight: FontWeight.w600,
-                                            ),
+                                        textScaler: TextScaler.noScaling,
+                                        style:
+                                            (icon ==
+                                                        IosGlassNavigationIcon
+                                                            .channel
+                                                    ? context
+                                                          .textTheme
+                                                          .titleSmall
+                                                    : context
+                                                          .textTheme
+                                                          .titleMedium)
+                                                ?.copyWith(
+                                                  color: effectiveForeground,
+                                                  fontWeight: FontWeight.w600,
+                                                ),
                                       ),
                                       if (subtitle != null)
                                         Text(
                                           subtitle!,
                                           maxLines: 1,
                                           overflow: TextOverflow.ellipsis,
-                                          style: context.textTheme.labelSmall
+                                          textScaler: TextScaler.noScaling,
+                                          style: context.textTheme.bodySmall
                                               ?.copyWith(
                                                 color: context.colors.onSurface
                                                     .withValues(alpha: 0.65),
@@ -450,7 +454,7 @@ class IosGlassNavigationButton extends HookWidget {
                             fallbackIcon,
                             size: icon == IosGlassNavigationIcon.shutter
                                 ? controlSize * 0.72
-                                : 22,
+                                : 17,
                             color: icon == IosGlassNavigationIcon.colorSwatch
                                 ? swatchColor
                                 : effectiveForeground,
@@ -502,16 +506,12 @@ class IosGlassNavigationButton extends HookWidget {
         width: width,
         height: height,
         child: nativeViewSuppressed == null
-            ? buildControl(
-                suppressNativeView: routeIsTransitioning.value,
-                hideDuringRouteTransition: routeIsTransitioning.value,
-              )
+            ? buildControl(suppressNativeView: routeIsTransitioning.value)
             : ValueListenableBuilder<bool>(
                 valueListenable: nativeViewSuppressed!,
                 builder: (context, suppressNativeView, _) => buildControl(
                   suppressNativeView:
                       suppressNativeView || routeIsTransitioning.value,
-                  hideDuringRouteTransition: routeIsTransitioning.value,
                 ),
               ),
       ),

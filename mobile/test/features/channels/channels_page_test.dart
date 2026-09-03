@@ -134,7 +134,7 @@ void main() {
       find.byKey(const ValueKey('community-header-glass-control')),
     );
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Manage Communities…'));
+    await tester.tap(find.text('Manage'));
     await tester.pumpAndSettle();
   }
 
@@ -793,7 +793,7 @@ void main() {
       startsWith('data:image/png;base64,'),
     );
     expect(items.first, containsPair('avatarFallback', 'A'));
-    expect(items.last, containsPair('label', 'Manage Communities'));
+    expect(items.last, containsPair('label', 'Manage'));
     expect(items.last, containsPair('systemIconName', 'gearshape'));
     expect(items.last, containsPair('keepsSingleLine', true));
 

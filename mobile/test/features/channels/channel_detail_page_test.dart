@@ -9258,7 +9258,7 @@ void main() {
   });
 
   group('App bar', () {
-    testWidgets('does not composite native glass during the channel route', (
+    testWidgets('shows matching controls while native glass waits for route', (
       tester,
     ) async {
       debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
@@ -9307,19 +9307,17 @@ void main() {
         find.descendant(of: huddle, matching: find.byType(UiKitView)),
         findsNothing,
       );
-      expect(
-        find.descendant(
-          of: back,
-          matching: find.byKey(
-            const ValueKey('ios-glass-navigation-route-placeholder'),
+      for (final control in [back, identity, huddle]) {
+        expect(
+          find.descendant(
+            of: control,
+            matching: find.byKey(
+              const ValueKey('ios-glass-navigation-flutter-fallback'),
+            ),
           ),
-        ),
-        findsOneWidget,
-      );
-      expect(
-        find.byKey(const ValueKey('ios-glass-navigation-flutter-fallback')),
-        findsNothing,
-      );
+          findsOneWidget,
+        );
+      }
 
       await tester.pumpAndSettle();
 
