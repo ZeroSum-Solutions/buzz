@@ -251,20 +251,31 @@ async function addGenericAgent(
   );
 }
 
-async function waitForMockLiveSubscription(page: Page, channelName: string) {
+async function waitForMockLiveSubscription(
+  page: Page,
+  channelName: string,
+  kind?: number,
+) {
   await expect
     .poll(async () => {
-      return page.evaluate((channelName) => {
-        return (
-          (
-            window as Window & {
-              __BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?: (input: {
-                channelName: string;
-              }) => boolean;
-            }
-          ).__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({ channelName }) ?? false
-        );
-      }, channelName);
+      return page.evaluate(
+        ({ channelName, kind }) => {
+          return (
+            (
+              window as Window & {
+                __BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?: (input: {
+                  channelName: string;
+                  kind?: number;
+                }) => boolean;
+              }
+            ).__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
+              channelName,
+              kind,
+            }) ?? false
+          );
+        },
+        { channelName, kind },
+      );
     })
     .toBe(true);
 }
@@ -1131,6 +1142,25 @@ test("renders agent profile ingress subviews from the Playwright mock bridge", a
     "Memory Bot",
     longAgentInstruction,
   );
+  // A running process is not presence. Supply this scenario's snapshot and
+  // authored kind-20001 updates through the mock relay, not the query cache.
+  const emitAgentPresence = (status: "online" | "offline") =>
+    page.evaluate(
+      ({ pubkey, status }) => {
+        const emit = (
+          window as Window & {
+            __BUZZ_E2E_EMIT_MOCK_PRESENCE__?: (input: {
+              pubkey: string;
+              status: "online" | "offline";
+            }) => void;
+          }
+        ).__BUZZ_E2E_EMIT_MOCK_PRESENCE__;
+        if (!emit) throw new Error("Mock presence emitter is unavailable.");
+        emit({ pubkey, status });
+      },
+      { pubkey: agentPubkey, status },
+    );
+  await emitAgentPresence("online");
 
   await page.getByTestId("channel-general").click();
   await expect(page.getByTestId("chat-title")).toHaveText("general");
@@ -1232,8 +1262,11 @@ test("renders agent profile ingress subviews from the Playwright mock bridge", a
   );
   await expect(agentPrimaryAction).toHaveClass(/bg-foreground/);
   await expect(agentPrimaryAction).toHaveClass(/text-background/);
+  await waitForMockLiveSubscription(page, "general", 20001);
   await agentPrimaryAction.click();
   await expect(agentPrimaryAction).toHaveAttribute("aria-label", "Start agent");
+  await expect(agentPresenceBadge).toHaveAttribute("aria-label", "Online");
+  await emitAgentPresence("offline");
   await expect(agentPresenceBadge).toHaveAttribute("aria-label", "Offline");
   await expectHashSearchParam(page, "profile", agentPubkey);
   await expect(agentPrimaryAction).toHaveClass(/bg-foreground/);
@@ -1252,6 +1285,9 @@ test("renders agent profile ingress subviews from the Playwright mock bridge", a
   await expect(agentPrimaryAction).toBeEnabled();
   await agentPrimaryAction.click();
   await expect(agentPrimaryAction).toHaveAttribute("aria-label", "Stop");
+  await waitForMockLiveSubscription(page, "general", 20001);
+  await expect(agentPresenceBadge).toHaveAttribute("aria-label", "Offline");
+  await emitAgentPresence("online");
   await expect(agentPresenceBadge).toHaveAttribute("aria-label", "Online");
   await expect(page.getByTestId("user-profile-agent-restart")).toBeVisible();
   await expectHashSearchParam(page, "profileTab", null);

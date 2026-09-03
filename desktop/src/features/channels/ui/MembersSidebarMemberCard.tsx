@@ -1,3 +1,4 @@
+import { agentPresenceStartBlockReason } from "@/features/agents/lib/useAgentAvailability";
 import {
   Activity,
   Ban,
@@ -293,6 +294,7 @@ export function MembersSidebarMemberCard({
           onUntimeout={onUntimeout}
           onViewActivity={onViewActivity}
           pairAction={pairAction}
+          availability={presenceStatus ?? undefined}
         />
       ) : null}
     </div>
@@ -302,6 +304,7 @@ export function MembersSidebarMemberCard({
 const PEOPLE_ROLES = ["admin", "member", "guest"] as const;
 
 function MemberActionsMenu({
+  availability,
   canChangeRole,
   canModerateMember,
   canRemoveMember,
@@ -323,6 +326,7 @@ function MemberActionsMenu({
   pairAction,
 }: {
   canChangeRole: boolean;
+  availability: PresenceStatus | undefined;
   canModerateMember: boolean;
   canRemoveMember: boolean;
   canViewActivity: boolean;
@@ -346,6 +350,13 @@ function MemberActionsMenu({
     canChangeRole && !memberIsBot && member.role !== "owner";
   const isBanned = moderationState?.banned ?? false;
   const isTimedOut = moderationState?.timedOut ?? false;
+
+  const startBlockReason = managedAgent
+    ? agentPresenceStartBlockReason(
+        pairAction ? pairAction === "stop" : isManagedAgentActive(managedAgent),
+        availability,
+      )
+    : undefined;
 
   return (
     <DropdownMenu modal={false}>
@@ -376,8 +387,11 @@ function MemberActionsMenu({
             {canViewActivity ? <DropdownMenuSeparator /> : null}
             <DropdownMenuItem
               data-testid={`sidebar-agent-action-${member.pubkey}`}
-              disabled={disabled}
-              onClick={() => onManagedAgentAction(managedAgent)}
+              disabled={disabled || Boolean(startBlockReason)}
+              title={startBlockReason}
+              onClick={() => {
+                if (!startBlockReason) onManagedAgentAction(managedAgent);
+              }}
             >
               {pairAction
                 ? getPairActionIcon(pairAction)

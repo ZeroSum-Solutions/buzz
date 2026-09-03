@@ -1230,6 +1230,11 @@ declare global {
       ownerPubkey: string;
       kind: number;
     }) => boolean;
+    /** Explicit presence evidence; independent of managed-agent runtime state. */
+    __BUZZ_E2E_EMIT_MOCK_PRESENCE__?: (input: {
+      pubkey: string;
+      status: PresenceStatus;
+    }) => void;
     __BUZZ_E2E_EMIT_MOCK_MESSAGE__?: (input: {
       channelName: string;
       content: string;
@@ -2475,6 +2480,7 @@ function resetMockRelayAgents(config?: E2eConfig) {
 
 function resetMockManagedAgents(config?: E2eConfig) {
   mockManagedAgents = [];
+  mockBestieAssignment = null;
   mockManagedAgentRuntimes = (config?.mock?.managedAgentRuntimes ?? []).map(
     (seed) => ({
       pubkey: seed.pubkey,
@@ -3225,6 +3231,9 @@ let mockClosedChannelLiveSubscription = false;
 const realSockets = new Map<number, WebSocket>();
 let mockManagedAgents: MockManagedAgent[] = [];
 let mockManagedAgentRuntimes: MockManagedAgentRuntimeRow[] = [];
+let mockBestieAssignment: {
+  agent_pubkey: string;
+} | null = null;
 
 // Mutable `save_subscriptions` table mirror — TEST-ONLY.
 //
@@ -9640,7 +9649,7 @@ async function handleStartManagedAgent(
   agent.updated_at = now;
   agent.last_started_at = now;
   agent.last_error = null;
-  setMockPresenceStatus(agent.pubkey, "online");
+  // Lifecycle is not presence; scenarios publish explicit relay evidence.
   agent.log_lines.push(
     agent.backend.type === "provider"
       ? `deployed mock provider harness at ${now}`
@@ -9668,7 +9677,7 @@ async function handleStopManagedAgent(args: {
       row.pid = null;
     }
   }
-  setMockPresenceStatus(agent.pubkey, "offline");
+  // A stop result alone is not an authored offline presence event.
   agent.log_lines.push(`stopped mock harness at ${now}`);
   syncMockRelayAgentsFromManagedAgents();
   return cloneManagedAgent(agent);
@@ -9694,6 +9703,9 @@ async function handleDeleteManagedAgent(args: {
   mockManagedAgents = mockManagedAgents.filter(
     (candidate) => candidate.pubkey !== args.pubkey,
   );
+  if (mockBestieAssignment?.agent_pubkey === args.pubkey) {
+    mockBestieAssignment = null;
+  }
   syncMockRelayAgentsFromManagedAgents();
 }
 
@@ -11436,6 +11448,11 @@ export function maybeInstallE2eTauriMocks() {
     ownerPubkey,
     kind,
   }) => hasMockOwnerKindSubscription(ownerPubkey, kind);
+  window.__BUZZ_E2E_EMIT_MOCK_PRESENCE__ = ({ pubkey, status }) => {
+    const author = pubkey.toLowerCase();
+    setMockPresenceStatus(author, status);
+    emitMockGlobalEvent(createMockEvent(20001, status, [], author));
+  };
   window.__BUZZ_E2E_REPLACE_MOCK_TEAM_CATALOG_HEAD__ = (event) => {
     const dTag = event.tags.find((tag) => tag[0] === "d")?.[1];
     const existingIndex = mockTeamCatalogEvents.findIndex(
@@ -13734,6 +13751,32 @@ export function maybeInstallE2eTauriMocks() {
         );
       case "list_managed_agent_runtimes":
         return mockManagedAgentRuntimes.map((row) => ({ ...row }));
+      case "get_bestie_assignment":
+        return mockBestieAssignment ? { ...mockBestieAssignment } : null;
+      case "assign_bestie": {
+        const agentPubkey = (payload as { agentPubkey: string }).agentPubkey;
+        const agent = getMockManagedAgent(agentPubkey);
+        if (agent.backend.type !== "local") {
+          throw new Error("only a local managed agent can be your Bestie");
+        }
+        mockBestieAssignment = {
+          agent_pubkey: agent.pubkey,
+        };
+        return { ...mockBestieAssignment };
+      }
+      case "clear_bestie_assignment":
+        mockBestieAssignment = null;
+        return undefined;
+      case "resolve_bestie_conversation": {
+        if (!mockBestieAssignment) {
+          throw new Error("choose an agent before opening Bestie");
+        }
+        const channel = await handleOpenDm(
+          { pubkeys: [mockBestieAssignment.agent_pubkey] },
+          activeConfig,
+        );
+        return channel;
+      }
       case "start_managed_agent_runtime":
         return handleManagedAgentRuntimeAction(
           "start",
