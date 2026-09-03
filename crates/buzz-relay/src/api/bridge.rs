@@ -5011,6 +5011,87 @@ mod postgres_tests {
         );
     }
 
+    // ── T1-IMP2: POST /internal/git/policy — Enforce mode → NOT 401 ─────────
+    //
+    // Verifies that `/internal/git/policy` is exempt from the NIP-FI guard in
+    // Enforce mode.  The pre-receive hook callback carries no
+    // Nostr-Federated-Identity assertion and must reach the policy handler's
+    // own authorization layer, not be rejected by the guard.
+    //
+    // ## What this proves
+    //
+    // In Enforce mode, every non-exempt route without an assertion header gets
+    // 401 (MissingEvidence) from `nip_fi_assertion_guard`.  `/internal/git/policy`
+    // appears in `NIP_FI_EXEMPT_PREFIXES`, so the guard forwards it instead.
+    // `require_localhost` then rejects (403) because Tower's `oneshot` does not
+    // inject `ConnectInfo`.  A 403 proves the NIP-FI guard was NOT the rejector;
+    // a 401 would mean the guard fired and the exempt entry is broken.
+    //
+    // ## Falsifying mutation
+    //
+    // Remove `"/internal/git/policy"` from `NIP_FI_EXEMPT_PREFIXES` in
+    // `router.rs`.  The guard fires, returns 401, and the `assert_ne!(401)`
+    // assertion panics.
+    #[test]
+    #[ignore = "requires Postgres"]
+    fn nip_fi_enforce_git_policy_callback_reaches_own_auth_not_nip_fi_guard() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current_thread runtime");
+
+        let Some(state) = rt.block_on(nip_fi_enforce_test_state()) else {
+            panic!("local Postgres not reachable");
+        };
+
+        // Minimal syntactically-valid payload — the HMAC will fail (no real
+        // hook secret), so the policy handler returns 403.  We only care that
+        // the NIP-FI guard does NOT produce a 401 first.
+        let body = br#"{
+            "repo_id": "test-repo",
+            "repo_owner": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "community_id": "test",
+            "pusher_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "ref_updates": [],
+            "timestamp": 1234567890,
+            "signature": "0000000000000000000000000000000000000000000000000000000000000000"
+        }"#;
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().expect("valid header"),
+        );
+        // No Nostr-Federated-Identity header — the guard must pass this through.
+
+        let status = rt.block_on(oneshot_request(
+            state,
+            "POST",
+            "/internal/git/policy",
+            "test.local",
+            headers,
+            body,
+        ));
+
+        assert_ne!(
+            status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "NIP-FI Enforce mode: POST /internal/git/policy with no assertion must NOT \
+             be denied by the NIP-FI guard (401); the pre-receive hook does not carry an \
+             assertion and must reach the policy handler's own auth layer \
+             [FI-TRACE-HTTP-INGRESS T1-IMP2]"
+        );
+        // The policy handler returns 403 (require_localhost check, since
+        // Tower's oneshot does not inject ConnectInfo) — not 401 from the guard.
+        // 403 proves the NIP-FI guard was not the rejector.
+        assert_eq!(
+            status,
+            axum::http::StatusCode::FORBIDDEN,
+            "POST /internal/git/policy must reach its own authorization layer (403), \
+             not be blocked at the NIP-FI guard layer (which would return 401)"
+        );
+    }
+
     // ── F4: bridge POST /query — deny_protected mode → 503 ──────────────────
     //
     // DenyProtected fires the gate unconditionally before any NIP-98 check,
