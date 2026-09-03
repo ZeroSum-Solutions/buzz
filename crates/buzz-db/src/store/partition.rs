@@ -254,7 +254,7 @@ async fn partition_range_covered(
 }
 
 #[cfg(test)]
-mod tests {
+mod postgres_tests {
     use super::*;
 
     #[test]
