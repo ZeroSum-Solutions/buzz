@@ -1539,7 +1539,7 @@ test("managed relay-profile agents with member roles can be addressed explicitly
   ).toBeVisible();
 });
 
-test("other-owned agents without a shared channel are hidden from mentions", async ({
+test("other-owned agents without a shared channel remain unavailable", async ({
   page,
 }) => {
   await installMockBridge(page, {
@@ -1561,16 +1561,17 @@ test("other-owned agents without a shared channel are hidden from mentions", asy
   await input.fill("@mira");
 
   const dropdown = autocomplete(page);
-  await expect(
-    page.getByRole("status").filter({ hasText: "No mentions found" }),
-  ).toBeVisible();
-  await expect(
-    dropdown.locator("[data-testid^=mention-suggestion-]"),
-  ).toHaveCount(0);
+  const action = autocomplete(page).getByRole("button", {
+    name: "Unavailable mira",
+    exact: true,
+  });
+  await expect(action).toBeDisabled();
+  await input.press("Tab");
+  await expect(input).toHaveText("@mira");
   await expect(input.locator(".mention-chip")).toHaveCount(0);
 });
 
-test("stale channel-member agents absent from managed and relay directories stay hidden", async ({
+test("stale channel-member agents absent from managed and relay directories remain unavailable", async ({
   page,
 }) => {
   await installMockBridge(page, { userSearchDelayMs: 1_000 });
@@ -1581,12 +1582,13 @@ test("stale channel-member agents absent from managed and relay directories stay
   const input = page.getByTestId("message-input");
   await input.fill("@mira");
 
-  await expect(
-    page.getByRole("status").filter({ hasText: "No mentions found" }),
-  ).toBeVisible();
-  await expect(
-    autocomplete(page).locator("[data-testid^=mention-suggestion-]"),
-  ).toHaveCount(0);
+  const action = autocomplete(page).getByRole("button", {
+    name: "Unavailable mira",
+    exact: true,
+  });
+  await expect(action).toBeDisabled();
+  await input.press("Tab");
+  await expect(input).toHaveText("@mira");
 });
 
 test("managed relay agents are visible in channel mentions regardless of relay policy", async ({
@@ -1621,7 +1623,7 @@ test("managed relay agents are visible in channel mentions regardless of relay p
   await expect(dropdown.getByText("agent")).toBeVisible();
 });
 
-test("relay-only shared agents stay hidden from DM mentions", async ({
+test("relay-only shared agents remain unavailable from DM mentions", async ({
   page,
 }) => {
   await page.goto("/");
@@ -1630,12 +1632,13 @@ test("relay-only shared agents stay hidden from DM mentions", async ({
 
   await page.getByTestId("message-input").fill("@alice");
 
-  await expect(
-    page.getByRole("status").filter({ hasText: "No mentions found" }),
-  ).toBeVisible();
-  await expect(
-    autocomplete(page).locator("[data-testid^=mention-suggestion-]"),
-  ).toHaveCount(0);
+  const action = autocomplete(page).getByRole("button", {
+    name: "Unavailable alice",
+    exact: true,
+  });
+  await expect(action).toBeDisabled();
+  await page.getByTestId("message-input").press("Tab");
+  await expect(page.getByTestId("message-input")).toHaveText("@alice");
 });
 
 test("cached relay-agent members become unavailable when channel authorization disappears", async ({
@@ -1885,18 +1888,23 @@ test("relay-agent directory errors fail closed and recover after a fresh fetch",
   const input = page.getByTestId("message-input");
   await input.fill("@quinn");
   await expect(
-    page.getByRole("status").filter({ hasText: "No mentions found" }),
-  ).toBeVisible();
+    autocomplete(page).getByRole("button", {
+      name: "Unavailable quinn",
+      exact: true,
+    }),
+  ).toBeDisabled();
 
   await page.evaluate(async () => {
     window.__BUZZ_E2E__.mock!.relayAgentListErrors = [];
-    await window.__BUZZ_E2E_QUERY_CLIENT__?.invalidateQueries({
-      queryKey: ["relay-agents"],
-    });
   });
-  await input.press("Escape");
-  await input.fill("@quin");
-  await expect(autocomplete(page).getByText("quinn")).toBeVisible();
+  await autocomplete(page)
+    .getByRole("button", { name: "Retry", exact: true })
+    .click();
+  await expect(
+    autocomplete(page).getByRole("button", {
+      name: /^(Mention|Invite) quinn$/,
+    }),
+  ).toBeEnabled();
 
   await page.evaluate(() => {
     window.__BUZZ_E2E__.mock ??= {};

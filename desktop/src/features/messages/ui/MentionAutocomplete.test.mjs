@@ -616,7 +616,7 @@ test("evidence times out, retries explicitly, and forgets classification on scop
   const view = renderHook((props) => useMentionEvidence(props), {
     initialProps: {
       scope: "viewer:room",
-      open: true,
+      request: {},
       agentKeys: new Set(["a"]),
       directoryUpdatedAt: 10000,
       directoryError: false,
@@ -626,12 +626,29 @@ test("evidence times out, retries explicitly, and forgets classification on scop
   assert.equal(view.result.current.verificationFailed, false);
   act(() => t.mock.timers.tick(5000));
   assert.equal(view.result.current.verificationFailed, true);
+  view.rerender({
+    scope: "viewer:room",
+    request: {},
+    agentKeys: new Set(["a"]),
+    directoryUpdatedAt: 10000,
+    directoryError: false,
+    retry: () => retries++,
+  });
+  assert.equal(
+    view.result.current.verificationFailed,
+    false,
+    "new completion gets a fresh verification window",
+  );
+  act(() => t.mock.timers.tick(4999));
+  assert.equal(view.result.current.verificationFailed, false);
+  act(() => t.mock.timers.tick(1));
+  assert.equal(view.result.current.verificationFailed, true);
   act(() => view.result.current.retryVerification());
   assert.equal(retries, 1);
   assert.equal(view.result.current.verificationFailed, false);
   view.rerender({
     scope: "viewer:other",
-    open: true,
+    request: {},
     agentKeys: new Set(),
     directoryUpdatedAt: 10000,
     directoryError: false,

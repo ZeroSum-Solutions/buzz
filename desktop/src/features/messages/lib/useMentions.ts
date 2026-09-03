@@ -265,7 +265,7 @@ export function useMentions(
     retryVerification,
   } = useMentionEvidence({
     scope: `${currentPubkey}:${channelId}`,
-    open: mentionQuery !== null,
+    request: query.request,
     agentKeys: new Set([
       ...agentIdentityPubkeys,
       ...userSearchResults
@@ -439,21 +439,24 @@ export function useMentions(
   const getDefaultAgentSuggestion = defaultAgentSuggestion;
   // Search hooks are keyed by the requested text. Wait for that request's
   // first page and initial directories, then keep exactly one displayed set.
+  const searchReady =
+    !canSearchGlobalUsers ||
+    (!userSearchQuery.isPending && !userSearchQuery.isFetching);
   const resultsReady =
-    verificationFailed ||
-    ((channelId === null ||
-      !!externalMembers ||
-      (!membersQuery.isPending && !membersQuery.isFetching)) &&
-      !managedAgentsQuery.isPending &&
-      !managedAgentsQuery.isFetching &&
-      !relayAgentsQuery.isPending &&
-      !relayAgentsQuery.isFetching &&
-      !personasQuery.isPending &&
-      !personasQuery.isFetching &&
-      !teamsQuery.isPending &&
-      !teamsQuery.isFetching &&
-      (!canSearchGlobalUsers ||
-        (!userSearchQuery.isPending && !userSearchQuery.isFetching)));
+    searchReady &&
+    (verificationFailed ||
+      ((channelId === null ||
+        !!externalMembers ||
+        (!membersQuery.isPending && !membersQuery.isFetching)) &&
+        !managedAgentsQuery.isPending &&
+        !managedAgentsQuery.isFetching &&
+        !relayAgentsQuery.isPending &&
+        !relayAgentsQuery.isFetching &&
+        !personasQuery.isPending &&
+        !personasQuery.isFetching &&
+        !teamsQuery.isPending &&
+        !teamsQuery.isFetching &&
+        searchReady));
   const mentionSelection = useMentionSelection(
     query.request,
     matchingSuggestions,

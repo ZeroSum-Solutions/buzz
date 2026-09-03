@@ -900,3 +900,23 @@ test("checking resolves and retry refreshes without moving the selected identity
   assert.equal(rows()[0].pubkey, identity);
   assert.equal(rows()[0].action, "mention");
 });
+
+test("verification expiry never installs an unfinished people search", async () => {
+  await setup();
+  let release;
+  state.pendingSearch = {
+    slow: new Promise((resolve) => {
+      release = resolve;
+    }),
+  };
+  await act(async () => mention.updateMentionQuery("@slow", 5));
+  await act(async () => new Promise((resolve) => setTimeout(resolve, 5100)));
+  assert.equal(mention.isMentionLoading, true);
+  assert.deepEqual(mention.suggestions, []);
+  await act(async () =>
+    release({ users: [person(OTHER, "Slow")], next_cursor: null }),
+  );
+  await settle();
+  assert.equal(mention.isMentionLoading, false);
+  assert.equal(mention.suggestions[0].pubkey, OTHER);
+});
