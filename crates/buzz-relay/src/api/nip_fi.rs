@@ -1460,9 +1460,10 @@ mod route_integration_tests {
 
         let deny_map = state.nip_fi_deny_map.as_deref().expect("deny map present");
 
-        // Denied immediately after T (now = T + 1ns, until = T + 500_000_000ns).
+        // Denied immediately after T (now = T + 1ns, well inside the deadline T+500ms).
+        let now_after_t = t_whole + chrono::Duration::nanoseconds(1);
         assert!(
-            deny_map.is_denied(TEST_ISS, &target, now_inside),
+            deny_map.is_denied(TEST_ISS, &target, now_after_t),
             "must be denied at T+1ns (deadline is T+500ms)"
         );
 

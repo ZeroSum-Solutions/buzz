@@ -31,6 +31,11 @@ use nostr::PublicKey;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+// Test-only type alias for the pre-lock hook, silencing the `clippy::type_complexity`
+// lint that fires on the raw trait-object form under `#[cfg(test)] -D warnings`.
+#[cfg(test)]
+type PreLockHook = Arc<dyn Fn(&str) + Send + Sync>;
+
 // ── Error type ────────────────────────────────────────────────────────────────
 
 /// Returned when the per-issuer deny-set capacity is exhausted.
@@ -246,7 +251,7 @@ pub struct NipFiDenyMap {
     /// and immediately before acquiring the shard lock.
     ///
     /// Used by `remote_capacity_transition_linearizes_before_waiting_admission`
-    /// to park admission between its initial shard-resolve and the lock, allowing
+    /// to park admission between its shard-resolve and the lock, allowing
     /// a concurrent capacity-exhaustion transition to race against a real
     /// `is_denied` call.  Inert in production — the field is `None` unless set
     /// by a test via `set_pre_lock_hook_for_test`.
@@ -254,7 +259,7 @@ pub struct NipFiDenyMap {
     /// The hook receives the issuer string so it can selectively park only the
     /// target issuer's admission, leaving other issuers unaffected.
     #[cfg(test)]
-    pre_lock_hook: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    pre_lock_hook: Option<PreLockHook>,
 }
 
 /// A per-issuer capacity override supplied at construction time.
@@ -310,15 +315,17 @@ impl NipFiDenyMap {
     /// `blocked = true`.
     pub fn is_denied(&self, issuer: &str, pubkey: &PublicKey, now: DateTime<Utc>) -> bool {
         let pubkey_hex = pubkey.to_hex();
-        #[cfg(test)]
-        if let Some(hook) = &self.pre_lock_hook {
-            hook(issuer);
-        }
         match self.shards.get(issuer) {
-            Some(shard) => shard
-                .lock()
-                .map(|guard| guard.is_denied_or_blocked(&pubkey_hex, now))
-                .unwrap_or(true), // poisoned shard → fail closed (deny)
+            Some(shard) => {
+                #[cfg(test)]
+                if let Some(hook) = &self.pre_lock_hook {
+                    hook(issuer);
+                }
+                shard
+                    .lock()
+                    .map(|guard| guard.is_denied_or_blocked(&pubkey_hex, now))
+                    .unwrap_or(true) // poisoned shard → fail closed (deny)
+            }
             None => false,
         }
     }
@@ -1183,11 +1190,12 @@ mod tests {
             .filter(|r| matches!(r, Err(ReserveError::CapacityExceeded)))
             .count();
 
-        // The pre-insert consumes 1 JTI slot; ceiling is 4; so at most 3 of the
+        // The pre-insert consumes 1 JTI slot; ceiling is 4; so exactly 3 of the
         // concurrent threads succeed (4 - 1 = 3 remaining slots).
-        assert!(
-            successes <= 3,
-            "at most 3 concurrent successes allowed (4 JTI ceiling - 1 pre-used = 3), got {successes}"
+        assert_eq!(
+            successes,
+            3,
+            "exactly 3 concurrent successes allowed (4 JTI ceiling - 1 pre-used = 3), got {successes}"
         );
         assert_eq!(
             successes + capacity_exceeded,
@@ -1195,11 +1203,11 @@ mod tests {
             "every result must be Ok or CapacityExceeded"
         );
 
-        // Confirm the shard's JTI count never exceeded the ceiling.
+        // Confirm the shard's JTI count is exactly at the ceiling.
         let live_jtis = m.shards.get(iss()).unwrap().lock().unwrap().jtis.len();
-        assert!(
-            live_jtis <= 4,
-            "shard must have ≤4 live JTIs, found {live_jtis}"
+        assert_eq!(
+            live_jtis, 4,
+            "shard must have exactly 4 live JTIs (ceiling), found {live_jtis}"
         );
     }
 
