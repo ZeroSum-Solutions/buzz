@@ -438,8 +438,8 @@ test("duplicate owned agents preserve provenance and exact pubkey selection", as
   await expect(relayProvenanceMarker).toBeVisible();
   await expect(relayProvenanceMarker).toHaveText("");
   await expect(relayProvenanceMarker.locator("svg")).toBeVisible();
-  await expect(managedRow).not.toContainText("managed by you");
-  await expect(relayRow).not.toContainText("managed by you");
+  await expect(managedRow).toContainText("managed by you");
+  await expect(relayRow).toContainText("managed by you");
 
   await page.setViewportSize({ width: 760, height: 640 });
   await expect(relayProvenanceMarker).toBeVisible();
@@ -1638,7 +1638,7 @@ test("relay-only shared agents stay hidden from DM mentions", async ({
   ).toHaveCount(0);
 });
 
-test("cached relay-agent choices cannot insert when channel authorization disappears", async ({
+test("cached relay-agent members become unavailable when channel authorization disappears", async ({
   page,
 }) => {
   await installMockBridge(page, { userSearchDelayMs: 100 });
@@ -1674,9 +1674,24 @@ test("cached relay-agent choices cannot insert when channel authorization disapp
     await bridge.__BUZZ_E2E_INVALIDATE_CHANNELS__?.();
   }, GENERAL_CHANNEL_ID);
 
-  await expect(aliceSuggestion).toBeVisible();
-  await input.press("Tab");
+  const action = aliceSuggestion.getByRole("button", {
+    name: "Unavailable alice",
+    exact: true,
+  });
+  await expect(action).toBeDisabled();
+  await expect(
+    aliceSuggestion.getByRole("button", { name: "Retry" }),
+  ).toBeEnabled();
+  await expect(
+    aliceSuggestion.getByRole("button", { name: /automatic/i }),
+  ).toHaveCount(0);
+  await action.dispatchEvent("click");
+  for (const key of ["Tab", "Enter"]) await input.press(key);
   await expect(input).toHaveText("@alice");
+  await expect(
+    page.getByTestId(`composer-address-lock-${TEST_IDENTITIES.alice.pubkey}`),
+  ).toHaveCount(0);
+  expect(await readOutgoingMentionPubkeys(page, "@alice")).toBeNull();
 });
 
 test("relay-only shared agents appear in forum mentions", async ({ page }) => {
@@ -1829,6 +1844,9 @@ test("managed agents use the channel roster for membership labels", async ({
         queryKey: ["channels"],
         exact: true,
       });
+      await window.__BUZZ_E2E_QUERY_CLIENT__?.invalidateQueries({
+        queryKey: ["channels", channelId, "members"],
+      });
     },
     {
       channelId: GENERAL_CHANNEL_ID,
@@ -1843,6 +1861,8 @@ test("managed agents use the channel roster for membership labels", async ({
   await expect(carlRow).toBeVisible();
   await expect(carlRow.getByText("agent")).toBeVisible();
   await expect(carlRow.getByText("not in channel")).toHaveCount(0);
+  await expect(carlRow).toContainText("Member · Mention");
+  await expect(carlRow).not.toContainText("Invite");
 });
 
 test("relay-agent directory errors fail closed and recover after a fresh fetch", async ({
@@ -2108,7 +2128,10 @@ test("selected relay agents are invited as bots before sending", async ({
   await input.fill("@quinn");
   const quinnRow = autocomplete(page).locator("button", { hasText: "quinn" });
   await expect(quinnRow).toBeVisible();
-  await expect(quinnRow.getByText("not in channel")).toHaveCount(0);
+  await expect(quinnRow.getByText("not in channel")).toBeVisible();
+  await expect(quinnRow).toContainText("Invite");
+  await expect(quinnRow).not.toContainText("Member · Mention");
+  await expect(quinnRow).toBeEnabled();
   await quinnRow.click();
   await page.keyboard.type("hello");
 
@@ -2119,11 +2142,17 @@ test("selected relay agents are invited as bots before sending", async ({
     exact: true,
   });
   await expect(inviteButton).toBeVisible();
+  expect(await readOutgoingMentionPubkeys(page, "@quinn hello")).toBeNull();
+  expect(
+    (await readCommandPayloadLog(page))
+      .slice(baselinePayloadCount)
+      .some((entry) => entry.command === "add_channel_members"),
+  ).toBe(false);
   await inviteButton.click();
 
   await expect
     .poll(() => readOutgoingMentionPubkeys(page, "@quinn hello"))
-    .toContain(ALLOWLIST_RELAY_AGENT_PUBKEY);
+    .toEqual([ALLOWLIST_RELAY_AGENT_PUBKEY]);
   const sendCommands = (await readCommandPayloadLog(page)).slice(
     baselinePayloadCount,
   );
