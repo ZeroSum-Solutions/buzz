@@ -183,6 +183,7 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
   private var buttonIconName = "chevron.backward"
   private var contentIcon = "back"
   private var buttonImage: UIImage?
+  private var resolvedForegroundColor: UIColor?
   private var isBusy = false
   private var controlSize: CGFloat = 44
   private var avatarImageURL: String?
@@ -364,6 +365,7 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
     let interfaceStyle: UIUserInterfaceStyle = brightness == "dark" ? .dark : .light
     let colorValue = (arguments?["foregroundColor"] as? NSNumber)?.uint32Value
     let foregroundColor = colorValue.map(Self.color(from:))
+    resolvedForegroundColor = foregroundColor
     let enabled = arguments?["enabled"] as? Bool ?? true
     let busy = arguments?["busy"] as? Bool ?? false
     let selected = arguments?["selected"] as? Bool ?? false
@@ -551,11 +553,17 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
       let displaysSwatch = contentIcon == "colorSwatch"
       let displaysAvatar = contentIcon == "avatar"
       let displaysLeadingImage = displaysAvatar || contentIcon == "channel"
+      let displayedImage = displaysAvatar
+        ? buttonImage
+        : buttonImage?.withTintColor(
+          resolvedForegroundColor ?? button.tintColor,
+          renderingMode: .alwaysOriginal
+        )
       button.configuration?.title = displaysSwatch ? nil : buttonLabel
       button.configuration?.subtitle = displaysSwatch ? nil : buttonSubtitle
       button.configuration?.image = displaysSwatch || (buttonLabel != nil && !displaysLeadingImage)
         ? nil
-        : buttonImage
+        : displayedImage
       swatchView.isHidden = !displaysSwatch
       activityIndicator.stopAnimating()
     }
