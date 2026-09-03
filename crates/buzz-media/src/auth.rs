@@ -318,7 +318,7 @@ pub fn verify_blossom_get_auth(
         .filter_map(|tag| tag.content())
         .collect();
 
-    let has_matching_x = x_tags.iter().any(|&v| v == sha256);
+    let has_matching_x = x_tags.contains(&sha256);
 
     let has_matching_server = match server_domain {
         Some(domain) => {
