@@ -6321,7 +6321,7 @@ mod postgres_tests {
         // a stale membership cache entry and an active channel subscription.
         // These are what the crash-recovery live side effects must clear.
         let cid = buzz_core::CommunityId::from_uuid(community_id);
-        let tenant = e2e_tenant(community_id, "worker-midflight-purge.example");
+        let _tenant = e2e_tenant(community_id, "worker-midflight-purge.example");
         state
             .membership_cache
             .insert((cid, channel_id, author.clone()), true);
@@ -7997,7 +7997,7 @@ mod postgres_tests {
 
         // Build state with real DB. Seed stale in-process entries.
         let state = state_from_pool(pool.clone()).await;
-        let tenant = e2e_tenant(community_id, &host);
+        let _tenant = e2e_tenant(community_id, &host);
 
         state
             .membership_cache
@@ -8255,7 +8255,7 @@ mod postgres_tests {
         // Build state with real DB. Register a live subscription and workflow
         // for the re-added member — recovery must NOT revoke these.
         let state = state_from_pool(pool.clone()).await;
-        let tenant = e2e_tenant(community_id, &host);
+        let _tenant = e2e_tenant(community_id, &host);
 
         let conn_id = uuid::Uuid::new_v4();
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
