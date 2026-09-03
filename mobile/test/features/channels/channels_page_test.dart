@@ -26,6 +26,7 @@ import 'package:buzz/shared/widgets/avatar_image.dart';
 import 'package:buzz/shared/widgets/adaptive_glass_avatar_button.dart';
 import 'package:buzz/shared/widgets/buzz_loading_indicator.dart';
 import 'package:buzz/shared/widgets/frosted_app_bar.dart';
+import 'package:buzz/shared/widgets/native_avatar_data_uri_provider.dart';
 import 'package:buzz/shared/widgets/skeleton.dart';
 
 void main() {
@@ -656,6 +657,43 @@ void main() {
     expect(communityRect.top - communityControlRect.top, 6);
     expect(communityControlRect.bottom - communityRect.bottom, 6);
     expect(profileRect.center.dy, communityRect.center.dy);
+  });
+
+  testWidgets('keeps the source avatar while its native copy is prepared', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    final conversion = Completer<String?>();
+    addTearDown(() {
+      if (!conversion.isCompleted) conversion.complete(null);
+    });
+    const source = 'https://example.com/community.png';
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          nativeAvatarDataUriProvider.overrideWith(
+            (ref, imageUrl) => conversion.future,
+          ),
+        ],
+        child: MaterialApp(
+          theme: AppTheme.light(),
+          home: AdaptiveGlassAvatarButton(
+            imageUrl: source,
+            fallbackText: 'C',
+            semanticLabel: 'Community',
+            onPressed: () {},
+            width: 48,
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    final nativeView = tester.widget<UiKitView>(find.byType(UiKitView));
+    expect(nativeView.creationParams, containsPair('avatarImageUrl', source));
+    debugDefaultTargetPlatformOverride = null;
   });
 
   testWidgets('morphs the community capsule symmetrically with scroll', (
@@ -1378,6 +1416,48 @@ void main() {
     await openCommunitySwitcher(tester);
 
     expect(iconLoads, greaterThan(initialIconLoads));
+  });
+
+  testWidgets('opening the community switcher preserves a loaded icon', (
+    tester,
+  ) async {
+    final community = Community(
+      id: 'alpha',
+      name: 'Alpha',
+      relayUrl: 'wss://alpha.example.com',
+      addedAt: DateTime(2025),
+    );
+    var iconLoads = 0;
+    const icon =
+        'data:image/png;base64,'
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+
+    await tester.pumpWidget(
+      buildTestable(
+        communityIcons: const {'wss://alpha.example.com': icon},
+        onCommunityIconLoad: (_) => iconLoads++,
+        overrides: [
+          channelsProvider.overrideWith(() => _FakeNotifier(testChannels)),
+          communityListProvider.overrideWith(
+            () => _FakeCommunityListNotifier([community]),
+          ),
+          activeCommunityProvider.overrideWith((ref) async => community),
+        ],
+      ),
+    );
+    await tester.pumpAndSettle();
+    final initialIconLoads = iconLoads;
+
+    await openCommunitySwitcher(tester);
+
+    expect(iconLoads, initialIconLoads);
+    final avatar = tester.widget<AvatarImage>(
+      find.descendant(
+        of: find.byKey(const Key('community-switcher-avatar-alpha')),
+        matching: find.byType(AvatarImage),
+      ),
+    );
+    expect(avatar.imageUrl, icon);
   });
 
   testWidgets('community switcher header grows with accessible text', (

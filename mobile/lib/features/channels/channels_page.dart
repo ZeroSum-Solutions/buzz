@@ -308,7 +308,13 @@ class ChannelsPage extends HookConsumerWidget {
     void openCommunitySwitcher() {
       unawaited(HapticFeedback.selectionClick());
       nativeHeaderControlsSuppressed.value = true;
-      ref.invalidate(communityIconProvider);
+      final communities = ref.read(communityListProvider).value ?? const [];
+      for (final community in communities) {
+        final icon = ref.read(communityIconProvider(community.relayUrl));
+        if (!icon.isLoading && icon.value == null) {
+          ref.invalidate(communityIconProvider(community.relayUrl));
+        }
+      }
       unawaited(
         showBuzzModalBottomSheet<void>(
           context: context,

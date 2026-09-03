@@ -44,7 +44,7 @@ class AdaptiveGlassAvatarButton extends ConsumerWidget {
       final source = imageUrl;
       final nativeImage = source == null
           ? null
-          : ref.watch(nativeAvatarDataUriProvider(source)).value;
+          : ref.watch(nativeAvatarDataUriProvider(source)).value ?? source;
       return IosGlassNavigationButton(
         icon: IosGlassNavigationIcon.avatar,
         label: label,

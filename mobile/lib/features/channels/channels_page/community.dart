@@ -474,7 +474,7 @@ class _CommunityHeaderControl extends ConsumerWidget {
       final source = ref.watch(communityIconProvider(community.relayUrl)).value;
       return source == null
           ? null
-          : ref.watch(nativeAvatarDataUriProvider(source)).value;
+          : ref.watch(nativeAvatarDataUriProvider(source)).value ?? source;
     }
 
     final menuItems = [
