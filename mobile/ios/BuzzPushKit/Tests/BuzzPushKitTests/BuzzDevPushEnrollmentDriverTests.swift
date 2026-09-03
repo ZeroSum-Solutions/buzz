@@ -889,6 +889,7 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
 
     XCTAssertEqual(replacement.relayPubkey, newRelayPubkey)
     XCTAssertTrue(store.saved.contains(sibling))
+    XCTAssertEqual(store.replacementOrigins, ["wss://sibling.example"])
     XCTAssertEqual(
       store.saved.filter { $0.relayOrigin == "wss://relay.example" }.map(\.relayPubkey),
       [newRelayPubkey]

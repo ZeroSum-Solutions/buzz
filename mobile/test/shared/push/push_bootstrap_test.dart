@@ -52,6 +52,8 @@ void main() {
     await Future<void>.delayed(Duration.zero);
 
     expect(retries, 0);
+    expect(gate.isCurrent('old'), isFalse);
+    expect(gate.isCurrent('new'), isTrue);
     expect(gate.tryBegin('new'), isFalse);
   });
 

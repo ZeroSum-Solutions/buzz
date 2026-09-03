@@ -523,8 +523,13 @@ public final class BuzzDevPushEnrollmentDriver {
         }
         if !siblingDelegationRecords.isEmpty {
           // Delegation authority is shared by relay key, installation, and app
-          // profile. Keep it alive while another relay origin still uses it;
-          // only the rotating origin's obsolete grant is removed.
+          // profile. A response-lost higher generation may already have
+          // invalidated every sibling grant, so queue their relay origins
+          // before discarding the journal. Keep the delegation alive and
+          // remove only the rotating origin's obsolete grant.
+          try store.queueReplacementRelayOrigins(
+            siblingDelegationRecords.map(\.relayOrigin)
+          )
           try store.removeRecord(
             gatewayOrigin: gatewayOrigin,
             relayOrigin: pending.relayOrigin,

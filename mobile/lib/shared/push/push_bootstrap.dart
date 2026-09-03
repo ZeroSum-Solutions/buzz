@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
@@ -44,6 +45,8 @@ class BuzzPushAttemptGate {
     _attempt = attempt;
     return true;
   }
+
+  bool isCurrent(String attempt) => _attempt == attempt;
 
   void failed(String attempt, {required VoidCallback retry}) {
     if (_attempt != attempt) return;
@@ -376,7 +379,8 @@ class BuzzPushBootstrap extends HookConsumerWidget {
         }
         final attempt = [
           token,
-          ...migrationRelayOrigins.toList()..sort(),
+          'retired:${(retiredRelayOrigins.toList()..sort()).join(',')}',
+          'replacement:${(replacementRelayOrigins.toList()..sort()).join(',')}',
         ].join('|');
         if (!gatewayMigrationAttempt.tryBegin(attempt)) return null;
         unawaited(() async {
@@ -394,6 +398,18 @@ class BuzzPushBootstrap extends HookConsumerWidget {
                 communities,
                 targetGatewayOrigin,
               );
+            }
+            final latestRetiredRelayOrigins = retiredBuzzPushRelayOrigins.value;
+            final latestReplacementRelayOrigins =
+                replacementBuzzPushRelayOrigins.value;
+            if (!gatewayMigrationAttempt.isCurrent(attempt) ||
+                token != apnsDeviceToken.value ||
+                !setEquals(retiredRelayOrigins, latestRetiredRelayOrigins) ||
+                !setEquals(
+                  replacementRelayOrigins,
+                  latestReplacementRelayOrigins,
+                )) {
+              return;
             }
             await completeBuzzPushGatewayMigration();
             gatewayMigrationFailures.value = 0;
