@@ -278,8 +278,8 @@ async fn test_auth_wrong_kind() {
         ],
     );
     let resp = upload_with_auth(&client, &auth, &sha256, &jpeg).await;
-    assert_eq!(resp.status(), 401, "wrong kind must be 401");
-    println!("✅ Wrong kind → 401");
+    assert_eq!(resp.status(), 403, "wrong kind must be 403");
+    println!("✅ Wrong kind → 403");
 }
 
 #[tokio::test]
@@ -300,8 +300,8 @@ async fn test_auth_missing_t_tag() {
         ],
     );
     let resp = upload_with_auth(&client, &auth, &sha256, &jpeg).await;
-    assert_eq!(resp.status(), 401, "missing t tag must be 401");
-    println!("✅ Missing t tag → 401");
+    assert_eq!(resp.status(), 403, "missing t tag must be 403");
+    println!("✅ Missing t tag → 403");
 }
 
 #[tokio::test]
@@ -321,8 +321,8 @@ async fn test_auth_missing_expiration() {
         ],
     );
     let resp = upload_with_auth(&client, &auth, &sha256, &jpeg).await;
-    assert_eq!(resp.status(), 401, "missing expiration must be 401");
-    println!("✅ Missing expiration → 401");
+    assert_eq!(resp.status(), 403, "missing expiration must be 403");
+    println!("✅ Missing expiration → 403");
 }
 
 #[tokio::test]
@@ -344,8 +344,8 @@ async fn test_auth_expired_token() {
         ],
     );
     let resp = upload_with_auth(&client, &auth, &sha256, &jpeg).await;
-    assert_eq!(resp.status(), 401, "expired token must be 401");
-    println!("✅ Expired token → 401");
+    assert_eq!(resp.status(), 403, "expired token must be 403");
+    println!("✅ Expired token → 403");
 }
 
 #[tokio::test]
@@ -367,8 +367,8 @@ async fn test_auth_empty_content() {
         ],
     );
     let resp = upload_with_auth(&client, &auth, &sha256, &jpeg).await;
-    assert_eq!(resp.status(), 401, "empty content must be 401");
-    println!("✅ Empty content → 401");
+    assert_eq!(resp.status(), 403, "empty content must be 403");
+    println!("✅ Empty content → 403");
 }
 
 #[tokio::test]
