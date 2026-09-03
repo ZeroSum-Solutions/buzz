@@ -77,6 +77,8 @@ export default defineConfig({
         "**/composer-selection-formatting.spec.ts",
         "**/composer-tooltip-dismiss.spec.ts",
         "**/mentions.spec.ts",
+        "**/mention-spacing.spec.ts",
+        "**/cloud-provenance.spec.ts",
         "**/team-mentions.spec.ts",
         "**/persistent-agent-audience.spec.ts",
         "**/relay-reconnect.spec.ts",
@@ -177,6 +179,7 @@ export default defineConfig({
       name: "integration",
       testMatch: [
         "**/agents.spec.ts",
+        "**/agent-availability.spec.ts",
         "**/agent-snapshot-recipient.spec.ts",
         "**/onboarding.spec.ts",
         "**/stream.spec.ts",
