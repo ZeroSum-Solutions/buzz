@@ -45,7 +45,13 @@ pub enum BlossomStrictness {
 /// Checks in order:
 ///   1. Schnorr signature
 ///   2. kind == 24242 and non-empty content
-///   3. `t` tag matches `verb` — exactly one in `Strict`, at-least-one in `Permissive`
+///   3. `t` tag matches `verb`:
+///      - `Strict`: count every tag named `t` by field name; require exactly
+///        one occurrence; require its content to be non-empty and equal to
+///        `verb` (NIP-FI.md:658-666 — malformed/empty/duplicate instances MUST
+///        be rejected as `evidence_rejected`).
+///      - `Permissive`: at least one valid-valued `t` tag equal to `verb`;
+///        valueless/empty tags are ignored (origin/main `found_t` semantics).
 ///   4. `expiration` tag present, strictly future, and within the freshness window
 ///   5. `created_at` bounded: not more than 5s in the future; not older than the
 ///      mode-selected window (60s `Strict`, 3600s `Permissive`)
@@ -96,24 +102,37 @@ pub fn verify_blossom_auth_event_for_verb(
         let kind = tag.kind().to_string();
         match kind.as_str() {
             "t" => {
-                // A `t` tag only counts if it has non-empty content equal to
-                // the requested verb.  A valueless/empty tag cannot satisfy
-                // verb binding and is ignored for cardinality purposes — it is
-                // structurally malformed but not an explicit rejection.  This
-                // matches origin/main's `found_t` semantics.
-                if let Some(v) = tag.content() {
-                    if v.is_empty() {
-                        // Empty string value: does not satisfy the requirement.
-                    } else if v != verb.as_str() {
-                        return Err(MediaError::InvalidAuthVerb);
-                    } else {
-                        t_count = t_count.saturating_add(1);
-                        if strict && t_count > 1 {
-                            return Err(MediaError::DuplicateTag("t"));
+                if strict {
+                    // Strict (NIP-FI): count EVERY tag named "t" by field name,
+                    // regardless of its content.  NIP-FI.md:658-666 requires
+                    // that malformed, empty, duplicate, or conflicting instances
+                    // be rejected as `evidence_rejected`.  We count first, gate
+                    // on cardinality, then validate content.
+                    t_count = t_count.saturating_add(1);
+                    if t_count > 1 {
+                        return Err(MediaError::DuplicateTag("t"));
+                    }
+                    // Exactly one t tag: its content must be non-empty and
+                    // equal to the requested verb.
+                    match tag.content() {
+                        Some(v) if !v.is_empty() && v == verb.as_str() => {}
+                        _ => return Err(MediaError::InvalidAuthVerb),
+                    }
+                } else {
+                    // Permissive: only valid-valued matching tags count
+                    // (origin/main's `found_t` semantics).  Valueless/empty
+                    // tags are ignored for cardinality; wrong-verb tags reject.
+                    if let Some(v) = tag.content() {
+                        if v.is_empty() {
+                            // Empty string value: does not satisfy the requirement.
+                        } else if v != verb.as_str() {
+                            return Err(MediaError::InvalidAuthVerb);
+                        } else {
+                            t_count = t_count.saturating_add(1);
                         }
                     }
+                    // No content: tag is ignored (not counted, not rejected).
                 }
-                // No content: tag is ignored (not counted, not rejected).
             }
             "expiration" => {
                 exp_count = exp_count.saturating_add(1);
@@ -1141,15 +1160,15 @@ mod tests {
 
     // ── Finding 3: valueless / empty-string t tag must not satisfy verb binding ──
 
-    /// A `t` tag with no content (`["t"]`) cannot satisfy the verb requirement.
-    /// It is ignored for cardinality purposes; `t_count` stays 0 → MissingTag.
+    /// A `t` tag with no content (`["t"]`) in Strict mode: counted as one occurrence,
+    /// content check fires → `InvalidAuthVerb` (malformed instance, NIP-FI §cardinality).
     #[test]
     fn test_valueless_t_tag_is_not_counted_strict() {
         let keys = Keys::generate();
         let sha256 = "a".repeat(64);
         let now = Timestamp::now().as_secs();
         let exp_str = (now + 55).to_string();
-        // ["t"] with no second element — no content, should not satisfy t requirement
+        // ["t"] with no second element — no content, must be rejected
         let tags = vec![
             Tag::parse(["t"]).unwrap(),
             Tag::parse(["x", &sha256]).unwrap(),
@@ -1168,9 +1187,9 @@ mod tests {
                     Some("relay.example"),
                     BlossomStrictness::Strict
                 ),
-                Err(MediaError::MissingTag("t"))
+                Err(MediaError::InvalidAuthVerb)
             ),
-            "valueless t tag must not satisfy t requirement in Strict mode"
+            "valueless t tag must be rejected in Strict mode (counted once, content invalid)"
         );
     }
 
@@ -1203,8 +1222,8 @@ mod tests {
         );
     }
 
-    /// A `t` tag with an empty-string value (`["t", ""]`) cannot satisfy the
-    /// verb requirement — empty content does not equal any verb.
+    /// A `t` tag with an empty-string value (`["t", ""]`) in Strict mode: counted
+    /// as one occurrence, content check fires → `InvalidAuthVerb`.
     #[test]
     fn test_empty_string_t_tag_is_not_counted_strict() {
         let keys = Keys::generate();
@@ -1229,9 +1248,9 @@ mod tests {
                     Some("relay.example"),
                     BlossomStrictness::Strict
                 ),
-                Err(MediaError::MissingTag("t"))
+                Err(MediaError::InvalidAuthVerb)
             ),
-            "empty-string t tag must not satisfy t requirement in Strict mode"
+            "empty-string t tag must be rejected in Strict mode (counted once, content invalid)"
         );
     }
 
@@ -1263,6 +1282,123 @@ mod tests {
                 Err(MediaError::HashMismatch)
             ),
             "valueless x tag must not satisfy hash requirement"
+        );
+    }
+
+    // ── Finding 3 R2: mixed malformed+valid t combos must reject in Strict ────
+
+    /// `["t"]` (valueless) + `["t","upload"]` in Strict: the malformed tag is counted
+    /// and content-validated on first encounter; the exact rejection error depends on
+    /// tag ordering but any error is correct — no combination may be admitted.
+    /// (If malformed comes first: `InvalidAuthVerb`; if valid first: `DuplicateTag("t")`.)
+    #[test]
+    fn test_strict_rejects_valueless_plus_valid_t_combo() {
+        let keys = Keys::generate();
+        let sha256 = "a".repeat(64);
+        let now = Timestamp::now().as_secs();
+        let exp_str = (now + 55).to_string();
+        let tags = vec![
+            Tag::parse(["t"]).unwrap(),           // valueless — counted in Strict
+            Tag::parse(["t", "upload"]).unwrap(), // valid — but two t tags total
+            Tag::parse(["x", &sha256]).unwrap(),
+            Tag::parse(["expiration", &exp_str]).unwrap(),
+            Tag::parse(["server", "relay.example"]).unwrap(),
+        ];
+        let event = EventBuilder::new(Kind::from(24242), "Upload bypass attempt")
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .unwrap();
+        let result = verify_blossom_upload_auth(
+            &event,
+            &sha256,
+            Some("relay.example"),
+            BlossomStrictness::Strict,
+        );
+        assert!(
+            result.is_err(),
+            "valueless+valid t combo must be rejected in Strict mode, got Ok"
+        );
+        // The first tag is valueless → InvalidAuthVerb fires before the second tag
+        // is seen; if ordering were reversed it would be DuplicateTag("t"). Both are
+        // valid evidence_rejected-class outcomes — what matters is admission is denied.
+        assert!(
+            matches!(
+                result,
+                Err(MediaError::InvalidAuthVerb) | Err(MediaError::DuplicateTag("t"))
+            ),
+            "expected InvalidAuthVerb or DuplicateTag(t), got unexpected error variant"
+        );
+    }
+
+    /// `["t",""]` (empty-string) + `["t","upload"]` in Strict: same reasoning —
+    /// any error is correct; admission must be denied.
+    #[test]
+    fn test_strict_rejects_empty_plus_valid_t_combo() {
+        let keys = Keys::generate();
+        let sha256 = "a".repeat(64);
+        let now = Timestamp::now().as_secs();
+        let exp_str = (now + 55).to_string();
+        let tags = vec![
+            Tag::parse(["t", ""]).unwrap(), // empty-string — counted in Strict
+            Tag::parse(["t", "upload"]).unwrap(), // valid — but two t tags total
+            Tag::parse(["x", &sha256]).unwrap(),
+            Tag::parse(["expiration", &exp_str]).unwrap(),
+            Tag::parse(["server", "relay.example"]).unwrap(),
+        ];
+        let event = EventBuilder::new(Kind::from(24242), "Upload bypass attempt")
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .unwrap();
+        let result = verify_blossom_upload_auth(
+            &event,
+            &sha256,
+            Some("relay.example"),
+            BlossomStrictness::Strict,
+        );
+        assert!(
+            result.is_err(),
+            "empty-string+valid t combo must be rejected in Strict mode, got Ok"
+        );
+        assert!(
+            matches!(
+                result,
+                Err(MediaError::InvalidAuthVerb) | Err(MediaError::DuplicateTag("t"))
+            ),
+            "expected InvalidAuthVerb or DuplicateTag(t), got unexpected error variant"
+        );
+    }
+
+    /// `["x"]` (valueless) + `["x", sha256]` (valid) in Strict: `x_count` increments
+    /// unconditionally for both occurrences → `DuplicateTag("x")`.  This confirms
+    /// the x arm already handles mixed malformed+valid correctly.
+    #[test]
+    fn test_strict_rejects_valueless_plus_valid_x_combo() {
+        let keys = Keys::generate();
+        let sha256 = "a".repeat(64);
+        let now = Timestamp::now().as_secs();
+        let exp_str = (now + 55).to_string();
+        let tags = vec![
+            Tag::parse(["t", "upload"]).unwrap(),
+            Tag::parse(["x"]).unwrap(), // valueless — counted unconditionally
+            Tag::parse(["x", &sha256]).unwrap(), // valid — but makes x_count = 2
+            Tag::parse(["expiration", &exp_str]).unwrap(),
+            Tag::parse(["server", "relay.example"]).unwrap(),
+        ];
+        let event = EventBuilder::new(Kind::from(24242), "Upload bypass attempt")
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert!(
+            matches!(
+                verify_blossom_upload_auth(
+                    &event,
+                    &sha256,
+                    Some("relay.example"),
+                    BlossomStrictness::Strict
+                ),
+                Err(MediaError::DuplicateTag("x"))
+            ),
+            "valueless+valid x combo must be rejected as DuplicateTag in Strict mode"
         );
     }
 }
