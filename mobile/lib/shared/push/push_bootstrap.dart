@@ -144,6 +144,24 @@ bool buzzPushGatewayMigrationAttemptIsCurrent({
     setEquals(replacementRelayOrigins, liveReplacementRelayOrigins) &&
     replacementGeneration == liveReplacementGeneration;
 
+typedef BuzzPushGatewayMigrationTarget = ({
+  Community community,
+  String relayOrigin,
+  BuzzPushLeaseDescriptor descriptor,
+});
+
+@visibleForTesting
+Map<String, List<BuzzPushGatewayMigrationTarget>>
+buzzPushGroupGatewayMigrationsByDelegationAuthority(
+  Iterable<BuzzPushGatewayMigrationTarget> targets,
+) {
+  final groups = <String, List<BuzzPushGatewayMigrationTarget>>{};
+  for (final target in targets) {
+    groups.putIfAbsent(target.descriptor.executorPubkey, () => []).add(target);
+  }
+  return groups;
+}
+
 /// Owns the APNs-registration side effect so migration-triggered registration
 /// is exercised through the same production boundary as active-community
 /// registration.
@@ -435,6 +453,7 @@ class BuzzPushBootstrap extends HookConsumerWidget {
                     .toSet()
                     .toList()
                   ..sort();
+            final targets = <BuzzPushGatewayMigrationTarget>[];
             for (final relayOrigin in candidateOrigins) {
               final originCandidates = candidates
                   .where(
@@ -443,27 +462,46 @@ class BuzzPushBootstrap extends HookConsumerWidget {
                         relayOrigin,
                   )
                   .toList();
-              for (var index = 0; index < originCandidates.length; index += 1) {
+              for (final originCandidate in originCandidates) {
+                final descriptor = await fetchBuzzPushLeaseDescriptor(
+                  originCandidate.relayUrl,
+                );
+                targets.add((
+                  community: originCandidate,
+                  relayOrigin: relayOrigin,
+                  descriptor: descriptor,
+                ));
+              }
+            }
+            final authorityGroups =
+                buzzPushGroupGatewayMigrationsByDelegationAuthority(targets);
+            for (final authorityTargets in authorityGroups.values) {
+              final queuedOrigins = authorityTargets
+                  .map((target) => target.relayOrigin)
+                  .where(replacementRelayOrigins.contains)
+                  .toSet();
+              for (var index = 0; index < authorityTargets.length; index += 1) {
+                final target = authorityTargets[index];
                 await _publishCommunityReplacement(
                   ref,
-                  originCandidates[index],
+                  target.community,
                   communities,
                   targetGatewayOrigin,
+                  descriptor: target.descriptor,
                   forceDelegationRenewal:
-                      replacementRelayOrigins.contains(relayOrigin) &&
-                      index == 0,
+                      queuedOrigins.isNotEmpty && index == 0,
                 );
               }
-              if (replacementRelayOrigins.contains(relayOrigin)) {
+              if (queuedOrigins.isNotEmpty) {
                 if (!attemptIsCurrent()) return;
-                await checkpointBuzzPushGatewayReplacement(
-                  relayOrigin,
+                await checkpointBuzzPushGatewayReplacements(
+                  queuedOrigins,
                   replacementGeneration,
                   token,
                 );
-                // The checkpoint updates the listenable replacement inventory.
-                // Let the resulting rebuild own the next origin so two attempts
-                // cannot publish the remaining work concurrently.
+                // The checkpoint atomically removes every origin whose grants
+                // share this delegation authority. Let the resulting rebuild
+                // own the next authority so attempts cannot overlap.
                 return;
               }
             }
@@ -658,6 +696,7 @@ class BuzzPushBootstrap extends HookConsumerWidget {
     Community community,
     List<Community> communities,
     String targetGatewayOrigin, {
+    required BuzzPushLeaseDescriptor descriptor,
     bool forceDelegationRenewal = false,
   }) async {
     final config = RelayConfig(
@@ -671,7 +710,6 @@ class BuzzPushBootstrap extends HookConsumerWidget {
         'Cannot migrate push for ${community.id}: signing key is unavailable',
       );
     }
-    final descriptor = await fetchBuzzPushLeaseDescriptor(config.baseUrl);
     final grant = await enrollBuzzPush(
       config.wsUrl,
       Env.pushGatewayUrl,

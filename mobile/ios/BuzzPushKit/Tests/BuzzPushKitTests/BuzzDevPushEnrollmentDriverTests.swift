@@ -2534,12 +2534,13 @@ private final class MemoryGrantStore: BuzzPushEndpointGrantStore {
     replacementGeneration += 1
     replacementOrigins = Array(Set(replacementOrigins + relayOrigins)).sorted()
   }
-  func checkpointReplacementRelayOrigin(
-    _ relayOrigin: String,
+  func checkpointReplacementRelayOrigins(
+    _ relayOrigins: [String],
     expectedGeneration: Int64
   ) throws -> Bool {
     guard replacementGeneration == expectedGeneration else { return false }
-    replacementOrigins.removeAll { $0 == relayOrigin }
+    let completedOrigins = Set(relayOrigins)
+    replacementOrigins.removeAll { completedOrigins.contains($0) }
     return true
   }
   func clearReplacementRelayOrigins() throws {

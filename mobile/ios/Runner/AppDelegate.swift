@@ -408,10 +408,11 @@ import os.log
           )
         )
       }
-    case "checkpointGatewayReplacement":
+    case "checkpointGatewayReplacements":
       guard let arguments = call.arguments as? [String: Any],
-        let relayOrigin = arguments["relayOrigin"] as? String,
-        !relayOrigin.isEmpty,
+        let relayOrigins = arguments["relayOrigins"] as? [String],
+        !relayOrigins.isEmpty,
+        relayOrigins.allSatisfy({ !$0.isEmpty }),
         let generation = (arguments["generation"] as? NSNumber)?.int64Value,
         let expectedDeviceToken = arguments["deviceToken"] as? String,
         !expectedDeviceToken.isEmpty
@@ -419,7 +420,7 @@ import os.log
         result(
           FlutterError(
             code: "invalid_arguments",
-            message: "Gateway replacement checkpoint requires relayOrigin.",
+            message: "Gateway replacement checkpoint requires relayOrigins.",
             details: nil
           )
         )
@@ -434,8 +435,8 @@ import os.log
       }
       do {
         result(
-          try endpointGrantStore.checkpointReplacementRelayOrigin(
-            relayOrigin,
+          try endpointGrantStore.checkpointReplacementRelayOrigins(
+            relayOrigins,
             expectedGeneration: generation
           )
         )

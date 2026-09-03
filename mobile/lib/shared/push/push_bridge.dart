@@ -179,29 +179,27 @@ Future<void> completeBuzzPushGatewayMigration() async {
   }
 }
 
-/// Removes one same-gateway relay origin only after all of its community
-/// replacement leases have been durably accepted.
-Future<void> checkpointBuzzPushGatewayReplacement(
-  String relayOrigin,
+/// Atomically removes same-gateway relay origins only after all community
+/// replacement leases sharing their delegation authority are durable.
+Future<void> checkpointBuzzPushGatewayReplacements(
+  Set<String> relayOrigins,
   int generation,
   String deviceToken,
 ) async {
   if (defaultTargetPlatform != TargetPlatform.iOS) return;
   try {
-    final checkpointed = await _channel.invokeMethod<bool>(
-      'checkpointGatewayReplacement',
-      {
-        'relayOrigin': relayOrigin,
-        'generation': generation,
-        'deviceToken': deviceToken,
-      },
-    );
+    final checkpointed = await _channel
+        .invokeMethod<bool>('checkpointGatewayReplacements', {
+          'relayOrigins': relayOrigins.toList()..sort(),
+          'generation': generation,
+          'deviceToken': deviceToken,
+        });
     if (checkpointed != true) {
       throw StateError('Push replacement inventory changed before checkpoint.');
     }
     replacementBuzzPushRelayOrigins.value = {
       ...replacementBuzzPushRelayOrigins.value,
-    }..remove(relayOrigin);
+    }..removeAll(relayOrigins);
   } on MissingPluginException {
     // Flutter tests and non-Runner embeddings do not install the native bridge.
   }

@@ -190,13 +190,14 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
     try replaceValue(state, account: Self.replacementRelaysAccount)
   }
 
-  func checkpointReplacementRelayOrigin(
-    _ relayOrigin: String,
+  func checkpointReplacementRelayOrigins(
+    _ relayOrigins: [String],
     expectedGeneration: Int64
   ) throws -> Bool {
     var state = try replacementQueueState()
     guard state.generation == expectedGeneration else { return false }
-    state.relayOrigins.removeAll { $0 == relayOrigin }
+    let completedOrigins = Set(relayOrigins)
+    state.relayOrigins.removeAll { completedOrigins.contains($0) }
     try replaceValue(state, account: Self.replacementRelaysAccount)
     return true
   }

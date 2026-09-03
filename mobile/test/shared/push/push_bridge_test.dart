@@ -96,7 +96,7 @@ void main() {
     },
   );
 
-  test('checkpoints one completed same-gateway relay origin', () async {
+  test('atomically checkpoints origins sharing delegation authority', () async {
     debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
     replacementBuzzPushRelayOrigins.value = {
       'wss://done.example',
@@ -105,17 +105,21 @@ void main() {
     replacementBuzzPushGeneration.value = 7;
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(_channel, (call) async {
-          expect(call.method, 'checkpointGatewayReplacement');
+          expect(call.method, 'checkpointGatewayReplacements');
           expect(call.arguments, {
-            'relayOrigin': 'wss://done.example',
+            'relayOrigins': ['wss://also-done.example', 'wss://done.example'],
             'generation': 7,
             'deviceToken': 'device-token',
           });
           return true;
         });
 
-    await checkpointBuzzPushGatewayReplacement(
-      'wss://done.example',
+    replacementBuzzPushRelayOrigins.value = {
+      'wss://also-done.example',
+      ...replacementBuzzPushRelayOrigins.value,
+    };
+    await checkpointBuzzPushGatewayReplacements(
+      {'wss://done.example', 'wss://also-done.example'},
       7,
       'device-token',
     );
@@ -129,9 +133,9 @@ void main() {
     replacementBuzzPushGeneration.value = 7;
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(_channel, (call) async {
-          expect(call.method, 'checkpointGatewayReplacement');
+          expect(call.method, 'checkpointGatewayReplacements');
           expect(call.arguments, {
-            'relayOrigin': 'wss://pending.example',
+            'relayOrigins': ['wss://pending.example'],
             'generation': 7,
             'deviceToken': 'stale-token',
           });
@@ -139,8 +143,8 @@ void main() {
         });
 
     await expectLater(
-      checkpointBuzzPushGatewayReplacement(
-        'wss://pending.example',
+      checkpointBuzzPushGatewayReplacements(
+        {'wss://pending.example'},
         7,
         'stale-token',
       ),

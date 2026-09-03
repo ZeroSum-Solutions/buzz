@@ -25,7 +25,7 @@ engine all come from the same Flutter version.
 just mobile-dev
 
 # Direct (uses the app's configured community; apply worktree overrides first):
-cd mobile && flutter run
+cd mobile && flutter run --dart-define=BUZZ_PUSH_GATEWAY_URL=https://push.example
 ```
 
 ### Worktree-aware debug identity

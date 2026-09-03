@@ -267,6 +267,47 @@ void main() {
     );
   });
 
+  test('queued origins sharing delegation authority migrate atomically', () {
+    final first = Community.create(
+      name: 'First',
+      relayUrl: 'wss://first.example',
+    );
+    final second = Community.create(
+      name: 'Second',
+      relayUrl: 'wss://second.example',
+    );
+    final independent = Community.create(
+      name: 'Independent',
+      relayUrl: 'wss://independent.example',
+    );
+
+    final groups = buzzPushGroupGatewayMigrationsByDelegationAuthority([
+      (
+        community: first,
+        relayOrigin: 'wss://first.example',
+        descriptor: _descriptor(keyId: 'first', pubkey: _hex('a')),
+      ),
+      (
+        community: second,
+        relayOrigin: 'wss://second.example',
+        descriptor: _descriptor(keyId: 'second', pubkey: _hex('a')),
+      ),
+      (
+        community: independent,
+        relayOrigin: 'wss://independent.example',
+        descriptor: _descriptor(keyId: 'third', pubkey: _hex('b')),
+      ),
+    ]);
+
+    expect(groups[_hex('a')]!.map((target) => target.relayOrigin), [
+      'wss://first.example',
+      'wss://second.example',
+    ]);
+    expect(groups[_hex('b')]!.map((target) => target.relayOrigin), [
+      'wss://independent.example',
+    ]);
+  });
+
   test('pending opt-out tombstone keeps active push lifecycle disabled', () {
     final subscription = BuzzPushSubscription(
       filter: BuzzPushFilter(kinds: const [9], pTags: [_hex('a')]),

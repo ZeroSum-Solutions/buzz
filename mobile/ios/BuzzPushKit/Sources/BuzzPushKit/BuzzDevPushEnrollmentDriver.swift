@@ -141,9 +141,10 @@ public protocol BuzzPushEndpointGrantStore {
   func replacementQueueState() throws -> BuzzPushReplacementQueueState
   /// Atomically merges relay origins into the durable replacement queue.
   func queueReplacementRelayOrigins(_ relayOrigins: [String]) throws
-  /// Removes one relay origin after all of its community leases are durable.
-  func checkpointReplacementRelayOrigin(
-    _ relayOrigin: String,
+  /// Atomically removes relay origins sharing delegation authority after all
+  /// of their community leases are durable.
+  func checkpointReplacementRelayOrigins(
+    _ relayOrigins: [String],
     expectedGeneration: Int64
   ) throws -> Bool
   /// Clears the queue only after replacement publication has completed.
