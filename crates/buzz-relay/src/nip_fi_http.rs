@@ -46,8 +46,7 @@ use axum::{
     response::IntoResponse,
 };
 use buzz_auth::{
-    DenialClass, FederatedAssertionVerifier, IssuerKeySource, NipFiMode, VerifiedAssertion,
-    CLIENT_ATTACHED_HEADER,
+    DenialClass, NipFiMode, VerifiedAssertion, VerifyAssertion, CLIENT_ATTACHED_HEADER,
 };
 use chrono::{DateTime, Utc};
 use nostr::PublicKey;
@@ -130,10 +129,10 @@ pub(crate) enum NipFiHttpOutcome {
 ///
 /// [FI-TRACE-AUTHORITY-UNIFORM] All protected surfaces reach one admission
 /// authority — this function.
-pub(crate) fn check_nip_fi_http<S: IssuerKeySource, D: HttpDenyMap>(
+pub(crate) fn check_nip_fi_http<D: HttpDenyMap>(
     headers: &HeaderMap,
     proven_pubkey: &PublicKey,
-    verifier: Option<&FederatedAssertionVerifier<S>>,
+    verifier: Option<&dyn VerifyAssertion>,
     mode: NipFiMode,
     deny_map: &D,
 ) -> NipFiHttpOutcome {
@@ -163,7 +162,7 @@ pub(crate) fn check_nip_fi_http<S: IssuerKeySource, D: HttpDenyMap>(
         }
     };
 
-    let assertion = match verifier.verify(token) {
+    let assertion = match verifier.verify_assertion(token) {
         Ok(a) => a,
         Err(e) => {
             tracing::debug!(code = e.code(), "nip-fi assertion denied at http ingress");
@@ -323,7 +322,7 @@ impl IntoResponse for NipFiHttpOutcome {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
-    use buzz_auth::{NipFiMode, ProductionJwksSource};
+    use buzz_auth::{NipFiMode, VerifyAssertion};
     use chrono::Utc;
 
     // Helper: read the body bytes synchronously (tests only).
@@ -520,7 +519,7 @@ mod tests {
         let outcome = check_nip_fi_http(
             &headers,
             &pubkey,
-            None::<&FederatedAssertionVerifier<ProductionJwksSource>>,
+            None::<&dyn VerifyAssertion>,
             NipFiMode::Off,
             &AlwaysAdmitStubDenyMap,
         );
@@ -543,7 +542,7 @@ mod tests {
         let outcome = check_nip_fi_http(
             &headers,
             &pubkey,
-            None::<&FederatedAssertionVerifier<ProductionJwksSource>>,
+            None::<&dyn VerifyAssertion>,
             NipFiMode::DenyProtected,
             &AlwaysAdmitStubDenyMap,
         );
@@ -569,7 +568,7 @@ mod tests {
         let outcome = check_nip_fi_http(
             &headers,
             &pubkey,
-            None::<&FederatedAssertionVerifier<ProductionJwksSource>>,
+            None::<&dyn VerifyAssertion>,
             NipFiMode::Enforce,
             &AlwaysAdmitStubDenyMap,
         );
@@ -600,7 +599,7 @@ mod tests {
         let outcome = check_nip_fi_http(
             &headers,
             &pubkey,
-            None::<&FederatedAssertionVerifier<ProductionJwksSource>>,
+            None::<&dyn VerifyAssertion>,
             NipFiMode::Enforce,
             &AlwaysAdmitStubDenyMap,
         );

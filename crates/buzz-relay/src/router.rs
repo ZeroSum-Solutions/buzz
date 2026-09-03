@@ -62,26 +62,29 @@ use crate::state::AppState;
 //
 // ## What this guard checks (and does NOT check)
 //
-// The guard calls `extract_bearer_token` — the same transport-parsing
-// function used by the full per-handler verifier.  This means:
+// The guard performs the full offline assertion verification (transport
+// extraction + JWT signature + issuer + expiry + claims) using the same
+// `FederatedAssertionVerifier` instance that per-handler calls use.  This
+// means:
 //
-//   • Absent header                → 401 MissingEvidence
-//   • Junk / non-Bearer value      → 403 EvidenceRejected
-//   • Repeated header fields       → 403 EvidenceRejected
-//   • Comma-combined fields        → 403 EvidenceRejected
-//   • Empty / whitespace token     → 403 EvidenceRejected
-//   • Structurally valid token     → forward to handler
+//   • Absent header                         → 401 MissingEvidence
+//   • Junk / non-Bearer value               → 403 EvidenceRejected
+//   • Repeated / comma-combined fields      → 403 EvidenceRejected
+//   • Structurally malformed / bad sig      → 403 EvidenceRejected
+//   • Unknown issuer / expired / bad claims → 403 EvidenceRejected
+//   • No verifier yet (startup race)        → 503 AuthorizationUnavailable
+//   • Cryptographically valid assertion     → forward to handler
 //
-// The guard does NOT verify the JWT signature, issuer, expiry, or key
-// pairing — those require `proven_pubkey` from per-handler NIP-98
-// verification, which is not available in the middleware.  Full admission
-// authority remains with the per-handler `check_nip_fi_http_on_state` call.
+// The guard does NOT check key pairing (`asserted_key == proven_pubkey`):
+// that requires the NIP-98 `proven_pubkey` extracted by each handler, which
+// is not available in middleware.  Per-handler `check_nip_fi_http_on_state`
+// calls perform the pairing and deny-map checks on top.
 //
-// Key invariant: a forgotten-gate handler cannot admit with
-// `Nostr-Federated-Identity: junk` — the guard rejects any malformed or
-// non-Bearer token before the handler fires.  Only a structurally-valid
-// compact JWS token reaches the handler, which then performs the full
-// assertion signature verification and key pairing.
+// Fail-closed invariant: a forgotten-gate handler — one that omits its own
+// `check_nip_fi_http_on_state` call — cannot admit with a structurally valid
+// but invalidly signed assertion, because the guard verifies the JWT
+// signature before the handler fires.  Only a cryptographically verified
+// assertion reaches the handler.
 //
 // [FI-TRACE-AUTHORITY-UNIFORM] Both the guard and the per-handler checks
 // delegate to `nip_fi_http.rs`; the guard fires first.
@@ -140,22 +143,25 @@ const NIP_FI_EXEMPT_PREFIXES: &[&str] = &[
     "/internal/git/policy",
 ];
 
-/// Middleware: assertion-transport guard for NIP-FI protected paths.
+/// Middleware: full offline assertion guard for NIP-FI protected paths.
 ///
 /// Fires before any handler.  In Enforce mode, if the request path is not
-/// covered by [`NIP_FI_EXEMPT_PREFIXES`] the guard calls
-/// [`crate::nip_fi_http::extract_bearer_token`] on the assertion header:
+/// covered by [`NIP_FI_EXEMPT_PREFIXES`] the guard performs the full offline
+/// NIP-FI assertion verification (transport extraction + JWT signature +
+/// issuer + expiry + claims) via the relay's `FederatedAssertionVerifier`:
 ///
 /// - Absent header               → 401 `authentication required\n`
 /// - Junk / non-Bearer value     → 403 `evidence rejected\n`
 /// - Repeated / comma-combined   → 403 `evidence rejected\n`
-/// - Structurally valid token    → forward to handler
+/// - Bad signature / claims      → 403 `evidence rejected\n`
+/// - No verifier (startup race)  → 503 `authorization unavailable\n`
+/// - Cryptographically valid     → forward to handler
 ///
 /// A "forgotten gate" handler — one that omits its own
-/// `check_nip_fi_http_on_state` call — cannot admit with an invalid or
-/// malformed assertion because the guard rejects those shapes here.
-/// Only a structurally-valid compact JWS token reaches the handler; the
-/// handler then performs the full JWT signature verification and key pairing.
+/// `check_nip_fi_http_on_state` call — cannot admit with an invalidly signed
+/// assertion because the guard rejects it here before the handler fires.
+/// Only a cryptographically verified assertion reaches the handler; the
+/// handler then performs the key pairing and deny-map checks on top.
 ///
 /// In Off mode the middleware is fully transparent.
 async fn nip_fi_assertion_guard(
@@ -207,15 +213,33 @@ async fn nip_fi_assertion_guard(
         return http_denial(buzz_auth::DenialClass::AuthorizationUnavailable);
     }
 
-    // Enforce mode: validate assertion-token transport.
-    // `extract_bearer_token` rejects absent, junk, repeated, comma-combined,
-    // empty, and whitespace-containing values — not just "no header present".
-    // This means a forgotten-gate handler cannot admit with any invalid
-    // header value; only a structurally-valid compact JWS token passes.
+    // Enforce mode: full offline assertion verification.
+    //
+    // Step 1 — transport: extract the Bearer token.  Rejects absent, junk,
+    // repeated, comma-combined, empty, and whitespace-containing values.
     // [FI-TRACE-TRANSPORT-CLOSED]
-    match extract_bearer_token(request.headers()) {
-        Ok(_token) => next.run(request).await,
-        Err(class) => http_denial(class),
+    let token = match extract_bearer_token(request.headers()) {
+        Ok(t) => t,
+        Err(class) => return http_denial(class),
+    };
+
+    // Step 2 — cryptographic: verify signature, issuer, expiry, and claims.
+    // A forgotten-gate handler that omits `check_nip_fi_http_on_state` can
+    // only be reached with a cryptographically valid assertion.  Key pairing
+    // (`asserted_key == proven_pubkey`) is NOT checked here — that requires
+    // the NIP-98 `proven_pubkey` extracted by each handler.  Per-handler
+    // `check_nip_fi_http_on_state` calls add the pairing and deny-map checks.
+    // [FI-TRACE-AUTHORITY-UNIFORM]
+    let verifier = match state.nip_fi_verifier.as_deref() {
+        Some(v) => v,
+        None => {
+            // Verifier not yet constructed (startup race); fail closed.
+            return http_denial(buzz_auth::DenialClass::AuthorizationUnavailable);
+        }
+    };
+    match verifier.verify_assertion(token) {
+        Ok(_) => next.run(request).await,
+        Err(e) => http_denial(e.denial_class()),
     }
 }
 
@@ -1730,23 +1754,19 @@ mod tests {
     //
     // Before this fix the guard called `headers.contains_key(CLIENT_ATTACHED_HEADER)`,
     // so `Nostr-Federated-Identity: junk` would pass because the header is
-    // present.  After the fix the guard calls `extract_bearer_token`, which
-    // rejects any value that is not a well-formed `Bearer <compact-JWS>` token.
+    // present.  After the fix the guard performs full offline assertion
+    // verification (transport extraction + JWT signature + issuer + expiry):
     //
-    // This test proves the adversarial case named in Thufir's IMP1: a
-    // forgotten-gate handler with a junk/invalid assertion header must be
-    // denied — not forwarded to the handler.
+    //   • Junk / non-Bearer value      → transport extraction fails → 403
+    //   • Empty Bearer token           → transport extraction fails → 403
+    //   • Structurally valid token     → transport extraction passes → crypto verify → 403 if bad sig
     //
-    // The test does NOT need to build the full production router: it verifies
-    // that `extract_bearer_token` would deny the invalid header, which is
-    // exactly what the guard calls.  The middleware path coverage (guard →
-    // extract_bearer_token → http_denial) is fixed code; the logic
-    // under test is the transport-validation function itself.
-    //
-    // Falsifying mutation: revert the guard to `headers.contains_key(...)`.
-    // With the old code, `extract_bearer_token(&headers).is_err()` is true but
-    // the guard never calls it — the request would be forwarded. This test
-    // directly exercises the path the guard now takes.
+    // This test proves the transport-extraction cases.  The crypto-verification
+    // case (structurally valid but bad signature) is proven by the production-
+    // router test `nip_fi_guard_rejects_crypto_invalid_assertion_before_handler_fires`
+    // in bridge.rs, which has a falsifying mutation: removing
+    // `verifier.verify_assertion(token)` from the guard turns the expected
+    // 403 into 401 (handler's NIP-98 auth fires instead).
     #[test]
     fn guard_rejects_junk_assertion_not_just_absent_header() {
         use crate::nip_fi_http::extract_bearer_token;
@@ -1775,9 +1795,12 @@ mod tests {
             "guard calls extract_bearer_token: 'Bearer ' with empty token must be rejected"
         );
 
-        // Case 3: invalidly-signed compact JWS would still be structurally
-        // valid here (three Base64url-separated dots) — the guard forwards it
-        // and the per-handler call performs the signature check.
+        // Case 3: structurally valid compact JWS (three Base64url-separated dots)
+        // passes transport extraction.  The guard then calls
+        // `verifier.verify_assertion()` which would reject it as
+        // InvalidSignatureOrClaims → EvidenceRejected (403) in the full guard.
+        // This test only exercises transport extraction; the full-guard crypto
+        // falsifier is in bridge.rs::nip_fi_guard_rejects_crypto_invalid_assertion_before_handler_fires.
         let mut headers = HeaderMap::new();
         headers.insert(
             CLIENT_ATTACHED_HEADER,
@@ -1785,8 +1808,8 @@ mod tests {
         );
         assert!(
             extract_bearer_token(&headers).is_ok(),
-            "structurally-valid compact JWS token must pass the guard \
-             (full signature check is the per-handler job)"
+            "structurally-valid compact JWS passes transport extraction; \
+             guard then proceeds to crypto verification"
         );
     }
 

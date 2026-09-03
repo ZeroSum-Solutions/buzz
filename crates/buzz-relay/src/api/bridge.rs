@@ -5148,4 +5148,244 @@ mod postgres_tests {
              removed or mode was changed"
         );
     }
+
+    // ── T1-IMP1 (final): guard performs crypto verification, not just transport ──
+    //
+    // ## What this proves
+    //
+    // `nip_fi_assertion_guard` now performs the full offline assertion
+    // verification — not just transport-level shape validation.  A structurally
+    // valid but cryptographically invalid assertion (wrong signature) MUST be
+    // denied by the guard with 403 `evidence_rejected`, before the handler fires.
+    //
+    // ## Why the test distinguishes guard vs per-handler
+    //
+    // The request carries a bad-sig assertion token but NO NIP-98
+    // `Authorization: Nostr ...` header.  With `require_auth_token = true`:
+    //
+    //   • Guard intact: `verifier.verify_assertion(bad_token)` → EvidenceRejected
+    //     → 403 (guard denies before handler fires).
+    //
+    //   • Guard mutated (step 2 removed): guard forwards.  Handler's NIP-98
+    //     auth layer fires first → missing auth → 401.
+    //
+    // 403 ≠ 401, so the mutation turns this test RED.
+    //
+    // ## What "mandatory wiring" means
+    //
+    // The removed wiring in the falsifying mutation is the
+    // `verifier.verify_assertion(token)` call in `nip_fi_assertion_guard`
+    // (`router.rs`).  Removing it restores the old transport-only guard, which
+    // forwards any structurally valid token to the handler.  That is the
+    // "forgotten-gate" failure class: a handler that omits
+    // `check_nip_fi_http_on_state` would admit with an invalidly-signed
+    // assertion if the guard doesn't verify.
+    //
+    // ## Verifier construction
+    //
+    // To get a distinguishable outcome, this test injects a real
+    // `StaticIssuerKeySource`-backed verifier into the state (rather than
+    // `nip_fi_verifier = None`), so that a bad-sig token produces a definite
+    // 403 (not a startup-race 503 that a handler check would also produce).
+    #[test]
+    #[ignore = "requires Postgres"]
+    fn nip_fi_guard_rejects_crypto_invalid_assertion_before_handler_fires() {
+        use buzz_auth::{
+            AssertionKeySet, FederatedAssertionVerifier, FreshnessClass, IssuerPolicy,
+            IssuerRegistry, StaticIssuerKeySource, TokenClass, VerifyAssertion,
+        };
+        use jsonwebtoken::{jwk::JwkSet, Algorithm};
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current_thread runtime");
+
+        // ── 1. Build the test state with a real injected verifier ─────────────
+
+        let Some(mut state) = rt.block_on(async {
+            // Clone nip_fi_enforce_test_state setup, but return the state
+            // before Arc-wrapping so we can inject the verifier.
+            let mut config = crate::config::Config::from_env().ok()?;
+            config.database_url = crate::test_support::database_url();
+            config.redis_url =
+                std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+            config.relay_url = "wss://nip-fi-test.local".to_string();
+            config.require_auth_token = true;
+            config.require_relay_membership = false;
+            config.nip_fi.mode = buzz_auth::NipFiMode::Enforce;
+
+            let pool = sqlx::PgPool::connect(&crate::test_support::database_url())
+                .await
+                .ok()?;
+            let db = buzz_db::Db::from_pool(pool.clone());
+            let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .ok()?;
+            let pubsub = Arc::new(
+                buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                    .await
+                    .ok()?,
+            );
+            let audit = buzz_audit::AuditService::new(pool.clone());
+            let auth = buzz_auth::AuthService::new(config.auth.clone());
+            let search = buzz_search::SearchService::new(pool.clone());
+            let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+                db.clone(),
+                buzz_workflow::WorkflowConfig::default(),
+            ));
+            let media_storage = buzz_media::MediaStorage::new(&config.media).ok()?;
+
+            let (mut state, _) = crate::state::AppState::new(
+                config,
+                db,
+                redis_pool,
+                audit,
+                pubsub,
+                auth,
+                search,
+                workflow_engine,
+                nostr::Keys::generate(),
+                media_storage,
+            );
+            state.nip98_replay = Arc::new(AlwaysFreshReplayGuard);
+            Some(state)
+        }) else {
+            panic!("local Postgres not reachable");
+        };
+
+        // ── 2. Build the verifier with StaticIssuerKeySource + test key ───────
+        //
+        // The verifier is seeded with a known P-256 public key.  Tokens that
+        // claim `iss=https://issuer.test` will be verified against this key.
+        // A token with an all-zero signature will fail `InvalidSignatureOrClaims`
+        // → DenialClass::EvidenceRejected → 403.
+        //
+        // Key constants match the canonical test key in buzz-auth
+        // (verifier/tests.rs): TEST_JWK_X / TEST_JWK_Y / TEST_KID / ISSUER.
+        const TEST_ISSUER: &str = "https://issuer.example";
+        const TEST_AUDIENCE: &str = "https://relay.example";
+        const TEST_KID: &str = "test-key-1";
+
+        let jwks: JwkSet = serde_json::from_value(serde_json::json!({
+            "keys": [{
+                "kty": "EC",
+                "crv": "P-256",
+                "use": "sig",
+                "alg": "ES256",
+                "kid": TEST_KID,
+                "x": "RW-mZ7H5Kjjl8hIY9ygUKYRiheL02s4Xm22r22dWaJI",
+                "y": "WqQXVwaD6NM7us40BUTNe9dRa1XoJ0NX6vJuJWYU_bA"
+            }]
+        }))
+        .expect("valid test JWKS");
+
+        let hard_deadline = chrono::Utc::now() + chrono::Duration::seconds(3600);
+        let key_set = AssertionKeySet::new_for_test(TEST_ISSUER.to_owned(), 1, jwks, hard_deadline)
+            .expect("valid test key set");
+
+        let jwks_contract = buzz_auth::JwksSourceContract::new(
+            format!("{TEST_ISSUER}/.well-known/jwks.json"),
+            300,
+            3600,
+        )
+        .expect("valid jwks contract");
+
+        let policy = IssuerPolicy::new(
+            TEST_ISSUER.to_owned(),
+            vec![TEST_AUDIENCE.to_owned()],
+            TokenClass::DedicatedNipFi,
+            FreshnessClass::OfflineJwt,
+            vec![Algorithm::ES256],
+            60,   // skew_seconds
+            3600, // max_assertion_age_seconds
+            None,
+            jwks_contract,
+        )
+        .expect("valid issuer policy");
+
+        let mut registry = IssuerRegistry::new();
+        registry.insert(policy);
+
+        let verifier: Arc<dyn VerifyAssertion> = Arc::new(FederatedAssertionVerifier::new(
+            registry,
+            StaticIssuerKeySource::new([key_set]),
+        ));
+
+        state.nip_fi_verifier = Some(verifier);
+        let state = Arc::new(state);
+
+        let host = format!("nip-fi-seam-{}.local", uuid::Uuid::new_v4().simple());
+        rt.block_on(state.db.ensure_configured_community(&host))
+            .expect("ensure community");
+
+        // ── 3. Build a structurally valid but cryptographically invalid token ─
+        //
+        // Header and claims match the verifier's expectations (correct issuer,
+        // audience, exp, nostr_pubkey).  The signature is 64 zero bytes —
+        // structurally valid base64url for an ES256 DER signature, but
+        // cryptographically invalid.  The verifier will parse through to the
+        // signature check and fail with EvidenceRejected (403).
+        const BAD_SIG_TOKEN: &str = concat!(
+            // Header: {"alg":"ES256","kid":"test-key-1"}
+            "eyJhbGciOiJFUzI1NiIsImtpZCI6InRlc3Qta2V5LTEifQ",
+            ".",
+            // Claims: {"iss":"https://issuer.example","aud":"https://relay.example",
+            //          "iat":1700000000,"exp":9999999999,
+            //          "nostr_pubkey":"1234...cdef","sub":"test-subject"}
+            "eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwiYXVkIjoiaHR0cHM6Ly9yZWxheS5leGFtcGxlIiwiaWF0IjoxNzAwMDAwMDAwLCJleHAiOjk5OTk5OTk5OTksIm5vc3RyX3B1YmtleSI6IjEyMzQ1Njc4OTBhYmNkZWYxMjM0NTY3ODkwYWJjZGVmMTIzNDU2Nzg5MGFiY2RlZjEyMzQ1Njc4OTBhYmNkZWYiLCJzdWIiOiJ0ZXN0LXN1YmplY3QifQ",
+            ".",
+            // Signature: 64 zero bytes (invalid)
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        );
+
+        // Verify the token is structurally valid (3 dots, valid base64url segments)
+        // but is actually rejected by the verifier:
+        let verifier_check = state
+            .nip_fi_verifier
+            .as_deref()
+            .expect("verifier injected")
+            .verify_assertion(BAD_SIG_TOKEN);
+        assert!(
+            verifier_check.is_err(),
+            "pre-condition: the bad-sig token MUST be rejected by the verifier; \
+             if it passes, the test cannot distinguish guard-deny from handler-deny"
+        );
+
+        // ── 4. Send the request through the production router ─────────────────
+        //
+        // The request carries:
+        //   • Nostr-Federated-Identity: Bearer <bad-sig token>  (structurally valid, bad sig)
+        //   • NO Authorization: Nostr ...  (no NIP-98)
+        //
+        // Expected with guard verifying (current code):
+        //   Guard calls verifier.verify_assertion(bad_token) → EvidenceRejected
+        //   → 403 evidence_rejected before handler fires.
+        //
+        // Falsifying mutation (remove verifier.verify_assertion from guard):
+        //   Guard forwards (step 2 removed) → handler's NIP-98 auth fires first
+        //   → missing NIP-98 → 401.  403 ≠ 401 → test fails.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            buzz_auth::CLIENT_ATTACHED_HEADER,
+            format!("Bearer {BAD_SIG_TOKEN}")
+                .parse()
+                .expect("valid header"),
+        );
+        // Deliberately NO Authorization header (no NIP-98).
+
+        let status = rt.block_on(oneshot_request(
+            state, "POST", "/events", &host, headers, b"{}",
+        ));
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::FORBIDDEN,
+            "NIP-FI enforce mode: POST /events with cryptographically invalid assertion \
+             (bad sig) MUST deny 403 evidence_rejected from the guard before the handler \
+             fires [FI-TRACE-AUTHORITY-UNIFORM, T1-IMP1]. \
+             Falsifying mutation: remove verifier.verify_assertion from nip_fi_assertion_guard \
+             → guard forwards → missing NIP-98 → 401 ≠ 403 → test fails."
+        );
+    }
 }

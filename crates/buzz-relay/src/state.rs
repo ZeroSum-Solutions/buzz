@@ -786,8 +786,14 @@ pub struct AppState {
     /// is the single offline authority for assertion validation on every
     /// protected HTTP surface. The backing `ProductionJwksSource` is also
     /// shared and performs bounded periodic JWKS refresh internally.
-    pub nip_fi_verifier:
-        Option<Arc<buzz_auth::FederatedAssertionVerifier<Arc<buzz_auth::ProductionJwksSource>>>>,
+    ///
+    /// The field uses `dyn VerifyAssertion` (type erasure) so that
+    /// integration tests can inject a `StaticIssuerKeySource`-backed verifier
+    /// without requiring a live JWKS fetch.  Production code always stores a
+    /// `FederatedAssertionVerifier<Arc<ProductionJwksSource>>` here; the type
+    /// erased form costs one vtable dispatch per request, which is negligible
+    /// relative to the JWT crypto.
+    pub nip_fi_verifier: Option<Arc<dyn buzz_auth::VerifyAssertion>>,
 
     /// The shared JWKS source backing `nip_fi_verifier`, exposed so `main.rs`
     /// can warm it at startup and drive the background refresh loop.
@@ -1396,7 +1402,7 @@ impl AuditShutdownHandle {
 /// The source starts empty; HTTP admission returns `authorization_unavailable`
 /// (503) until the startup warm in `main.rs` succeeds. [FI-TRACE-DEPENDENCY-FAIL-CLOSED]
 type NipFiComponents = (
-    Option<Arc<buzz_auth::FederatedAssertionVerifier<Arc<buzz_auth::ProductionJwksSource>>>>,
+    Option<Arc<dyn buzz_auth::VerifyAssertion>>,
     Option<Arc<buzz_auth::ProductionJwksSource>>,
 );
 
@@ -1424,7 +1430,7 @@ fn build_nip_fi_components(config: &crate::config::Config) -> NipFiComponents {
             }
         };
 
-    let verifier = Arc::new(FederatedAssertionVerifier::new(
+    let verifier: Arc<dyn buzz_auth::VerifyAssertion> = Arc::new(FederatedAssertionVerifier::new(
         config.nip_fi.registry.clone(),
         Arc::clone(&source),
     ));
