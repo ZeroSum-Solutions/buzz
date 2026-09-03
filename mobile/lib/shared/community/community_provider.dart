@@ -429,6 +429,12 @@ class CommunityListNotifier extends AsyncNotifier<List<Community>> {
     final generationCursor =
         community.pushSubscriptionState.generationCursor ?? 0;
     if (generation < max(acceptedGeneration, generationCursor)) return false;
+    if (buzzPushSubscriptionsFingerprint(
+          community.pushSubscriptionState.desired,
+        ) !=
+        buzzPushSubscriptionsFingerprint(subscriptions)) {
+      return false;
+    }
     final updated = community.copyWith(
       pushSubscriptionState: community.pushSubscriptionState.withAccepted(
         subscriptions: subscriptions,

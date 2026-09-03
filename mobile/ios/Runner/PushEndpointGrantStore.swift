@@ -20,6 +20,10 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
   }
 
   func reset(forGatewayOrigin gatewayOrigin: String) throws {
+    let legacyInventory = try quarantinedLegacyInventory()
+    if !legacyInventory.relayOrigins.isEmpty {
+      try queueReplacementRelayOrigins(legacyInventory.relayOrigins)
+    }
     let allRecords = try records()
     let allPending = try pendingEnrollments()
     try BuzzPushGatewayStateReset.run(
@@ -34,13 +38,20 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
     )
   }
 
-  /// Legacy records do not identify their gateway origin, and grants do not
-  /// identify the App Attest key that created their installation. Keep those
-  /// Keychain accounts as a durable quarantine rather than inventing authority
-  /// that could revoke an unrelated installation after a gateway change.
-  func hasQuarantinedLegacyState() throws -> Bool {
-    try data(account: Self.legacyRecordsAccount) != nil
-      || data(account: Self.legacyPendingAccount) != nil
+  func quarantinedLegacyEndpointGrants() throws -> [String] {
+    try quarantinedLegacyInventory().endpointGrants
+  }
+
+  func clearQuarantinedLegacyState() throws {
+    try delete(account: Self.legacyRecordsAccount)
+    try delete(account: Self.legacyPendingAccount)
+  }
+
+  private func quarantinedLegacyInventory() throws -> BuzzPushLegacyRecoveryInventory {
+    try BuzzPushLegacyRecoveryInventory.decode(
+      grants: data(account: Self.legacyRecordsAccount),
+      pending: data(account: Self.legacyPendingAccount)
+    )
   }
 
   func records() throws -> [BuzzPushEndpointGrantRecord] {
@@ -254,6 +265,13 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
 
   private func replace<T: Encodable>(_ values: [T], account: String) throws {
     try replaceValue(values, account: account)
+  }
+
+  private func delete(account: String) throws {
+    let status = SecItemDelete(baseQuery(account: account) as CFDictionary)
+    guard status == errSecSuccess || status == errSecItemNotFound else {
+      throw keychainError(status, operation: "delete legacy state")
+    }
   }
 
   private func replaceValue<T: Encodable>(_ value: T, account: String) throws {

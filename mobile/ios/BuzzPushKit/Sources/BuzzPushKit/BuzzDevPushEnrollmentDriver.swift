@@ -149,6 +149,13 @@ public protocol BuzzPushEndpointGrantStore {
   ) throws -> Bool
   /// Clears the queue only after replacement publication has completed.
   func clearReplacementRelayOrigins() throws
+  /// Opaque grants retained from the gateway-neutral legacy schema. A gateway
+  /// may open one as proof that it owns the conflicting installation.
+  func quarantinedLegacyEndpointGrants() throws -> [String]
+}
+
+extension BuzzPushEndpointGrantStore {
+  public func quarantinedLegacyEndpointGrants() throws -> [String] { [] }
 }
 
 public enum BuzzDevPushEnrollmentError: Error, LocalizedError, Equatable {
@@ -835,7 +842,20 @@ public final class BuzzDevPushEnrollmentDriver {
           ) = error
         else { throw error }
         let cleanupStates = try store.gatewayCleanupStates()
-        guard !cleanupStates.isEmpty else { throw error }
+        if cleanupStates.isEmpty {
+          let recovered = try await recoverQuarantinedLegacyInstallation(endpoint: endpoint)
+          guard recovered else { throw error }
+          try store.removePendingEnrollment(
+            gatewayOrigin: gatewayOrigin,
+            relayOrigin: relayOrigin.text,
+            appProfile: Self.appProfile
+          )
+          return try await enrollCurrent(
+            deviceToken: deviceToken,
+            relayURL: relayURL,
+            forceDelegationRenewal: forceDelegationRenewal
+          )
+        }
         let affectedRelayOrigins = cleanupStates.flatMap {
           $0.grants.map(\.relayOrigin) + $0.pendingEnrollments.map(\.relayOrigin)
         }
@@ -1180,6 +1200,34 @@ public final class BuzzDevPushEnrollmentDriver {
     return installation
   }
 
+  private func recoverQuarantinedLegacyInstallation(endpoint: String) async throws -> Bool {
+    for endpointGrant in try store.quarantinedLegacyEndpointGrants() {
+      do {
+        let response: MutationResponse = try await post(
+          route: "v1/installations/recover",
+          expectedStatus: 200,
+          body: RecoverInstallationRequest(
+            v: 1,
+            endpointGrant: endpointGrant,
+            appProfile: Self.appProfile,
+            endpoint: endpoint
+          )
+        )
+        guard response.status == "revoked" else {
+          throw BuzzDevPushEnrollmentError.invalidResponse(
+            route: "v1/installations/recover"
+          )
+        }
+        return true
+      } catch BuzzDevPushEnrollmentError.unexpectedStatus(
+        route: "v1/installations/recover", _, actual: 404, _
+      ) {
+        continue
+      }
+    }
+    return false
+  }
+
   private func delegate(
     challenge: Challenge,
     installationHandle: UUID,
@@ -1473,6 +1521,18 @@ private struct InstallationResponse: Decodable {
     case installationHandle = "installation_handle"
     case endpointEpoch = "endpoint_epoch"
     case expiresAt = "expires_at"
+  }
+}
+private struct RecoverInstallationRequest: Encodable {
+  let v: Int
+  let endpointGrant: String
+  let appProfile: String
+  let endpoint: String
+  enum CodingKeys: String, CodingKey {
+    case v
+    case endpointGrant = "endpoint_grant"
+    case appProfile = "app_profile"
+    case endpoint
   }
 }
 private struct DelegationRequest: Encodable {

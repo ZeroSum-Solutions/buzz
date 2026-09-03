@@ -331,6 +331,16 @@ The client MUST durably journal the exact attested enrollment request before its
 
 Invalid attestation is `401 invalid_attestation`; a consumed/expired challenge or a key/token owned by a live installation is `404 not_authorized`. A fresh verified enrollment may replace expired or revoked ownership so an app that missed its renewal window can recover.
 
+### Gateway-neutral legacy recovery
+
+`POST /v1/installations/recover`
+
+```json
+{"v":1,"endpoint_grant":"<opaque-capability>","app_profile":"buzz-ios-dogfood","endpoint":"<lowercase APNs-token hex>"}
+```
+
+This narrowly recovers clients whose older durable schema retained a gateway-issued capability and APNs token but omitted the gateway origin and App Attest key associated with the installation. The gateway MUST decrypt the capability itself and atomically revoke only the live installation named by its current delegation when the capability profile, relay key, endpoint epoch, generation, expiry, and the installation's `(app_profile, SHA-256(token))` fingerprint all match. Thus neither a capability from another gateway nor a capability paired with another token grants recovery authority. The client MUST durably retain every affected relay origin for replacement publication before calling this route and MUST retain the legacy record until a replacement grant is durable. Success, including an exact retry after response loss, is `200 {"status":"revoked"}`; invalid, expired, or mismatched proof is `404 not_authorized`.
+
 ### Relay delegation and capability issuance
 
 `POST /v1/delegations`

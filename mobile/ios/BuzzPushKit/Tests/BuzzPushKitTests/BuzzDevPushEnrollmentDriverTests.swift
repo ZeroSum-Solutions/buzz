@@ -1828,6 +1828,67 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     XCTAssertEqual(record.endpointGrant, "new-grant")
   }
 
+  func testEnrollmentRecoversQuarantinedLegacyInstallationWithOpaqueGrant() async throws {
+    let store = MemoryGrantStore()
+    store.legacyEndpointGrants = ["legacy-grant"]
+    let driver = try makeDriver(store: store, appAttest: RecordingAppAttest())
+    var installationAttempts = 0
+    var recoveryAttempts = 0
+    URLProtocolStub.handler = { request in
+      switch (request.httpMethod, request.url?.absoluteString) {
+      case ("GET", "https://relay.example/"):
+        return Self.response(
+          request,
+          status: 200,
+          json: ["push": ["keys": [["pubkey": Self.relayPubkey, "current": true]]]]
+        )
+      case ("POST", "http://push.example/v1/installations/challenges"):
+        return Self.response(
+          request,
+          status: 200,
+          json: [
+            "challenge_id": Self.firstChallengeId,
+            "challenge": Self.challenge,
+            "expires_at": Self.now + 300,
+          ]
+        )
+      case ("POST", "http://push.example/v1/installations"):
+        installationAttempts += 1
+        if installationAttempts == 1 {
+          return Self.response(request, status: 409, json: ["error": "installation_conflict"])
+        }
+        return Self.response(
+          request,
+          status: 201,
+          json: [
+            "installation_handle": Self.installationHandle,
+            "endpoint_epoch": 1,
+            "expires_at": Self.expiresAt,
+          ]
+        )
+      case ("POST", "http://push.example/v1/installations/recover"):
+        recoveryAttempts += 1
+        let body = try Self.body(request)
+        XCTAssertEqual(body["endpoint_grant"] as? String, "legacy-grant")
+        return Self.response(request, status: 200, json: ["status": "revoked"])
+      case ("POST", "http://push.example/v1/delegations"):
+        return Self.response(request, status: 201, json: ["endpoint_grant": "new-grant"])
+      default:
+        XCTFail("Unexpected request \(request.url?.absoluteString ?? "nil")")
+        return Self.response(request, status: 500, json: [:])
+      }
+    }
+
+    let record = try await driver.enroll(
+      deviceToken: Data((1...32).map(UInt8.init)),
+      relayURL: Self.relayURL
+    )
+
+    XCTAssertEqual(installationAttempts, 2)
+    XCTAssertEqual(recoveryAttempts, 1)
+    XCTAssertEqual(record.endpointGrant, "new-grant")
+  }
+
   func testSecondOriginOnSameRelayKeyReusesGrantWithFreshLeaseAddress() async throws {
     let existing = BuzzPushEndpointGrantRecord(
       gatewayOrigin: Self.gatewayOrigin,
@@ -2471,6 +2532,7 @@ private final class MemoryGrantStore: BuzzPushEndpointGrantStore {
   var cleanup: [BuzzPushGatewayCleanupState] = []
   var replacementOrigins: [String] = []
   var replacementGeneration: Int64 = 0
+  var legacyEndpointGrants: [String] = []
   var resetOperations: [String] = []
   var grantSaveFailuresRemaining: Int
   var cleanupSaveFailureCalls: Set<Int>
@@ -2614,6 +2676,7 @@ private final class MemoryGrantStore: BuzzPushEndpointGrantStore {
     replacementGeneration += 1
     replacementOrigins = []
   }
+  func quarantinedLegacyEndpointGrants() throws -> [String] { legacyEndpointGrants }
 }
 
 private final class RecordingAppAttest: BuzzDevAppAttesting {

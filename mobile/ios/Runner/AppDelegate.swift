@@ -630,6 +630,7 @@ import os.log
             relayURL: relayURL,
             forceDelegationRenewal: forceDelegationRenewal
           )
+          try self?.endpointGrantStore.clearQuarantinedLegacyState()
           var arguments = record.flutterArguments
           if let inventory = try self?.pushGatewayMigrationInventory() {
             arguments.merge(inventory) { _, latest in latest }
