@@ -205,11 +205,13 @@ String buzzPushGatewayOrigin(String gatewayUrl) {
 Future<int> publishBuzzPushLeaseRecoverably({
   required Future<int> Function() reserveGeneration,
   required Future<void> Function(int generation) publish,
-  required Future<void> Function(int generation) markAccepted,
+  required Future<bool> Function(int generation) markAccepted,
 }) async {
   final generation = await reserveGeneration();
   await publish(generation);
-  await markAccepted(generation);
+  if (!await markAccepted(generation)) {
+    throw StateError('A newer push lease superseded the published generation.');
+  }
   return generation;
 }
 

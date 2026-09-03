@@ -204,10 +204,13 @@ void main() {
       final notifier = container.read(communityListProvider.notifier);
       await notifier.addCommunity(community);
 
-      await notifier.markPushLeaseAccepted(
-        community.id,
-        subscriptions: const [],
-        generation: 5,
+      expect(
+        await notifier.markPushLeaseAccepted(
+          community.id,
+          subscriptions: const [],
+          generation: 5,
+        ),
+        isFalse,
       );
 
       final stored = (await communityStorage.loadAll()).single;

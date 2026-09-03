@@ -307,12 +307,13 @@ void main() {
         relayGeneration = generation;
       }
 
-      Future<void> markAccepted(int generation) async {
+      Future<bool> markAccepted(int generation) async {
         if (failLocalSave) {
           failLocalSave = false;
           throw StateError('injected local persistence failure');
         }
         acceptedGeneration = generation;
+        return true;
       }
 
       await expectLater(
@@ -335,6 +336,17 @@ void main() {
       expect(acceptedGeneration, 2);
     },
   );
+
+  test('superseded lease acceptance fails the publication attempt', () async {
+    await expectLater(
+      publishBuzzPushLeaseRecoverably(
+        reserveGeneration: () async => 3,
+        publish: (_) async {},
+        markAccepted: (_) async => false,
+      ),
+      throwsStateError,
+    );
+  });
 }
 
 BuzzPushLeaseDescriptor _descriptor({
