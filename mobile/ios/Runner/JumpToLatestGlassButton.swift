@@ -451,6 +451,7 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
       )
       button.configuration?.imagePadding = buttonLabel == nil ? 0 : 8
       button.configuration?.titleLineBreakMode = .byTruncatingTail
+      button.configuration?.subtitleLineBreakMode = .byTruncatingTail
       let usesChannelTypography = contentIcon == "channel"
       button.configuration?.titleTextAttributesTransformer =
         UIConfigurationTextAttributesTransformer { incoming in

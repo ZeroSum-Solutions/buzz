@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -638,6 +639,37 @@ void main() {
       expect(titleParams['subtitle'], 'Offline');
       expect(titleParams['avatarImageUrl'], 'https://example.com/alice.png');
       expect(titleParams['fillWidth'], isTrue);
+      final titleControl = find.byKey(
+        const ValueKey('dm-header-glass-trigger'),
+      );
+      final titleContext = tester.element(titleControl);
+      double measure(String text, TextStyle? style) {
+        final painter = TextPainter(
+          text: TextSpan(text: text, style: style),
+          maxLines: 1,
+          textDirection: TextDirection.ltr,
+          textScaler: MediaQuery.textScalerOf(titleContext),
+        )..layout();
+        return painter.width;
+      }
+
+      final expectedTitleWidth =
+          6.0 +
+          36.0 +
+          8.0 +
+          8.0 +
+          4.0 +
+          max(
+            measure(
+              titleParams['label']! as String,
+              Theme.of(titleContext).textTheme.titleMedium,
+            ),
+            measure('Offline', Theme.of(titleContext).textTheme.bodySmall),
+          );
+      expect(
+        tester.getSize(titleControl).width,
+        moreOrLessEquals(expectedTitleWidth),
+      );
       expect(
         nativeParams(const ValueKey('channel-huddle-button'))['icon'],
         'headphones',
@@ -9719,7 +9751,39 @@ void main() {
         expect(channelParams['systemIconName'], 'number');
         expect(channelParams['controlSize'], buzzNavigationActionSize);
         expect(channelParams['controlSize'], backParams['controlSize']);
-        expect(channelIdentityRect.width, lessThanOrEqualTo(300));
+        final identityContext = tester.element(channelIdentity);
+        double measure(String text, TextStyle? style) {
+          final painter = TextPainter(
+            text: TextSpan(text: text, style: style),
+            maxLines: 1,
+            textDirection: TextDirection.ltr,
+            textScaler: MediaQuery.textScalerOf(identityContext),
+          )..layout();
+          return painter.width;
+        }
+
+        final expectedIdentityWidth =
+            12.0 +
+            16.0 +
+            12.0 +
+            8.0 +
+            4.0 +
+            max(
+              measure(
+                'general',
+                Theme.of(
+                  identityContext,
+                ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w600),
+              ),
+              measure(
+                '0 members',
+                Theme.of(identityContext).textTheme.bodySmall,
+              ),
+            );
+        expect(
+          channelIdentityRect.width,
+          moreOrLessEquals(expectedIdentityWidth),
+        );
         final huddleNativeView = tester.widget<UiKitView>(
           find.descendant(
             of: find.byKey(const ValueKey('channel-huddle-button')),

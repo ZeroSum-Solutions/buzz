@@ -7,6 +7,11 @@ const _iosChannelHeaderIconSize = 12.0;
 const _iosChannelHeaderLeadingInset = 12.0;
 const _iosChannelHeaderTrailingInset = 16.0;
 const _iosChannelHeaderIconSpacing = 8.0;
+const _iosDmHeaderLeadingInset = 6.0;
+const _iosDmHeaderTrailingInset = 8.0;
+const _iosDmHeaderAvatarSize = 36.0;
+const _iosDmHeaderAvatarSpacing = 8.0;
+const _iosNativeTextWidthAllowance = 4.0;
 const _dmPresenceDotRatio = 8 / 14;
 
 bool _showsMembersAction(Channel channel) {
@@ -92,7 +97,8 @@ class _ChannelAppBarTitle extends ConsumerWidget {
               _iosChannelHeaderTrailingInset +
               _iosChannelHeaderIconSize +
               _iosChannelHeaderIconSpacing +
-              textWidth;
+              textWidth +
+              _iosNativeTextWidthAllowance;
           final controlWidth = min(naturalWidth, constraints.maxWidth);
           return Align(
             alignment: Alignment.centerLeft,
@@ -421,7 +427,13 @@ class _DmAppBarTitle extends ConsumerWidget {
             measure(displayLabel, context.textTheme.titleMedium),
             measure(presenceLabel, context.textTheme.bodySmall),
           );
-          final naturalWidth = 54.0 + textWidth;
+          final naturalWidth =
+              _iosDmHeaderLeadingInset +
+              _iosDmHeaderAvatarSize +
+              _iosDmHeaderAvatarSpacing +
+              _iosDmHeaderTrailingInset +
+              textWidth +
+              _iosNativeTextWidthAllowance;
           return Align(
             alignment: Alignment.centerLeft,
             child: IosGlassNavigationButton(
