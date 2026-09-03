@@ -64,6 +64,7 @@ const { stubRelay } = makeHookStubs();
  * @param {Function} opts.useHook            the hook under test
  * @param {Function} opts.makeEditStore      () => store (the restored edit)
  * @param {Function} opts.makeRemoteStore    () => store (peer head content)
+ * @param {Function} opts.assertHookState    (hookResult, label) => void (lane-specific hook oracle)
  */
 export function runWholeBlobCarlSuite({
   label,
@@ -74,6 +75,7 @@ export function runWholeBlobCarlSuite({
   useHook,
   makeEditStore,
   makeRemoteStore,
+  assertHookState,
 }) {
   // ── P1/C1-publish: failed bootstrap → restored outbox (queuedAt=200) →
   //   relay head at createdAt=100 → MUST PUBLISH (restored edit is newer).
@@ -212,19 +214,13 @@ export function runWholeBlobCarlSuite({
   // ── P1/C1-stale: failed bootstrap → restored outbox (queuedAt=100) →
   //   relay head at createdAt=200 → MUST ADOPT (head is strictly newer).
   //
-  // Production sequence:
-  //   1. Outbox seeded with queuedAt=100.
-  //   2. Bootstrap fails → result.action="hold" → shouldReplay=true.
-  //   3. hook .then(): publishSections(store, true, 100) → pendingRestoredQueuedAt=100.
-  //   4. Debounce. fetchOwnBlobBeforePublish returns peerHead (createdAt=200).
-  //      !pendingIsRestoredReplay guard suppresses the failed-bootstrap exception.
-  //      Restored adopt-guard: remote.createdAt(200) > queuedAt(100) → ADOPT.
-  //      Outbox is cleared (head supersedes old edit). Zero publishes.
+  // Bootstrap fails → shouldReplay=true → pendingRestoredQueuedAt=100.
+  // Debounce: peerHead createdAt=200. !pendingIsRestoredReplay guard suppresses
+  // the failed-bootstrap exception; restored adopt-guard: 200>100 → ADOPT.
+  // Outbox cleared; zero publishes. Hook and storage reflect remote store.
   //
-  // Causality mutation: remove !pendingIsRestoredReplay guard
-  //   → failed-bootstrap exception fires → publishBaseline absorbs 200
-  //   → returns {kind:"publish"} → publishes old stale edit OVER newer head
-  //   → test FAILS (publishCalls.length > 0, no adopt, outbox not cleared).
+  // Mutation (!pendingIsRestoredReplay removed): exception fires → publishBaseline
+  // absorbs 200 → publishes stale edit over newer head → test FAILS.
   test(`P1/C1-stale ${label}: failed-bootstrap hook replay — stale restored edit (queuedAt=100) must ADOPT newer relay head (createdAt=200), not publish over it`, async () => {
     const { act, cleanup, renderHook } = await import("@testing-library/react");
     const pubkey = `pk-c1-stale-${label}`;
@@ -310,10 +306,9 @@ export function runWholeBlobCarlSuite({
           `remove onRemoteAdopted callback → old edit store remains persisted`,
       );
 
-      // (b) Hook state reflects the adopted remote store (driven by localStorage).
-      // After act+microtasks above the hook has already re-rendered from the adopted value.
-      // We use the persisted value as the oracle because it is the source of hook state.
-      // (assertion collapsed into (a) above — same invariant, same mutation tripwire)
+      // (b) Hook/UI state must reflect the adopted remote store independently of storage.
+      // Mutation (applyRemote returns prev): storage correct, React state stale → fails.
+      assertHookState(hook.result.current, label);
 
       // (c) Losing own outbox must be cleared — head supersedes the stale edit.
       // Mutation (clearOutbox removed from clearPendingState): old outbox persists → not null → fails.
@@ -610,26 +605,18 @@ export function runWholeBlobP2a1Suite({
 /**
  * Hook-layer P2a-1 regression (IMPORTANT 3).
  *
- * Drives the blocked-bootstrap sequence through the ACTUAL React hook so that
+ * Drives the blocked-bootstrap sequence through the actual React hook so that
  * shouldReplay, outbox read, queuedAt threading, and the real .then() callback
- * are all exercised. The manager-layer test (runWholeBlobP2a1Suite) verifies
- * the baseline state-machine; this test verifies the hook seam that feeds it.
+ * are exercised. The manager-layer test (runWholeBlobP2a1Suite) verifies the
+ * baseline state-machine; this test verifies the hook seam that feeds it.
  *
- * Sequence:
- *   1. Block bootstrap fetch (park Promise).
- *   2. Mount hook — bootstrap is pending.
- *   3. Click through the hook API (makeEdit) — publishSections(store, false)
- *      writes v2 outbox at Date.now()/1000.
- *   4. Deliver H102 via subscribeLive — suppressed by hasPendingEdit.
- *   5. Release bootstrap with H100 → hook .then() callback fires naturally:
- *      readOutbox → shouldReplay=true → publishSections(outbox, true, queuedAt).
- *   6. Fire debounce → pre-publish fetch returns H102 →
- *      canonicalMax(publishBaseline, bootstrapResultHead=H100) = H100;
- *      H102 is a genuine advance → ADOPT. publishCalls === 0.
+ * Sequence: park bootstrap → mount → click (writeOutbox queuedAt=50) →
+ * deliver H102 live (suppressed by hasPendingEdit) → release bootstrap H100 →
+ * .then() fires shouldReplay=true → debounce → publishBaseline={30,H100};
+ * H102 advance → ADOPT. Hook and storage reflect H102; outbox cleared.
  *
  * Causality mutation: set publishBaseline = lastRemoteHead in publish(_, true)
- *   → publishBaseline = H102 → pre-publish sees equality → publishes over H102
- *   → test FAILS.
+ *   → publishBaseline = H102 → pre-publish sees equality → publishes over H102.
  */
 export function runWholeBlobP2a1HookSuite({
   label,
@@ -638,6 +625,7 @@ export function runWholeBlobP2a1HookSuite({
   useHook,
   makeEdit,
   makeRemoteStore,
+  assertHookState,
 }) {
   test(`P2a-1 ${label} (hook): blocked-bootstrap real hook replay — H102 must be adopted as genuine advance, not published over`, async () => {
     const { act, cleanup, renderHook } = await import("@testing-library/react");
@@ -728,15 +716,9 @@ export function runWholeBlobP2a1HookSuite({
         for (let i = 0; i < 60; i++) await Promise.resolve();
       });
 
-      // Fire debounce. publish(_, true, 50):
-      //   publishBaseline = canonicalMax({0,""}, bootstrapResultHead={30,H100}) = {30,H100}.
-      //   pre-publish fetch returns H102 (createdAt=200 > 30) → remoteAdvancedSince = true.
-      //   C1 adopt-guard: remote.createdAt(200) > queuedAt(50) → ADOPT H102.
-      //   publishCalls === 0.
-      //
-      // Mutation: set publishBaseline = lastRemoteHead in publish(_, true)
-      //   → lastRemoteHead = H102 (hasPendingEdit kept it, but recordRemoteHead ran at liveCallback)
-      //   → publishBaseline = H102 → pre-publish H102 == baseline → no advance → PUBLISH over H102.
+      // Fire debounce. publish(_, true, 50): publishBaseline={30,H100}; pre-publish
+      // fetch returns H102 (200>30) → remoteAdvancedSince=true; C1 adopt-guard
+      // (200>queuedAt=50) → ADOPT. Mutation: publishBaseline=H102 → no advance → PUBLISH.
       await fireDelay(2000);
       for (let i = 0; i < 100; i++) await Promise.resolve();
 
@@ -769,6 +751,10 @@ export function runWholeBlobP2a1HookSuite({
         `P2a-1 ${label} (hook): lane storage must equal the adopted H102 store — ` +
           `remove onRemoteAdopted callback → own edit store remains persisted`,
       );
+
+      // Hook/UI state must reflect the adopted H102 store independently of storage.
+      // Mutation (applyRemote returns prev): storage correct, React state stale → fails.
+      assertHookState(hook.result.current, label);
 
       // Own outbox written by the click must be cleared after H102 supersedes it.
       // Mutation (onRemoteAdopted callback removed): adopt never fires, outbox not cleared → not null → fails.

@@ -164,6 +164,13 @@ runWholeBlobCarlSuite({
   useHook: useChannelSortPreference,
   makeEditStore: () => ({ version: 1, groups: { click: "alpha" } }),
   makeRemoteStore: () => ({ version: 1, groups: { remote: "recent" } }),
+  assertHookState: (r, label) => {
+    assert.equal(
+      r.sortModeFor("remote"),
+      "recent",
+      `P*/hook ${label}: hook.sortModeFor("remote") must reflect adopted remote store — applyRemote returning prev leaves UI stale`,
+    );
+  },
 });
 
 runWholeBlobP2a1Suite({
@@ -218,4 +225,11 @@ runWholeBlobP2a1HookSuite({
   makeEdit: (r) => r.setSortModeFor("channels", "alpha"),
   makeEditStore: () => ({ version: 1, groups: { click: "alpha" } }),
   makeRemoteStore: () => ({ version: 1, groups: { remote: "recent" } }),
+  assertHookState: (r, label) => {
+    assert.equal(
+      r.sortModeFor("remote"),
+      "recent",
+      `P2a-1/hook ${label}: hook.sortModeFor("remote") must reflect adopted H102 store — applyRemote returning prev leaves UI stale`,
+    );
+  },
 });

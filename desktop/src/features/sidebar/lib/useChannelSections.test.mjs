@@ -257,6 +257,18 @@ runWholeBlobCarlSuite({
     sections: [{ id: "remote", name: "Remote", order: 0 }],
     assignments: {},
   }),
+  assertHookState: (r, label) => {
+    assert.deepEqual(
+      r.sections,
+      [{ id: "remote", name: "Remote", order: 0 }],
+      `P*/hook ${label}: hook.sections must reflect adopted remote store — applyRemote returning prev leaves UI stale`,
+    );
+    assert.deepEqual(
+      r.assignments,
+      {},
+      `P*/hook ${label}: hook.assignments must reflect adopted remote store`,
+    );
+  },
 });
 
 runWholeBlobP2a1Suite({
@@ -359,4 +371,16 @@ runWholeBlobP2a1HookSuite({
     sections: [{ id: "remote", name: "Remote", order: 0 }],
     assignments: {},
   }),
+  assertHookState: (r, label) => {
+    assert.deepEqual(
+      r.sections,
+      [{ id: "remote", name: "Remote", order: 0 }],
+      `P2a-1/hook ${label}: hook.sections must reflect adopted H102 store — applyRemote returning prev leaves UI stale`,
+    );
+    assert.deepEqual(
+      r.assignments,
+      {},
+      `P2a-1/hook ${label}: hook.assignments must reflect adopted H102 store`,
+    );
+  },
 });
