@@ -252,14 +252,7 @@ async fn authenticate(
         pubkey,
         event_id_bytes,
         ..
-    } = bridge::verify_bridge_auth_with_options(
-        headers,
-        "POST",
-        &url,
-        Some(body),
-        true, // invites always require NIP-98; no X-Pubkey dev fallback
-        true, // POST bodies must be covered by a payload tag
-    )?;
+    } = bridge::verify_nip98_exempt_invite_claim(headers, "POST", &url, Some(body))?;
     bridge::check_nip98_replay(state, &tenant, event_id_bytes).await?;
 
     Ok((tenant, pubkey))
@@ -320,23 +313,23 @@ async fn mint_invite_checked(
     // NIP-FI admission: NIP-98 extraction runs inside the closure, followed by
     // assertion verify → pair → deny-map in fixed order. The proven pubkey is
     // only available through the returned NipFiAdmission. [FI-TRACE-AUTHORITY-UNIFORM]
-    let admission = match admit_nip_fi_http_on_state(&state, &headers, || {
-        bridge::verify_bridge_auth_with_options(
-            &headers,
+    let admission = match admit_nip_fi_http_on_state(
+        &state,
+        &headers,
+        bridge::make_nip98_closure_for_admission(
+            headers.clone(),
             "POST",
-            &url,
-            Some(&body),
+            url,
+            Some(body.to_vec()),
             true, // invites always require NIP-98; no X-Pubkey dev fallback
             true, // POST bodies must be covered by a payload tag
-        )
-        .map(|auth| (auth.pubkey, auth.event_id_bytes))
-        .map_err(|e| e.into_response())
-    }) {
+        ),
+    ) {
         Ok(a) => a,
         Err(resp) => return resp,
     };
     let pubkey = *admission.proven_pubkey();
-    let event_id_bytes = admission.into_extra();
+    let (event_id_bytes, _signed_created_at) = admission.into_extra();
 
     // Replay detection runs after NIP-98+assertion admission (both proofs verified).
     if let Err(e) = bridge::check_nip98_replay(&state, &tenant, event_id_bytes).await {

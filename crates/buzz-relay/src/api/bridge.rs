@@ -71,7 +71,11 @@ type BridgeAuthResult = Result<VerifiedBridgeAuth, (StatusCode, Json<Value>)>;
 /// Returns the authenticated public key, an event ID for replay detection, and
 /// the verified signed auth timestamp. For X-Pubkey dev mode, the event ID is
 /// a zero hash and the timestamp is absent.
-pub(crate) fn verify_bridge_auth(
+///
+/// Private: external callers use [`make_nip98_closure_for_admission`] (admitted
+/// surfaces) or [`verify_nip98_exempt_invite_claim`] /
+/// [`verify_nip98_exempt_operator`] (explicitly-named exempt paths).
+fn verify_bridge_auth(
     headers: &HeaderMap,
     method: &str,
     url: &str,
@@ -81,7 +85,7 @@ pub(crate) fn verify_bridge_auth(
     verify_bridge_auth_with_options(headers, method, url, body, require_auth_token, false)
 }
 
-pub(crate) fn verify_bridge_auth_with_options(
+fn verify_bridge_auth_with_options(
     headers: &HeaderMap,
     method: &str,
     url: &str,
@@ -145,6 +149,101 @@ pub(crate) fn verify_bridge_auth_with_options(
     }
 
     Err(api_error(StatusCode::UNAUTHORIZED, "missing Nostr auth"))
+}
+
+// ── NIP-FI Authority boundary ─────────────────────────────────────────────────
+//
+// The two functions below are the ONLY `pub(crate)` entry points to the raw
+// NIP-98 verifier.  All other callers must use one of:
+//
+//   • `make_nip98_closure_for_admission` — for HTTP surfaces under NIP-FI
+//     admission. The closure is passed directly to `admit_nip_fi_http_on_state`
+//     and its result is never projected outside a `NipFiAdmission`.
+//
+//   • `verify_nip98_exempt_invite_claim` / `verify_nip98_exempt_operator` —
+//     for the two explicitly NIP-FI-exempt paths that pre-date NIP-FI and must
+//     continue to run independently of the NIP-FI state machine.
+//
+// [FI-TRACE-AUTHORITY-EXEMPT]: grep this tag to audit all exempt call sites.
+
+/// Build a NIP-98 extraction closure suitable for passing directly to
+/// [`crate::nip_fi_http::admit_nip_fi_http_on_state`].
+///
+/// The closure captures all needed parameters by value and, when called,
+/// runs the full NIP-98 verification (including optional payload-tag check and
+/// X-Pubkey dev-mode fallback) with the same semantics as the private
+/// `verify_bridge_auth_with_options`.
+///
+/// Callers outside `bridge.rs` MUST use this instead of calling the private
+/// verifier directly. The pubkey in the closure's result is only accessible
+/// through the `NipFiAdmission` produced by `admit_nip_fi_http_on_state` —
+/// it cannot be projected without executing the full admission sequence.
+///
+/// [FI-TRACE-AUTHORITY-UNIFORM]
+// Response<Body> is intentionally large (axum's design); see nip_fi_http.rs allow blocks.
+#[allow(clippy::result_large_err)]
+#[allow(clippy::type_complexity)] // The return type IS the admission closure contract; a type alias cannot name impl Trait
+pub(crate) fn make_nip98_closure_for_admission(
+    headers: HeaderMap,
+    method: &'static str,
+    url: String,
+    body: Option<Vec<u8>>,
+    require_auth_token: bool,
+    require_payload: bool,
+) -> impl FnOnce() -> Result<
+    (nostr::PublicKey, ([u8; 32], Option<u64>)),
+    axum::http::Response<axum::body::Body>,
+> {
+    move || {
+        verify_bridge_auth_with_options(
+            &headers,
+            method,
+            &url,
+            body.as_deref(),
+            require_auth_token,
+            require_payload,
+        )
+        .map(|auth| (auth.pubkey, (auth.event_id_bytes, auth.signed_created_at)))
+        .map_err(|e| e.into_response())
+    }
+}
+
+/// NIP-FI-exempt NIP-98 verifier for the invite-claim path.
+///
+/// Invite claims run before a tenant's NIP-FI config is consulted and are
+/// structurally outside the NIP-FI state machine. This function makes the
+/// exemption nameable and greppable. [FI-TRACE-AUTHORITY-EXEMPT]
+pub(crate) fn verify_nip98_exempt_invite_claim(
+    headers: &HeaderMap,
+    method: &str,
+    url: &str,
+    body: Option<&[u8]>,
+) -> BridgeAuthResult {
+    verify_bridge_auth_with_options(
+        headers, method, url, body,
+        true, // invite-claim always requires NIP-98; no X-Pubkey dev fallback
+        true, // POST bodies must be covered by a payload tag
+    )
+}
+
+/// NIP-FI-exempt NIP-98 verifier for operator-management endpoints.
+///
+/// Operator endpoints use a separate auth origin and are structurally outside
+/// the per-tenant NIP-FI state machine. [FI-TRACE-AUTHORITY-EXEMPT]
+pub(crate) fn verify_nip98_exempt_operator(
+    headers: &HeaderMap,
+    method: &str,
+    url: &str,
+    body: Option<&[u8]>,
+) -> BridgeAuthResult {
+    verify_bridge_auth_with_options(
+        headers,
+        method,
+        url,
+        body,
+        true, // operator endpoints always require NIP-98; no X-Pubkey dev fallback
+        body.is_some(),
+    )
 }
 
 /// Check NIP-98 replay and record the event ID atomically.

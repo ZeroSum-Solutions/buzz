@@ -142,18 +142,18 @@ async fn authenticate(
     let expected_url = bridge::nip98_expected_url(&state.config.relay_url, &tenant, path);
 
     // NIP-FI admission. [FI-TRACE-AUTHORITY-UNIFORM]
-    let admission = crate::nip_fi_http::admit_nip_fi_http_on_state(state, headers, || {
-        bridge::verify_bridge_auth_with_options(
-            headers,
+    let admission = crate::nip_fi_http::admit_nip_fi_http_on_state(
+        state,
+        headers,
+        bridge::make_nip98_closure_for_admission(
+            headers.clone(),
             "POST",
-            &expected_url,
-            Some(body),
+            expected_url,
+            Some(body.to_vec()),
             true,
             true,
-        )
-        .map(|auth| (auth.pubkey, (auth.event_id_bytes, auth.signed_created_at)))
-        .map_err(|e| e.into_response())
-    })?;
+        ),
+    )?;
     let pubkey = *admission.proven_pubkey();
     let (event_id_bytes, signed_created_at) = admission.into_extra();
 

@@ -73,17 +73,19 @@ async fn authorize_workflow_read(
     let nip_fi_active = !matches!(state.config.nip_fi.mode, NipFiMode::Off);
 
     // NIP-FI admission. [FI-TRACE-AUTHORITY-UNIFORM]
-    let admission = admit_nip_fi_http_on_state(state, headers, || {
-        bridge::verify_bridge_auth(
-            headers,
+    let require_auth = state.config.require_auth_token || nip_fi_active;
+    let admission = admit_nip_fi_http_on_state(
+        state,
+        headers,
+        bridge::make_nip98_closure_for_admission(
+            headers.clone(),
             "GET",
-            &url,
+            url,
             None,
-            state.config.require_auth_token || nip_fi_active,
-        )
-        .map(|auth| (auth.pubkey, (auth.event_id_bytes, auth.signed_created_at)))
-        .map_err(|e| e.into_response())
-    })?;
+            require_auth,
+            false,
+        ),
+    )?;
     let pubkey = *admission.proven_pubkey();
     let (event_id_bytes, signed_created_at) = admission.into_extra();
 
