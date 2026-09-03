@@ -173,6 +173,19 @@ Future<bool> markBuzzPushGatewayMigrationAcceptedIfCurrent({
   return markAccepted();
 }
 
+@visibleForTesting
+Future<T> runBuzzPushGatewayMigrationMutationIfCurrent<T>({
+  required bool Function() attemptIsCurrent,
+  required Future<T> Function() mutate,
+}) {
+  if (!attemptIsCurrent()) {
+    return Future.error(
+      StateError('Push gateway migration attempt is obsolete.'),
+    );
+  }
+  return mutate();
+}
+
 typedef BuzzPushGatewayMigrationTarget = ({
   Community community,
   String relayOrigin,
@@ -849,11 +862,14 @@ class BuzzPushBootstrap extends HookConsumerWidget {
         'Cannot migrate push for ${community.id}: signing key is unavailable',
       );
     }
-    final grant = await enrollBuzzPush(
-      config.wsUrl,
-      Env.pushGatewayUrl,
-      communitiesForSnapshotRefresh: communities,
-      forceDelegationRenewal: forceDelegationRenewal,
+    final grant = await runBuzzPushGatewayMigrationMutationIfCurrent(
+      attemptIsCurrent: attemptIsCurrent,
+      mutate: () => enrollBuzzPush(
+        config.wsUrl,
+        Env.pushGatewayUrl,
+        communitiesForSnapshotRefresh: communities,
+        forceDelegationRenewal: forceDelegationRenewal,
+      ),
     );
     final notifier = ref.read(communityListProvider.notifier);
     await publishBuzzPushLeaseRecoverably(

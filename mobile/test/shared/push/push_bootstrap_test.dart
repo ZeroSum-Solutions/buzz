@@ -286,6 +286,21 @@ void main() {
     },
   );
 
+  test('stale migration cannot start an authority mutation', () async {
+    var mutated = false;
+
+    await expectLater(
+      runBuzzPushGatewayMigrationMutationIfCurrent<void>(
+        attemptIsCurrent: () => false,
+        mutate: () async {
+          mutated = true;
+        },
+      ),
+      throwsStateError,
+    );
+    expect(mutated, isFalse);
+  });
+
   test('queued origins sharing delegation authority migrate atomically', () {
     final first = Community.create(
       name: 'First',
