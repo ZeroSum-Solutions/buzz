@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 
 import '../theme/theme.dart';
+import 'avatar_image.dart';
 
 /// The navigation glyph displayed by [IosGlassNavigationButton].
 enum IosGlassNavigationIcon {
@@ -25,6 +26,29 @@ enum IosGlassNavigationIcon {
   sun,
   moon,
   systemAppearance,
+  avatar,
+}
+
+/// A native contextual-menu item attached to an iOS glass navigation button.
+class IosGlassNavigationMenuItem {
+  const IosGlassNavigationMenuItem({
+    required this.id,
+    required this.label,
+    this.selected = false,
+    this.destructive = false,
+  });
+
+  final String id;
+  final String label;
+  final bool selected;
+  final bool destructive;
+
+  Map<String, Object> toJson() => {
+    'id': id,
+    'label': label,
+    'selected': selected,
+    'destructive': destructive,
+  };
 }
 
 /// Leading width used by iOS channel-style headers.
@@ -57,6 +81,10 @@ class IosGlassNavigationButton extends HookWidget {
     this.isBusy = false,
     this.isSelected = false,
     this.nativeViewSuppressed,
+    this.avatarImageUrl,
+    this.avatarFallback,
+    this.menuItems = const [],
+    this.onMenuSelected,
   });
 
   static const viewType = 'buzz/navigation_glass';
@@ -103,16 +131,35 @@ class IosGlassNavigationButton extends HookWidget {
   /// When true, substitutes an accessible Flutter control for the native view.
   final ValueListenable<bool>? nativeViewSuppressed;
 
+  /// Optional avatar content used with [IosGlassNavigationIcon.avatar].
+  final String? avatarImageUrl;
+
+  /// Initial shown while an avatar image is unavailable.
+  final String? avatarFallback;
+
+  /// Native menu presented directly beneath the glass control.
+  final List<IosGlassNavigationMenuItem> menuItems;
+
+  /// Invoked when a native menu item is selected.
+  final ValueChanged<String>? onMenuSelected;
+
   @override
   Widget build(BuildContext context) {
     assert(defaultTargetPlatform == TargetPlatform.iOS);
     final nativeChannel = useState<MethodChannel?>(null);
     final onPressedRef = useRef(onPressed)..value = onPressed;
+    final onMenuSelectedRef = useRef(onMenuSelected)..value = onMenuSelected;
     final brightness = context.theme.brightness.name;
     final effectiveForeground = foregroundColor ?? context.colors.primary;
     final foregroundValue = effectiveForeground.toARGB32();
     final swatchColorValue = swatchColor?.toARGB32();
     final enabled = onPressed != null;
+    final menuSignature = menuItems
+        .map(
+          (item) =>
+              '${item.id}:${item.label}:${item.selected}:${item.destructive}',
+        )
+        .join('|');
 
     useEffect(() {
       final channel = nativeChannel.value;
@@ -120,6 +167,8 @@ class IosGlassNavigationButton extends HookWidget {
       channel.setMethodCallHandler((call) async {
         if (call.method == 'pressed') {
           onPressedRef.value?.call();
+        } else if (call.method == 'selected' && call.arguments is String) {
+          onMenuSelectedRef.value?.call(call.arguments as String);
         }
       });
       return () => channel.setMethodCallHandler(null);
@@ -153,18 +202,38 @@ class IosGlassNavigationButton extends HookWidget {
       ],
     );
 
-    useEffect(() {
-      final channel = nativeChannel.value;
-      if (channel != null) {
-        final content = <String, Object>{
-          'icon': icon.name,
-          'accessibilityLabel': semanticLabel,
-        };
-        if (label != null) content['label'] = label!;
-        unawaited(channel.invokeMethod<void>('setContent', content));
-      }
-      return null;
-    }, [nativeChannel.value, icon, label, semanticLabel]);
+    useEffect(
+      () {
+        final channel = nativeChannel.value;
+        if (channel != null) {
+          final content = <String, Object>{
+            'icon': icon.name,
+            'accessibilityLabel': semanticLabel,
+          };
+          if (label != null) content['label'] = label!;
+          if (avatarImageUrl != null) {
+            content['avatarImageUrl'] = avatarImageUrl!;
+          }
+          if (avatarFallback != null) {
+            content['avatarFallback'] = avatarFallback!;
+          }
+          content['menuItems'] = menuItems
+              .map((item) => item.toJson())
+              .toList();
+          unawaited(channel.invokeMethod<void>('setContent', content));
+        }
+        return null;
+      },
+      [
+        nativeChannel.value,
+        icon,
+        label,
+        semanticLabel,
+        avatarImageUrl,
+        avatarFallback,
+        menuSignature,
+      ],
+    );
 
     Widget buildControl({required bool suppressNativeView}) {
       if (suppressNativeView) {
@@ -215,6 +284,22 @@ class IosGlassNavigationButton extends HookWidget {
                               ),
                             ),
                           )
+                        : icon == IosGlassNavigationIcon.avatar
+                        ? Padding(
+                            padding: const EdgeInsets.all(6),
+                            child: AvatarImage(
+                              imageUrl: avatarImageUrl,
+                              radius: (controlSize - 12) / 2,
+                              backgroundColor: context.colors.primaryContainer,
+                              fallback: Text(
+                                avatarFallback ?? '?',
+                                style: context.textTheme.labelMedium?.copyWith(
+                                  color: context.colors.onPrimaryContainer,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                          )
                         : label != null
                         ? Text(
                             label!,
@@ -255,6 +340,7 @@ class IosGlassNavigationButton extends HookWidget {
                                 Icons.dark_mode_rounded,
                               IosGlassNavigationIcon.systemAppearance =>
                                 Icons.brightness_auto_rounded,
+                              IosGlassNavigationIcon.avatar => Icons.person,
                             },
                             size: icon == IosGlassNavigationIcon.shutter
                                 ? controlSize * 0.72
@@ -285,6 +371,9 @@ class IosGlassNavigationButton extends HookWidget {
         'hitTargetWidth': width,
         'hitTargetHeight': height,
         'swatchColor': ?swatchColorValue,
+        'avatarImageUrl': ?avatarImageUrl,
+        'avatarFallback': ?avatarFallback,
+        'menuItems': menuItems.map((item) => item.toJson()).toList(),
       };
       if (label != null) creationParams['label'] = label!;
       return UiKitView(

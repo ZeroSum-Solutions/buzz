@@ -12,22 +12,24 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
 import '../../shared/auth/auth.dart';
+import '../../shared/animated_avatar.dart';
 import '../../shared/community/community_icon_provider.dart';
 import '../../shared/relay/relay.dart';
 import '../../shared/theme/theme.dart';
 import '../../shared/widgets/avatar_image.dart';
+import '../../shared/widgets/adaptive_glass_avatar_button.dart';
 import '../../shared/widgets/anchored_popover_menu.dart';
 import '../../shared/widgets/bee_refresh_indicator.dart';
 import '../../shared/widgets/buzz_loading_indicator.dart';
 import '../../shared/widgets/buzz_titled_sheet_layout.dart';
 import '../../shared/widgets/frosted_app_bar.dart';
 import '../../shared/widgets/frosted_scaffold.dart';
+import '../../shared/widgets/ios_glass_navigation_button.dart';
 import '../../shared/widgets/modal_presentation.dart';
 import '../../shared/widgets/skeleton.dart';
 import '../../shared/custom_emoji/custom_emoji.dart';
 import '../../shared/custom_emoji/custom_emoji_provider.dart';
 import '../../shared/custom_emoji/custom_emoji_render.dart';
-import '../profile/profile_avatar.dart';
 import '../profile/profile_provider.dart';
 import '../profile/presence_cache_provider.dart';
 import '../../shared/profile/user_cache_provider.dart';
@@ -88,7 +90,6 @@ const double _kChannelLabelInset =
 const double _kDmAvatarSize = _kChannelIconSize;
 
 const double _kTopSectionCommunityAvatarSize = 40.0;
-const double _kTopSectionProfileAvatarSize = 36.0;
 const double _kTopSectionBottomPadding = Grid.xxs;
 
 /// The top section's avatars are 40dp circles, which fill their box edge to
@@ -334,31 +335,23 @@ class ChannelsPage extends HookConsumerWidget {
             ? _kHeaderFrostMaxBlurSigma * headerFrostProgress.value
             : 20,
         showBottomDivider: false,
-        leading: _CommunityIndicator(onTap: openCommunitySwitcher),
+        leading: _CommunityHeaderControl(
+          collapseProgress: headerFrostProgress.value,
+          onOpenSwitcher: openCommunitySwitcher,
+        ),
         centerTitle: false,
         titleStyle: headerTitleStyle,
-        title: _CommunityHeaderTitle(
-          style: headerTitleStyle,
-          onTap: openCommunitySwitcher,
-        ),
+        title: null,
         actions: [
-          SizedBox(
-            width: Grid.xl,
-            height: Grid.xl,
-            child: Center(
-              child: ProfileAvatar(
-                size: _kTopSectionProfileAvatarSize,
-                showPresence: false,
-                onTap: () {
-                  unawaited(HapticFeedback.lightImpact());
-                  final route = _SettingsPageRoute(
-                    builder: settingsPageBuilder,
-                    onTransitionProgress: onSettingsTransitionProgress,
-                  );
-                  Navigator.of(context).push(route);
-                },
-              ),
-            ),
+          _ProfileHeaderControl(
+            onTap: () {
+              unawaited(HapticFeedback.lightImpact());
+              final route = _SettingsPageRoute(
+                builder: settingsPageBuilder,
+                onTransitionProgress: onSettingsTransitionProgress,
+              );
+              Navigator.of(context).push(route);
+            },
           ),
         ],
         bottomHeight: _kTopSectionBottomPadding,

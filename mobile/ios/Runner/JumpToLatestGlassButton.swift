@@ -182,6 +182,9 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
   private var buttonImage: UIImage?
   private var isBusy = false
   private var controlSize: CGFloat = 40
+  private var avatarImageURL: String?
+  private var avatarFallback = "?"
+  private var avatarLoadTask: URLSessionDataTask?
 
   init(
     frame: CGRect,
@@ -395,6 +398,7 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
     let icon = arguments?["icon"] as? String
     contentIcon = icon ?? "back"
     buttonLabel = arguments?["label"] as? String
+    avatarFallback = arguments?["avatarFallback"] as? String ?? "?"
     if let accessibilityLabel = arguments?["accessibilityLabel"] as? String {
       button.accessibilityLabel = accessibilityLabel
     }
@@ -415,7 +419,29 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
     case "colorSwatch": buttonIconName = "circle.fill"
     default: buttonIconName = "chevron.backward"
     }
-    if buttonLabel != nil {
+    if contentIcon == "avatar" {
+      button.configuration?.contentInsets = NSDirectionalEdgeInsets(
+        top: 6,
+        leading: 6,
+        bottom: 6,
+        trailing: buttonLabel == nil ? 6 : 10
+      )
+      button.configuration?.imagePadding = buttonLabel == nil ? 0 : 8
+      button.configuration?.titleLineBreakMode = .byTruncatingTail
+      button.configuration?.titleTextAttributesTransformer =
+        UIConfigurationTextAttributesTransformer { incoming in
+          var outgoing = incoming
+          let preferred = UIFont.preferredFont(forTextStyle: .headline)
+          outgoing.font = UIFont.systemFont(
+            ofSize: preferred.pointSize,
+            weight: .semibold
+          )
+          return outgoing
+        }
+      updateAvatar(from: arguments?["avatarImageUrl"] as? String)
+    } else if buttonLabel != nil {
+      avatarLoadTask?.cancel()
+      avatarImageURL = nil
       buttonImage = nil
       button.configuration?.contentInsets = NSDirectionalEdgeInsets(
         top: 8,
@@ -435,6 +461,8 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
           return outgoing
         }
     } else {
+      avatarLoadTask?.cancel()
+      avatarImageURL = nil
       button.configuration?.titleTextAttributesTransformer = nil
       let iconInset: CGFloat = icon == "shutter"
         ? controlSize * Self.shutterInsetRatio
@@ -456,18 +484,12 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
         )
       )
     }
+    updateMenu(from: arguments?["menuItems"] as? [[String: Any]] ?? [])
     updateDisplayedContent()
     button.setNeedsUpdateConfiguration()
   }
 
   private func setContent(from value: Any?) {
-    let arguments = value as? [String: Any]
-    let nextIcon = arguments?["icon"] as? String ?? "back"
-    let nextLabel = arguments?["label"] as? String
-    guard nextIcon != contentIcon || nextLabel != buttonLabel else {
-      applyContent(from: value)
-      return
-    }
     let duration = UIAccessibility.isReduceMotionEnabled ? 0 : 0.12
     UIView.transition(
       with: button,
@@ -485,11 +507,99 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
       activityIndicator.startAnimating()
     } else {
       let displaysSwatch = contentIcon == "colorSwatch"
+      let displaysAvatar = contentIcon == "avatar"
       button.configuration?.title = displaysSwatch ? nil : buttonLabel
-      button.configuration?.image = displaysSwatch || buttonLabel != nil ? nil : buttonImage
+      button.configuration?.image = displaysSwatch || (buttonLabel != nil && !displaysAvatar)
+        ? nil
+        : buttonImage
       swatchView.isHidden = !displaysSwatch
       activityIndicator.stopAnimating()
     }
+  }
+
+  private func updateAvatar(from imageURL: String?) {
+    avatarLoadTask?.cancel()
+    avatarLoadTask = nil
+    avatarImageURL = imageURL
+    buttonImage = Self.avatarFallbackImage(text: avatarFallback)
+
+    guard let imageURL, !imageURL.isEmpty else { return }
+    if let comma = imageURL.firstIndex(of: ","), imageURL.hasPrefix("data:image") {
+      let encoded = String(imageURL[imageURL.index(after: comma)...])
+      if let data = Data(base64Encoded: encoded), let image = UIImage(data: data) {
+        buttonImage = Self.circularAvatarImage(image)
+      }
+      return
+    }
+    guard let url = URL(string: imageURL) else { return }
+    let expectedURL = imageURL
+    avatarLoadTask = URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+      guard let data, let image = UIImage(data: data) else { return }
+      DispatchQueue.main.async {
+        guard self?.avatarImageURL == expectedURL else { return }
+        self?.buttonImage = Self.circularAvatarImage(image)
+        self?.updateDisplayedContent()
+        self?.button.setNeedsUpdateConfiguration()
+      }
+    }
+    avatarLoadTask?.resume()
+  }
+
+  private func updateMenu(from items: [[String: Any]]) {
+    guard !items.isEmpty else {
+      button.menu = nil
+      button.showsMenuAsPrimaryAction = false
+      return
+    }
+    button.showsMenuAsPrimaryAction = true
+    button.menu = UIMenu(children: items.compactMap { item in
+      guard
+        let id = item["id"] as? String,
+        let label = item["label"] as? String
+      else { return nil }
+      var attributes = UIMenuElement.Attributes()
+      if item["destructive"] as? Bool == true { attributes.insert(.destructive) }
+      return UIAction(
+        title: label,
+        attributes: attributes,
+        state: item["selected"] as? Bool == true ? .on : .off
+      ) { [weak self] _ in
+        self?.channel.invokeMethod("selected", arguments: id)
+      }
+    })
+  }
+
+  private static func circularAvatarImage(_ image: UIImage) -> UIImage {
+    let size = CGSize(width: 36, height: 36)
+    return UIGraphicsImageRenderer(size: size).image { _ in
+      UIBezierPath(ovalIn: CGRect(origin: .zero, size: size)).addClip()
+      let scale = max(size.width / image.size.width, size.height / image.size.height)
+      let drawSize = CGSize(width: image.size.width * scale, height: image.size.height * scale)
+      image.draw(in: CGRect(
+        x: (size.width - drawSize.width) / 2,
+        y: (size.height - drawSize.height) / 2,
+        width: drawSize.width,
+        height: drawSize.height
+      ))
+    }.withRenderingMode(.alwaysOriginal)
+  }
+
+  private static func avatarFallbackImage(text: String) -> UIImage {
+    let size = CGSize(width: 36, height: 36)
+    return UIGraphicsImageRenderer(size: size).image { context in
+      UIColor.tertiarySystemFill.setFill()
+      context.cgContext.fillEllipse(in: CGRect(origin: .zero, size: size))
+      let value = String(text.prefix(1)).uppercased() as NSString
+      let attributes: [NSAttributedString.Key: Any] = [
+        .font: UIFont.systemFont(ofSize: 15, weight: .semibold),
+        .foregroundColor: UIColor.label,
+      ]
+      let textSize = value.size(withAttributes: attributes)
+      value.draw(
+        at: CGPoint(x: (size.width - textSize.width) / 2, y: (size.height - textSize.height) / 2),
+        withAttributes: attributes
+      )
+    }.withRenderingMode(.alwaysOriginal)
   }
 
   private static func color(from value: UInt32) -> UIColor {
@@ -501,6 +611,7 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
   }
 
   deinit {
+    avatarLoadTask?.cancel()
     channel.setMethodCallHandler(nil)
   }
 }
