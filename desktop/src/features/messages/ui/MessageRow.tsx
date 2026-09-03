@@ -14,6 +14,7 @@ import type { TimelineMessage } from "@/features/messages/types";
 import { useKnownAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
 import { HuddleAttachment } from "@/features/huddle/components/HuddleAttachment";
 import { MessageReactions } from "@/features/messages/ui/MessageReactions";
+import { MessageAuthorWithIndicators } from "@/features/messages/ui/MessageAuthorWithIndicators";
 import { useReactionHandler } from "@/features/messages/ui/useReactionHandler";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
@@ -50,7 +51,6 @@ import { toast } from "sonner";
 import { MessageAgentOwner } from "./MessageAgentOwner";
 import {
   MessageAuthorText,
-  MessageAuthorIdentity,
   MessageHeaderRow,
   MessageMetaSegments,
 } from "./MessageHeader";
@@ -647,14 +647,18 @@ export const MessageRow = React.memo(
 
     const headerNode = isDisplayedAsContinuation ? null : (
       <MessageHeaderRow>
-        <MessageAuthorIdentity
-          pubkey={message.pubkey}
-          ownerPubkey={message.ownerPubkey}
-          role={profilePopoverRole}
-          displayName={message.author}
-        >
-          {authorNode}
-        </MessageAuthorIdentity>
+        {message.pubkey ? (
+          <MessageAuthorWithIndicators
+            authorName={message.author}
+            ownerPubkey={message.ownerPubkey}
+            pubkey={message.pubkey}
+            role={profilePopoverRole}
+          >
+            {authorNode}
+          </MessageAuthorWithIndicators>
+        ) : (
+          authorNode
+        )}
         {/* Author is not a segment: "Alice 9:53 AM" needs no divider. */}
         <MessageMetaSegments
           segments={[
