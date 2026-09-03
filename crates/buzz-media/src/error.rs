@@ -171,19 +171,27 @@ impl IntoResponse for MediaError {
             Self::FileTooLarge { .. } | Self::ImageTooLarge => {
                 (StatusCode::PAYLOAD_TOO_LARGE, self.to_string())
             }
-            // NIP-FI rejection table (§Public denial classes and transport codes):
+            // NIP-FI denial-class split (NIP-FI §Transport and cardinality):
             //   missing_evidence  (401) — Authorization header absent
-            //   evidence_rejected (403) — structurally present but invalid, malformed,
-            //                            expired, or otherwise unacceptable proof
+            //   evidence_rejected (403) — wrong scheme, malformed, duplicate, or
+            //                            otherwise structurally invalid proof
             //
-            // The spec explicitly maps expired tokens, missing tags, signature failures,
-            // hash/server mismatches, etc. to `evidence_rejected` → 403.  401 is reserved
-            // solely for the absent-header case.
+            // This is the legacy/Permissive path: Off-mode deployments preserve the
+            // pre-NIP-FI behavior (JSON 401 for all auth failures) [FI-INV-15].
+            // Strict mode (via MediaDenial in buzz-relay) overrides this and
+            // applies the full NIP-FI rejection table (401/403 per spec class).
+            //
+            // Structural proof failures (wrong scheme, malformed header, duplicate
+            // tag, wrong kind, empty content) return 403 here because they are
+            // observable from pre-NIP-FI Blossom clients as format errors —
+            // they are NOT secret oracle information.  All other auth failures
+            // (signature, expiry, missing tag, hash/server mismatch) return 401
+            // to prevent oracle enumeration in Off/Permissive mode.
             Self::MissingAuth => {
                 tracing::warn!(error = %self, "authentication failed: missing evidence");
                 (
                     StatusCode::UNAUTHORIZED,
-                    "authentication required".to_string(),
+                    "authentication failed".to_string(),
                 )
             }
             Self::InvalidAuthScheme
@@ -191,8 +199,11 @@ impl IntoResponse for MediaError {
             | Self::InvalidAuthEvent
             | Self::InvalidAuthKind
             | Self::InvalidAuthVerb
-            | Self::DuplicateTag(_)
-            | Self::InvalidSignature
+            | Self::DuplicateTag(_) => {
+                tracing::warn!(error = %self, "authentication failed: evidence rejected");
+                (StatusCode::FORBIDDEN, "authorization denied".to_string())
+            }
+            Self::InvalidSignature
             | Self::TokenExpired
             | Self::TimestampOutOfWindow
             | Self::Unauthorized
@@ -201,8 +212,11 @@ impl IntoResponse for MediaError {
             | Self::HashMismatch
             | Self::ServerMismatch
             | Self::MissingTag(_) => {
-                tracing::warn!(error = %self, "authentication failed: evidence rejected");
-                (StatusCode::FORBIDDEN, "evidence rejected".to_string())
+                tracing::warn!(error = %self, "authentication failed");
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "authentication failed".to_string(),
+                )
             }
             Self::InsufficientScope => (StatusCode::FORBIDDEN, self.to_string()),
             Self::RelayMembershipRequired | Self::CommunityWriteFenced => {
@@ -289,8 +303,8 @@ mod tests {
     }
 
     // ── IntoResponse status code pins ──────────────────────────────────────
-    // These pins ensure MediaError::into_response() maps each error class to
-    // the correct HTTP status per the NIP-FI rejection table.
+    // These pins cover the legacy/Permissive path (MediaError::into_response).
+    // Strict mode overrides this via MediaDenial in buzz-relay [FI-INV-15].
 
     #[test]
     fn missing_auth_permissive_shape_is_json_401() {
@@ -314,18 +328,17 @@ mod tests {
     }
 
     #[test]
-    fn evidence_rejected_errors_return_json_403() {
-        // NIP-FI §Public denial classes: `evidence_rejected` maps to HTTP 403.
-        // This covers all structurally present but invalid/malformed/expired proofs.
+    fn structural_format_errors_return_json_403() {
+        // Wrong scheme, malformed header, duplicate tag, wrong kind, empty content:
+        // these are observable format errors even in Permissive mode — not secret
+        // oracle information — so they return 403 in both paths.
         for error in [
-            MediaError::InvalidSignature,
-            MediaError::TokenExpired,
-            MediaError::HashMismatch,
-            MediaError::ServerMismatch,
-            MediaError::MissingTag("server"),
             MediaError::InvalidAuthKind,
             MediaError::InvalidAuthVerb,
             MediaError::InvalidAuthEvent,
+            MediaError::InvalidAuthScheme,
+            MediaError::InvalidBase64,
+            MediaError::DuplicateTag("Authorization"),
         ] {
             let label = format!("{error:?}");
             let resp = error.into_response();
@@ -333,6 +346,37 @@ mod tests {
                 resp.status(),
                 StatusCode::FORBIDDEN,
                 "expected 403 for {label}"
+            );
+            let ct = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            assert!(
+                ct.contains("application/json"),
+                "expected JSON CT for {label}, got: {ct}"
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_rejected_errors_return_json_401_in_permissive_mode() {
+        // Signature, expiry, missing tag, hash/server mismatch: these return 401
+        // in the Permissive path to prevent oracle enumeration [FI-INV-15].
+        // Strict mode (MediaDenial) overrides these to 403 per the NIP-FI table.
+        for error in [
+            MediaError::InvalidSignature,
+            MediaError::TokenExpired,
+            MediaError::HashMismatch,
+            MediaError::ServerMismatch,
+            MediaError::MissingTag("server"),
+        ] {
+            let label = format!("{error:?}");
+            let resp = error.into_response();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "Permissive: expected 401 for {label}"
             );
             let ct = resp
                 .headers()
