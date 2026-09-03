@@ -160,8 +160,34 @@ void main() {
           'wss://inactive.example',
           'wss://disabled.example',
         },
+        targetGatewayOrigin: 'https://push.example',
       ).map((community) => community.name),
       ['Active', 'Inactive'],
+    );
+  });
+
+  test('gateway migration skips a durably checkpointed replacement', () {
+    final community =
+        Community.create(
+          name: 'Migrated',
+          relayUrl: 'wss://relay.example',
+        ).copyWith(
+          pushNotificationsEnabled: true,
+          pushSubscriptionState: BuzzPushLeaseSubscriptionState.accepted(
+            desired: const [],
+            acceptedSubscriptions: const [],
+            acceptedGeneration: 2,
+            acceptedGatewayOrigin: 'https://push.example',
+          ),
+        );
+
+    expect(
+      buzzPushCommunitiesRequiringGatewayMigration(
+        communities: [community],
+        retiredRelayOrigins: const {'wss://relay.example'},
+        targetGatewayOrigin: 'https://push.example',
+      ),
+      isEmpty,
     );
   });
 

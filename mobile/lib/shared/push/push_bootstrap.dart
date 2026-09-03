@@ -106,19 +106,28 @@ bool buzzPushLifecycleEnabled({
 List<Community> buzzPushCommunitiesRequiringGatewayMigration({
   required List<Community> communities,
   required Set<String> retiredRelayOrigins,
+  required String targetGatewayOrigin,
 }) => communities
     .where(
       (community) =>
           community.pushNotificationsEnabled &&
           retiredRelayOrigins.contains(
             buzzPushRelayWebSocketOrigin(community.relayUrl),
-          ),
+          ) &&
+          community.pushSubscriptionState.acceptedGatewayOrigin !=
+              targetGatewayOrigin,
     )
     .toList();
 
 @visibleForTesting
 String buzzPushRelayWebSocketOrigin(String relayUrl) {
   final uri = Uri.parse(RelayConfig(baseUrl: relayUrl).wsUrl);
+  return uri.replace(path: '', query: null, fragment: null).toString();
+}
+
+@visibleForTesting
+String buzzPushGatewayOrigin(String gatewayUrl) {
+  final uri = Uri.parse(gatewayUrl);
   return uri.replace(path: '', query: null, fragment: null).toString();
 }
 
@@ -155,6 +164,7 @@ class BuzzPushBootstrap extends HookConsumerWidget {
     final gatewayInitializationFailures = useRef(0);
     final publicationRetry = useState(0);
     final gatewayMigrationRetry = useState(0);
+    final gatewayMigrationFailures = useRef(0);
     final tombstoneRetry = useState(0);
     final revocationOutbox = ref.watch(buzzPushLeaseRevocationOutboxProvider);
     final session = ref.watch(relaySessionProvider);
@@ -344,23 +354,47 @@ class BuzzPushBootstrap extends HookConsumerWidget {
         if (!gatewayMigrationAttempt.tryBegin(attempt)) return null;
         unawaited(() async {
           try {
+            final targetGatewayOrigin = buzzPushGatewayOrigin(
+              Env.pushGatewayUrl,
+            );
             for (final candidate
                 in buzzPushCommunitiesRequiringGatewayMigration(
                   communities: communities,
                   retiredRelayOrigins: retiredRelayOrigins,
+                  targetGatewayOrigin: targetGatewayOrigin,
                 )) {
-              await _publishCommunityReplacement(ref, candidate, communities);
+              await _publishCommunityReplacement(
+                ref,
+                candidate,
+                communities,
+                targetGatewayOrigin,
+              );
             }
             await completeBuzzPushGatewayMigration();
+            gatewayMigrationFailures.value = 0;
             gatewayMigrationAttempt.complete(attempt);
           } catch (error, stack) {
-            gatewayMigrationAttempt.failed(
-              attempt,
-              retry: () {
-                if (context.mounted) gatewayMigrationRetry.value += 1;
-              },
+            gatewayMigrationFailures.value += 1;
+            final retryDelay = buzzPushGatewayInitializationRetryDelay(
+              gatewayMigrationFailures.value,
             );
+            if (retryDelay == null) {
+              gatewayMigrationAttempt.complete(attempt);
+            } else {
+              gatewayMigrationAttempt.retryAfter(
+                attempt,
+                delay: retryDelay,
+                retry: () {
+                  if (context.mounted) gatewayMigrationRetry.value += 1;
+                },
+              );
+            }
             debugPrint('Push gateway migration failed: $error');
+            if (retryDelay == null) {
+              debugPrint(
+                'Push gateway migration remains durably queued for the next app launch.',
+              );
+            }
             debugPrintStack(stackTrace: stack);
           }
         }());
@@ -505,6 +539,7 @@ class BuzzPushBootstrap extends HookConsumerWidget {
         community.id,
         subscriptions: desired,
         generation: leaseGeneration,
+        gatewayOrigin: buzzPushGatewayOrigin(Env.pushGatewayUrl),
       ),
     );
     return grant;
@@ -514,6 +549,7 @@ class BuzzPushBootstrap extends HookConsumerWidget {
     WidgetRef ref,
     Community community,
     List<Community> communities,
+    String targetGatewayOrigin,
   ) async {
     final config = RelayConfig(
       baseUrl: community.relayUrl,
@@ -558,6 +594,7 @@ class BuzzPushBootstrap extends HookConsumerWidget {
         community.id,
         subscriptions: community.pushSubscriptionState.desired,
         generation: generation,
+        gatewayOrigin: targetGatewayOrigin,
       ),
     );
     return grant;

@@ -93,10 +93,12 @@ public struct BuzzPushGatewayCleanupState: Codable, Equatable, Sendable {
 /// Persistence boundary for endpoint grants. The Runner implementation stores
 /// records in its Keychain access group and exposes them over the Flutter bridge.
 public protocol BuzzPushEndpointGrantStore {
-  /// Discards legacy records and moves records from other gateways into the cleanup journal.
+  /// Moves records from other gateways into the cleanup journal.
   func reset(forGatewayOrigin gatewayOrigin: String) throws
   func records() throws -> [BuzzPushEndpointGrantRecord]
   func save(_ record: BuzzPushEndpointGrantRecord) throws
+  /// Atomically removes one relay-origin grant without touching sibling origins.
+  func removeRecord(gatewayOrigin: String, relayOrigin: String, appProfile: String) throws
   /// Atomically removes every active grant backed by one installation.
   func removeRecords(gatewayOrigin: String, installationHandle: String) throws
   /// Atomically removes every active grant backed by one delegation.
@@ -505,47 +507,67 @@ public final class BuzzDevPushEnrollmentDriver {
         pending.endpointHash == endpointHash,
         let referencedInstallation
       {
-        let candidateGenerations = [
-          pending.delegationGeneration,
-          referencedInstallation.generation,
-        ].filter { $0 > 0 }.reduce(into: [Int64]()) { generations, generation in
-          if !generations.contains(generation) { generations.append(generation) }
-        }
-        var revoked = false
-        for generation in candidateGenerations {
-          do {
-            try await revokeDelegation(
-              installationHandle: handle,
-              relayPubkey: pending.relayPubkey,
-              generation: generation,
-              appAttestKeyId: keyId
-            )
-            revoked = true
-            break
-          } catch BuzzDevPushEnrollmentError.unexpectedStatus(
-            route: "v1/delegations/revoke", _, actual: 404, _
-          ) {
-            // The reserved generation may not have committed. Try the last
-            // generation known to have produced a durable grant as well.
-          }
-        }
-        guard revoked else {
-          throw BuzzDevPushEnrollmentError.retiredGatewayCleanupIncomplete
-        }
-        try store.savePendingEnrollment(pending.withDelegationRevoked())
-        try store.removeRecords(
-          gatewayOrigin: gatewayOrigin,
-          installationHandle: handleText,
-          relayPubkey: pending.relayPubkey
-        )
-      } else {
-        var cleanupState = try store.gatewayCleanupStates().first {
+        let siblingDelegationRecords = storedRecords.filter {
           $0.gatewayOrigin == gatewayOrigin
-        } ?? BuzzPushGatewayCleanupState(
-          gatewayOrigin: gatewayOrigin,
-          grants: [],
-          pendingEnrollments: []
-        )
+            && $0.gatewayInstallationHandle == handleText
+            && $0.relayPubkey == pending.relayPubkey
+            && $0.appProfile == pending.appProfile
+            && $0.relayOrigin != pending.relayOrigin
+        }
+        if !siblingDelegationRecords.isEmpty {
+          // Delegation authority is shared by relay key, installation, and app
+          // profile. Keep it alive while another relay origin still uses it;
+          // only the rotating origin's obsolete grant is removed.
+          try store.removeRecord(
+            gatewayOrigin: gatewayOrigin,
+            relayOrigin: pending.relayOrigin,
+            appProfile: pending.appProfile
+          )
+        } else {
+          let candidateGenerations = [
+            pending.delegationGeneration,
+            referencedInstallation.generation,
+          ].filter { $0 > 0 }.reduce(into: [Int64]()) { generations, generation in
+            if !generations.contains(generation) { generations.append(generation) }
+          }
+          var revoked = false
+          for generation in candidateGenerations {
+            do {
+              try await revokeDelegation(
+                installationHandle: handle,
+                relayPubkey: pending.relayPubkey,
+                generation: generation,
+                appAttestKeyId: keyId
+              )
+              revoked = true
+              break
+            } catch BuzzDevPushEnrollmentError.unexpectedStatus(
+              route: "v1/delegations/revoke", _, actual: 404, _
+            ) {
+              // The reserved generation may not have committed. Try the last
+              // generation known to have produced a durable grant as well.
+            }
+          }
+          guard revoked else {
+            throw BuzzDevPushEnrollmentError.retiredGatewayCleanupIncomplete
+          }
+          try store.savePendingEnrollment(pending.withDelegationRevoked())
+          try store.removeRecords(
+            gatewayOrigin: gatewayOrigin,
+            installationHandle: handleText,
+            relayPubkey: pending.relayPubkey
+          )
+        }
+      } else {
+        var cleanupState =
+          try store.gatewayCleanupStates().first {
+            $0.gatewayOrigin == gatewayOrigin
+          }
+          ?? BuzzPushGatewayCleanupState(
+            gatewayOrigin: gatewayOrigin,
+            grants: [],
+            pendingEnrollments: []
+          )
         cleanupState.pendingEnrollments.removeAll {
           $0.relayOrigin == pending.relayOrigin && $0.appProfile == pending.appProfile
         }
@@ -952,11 +974,13 @@ public final class BuzzDevPushEnrollmentDriver {
     for grant in state.grants {
       if grant.expiresAt <= nowSeconds { continue }
       guard let handle = grant.gatewayInstallationHandle else { return false }
-      guard mergeHandle(
-        handle,
-        endpointEpoch: grant.endpointEpoch,
-        keyId: grant.appAttestKeyId
-      ) else { return false }
+      guard
+        mergeHandle(
+          handle,
+          endpointEpoch: grant.endpointEpoch,
+          keyId: grant.appAttestKeyId
+        )
+      else { return false }
     }
     for index in state.pendingEnrollments.indices {
       var pending = state.pendingEnrollments[index]

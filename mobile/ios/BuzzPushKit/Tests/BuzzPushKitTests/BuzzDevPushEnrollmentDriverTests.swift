@@ -711,23 +711,8 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
       generation: 7,
       expiresAt: Self.expiresAt
     )
-    let siblingOrigin = BuzzPushEndpointGrantRecord(
-      gatewayOrigin: Self.gatewayOrigin,
-      relayOrigin: "wss://sibling-relay.example",
-      relayPubkey: Self.relayPubkey,
-      relayMetadataPubkey: Self.relayPubkey,
-      gatewayInstallationHandle: Self.installationHandle,
-      appAttestKeyId: Self.keyId,
-      installationId: "303132333435363738393a3b3c3d3e3f",
-      endpointGrant: "sibling-origin-grant",
-      endpointHash: endpointHash,
-      appProfile: "buzz-ios-dogfood",
-      endpointEpoch: 1,
-      generation: 1,
-      expiresAt: Self.expiresAt
-    )
     let store = MemoryGrantStore(
-      records: [unrelatedHigherGeneration, siblingOrigin, existing],
+      records: [unrelatedHigherGeneration, existing],
       pending: [pending],
       pendingRemoveFailuresRemaining: 1
     )
@@ -807,6 +792,103 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     XCTAssertEqual(store.pending.count, 1)
     XCTAssertEqual(store.pending.first?.relayPubkey, newRelayPubkey)
     XCTAssertEqual(store.pending.first?.gatewayInstallationHandle, Self.installationHandle)
+  }
+
+  func testRelayRotationPreservesDelegationUsedBySiblingOrigin() async throws {
+    let newRelayPubkey = String(repeating: "b", count: 64)
+    let endpointHash = Self.hex(SHA256.hash(data: Data((1...32).map(UInt8.init))))
+    let existing = BuzzPushEndpointGrantRecord(
+      gatewayOrigin: Self.gatewayOrigin,
+      relayOrigin: "wss://relay.example",
+      relayPubkey: Self.relayPubkey,
+      gatewayInstallationHandle: Self.installationHandle,
+      appAttestKeyId: Self.keyId,
+      installationId: Self.installationId,
+      endpointGrant: "existing-grant",
+      endpointHash: endpointHash,
+      appProfile: "buzz-ios-dogfood",
+      endpointEpoch: 1,
+      generation: 1,
+      expiresAt: Self.expiresAt
+    )
+    let sibling = BuzzPushEndpointGrantRecord(
+      gatewayOrigin: Self.gatewayOrigin,
+      relayOrigin: "wss://sibling.example",
+      relayPubkey: Self.relayPubkey,
+      gatewayInstallationHandle: Self.installationHandle,
+      appAttestKeyId: Self.keyId,
+      installationId: "303132333435363738393a3b3c3d3e3f",
+      endpointGrant: "sibling-grant",
+      endpointHash: endpointHash,
+      appProfile: "buzz-ios-dogfood",
+      endpointEpoch: 1,
+      generation: 1,
+      expiresAt: Self.expiresAt
+    )
+    let pending = BuzzPushPendingEnrollmentRecord(
+      gatewayOrigin: Self.gatewayOrigin,
+      relayOrigin: "wss://relay.example",
+      relayPubkey: Self.relayPubkey,
+      endpoint: Self.endpoint,
+      endpointHash: endpointHash,
+      appProfile: "buzz-ios-dogfood",
+      expiresAt: Self.expiresAt,
+      installationId: Self.installationId,
+      gatewayInstallationHandle: Self.installationHandle,
+      keyId: Self.keyId,
+      delegationGeneration: 2
+    )
+    let store = MemoryGrantStore(records: [sibling, existing], pending: [pending])
+    let driver = try makeDriver(store: store, appAttest: RecordingAppAttest())
+    URLProtocolStub.handler = { request in
+      switch (request.httpMethod, request.url?.absoluteString) {
+      case ("GET", "https://relay.example/"):
+        return Self.response(
+          request,
+          status: 200,
+          json: [
+            "self": newRelayPubkey,
+            "push": ["keys": [["pubkey": newRelayPubkey, "current": true]]],
+          ]
+        )
+      case ("POST", "http://push.example/v1/installations/challenges"):
+        return Self.response(
+          request,
+          status: 200,
+          json: [
+            "challenge_id": Self.firstChallengeId,
+            "challenge": Self.challenge,
+            "expires_at": Self.now + 300,
+          ]
+        )
+      case ("POST", "http://push.example/v1/delegations"):
+        let body = try Self.body(request)
+        XCTAssertEqual(body["relay_pubkey"] as? String, newRelayPubkey)
+        return Self.response(
+          request,
+          status: 201,
+          json: ["endpoint_grant": "replacement-grant"]
+        )
+      case ("POST", "http://push.example/v1/delegations/revoke"):
+        XCTFail("A delegation still used by a sibling origin must not be revoked")
+        return Self.response(request, status: 500, json: [:])
+      default:
+        XCTFail("Unexpected request \(request.url?.absoluteString ?? "nil")")
+        return Self.response(request, status: 500, json: [:])
+      }
+    }
+
+    let replacement = try await driver.enroll(
+      deviceToken: Data((1...32).map(UInt8.init)),
+      relayURL: Self.relayURL
+    )
+
+    XCTAssertEqual(replacement.relayPubkey, newRelayPubkey)
+    XCTAssertTrue(store.saved.contains(sibling))
+    XCTAssertEqual(
+      store.saved.filter { $0.relayOrigin == "wss://relay.example" }.map(\.relayPubkey),
+      [newRelayPubkey]
+    )
   }
 
   func testCleanupRevokesAndDeletesStaleGatewaysWithoutRelayEnrollment() async throws {
@@ -2210,6 +2292,12 @@ private final class MemoryGrantStore: BuzzPushEndpointGrantStore {
         && $0.appProfile == record.appProfile
     }
     saved.append(record)
+  }
+  func removeRecord(gatewayOrigin: String, relayOrigin: String, appProfile: String) throws {
+    saved.removeAll {
+      $0.gatewayOrigin == gatewayOrigin && $0.relayOrigin == relayOrigin
+        && $0.appProfile == appProfile
+    }
   }
   func removeRecords(gatewayOrigin: String, installationHandle: String) throws {
     saved.removeAll {
