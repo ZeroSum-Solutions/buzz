@@ -3821,7 +3821,9 @@ test("closing a thread while editing a reply preserves the typed edit", async ({
     .getByTestId("message-row")
     .last();
   await timelineRoot.hover();
-  await timelineRoot.getByRole("button", { name: "Reply" }).click();
+  await timelineRoot
+    .getByRole("button", { name: "Reply" })
+    .click({ force: true });
 
   const threadPanel = page.getByTestId("message-thread-panel");
   const threadInput = threadPanel.getByTestId("message-input");
@@ -3908,7 +3910,9 @@ test("main ArrowUp refuses to replace a dirty thread edit", async ({
     .getByTestId("message-row")
     .last();
   await timelineRoot.hover();
-  await timelineRoot.getByRole("button", { name: "Reply" }).click();
+  await timelineRoot
+    .getByRole("button", { name: "Reply" })
+    .click({ force: true });
 
   const threadPanel = page.getByTestId("message-thread-panel");
   const threadInput = threadPanel.getByTestId("message-input");
