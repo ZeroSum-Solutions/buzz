@@ -1035,11 +1035,10 @@ test("drops an expanded DM after the first message fails", async ({ page }) => {
   await expect(
     page.getByTestId("new-message-page").getByText(sendError, { exact: true }),
   ).toBeVisible();
-  await expect(
-    page
-      .locator("[data-sonner-toast]")
-      .filter({ hasText: `Message failed to send: ${sendError}` }),
-  ).toBeVisible();
+  const sendErrorToast = page
+    .locator("[data-sonner-toast]")
+    .filter({ hasText: `Message failed to send: ${sendError}` });
+  await expect(sendErrorToast).toBeVisible();
   await expect(input).toContainText("Fizz");
 
   const commandsAfterFailure = await readCommandPayloadLog(page);
@@ -1061,6 +1060,11 @@ test("drops an expanded DM after the first message fails", async ({ page }) => {
     "open_dm",
   );
 
+  // fill() does not move the pointer off Send, where the error toast appears.
+  // Sonner pauses dismissal on hover; move back to the editor and observe the
+  // toast's normal expiry before retrying the covered button.
+  await input.hover();
+  await expect(sendErrorToast).toHaveCount(0, { timeout: 10_000 });
   await input.fill(retryMessage);
   const retryBaseline = commandsAfterFailure.length;
   await page.getByTestId("send-message").click();

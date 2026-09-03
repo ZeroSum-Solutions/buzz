@@ -2,6 +2,7 @@ import * as React from "react";
 import { ChevronDown, ChevronUp, Pencil } from "lucide-react";
 
 import { useAgentWorking } from "@/features/agents/agentWorkingSignal";
+import { agentPresenceStartBlockReason } from "@/features/agents/lib/useAgentAvailability";
 import {
   getManagedAgentPrimaryActionLabel,
   isManagedAgentActive,
@@ -189,13 +190,6 @@ export function ProfileSummaryView({
   userStatus,
 }: ProfileSummaryViewProps) {
   const activeTurns = useAgentWorking(isBot ? pubkey : null).channels;
-  const avatarStatus = isBot
-    ? managedAgent
-      ? isManagedAgentActive(managedAgent)
-        ? "online"
-        : "offline"
-      : (presenceStatus ?? "offline")
-    : presenceStatus;
   const stickyLayoutRef = React.useRef<HTMLDivElement>(null);
   const [primaryActionsConcealed, setPrimaryActionsConcealed] =
     React.useState(false);
@@ -406,7 +400,7 @@ export function ProfileSummaryView({
           displayName={displayName}
           isBot={isBot}
           onEditAgent={canEditAgent ? handleEditAgent : undefined}
-          presenceStatus={avatarStatus}
+          presenceStatus={presenceStatus}
           profile={profile}
           userStatus={userStatus}
         />
@@ -427,6 +421,14 @@ export function ProfileSummaryView({
           concealed={primaryActionsConcealed}
           followMutation={followMutation}
           agentActionDisabled={isAgentActionPending}
+          agentStartBlockReason={
+            managedAgent
+              ? agentPresenceStartBlockReason(
+                  isManagedAgentActive(managedAgent),
+                  presenceStatus,
+                )
+              : undefined
+          }
           agentActionLabel={
             isOwner === true && managedAgent
               ? getManagedAgentPrimaryActionLabel(managedAgent)

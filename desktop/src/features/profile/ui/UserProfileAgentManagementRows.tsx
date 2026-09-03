@@ -264,7 +264,9 @@ function AgentDeleteConfirmDialog({
         <AlertDialogHeader>
           <AlertDialogTitle>Delete this agent?</AlertDialogTitle>
           <AlertDialogDescription>
-            Deleting this agent stops and removes the agent from this community.
+            {isProviderAgent
+              ? "Deleting removes this agent’s local management record, not its remote deployment."
+              : "Deleting this agent stops and removes the agent from this community."}
           </AlertDialogDescription>
         </AlertDialogHeader>
         <ul className="list-disc space-y-1.5 pl-5 text-sm text-muted-foreground">
@@ -276,7 +278,7 @@ function AgentDeleteConfirmDialog({
           </li>
           <li>
             {isProviderAgent
-              ? "Requests remote deletion; if it is online, Buzz first sends a shutdown command when possible. If the deployment cannot be reached through a channel, the remote process may keep running without local management."
+              ? "Unless the agent is known to be Offline, Buzz first requests shutdown through a channel when available. A failed request cancels deletion. The remote process may still be running even after a successful request."
               : "Stops any local agent process before deleting the record"}
           </li>
         </ul>

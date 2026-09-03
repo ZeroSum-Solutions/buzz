@@ -38,7 +38,7 @@ import {
 } from "@/features/agents/ui/personaDialogState";
 import { useChannelsQuery } from "@/features/channels/hooks";
 import { useIdentityArchive } from "@/features/identity-archive/hooks";
-import { usePresenceQuery } from "@/features/presence/hooks";
+import { useAgentAvailabilityLookup } from "@/features/agents/lib/useAgentAvailability";
 import {
   useContactListQuery,
   useFollowMutation,
@@ -251,9 +251,10 @@ export function UserProfilePanel({
     effectivePubkey ? [effectivePubkey] : [],
   );
   const channelsQuery = useChannelsQuery();
-  const presenceQuery = usePresenceQuery(
+  const { query: presenceQuery, getAvailability } = useAgentAvailabilityLookup(
     effectivePubkey ? [effectivePubkey] : [],
   );
+  const presenceStatus = getAvailability(effectivePubkey);
   const userStatusQuery = useUserStatusQuery(
     effectivePubkey ? [effectivePubkey] : [],
   );
@@ -269,9 +270,6 @@ export function UserProfilePanel({
   });
   const ownerPubkey = profile?.ownerPubkey ?? null;
   const ownerProfileQuery = useUserProfileQuery(ownerPubkey ?? undefined);
-  const presenceStatus = pubkeyLower
-    ? presenceQuery.data?.[pubkeyLower]
-    : undefined;
   const userStatus = pubkeyLower
     ? userStatusQuery.data?.[pubkeyLower]
     : undefined;
@@ -415,7 +413,7 @@ export function UserProfilePanel({
       deleteManagedAgent: deleteAgentMutation.mutateAsync,
       managedAgent,
       managedAgents: managedAgentsQuery.data,
-      presenceLookup: presenceQuery.data,
+      getAvailability,
       relayAgents: relayAgentsQuery.data,
     });
 
@@ -453,6 +451,7 @@ export function UserProfilePanel({
 
   const { handleAgentPrimaryAction, handleAgentRestart } =
     useAgentLifecycleActions({
+      availability: presenceStatus,
       channels: channelsQuery.data,
       managedAgent,
       relayAgents: relayAgentsQuery.data,
