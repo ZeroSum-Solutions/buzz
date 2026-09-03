@@ -349,8 +349,15 @@ Future<int> publishBuzzPushLeaseRecoverably({
   required Future<int> Function() reserveGeneration,
   required Future<void> Function(int generation) publish,
   required Future<bool> Function(int generation) markAccepted,
+  bool Function()? operationIsCurrent,
 }) async {
+  if (operationIsCurrent?.call() == false) {
+    throw StateError('Push lease publication attempt is obsolete.');
+  }
   final generation = await reserveGeneration();
+  if (operationIsCurrent?.call() == false) {
+    throw StateError('Push lease publication attempt is obsolete.');
+  }
   await publish(generation);
   if (!await markAccepted(generation)) {
     throw StateError('A newer push lease superseded the published generation.');
@@ -852,6 +859,7 @@ class BuzzPushBootstrap extends HookConsumerWidget {
     await publishBuzzPushLeaseRecoverably(
       reserveGeneration: () =>
           notifier.reservePushLeaseGeneration(community.id),
+      operationIsCurrent: attemptIsCurrent,
       publish: (generation) => publishBuzzDevPushLease(
         grant: grant,
         leaseInstallationId: community.pushLeaseInstallationId,

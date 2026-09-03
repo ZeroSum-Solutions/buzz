@@ -484,6 +484,48 @@ void main() {
       throwsStateError,
     );
   });
+
+  test(
+    'stale migration cannot reserve or publish a lease generation',
+    () async {
+      var reserved = false;
+      var published = false;
+
+      await expectLater(
+        publishBuzzPushLeaseRecoverably(
+          operationIsCurrent: () => false,
+          reserveGeneration: () async {
+            reserved = true;
+            return 3;
+          },
+          publish: (_) async => published = true,
+          markAccepted: (_) async => true,
+        ),
+        throwsStateError,
+      );
+      expect(reserved, isFalse);
+      expect(published, isFalse);
+    },
+  );
+
+  test('migration becoming stale during reservation cannot publish', () async {
+    var current = true;
+    var published = false;
+
+    await expectLater(
+      publishBuzzPushLeaseRecoverably(
+        operationIsCurrent: () => current,
+        reserveGeneration: () async {
+          current = false;
+          return 3;
+        },
+        publish: (_) async => published = true,
+        markAccepted: (_) async => true,
+      ),
+      throwsStateError,
+    );
+    expect(published, isFalse);
+  });
 }
 
 BuzzPushLeaseDescriptor _descriptor({
