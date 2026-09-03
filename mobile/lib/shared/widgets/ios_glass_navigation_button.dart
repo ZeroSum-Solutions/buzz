@@ -499,6 +499,41 @@ class IosGlassNavigationButton extends HookWidget {
       );
     }
 
+    Widget buildLayeredControl({required bool suppressNativeView}) {
+      final reduceMotion = MediaQuery.disableAnimationsOf(context);
+      return Stack(
+        fit: StackFit.expand,
+        children: [
+          IgnorePointer(
+            ignoring: suppressNativeView,
+            child: ExcludeSemantics(
+              excluding: suppressNativeView,
+              child: Opacity(
+                key: const ValueKey('ios-glass-navigation-native-layer'),
+                opacity: suppressNativeView ? 0 : 1,
+                child: buildControl(suppressNativeView: false),
+              ),
+            ),
+          ),
+          IgnorePointer(
+            ignoring: !suppressNativeView,
+            child: ExcludeSemantics(
+              excluding: !suppressNativeView,
+              child: AnimatedOpacity(
+                key: const ValueKey('ios-glass-navigation-fallback-layer'),
+                opacity: suppressNativeView ? 1 : 0,
+                duration: reduceMotion
+                    ? Duration.zero
+                    : const Duration(milliseconds: 120),
+                curve: Curves.easeOutCubic,
+                child: buildControl(suppressNativeView: true),
+              ),
+            ),
+          ),
+        ],
+      );
+    }
+
     return Tooltip(
       message: semanticLabel,
       excludeFromSemantics: true,
@@ -506,13 +541,16 @@ class IosGlassNavigationButton extends HookWidget {
         width: width,
         height: height,
         child: nativeViewSuppressed == null
-            ? buildControl(suppressNativeView: routeIsTransitioning.value)
+            ? buildLayeredControl(
+                suppressNativeView: routeIsTransitioning.value,
+              )
             : ValueListenableBuilder<bool>(
                 valueListenable: nativeViewSuppressed!,
-                builder: (context, suppressNativeView, _) => buildControl(
-                  suppressNativeView:
-                      suppressNativeView || routeIsTransitioning.value,
-                ),
+                builder: (context, suppressNativeView, _) => suppressNativeView
+                    ? buildControl(suppressNativeView: true)
+                    : buildLayeredControl(
+                        suppressNativeView: routeIsTransitioning.value,
+                      ),
               ),
       ),
     );

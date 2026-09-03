@@ -9258,7 +9258,7 @@ void main() {
   });
 
   group('App bar', () {
-    testWidgets('shows matching controls while native glass waits for route', (
+    testWidgets('prepares native glass behind matching route controls', (
       tester,
     ) async {
       debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
@@ -9295,19 +9295,29 @@ void main() {
       expect(back, findsOneWidget);
       expect(identity, findsOneWidget);
       expect(huddle, findsOneWidget);
-      expect(
-        find.descendant(of: back, matching: find.byType(UiKitView)),
-        findsNothing,
-      );
-      expect(
-        find.descendant(of: identity, matching: find.byType(UiKitView)),
-        findsNothing,
-      );
-      expect(
-        find.descendant(of: huddle, matching: find.byType(UiKitView)),
-        findsNothing,
-      );
       for (final control in [back, identity, huddle]) {
+        expect(
+          find.descendant(of: control, matching: find.byType(UiKitView)),
+          findsOneWidget,
+        );
+        final nativeLayer = tester.widget<Opacity>(
+          find.descendant(
+            of: control,
+            matching: find.byKey(
+              const ValueKey('ios-glass-navigation-native-layer'),
+            ),
+          ),
+        );
+        final fallbackLayer = tester.widget<AnimatedOpacity>(
+          find.descendant(
+            of: control,
+            matching: find.byKey(
+              const ValueKey('ios-glass-navigation-fallback-layer'),
+            ),
+          ),
+        );
+        expect(nativeLayer.opacity, 0);
+        expect(fallbackLayer.opacity, 1);
         expect(
           find.descendant(
             of: control,
@@ -9321,14 +9331,26 @@ void main() {
 
       await tester.pumpAndSettle();
 
-      expect(
-        find.descendant(of: back, matching: find.byType(UiKitView)),
-        findsOneWidget,
-      );
-      expect(
-        find.descendant(of: identity, matching: find.byType(UiKitView)),
-        findsOneWidget,
-      );
+      for (final control in [back, identity, huddle]) {
+        final nativeLayer = tester.widget<Opacity>(
+          find.descendant(
+            of: control,
+            matching: find.byKey(
+              const ValueKey('ios-glass-navigation-native-layer'),
+            ),
+          ),
+        );
+        final fallbackLayer = tester.widget<AnimatedOpacity>(
+          find.descendant(
+            of: control,
+            matching: find.byKey(
+              const ValueKey('ios-glass-navigation-fallback-layer'),
+            ),
+          ),
+        );
+        expect(nativeLayer.opacity, 1);
+        expect(fallbackLayer.opacity, 0);
+      }
       final huddleNativeView = tester.widget<UiKitView>(
         find.descendant(of: huddle, matching: find.byType(UiKitView)),
       );
