@@ -699,10 +699,15 @@ pub async fn is_member(
 /// = NULL` after recovery finishes) or serializes before it (in which case this
 /// check observes the re-add and returns `false`, preventing stale eviction).
 ///
-/// Designed for use in crash-recovery before firing subscription eviction and
-/// workflow disablement: cache invalidation is always safe (it only drops a
-/// stale positive), but eviction and workflow-disable must not target a member
-/// who was legitimately re-added after the kick committed.
+/// Designed for use before firing subscription eviction and workflow
+/// disablement: cache invalidation is always safe (it only drops a stale
+/// positive), but eviction and workflow-disable must not target a member who
+/// was legitimately re-added after the kick committed.
+///
+/// **Use [`membership_removal_fence`] instead of this function** when the caller
+/// needs to hold the advisory lock through the destructive effects themselves.
+/// This function releases the lock immediately after the read; concurrent
+/// `add_member` calls can commit between the return and the caller's effects.
 pub async fn verify_member_still_removed(
     pool: &PgPool,
     community_id: CommunityId,
@@ -738,6 +743,77 @@ pub async fn verify_member_still_removed(
     };
     tx.rollback().await?;
     Ok(still_removed)
+}
+
+/// A guard that holds the per-channel membership advisory lock for the
+/// duration of kick live side effects.
+///
+/// Acquired via [`membership_removal_fence`]. The lock is released when the
+/// guard is dropped (the inner transaction rolls back). Callers must NOT drop
+/// the guard until after subscription eviction and workflow-disable complete,
+/// so that no concurrent [`add_member`] can commit between the `still_removed`
+/// observation and the destructive effects.
+pub struct MembershipRemovalFence {
+    /// `true` when the member row still has `removed_at IS NOT NULL` — i.e., no
+    /// re-add has reversed the kick since it committed. When `false`, the caller
+    /// must NOT fire eviction or workflow-disable.
+    pub still_removed: bool,
+    // Keeps the advisory transaction lock alive. Rolled back (lock released)
+    // on drop — no domain writes happen here.
+    _tx: Transaction<'static, Postgres>,
+}
+
+/// Acquire the per-channel membership advisory lock and check whether the
+/// kicked member is still removed, returning a [`MembershipRemovalFence`] that
+/// keeps the lock alive until the guard is dropped.
+///
+/// By holding the lock from the moment of the `removed_at` check until after
+/// the caller's subscription eviction and workflow-disable complete, this
+/// prevents the window where a concurrent [`add_member`] could commit between
+/// the check and the effects (the race that [`verify_member_still_removed`]
+/// leaves open, since it releases the lock before returning).
+///
+/// The guard is read-only: no domain writes occur inside this transaction.
+/// Once the caller has finished its effects, dropping the guard releases the
+/// lock (the transaction is implicitly rolled back).
+pub async fn membership_removal_fence(
+    pool: &PgPool,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    pubkey: &[u8],
+) -> Result<MembershipRemovalFence> {
+    let connection = crate::observability::acquire_writer(
+        pool,
+        crate::observability::WriterOperation::Authorization,
+    )
+    .await?;
+    let mut tx = sqlx::Transaction::begin(connection, None).await?;
+    acquire_channel_membership_lock(&mut tx, community_id, channel_id).await?;
+
+    let row = sqlx::query(
+        "SELECT removed_at FROM channel_members \
+         WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3",
+    )
+    .bind(community_id.as_uuid())
+    .bind(channel_id)
+    .bind(pubkey)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    // Row absent → never joined or hard-deleted; treat as removed (safe to
+    // skip eviction for someone who isn't and wasn't a member).
+    let still_removed = match row {
+        None => true,
+        Some(r) => {
+            let removed_at: Option<chrono::DateTime<Utc>> = r.try_get("removed_at")?;
+            removed_at.is_some()
+        }
+    };
+
+    Ok(MembershipRemovalFence {
+        still_removed,
+        _tx: tx,
+    })
 }
 
 /// Return which of the given (channel, pubkey) combinations are active
@@ -1421,9 +1497,9 @@ impl Db {
     /// holding the channel-membership advisory lock so the check serializes
     /// with concurrent [`add_member`] calls.
     ///
-    /// Use this in crash-recovery before firing subscription eviction and
-    /// workflow disablement to guard against the kick-commit → re-add → recover
-    /// race (IMPORTANT 3).
+    /// **Note:** this function releases the lock before returning. Use
+    /// [`Db::membership_removal_fence`] when the advisory lock must remain
+    /// held through subscription eviction and workflow-disable.
     #[datastore_span(name = "verify_member_still_removed", system = "postgresql")]
     pub async fn verify_member_still_removed(
         &self,
@@ -1432,6 +1508,26 @@ impl Db {
         pubkey: &[u8],
     ) -> Result<bool> {
         verify_member_still_removed(&self.pool, community_id, channel_id, pubkey).await
+    }
+
+    /// Acquire the per-channel membership advisory lock and return a
+    /// [`MembershipRemovalFence`] that keeps the lock alive until it is
+    /// dropped, allowing the caller to run eviction and workflow-disable
+    /// while serializing against concurrent [`add_member`] calls.
+    ///
+    /// The guard's `still_removed` field indicates whether the kick is still
+    /// the current state (i.e., no re-add has reversed it). When `false` the
+    /// caller must skip eviction and workflow-disable. Dropping the guard
+    /// releases the advisory lock (the transaction is implicitly rolled back —
+    /// this is a read-only fence, no domain writes occur).
+    #[datastore_span(name = "membership_removal_fence", system = "postgresql")]
+    pub async fn membership_removal_fence(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        pubkey: &[u8],
+    ) -> Result<MembershipRemovalFence> {
+        membership_removal_fence(&self.pool, community_id, channel_id, pubkey).await
     }
 
     /// Return the active (channel, pubkey) membership pairs among the given

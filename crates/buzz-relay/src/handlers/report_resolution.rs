@@ -451,7 +451,6 @@ async fn drive_enforcement(
         }
 
         // Run mutation only if step marker is not yet committed.
-        let step_marker_was_set = rec.step_marker.is_some();
         if rec.step_marker.is_none() {
             // Acquire exclusive action lease before running the mutation. Two
             // concurrent HTTP retries with the same request_id would both reach
@@ -625,11 +624,12 @@ async fn drive_enforcement(
         // INSERT that claimed the action required both values and stored them; if
         // they are absent the row is corrupt and we must not silently succeed.
         //
-        // On the crash-recovery path only (marker was already set when we entered
-        // this loop iteration), eviction and workflow-disable are gated behind
-        // verify_member_still_removed so a kick-commit → re-add → recover race
-        // does not revoke a legitimately restored membership. Cache invalidation
-        // is unconditional because stale-positive is always safe to drop.
+        // Eviction and workflow-disable are fenced behind membership_removal_fence
+        // (which holds the per-channel advisory lock through both effects) so a
+        // kick-commit → re-add → re-drive race does not revoke a legitimately
+        // restored membership. Cache invalidation is unconditional because
+        // stale-positive is always safe to drop. The fence applies on every path
+        // (fresh and recovery) for a single consistent ordering guarantee.
         if action == "kick" {
             match (
                 rec.enforcement_target_pubkey.as_deref(),
@@ -637,11 +637,7 @@ async fn drive_enforcement(
             ) {
                 (Some(target), Some(ch)) => {
                     crate::handlers::side_effects::apply_kick_live_side_effects(
-                        tenant,
-                        state,
-                        ch,
-                        target,
-                        step_marker_was_set,
+                        tenant, state, ch, target,
                     )
                     .await;
                 }
@@ -1166,7 +1162,6 @@ mod tests {
             &state,
             channel_id,
             &target_pubkey,
-            false, // fresh path: member still removed, no re-add guard needed
         )
         .await;
 

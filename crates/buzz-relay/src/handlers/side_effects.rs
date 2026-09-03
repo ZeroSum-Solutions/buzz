@@ -56,62 +56,60 @@ pub fn is_side_effect_kind(kind: u32) -> bool {
 /// the notice-delivery contract: the enforcement is the promise; live revocation
 /// is the courtesy.
 ///
-/// `is_recovery` must be `true` when called on the crash-recovery path (i.e., the
-/// step marker was already set before this drive iteration began). On that path,
-/// eviction and workflow-disable are fenced behind a `verify_member_still_removed`
-/// check that serializes with any concurrent `add_member` call; if the member was
-/// legitimately re-added after the original kick committed the side effects are
-/// suppressed (cache invalidation still fires — stale-positive is always safe to
-/// drop). On the fresh path (`is_recovery = false`) the removal just committed in
-/// the same transaction and no re-add can have happened yet, so the guard is skipped.
+/// **Fencing:** eviction and workflow-disable are gated behind a
+/// `membership_removal_fence` that acquires the same `pg_advisory_xact_lock` as
+/// `add_member` and holds it through both destructive effects. This prevents the
+/// window where a concurrent re-add could commit between the `removed_at` check
+/// and the effects: any `add_member` either serializes before the fence (the
+/// fence then observes `removed_at IS NULL` and skips effects) or waits until
+/// after the effects complete (the re-add then succeeds cleanly). Cache
+/// invalidation fires unconditionally before the fence — stale-positive is
+/// always safe to drop.
 pub(crate) async fn apply_kick_live_side_effects(
     tenant: &TenantContext,
     state: &Arc<AppState>,
     channel_id: Uuid,
     target_pubkey: &[u8],
-    is_recovery: bool,
 ) {
     // Cache invalidation is unconditionally safe — drops a stale positive.
     state.invalidate_membership(tenant, channel_id, target_pubkey);
 
-    if is_recovery {
-        // Fence eviction and workflow-disable against a post-kick re-add.
-        // Acquire the membership lock and verify removed_at IS NOT NULL.
-        match state
-            .db
-            .verify_member_still_removed(tenant.community(), channel_id, target_pubkey)
-            .await
-        {
-            Ok(true) => {
-                // Still removed — safe to proceed.
+    // Acquire the membership advisory lock and check that the member is still
+    // removed. The fence guard keeps the lock alive through eviction and
+    // workflow-disable so no concurrent add_member can commit in that window.
+    match state
+        .db
+        .membership_removal_fence(tenant.community(), channel_id, target_pubkey)
+        .await
+    {
+        Ok(fence) => {
+            if fence.still_removed {
+                // Still removed — fire effects while the lock is held.
                 evict_live_channel_subscriptions(tenant, state, channel_id, target_pubkey).await;
                 disable_departed_member_workflows(tenant, state, channel_id, target_pubkey).await;
-            }
-            Ok(false) => {
-                // Member was re-added after the kick committed; skip eviction and
-                // workflow-disable so the re-add is not silently undone.
+                // Lock released here when `fence` is dropped.
+            } else {
+                // Member was re-added before this driver acquired the fence;
+                // skip eviction and workflow-disable so the re-add is not undone.
                 tracing::info!(
                     channel = %channel_id,
                     target = %hex::encode(target_pubkey),
-                    "crash-recovery kick: member re-added since kick committed; \
-                     skipping eviction and workflow-disable"
-                );
-            }
-            Err(e) => {
-                // DB error in the fence check. Err on the side of not revoking
-                // a potentially valid membership: skip eviction/disable and log.
-                warn!(
-                    channel = %channel_id,
-                    target = %hex::encode(target_pubkey),
-                    error = %e,
-                    "crash-recovery kick: verify_member_still_removed failed; \
+                    "kick live effects: member re-added before fence acquired; \
                      skipping eviction and workflow-disable"
                 );
             }
         }
-    } else {
-        evict_live_channel_subscriptions(tenant, state, channel_id, target_pubkey).await;
-        disable_departed_member_workflows(tenant, state, channel_id, target_pubkey).await;
+        Err(e) => {
+            // DB error acquiring the fence. Err on the side of not revoking a
+            // potentially valid membership: skip eviction/disable and log.
+            warn!(
+                channel = %channel_id,
+                target = %hex::encode(target_pubkey),
+                error = %e,
+                "kick live effects: membership_removal_fence failed; \
+                 skipping eviction and workflow-disable"
+            );
+        }
     }
 }
 

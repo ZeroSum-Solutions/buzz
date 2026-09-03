@@ -5180,6 +5180,207 @@ mod postgres_tests {
         );
     }
 
+    // ── 1c. pre-marker stranded delete: crash before mutation, recovery re-drives ──
+
+    /// Stranded delete: crash BEFORE the mutation+marker committed.
+    ///
+    /// Recovery worker must re-run the delete mutation, commit the step marker,
+    /// and finalize — resulting in the event being soft-deleted and both tombstone
+    /// and reporter_notice outbox rows created.
+    ///
+    /// This test guards against the Finding-2 regression introduced at ba34fb292:
+    /// if the persisted-context branch (`enforcement_target_pubkey` / `channel_id`
+    /// set) forces `target_event_id = None` for non-kick actions, delete recovery
+    /// fails pre-mutation with "delete requires target_event_id". Gate on action=="kick"
+    /// ensures non-kick actions always re-derive from the report.
+    #[tokio::test]
+    #[ignore = "requires Postgres — pre-marker stranded delete recovers correctly"]
+    async fn stranded_delete_pre_marker_recovers_via_worker() {
+        let pool = e2e_pool().await;
+        let (community_id, _host) = e2e_community(&pool, "stranded-delete-pre-marker").await;
+        let target_event_id: Vec<u8> = {
+            let u = uuid::Uuid::new_v4();
+            u.as_bytes()
+                .iter()
+                .chain(u.as_bytes().iter())
+                .copied()
+                .collect()
+        };
+        let actor = vec![6u8; 32];
+        let author = vec![7u8; 32];
+        let cid = buzz_core::CommunityId::from_uuid(community_id);
+
+        // Create a channel and seed the target event.
+        let channel_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO channels (id, community_id, name, channel_type, visibility, created_by)
+               VALUES ($1, $2, 'stranded-del-pre-ch', 'stream', 'open', $3)"#,
+        )
+        .bind(channel_id)
+        .bind(community_id)
+        .bind(&actor)
+        .execute(&pool)
+        .await
+        .expect("create channel");
+
+        let sig = vec![0u8; 64];
+        sqlx::query(
+            r#"INSERT INTO events (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id)
+               VALUES ($1, $2, $3, now(), 1, '[]', 'test', $4, now(), $5)"#,
+        )
+        .bind(community_id)
+        .bind(target_event_id.as_slice())
+        .bind(&author)
+        .bind(sig.as_slice())
+        .bind(channel_id)
+        .execute(&pool)
+        .await
+        .expect("insert event");
+
+        // Create an event report.
+        let reporter = vec![0u8; 32];
+        let report_event_raw: Vec<u8> = {
+            let u = uuid::Uuid::new_v4();
+            u.as_bytes()
+                .iter()
+                .chain(u.as_bytes().iter())
+                .copied()
+                .collect()
+        };
+        let report_id: uuid::Uuid = sqlx::query_scalar(
+            r#"INSERT INTO moderation_reports
+               (community_id, report_event_id, reporter_pubkey, target_kind, target_event_id,
+                channel_id, report_type)
+               VALUES ($1, $2, $3, 'event', $4, $5, 'spam') RETURNING id"#,
+        )
+        .bind(community_id)
+        .bind(report_event_raw.as_slice())
+        .bind(&reporter)
+        .bind(target_event_id.as_slice())
+        .bind(channel_id)
+        .fetch_one(&pool)
+        .await
+        .expect("insert event report");
+
+        // Claim DELETE action but do NOT run the mutation or commit the step marker.
+        // This simulates a crash immediately after claim — pre-mutation state.
+        let action_id = match buzz_db::relay_admin_actions::claim_report(
+            &pool,
+            cid,
+            report_id,
+            uuid::Uuid::new_v4(),
+            &actor,
+            "operator",
+            "delete",
+            None,
+            None,
+            "resolve:delete",
+            "relay_operator",
+            None,
+            Some(target_event_id.as_slice()),
+            Some(channel_id),
+        )
+        .await
+        .expect("claim")
+        {
+            buzz_db::relay_admin_actions::ClaimResult::Claimed(a) => a.id,
+            other => panic!("expected Claimed, got {other:?}"),
+        };
+
+        // Advance to enforcing but do not run mutation (crash point = post-claim, pre-mutation).
+        let _ = buzz_db::relay_admin_actions::begin_enforcing(&pool, action_id)
+            .await
+            .expect("begin_enforcing");
+
+        // Action is in enforcing state with no step_marker — stranded pre-mutation.
+        let rec = buzz_db::relay_admin_actions::get_action(&pool, action_id)
+            .await
+            .expect("get_action")
+            .expect("action exists");
+        assert_eq!(rec.state, "enforcing");
+        assert!(rec.step_marker.is_none(), "must have no step_marker yet");
+
+        // Also verify the event is NOT yet deleted.
+        let deleted_before: Option<Option<chrono::DateTime<chrono::Utc>>> =
+            sqlx::query_scalar("SELECT deleted_at FROM events WHERE community_id = $1 AND id = $2")
+                .bind(community_id)
+                .bind(target_event_id.as_slice())
+                .fetch_optional(&pool)
+                .await
+                .expect("fetch deleted_at before");
+        assert!(
+            deleted_before.flatten().is_none(),
+            "event must not be deleted before recovery"
+        );
+
+        // Expire the lease so the stranded batch can claim it.
+        sqlx::query(
+            "UPDATE relay_admin_actions SET action_lease_expires_at = $2, action_lease_token = NULL WHERE id = $1",
+        )
+        .bind(action_id)
+        .bind(chrono::Utc::now() - chrono::Duration::seconds(300))
+        .execute(&pool)
+        .await
+        .expect("expire lease");
+
+        // Re-drive via the real recovery worker.
+        let batch = buzz_db::relay_admin_actions::claim_stranded_action_batch(
+            &pool,
+            "e2e-stranded-del-pre",
+            chrono::Utc::now() + chrono::Duration::seconds(120),
+            1000,
+        )
+        .await
+        .expect("claim_stranded_action_batch");
+        let claim = batch
+            .into_iter()
+            .find(|c| c.record.id == action_id)
+            .expect("stranded action must appear in batch");
+
+        let state = state_from_pool(pool.clone()).await;
+        crate::handlers::admin_action_worker::recover_one(&state, claim).await;
+
+        // Action must have converged to succeeded.
+        let final_rec = buzz_db::relay_admin_actions::get_action(&pool, action_id)
+            .await
+            .expect("get_action")
+            .expect("exists");
+        assert_eq!(
+            final_rec.state, "succeeded",
+            "stranded pre-marker delete must converge to succeeded"
+        );
+
+        // Event must now be soft-deleted.
+        let deleted_after: Option<Option<chrono::DateTime<chrono::Utc>>> =
+            sqlx::query_scalar("SELECT deleted_at FROM events WHERE community_id = $1 AND id = $2")
+                .bind(community_id)
+                .bind(target_event_id.as_slice())
+                .fetch_optional(&pool)
+                .await
+                .expect("fetch deleted_at after");
+        assert!(
+            deleted_after.flatten().is_some(),
+            "event must be soft-deleted after stranded pre-marker delete recovery"
+        );
+
+        // Tombstone + reporter_notice outbox rows must exist.
+        let outbox_rows: Vec<String> = sqlx::query_scalar(
+            "SELECT task_type FROM relay_admin_outbox WHERE action_id = $1 ORDER BY task_type",
+        )
+        .bind(action_id)
+        .fetch_all(&pool)
+        .await
+        .expect("fetch outbox rows");
+        assert!(
+            outbox_rows.iter().any(|t| t == "tombstone"),
+            "tombstone outbox row must exist after delete recovery; got: {outbox_rows:?}"
+        );
+        assert!(
+            outbox_rows.iter().any(|t| t == "reporter_notice"),
+            "reporter_notice outbox row must exist; got: {outbox_rows:?}"
+        );
+    }
+
     // ── 1b. timeout affected-user notice: worker renders the authoritative term ─
 
     #[tokio::test]
@@ -7925,13 +8126,19 @@ mod postgres_tests {
 
     /// Re-add race: kick commits → crash → `add_member` re-adds → recovery fires.
     ///
-    /// Asserts that after a post-kick re-add, the recovery worker does NOT evict
-    /// subscriptions or disable workflows for the now-valid member. Cache
-    /// invalidation (stale positive) is always safe and may still fire.
+    /// Scenario: the member was legitimately re-added (via `add_member`) BEFORE
+    /// the recovery worker acquires the membership fence. When the fence is
+    /// acquired, `removed_at IS NULL` — the re-add already committed. Recovery
+    /// must NOT evict subscriptions or disable workflows for the now-valid member.
     ///
-    /// This test is falsifiable: removing the `verify_member_still_removed` fence
-    /// from `apply_kick_live_side_effects` would cause this test to fail because
-    /// the re-added member's subscription and workflow would be wrongly revoked.
+    /// This test is falsifiable: removing the `membership_removal_fence` check
+    /// from `apply_kick_live_side_effects` would cause the recovery to always
+    /// fire effects, wrongly evicting the re-added member's subscription and
+    /// disabling their workflow.
+    ///
+    /// Uses real `add_member` (not direct SQL) to exercise the advisory-lock
+    /// serialization: `add_member` sets `removed_at = NULL` inside the lock and
+    /// commits before the fence is acquired, so the fence observes the re-add.
     #[tokio::test]
     #[ignore = "requires Postgres — post-kick re-add survives crash recovery"]
     async fn crash_recovery_after_readd_preserves_membership_subscriptions_and_workflows() {
@@ -8022,23 +8229,22 @@ mod postgres_tests {
         .await
         .expect("expire lease");
 
-        // Re-add the member (simulates `add_member` re-granting access after kick).
-        sqlx::query(
-            "UPDATE channel_members SET removed_at = NULL, removed_by = NULL \
-             WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3",
+        // Re-add the member via the real `add_member` (not direct SQL).
+        // This acquires and releases the membership advisory lock, setting
+        // removed_at = NULL before the recovery worker's fence is acquired.
+        buzz_db::channel_members::add_member(
+            &pool,
+            cid,
+            channel_id,
+            &target,
+            buzz_db::channel::MemberRole::Member,
+            None,
         )
-        .bind(community_id)
-        .bind(channel_id)
-        .bind(&target)
-        .execute(&pool)
         .await
-        .expect("re-add member");
+        .expect("re-add member via add_member");
 
         // Verify pre-condition: member is active again.
-        let still_member = state_from_pool(pool.clone())
-            .await
-            .db
-            .is_member(cid, channel_id, &target)
+        let still_member = buzz_db::channel_members::is_member(&pool, cid, channel_id, &target)
             .await
             .expect("is_member");
         assert!(
@@ -8106,7 +8312,7 @@ mod postgres_tests {
 
         // ── Assertions: re-added member's live session must survive ──────────
 
-        // 1. Subscription NOT evicted: re-added member still has a live session.
+        // 1. Subscription NOT evicted: fence observed re-add, skipped eviction.
         assert!(
             state
                 .sub_registry
@@ -8115,7 +8321,7 @@ mod postgres_tests {
             "recovery must NOT evict the subscription of a re-added member"
         );
 
-        // 2. Workflow NOT disabled: re-added member's workflow remains active.
+        // 2. Workflow NOT disabled: fence observed re-add, skipped disable.
         assert!(
             state
                 .db
@@ -8144,6 +8350,111 @@ mod postgres_tests {
         assert_eq!(
             final_rec.state, "succeeded",
             "action must reach succeeded even when re-add fence suppresses eviction"
+        );
+    }
+
+    /// Fence ordering: the membership advisory lock is held through eviction and
+    /// workflow-disable, so `add_member` cannot commit between the removed-at
+    /// check and the destructive effects.
+    ///
+    /// This test verifies the other direction of the race: the fence is acquired
+    /// BEFORE any concurrent `add_member`. While the fence is held, an `add_member`
+    /// in a separate task must block and cannot commit until the fence is released.
+    ///
+    /// This is falsifiable: if `membership_removal_fence` released the transaction
+    /// lock before returning (as the old `verify_member_still_removed` did), the
+    /// `add_member` task would complete while effects are still running.
+    #[tokio::test]
+    #[ignore = "requires Postgres — membership_removal_fence holds advisory lock through effects"]
+    async fn membership_removal_fence_blocks_concurrent_add_member() {
+        let pool = e2e_pool().await;
+        let (community_id, _host) = e2e_community(&pool, "fence-ordering").await;
+        let cid = buzz_core::CommunityId::from_uuid(community_id);
+        let target = vec![0xEEu8; 32];
+        let actor = vec![0xFFu8; 32];
+
+        // Seed channel + member.
+        let channel_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO channels (id, community_id, name, channel_type, visibility, created_by)
+               VALUES ($1, $2, 'fence-ordering-ch', 'stream', 'open', $3)"#,
+        )
+        .bind(channel_id)
+        .bind(community_id)
+        .bind(&actor)
+        .execute(&pool)
+        .await
+        .expect("create channel");
+        sqlx::query(
+            "INSERT INTO channel_members (community_id, channel_id, pubkey, role) VALUES ($1, $2, $3, 'member')",
+        )
+        .bind(community_id)
+        .bind(channel_id)
+        .bind(&target)
+        .execute(&pool)
+        .await
+        .expect("add member");
+
+        // Kick: set removed_at (simulate kick committed).
+        sqlx::query(
+            "UPDATE channel_members SET removed_at = now(), removed_by = $4 \
+             WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3",
+        )
+        .bind(community_id)
+        .bind(channel_id)
+        .bind(&target)
+        .bind(&actor)
+        .execute(&pool)
+        .await
+        .expect("kick member");
+
+        // Acquire the fence — this holds the membership advisory lock.
+        let fence =
+            buzz_db::channel_members::membership_removal_fence(&pool, cid, channel_id, &target)
+                .await
+                .expect("acquire fence");
+        assert!(fence.still_removed, "pre-condition: member must be removed");
+
+        // Spawn `add_member` in a separate task. It must NOT complete while the
+        // fence is held — the advisory lock blocks it.
+        let pool2 = pool.clone();
+        let target_clone = target.clone();
+        let mut add_task = tokio::spawn(async move {
+            buzz_db::channel_members::add_member(
+                &pool2,
+                cid,
+                channel_id,
+                &target_clone,
+                buzz_db::channel::MemberRole::Member,
+                None,
+            )
+            .await
+        });
+
+        // `add_member` must block: the fence holds the same advisory lock.
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut add_task).await;
+        assert!(
+            blocked.is_err(),
+            "add_member must not complete while the membership fence is held"
+        );
+
+        // Release the fence — the advisory lock is dropped when `fence` is dropped.
+        drop(fence);
+
+        // Now `add_member` can proceed.
+        tokio::time::timeout(std::time::Duration::from_secs(5), add_task)
+            .await
+            .expect("add_member must proceed after fence is released")
+            .expect("add_member task panicked")
+            .expect("add_member must succeed after fence is released");
+
+        // Confirm member is active again.
+        assert!(
+            buzz_db::channel_members::is_member(&pool, cid, channel_id, &target)
+                .await
+                .expect("is_member"),
+            "member must be active after add_member succeeds"
         );
     }
 }
