@@ -462,7 +462,7 @@ export const MessageRow = React.memo(
     const isThreadReplyLayout = layoutVariant === "thread-reply";
     const guideBleedRem = isThreadReplyLayout ? 0.25 : 0;
     const avatarButtonRadiusClass = isAuthorAgent
-      ? "rounded-[30%]"
+      ? "agent-avatar-squircle"
       : "rounded-full";
 
     const showRespondToIndicator =
