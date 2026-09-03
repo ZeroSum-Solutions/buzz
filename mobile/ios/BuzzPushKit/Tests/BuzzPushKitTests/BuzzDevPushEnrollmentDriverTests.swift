@@ -469,6 +469,21 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
   func testRestoredResponseLostEnrollmentIsRevokedBeforeReplacement() async throws {
     let oldToken = Data(repeating: 0x07, count: 32)
     let newToken = Data(repeating: 0x08, count: 32)
+    let quarantinedHandle = "11111111-1111-4111-8111-111111111111"
+    let quarantined = BuzzPushEndpointGrantRecord(
+      gatewayOrigin: Self.gatewayOrigin,
+      relayOrigin: "wss://other-relay.example",
+      relayPubkey: String(repeating: "b", count: 64),
+      gatewayInstallationHandle: quarantinedHandle,
+      appAttestKeyId: Self.keyId,
+      installationId: "101112131415161718191a1b1c1d1e1f",
+      endpointGrant: "quarantined-grant",
+      endpointHash: Self.hex(SHA256.hash(data: oldToken)),
+      appProfile: "buzz-ios-dogfood",
+      endpointEpoch: 1,
+      generation: 1,
+      expiresAt: Self.expiresAt
+    )
     let pending = BuzzPushPendingEnrollmentRecord(
       gatewayOrigin: Self.gatewayOrigin,
       relayOrigin: "wss://relay.example",
@@ -487,14 +502,15 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     store.cleanup = [
       BuzzPushGatewayCleanupState(
         gatewayOrigin: Self.gatewayOrigin,
-        grants: [],
-        pendingEnrollments: [pending]
+        grants: [quarantined],
+        pendingEnrollments: [pending],
+        revocationPendingInstallationHandles: [quarantinedHandle]
       )
     ]
     let driver = try makeDriver(store: store, appAttest: RecordingAppAttest())
     var challengeRequests = 0
     var replayedOldEndpoint = false
-    var revoked = false
+    var revokedHandles = Set<String>()
     URLProtocolStub.handler = { request in
       switch (request.httpMethod, request.url?.absoluteString) {
       case ("GET", "https://relay.example/"):
@@ -519,7 +535,7 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
         )
       case ("POST", "http://push.example/v1/installations/challenges"):
         challengeRequests += 1
-        guard challengeRequests == 1 else {
+        guard challengeRequests <= 2 else {
           return Self.response(request, status: 503, json: ["error": "injected"])
         }
         return Self.response(
@@ -532,7 +548,7 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
           ]
         )
       case ("POST", "http://push.example/v1/installations/revoke"):
-        revoked = true
+        revokedHandles.insert(try XCTUnwrap(Self.body(request)["installation_handle"] as? String))
         return Self.response(request, status: 200, json: ["status": "revoked"])
       default:
         XCTFail("Unexpected request \(request.url?.absoluteString ?? "nil")")
@@ -550,7 +566,7 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     }
 
     XCTAssertTrue(replayedOldEndpoint)
-    XCTAssertTrue(revoked)
+    XCTAssertEqual(revokedHandles, [quarantinedHandle, Self.installationHandle])
     XCTAssertTrue(store.pending.isEmpty)
     XCTAssertTrue(store.cleanup.isEmpty)
   }
@@ -1130,7 +1146,12 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     }
 
     XCTAssertTrue(reachableRevoked)
-    XCTAssertEqual(store.cleanup, [offline])
+    XCTAssertEqual(store.cleanup.map(\.gatewayOrigin), [offlineOrigin])
+    XCTAssertEqual(store.cleanup.first?.grants, offline.grants)
+    XCTAssertEqual(
+      store.cleanup.first?.revocationPendingInstallationHandles,
+      ["44444444-4444-4444-8444-444444444444"]
+    )
   }
 
   func testRealAppAttestFailsLoudlyWhenUnsupported() async throws {

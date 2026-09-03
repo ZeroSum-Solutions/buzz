@@ -155,8 +155,9 @@ pub trait AuthorityStore: Send + Sync {
         token_ciphertext: Vec<u8>,
         token_fingerprint: [u8; 32],
     ) -> Result<(), AuthorityError>;
-    /// Revoke an active delegation only when `expected_generation` is current,
-    /// retaining that generation as the replacement watermark.
+    /// Revoke a delegation only when `expected_generation` is current,
+    /// retaining that generation as the replacement watermark. Repeating the
+    /// exact revocation succeeds so clients can recover from a lost response.
     async fn revoke_delegation(
         &self,
         installation_id: Uuid,
@@ -449,8 +450,11 @@ impl AuthorityStore for MemoryAuthorityStore {
             .delegations
             .get_mut(&key)
             .ok_or(AuthorityError::Rejected)?;
-        if old.revoked || expected_generation != old.generation {
+        if expected_generation != old.generation {
             return Err(AuthorityError::Rejected);
+        }
+        if old.revoked {
+            return Ok(());
         }
         old.revoked = true;
         Ok(())
@@ -838,6 +842,10 @@ mod tests {
             .revoke_delegation(Uuid::from_u128(1), &"11".repeat(32), 1)
             .await
             .expect("the current generation can be revoked");
+        store
+            .revoke_delegation(Uuid::from_u128(1), &"11".repeat(32), 1)
+            .await
+            .expect("the exact revocation is idempotent after response loss");
         assert!(admitted(&store, &"55".repeat(32), Uuid::new_v4())
             .await
             .is_err());

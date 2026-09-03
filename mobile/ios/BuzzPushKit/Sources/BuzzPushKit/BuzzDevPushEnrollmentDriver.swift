@@ -514,13 +514,21 @@ public final class BuzzDevPushEnrollmentDriver {
           throw BuzzDevPushEnrollmentError.retiredGatewayCleanupIncomplete
         }
       } else {
-        var cleanupState = BuzzPushGatewayCleanupState(
+        var cleanupState = try store.gatewayCleanupStates().first {
+          $0.gatewayOrigin == gatewayOrigin
+        } ?? BuzzPushGatewayCleanupState(
           gatewayOrigin: gatewayOrigin,
           grants: [],
-          pendingEnrollments: [pending]
+          pendingEnrollments: []
         )
+        cleanupState.pendingEnrollments.removeAll {
+          $0.relayOrigin == pending.relayOrigin && $0.appProfile == pending.appProfile
+        }
+        cleanupState.pendingEnrollments.append(pending)
         guard await cleanStaleGateway(&cleanupState, deviceToken: deviceToken) else {
-          if let reconciled = cleanupState.pendingEnrollments.first {
+          if let reconciled = cleanupState.pendingEnrollments.first(where: {
+            $0.relayOrigin == pending.relayOrigin && $0.appProfile == pending.appProfile
+          }) {
             try store.savePendingEnrollment(reconciled)
           }
           throw BuzzDevPushEnrollmentError.retiredGatewayCleanupIncomplete
