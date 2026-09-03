@@ -22,6 +22,173 @@ bool _showsMembersAction(Channel channel) {
   return participants.length != 2;
 }
 
+String? _otherDmPubkey(Channel channel, String? currentPubkey) {
+  final normalizedCurrent = currentPubkey?.toLowerCase();
+  for (final pubkey in channel.participantPubkeys) {
+    if (pubkey.toLowerCase() != normalizedCurrent) return pubkey.toLowerCase();
+  }
+  return null;
+}
+
+class _NativeIosChannelNavigationBinding extends ConsumerWidget {
+  const _NativeIosChannelNavigationBinding({
+    required this.channel,
+    required this.currentPubkey,
+    required this.showsComposer,
+    required this.showsHuddleAction,
+    required this.huddleEvents,
+  });
+
+  final Channel channel;
+  final String? currentPubkey;
+  final bool showsComposer;
+  final bool showsHuddleAction;
+  final List<NostrEvent> huddleEvents;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final membersAsync = ref.watch(channelMembersProvider(channel.id));
+    final memberCount = membersAsync.value?.length ?? channel.memberCount;
+    final memberLabel =
+        '$memberCount ${memberCount == 1 ? 'member' : 'members'}';
+    final otherPubkey = channel.isDm
+        ? _otherDmPubkey(channel, currentPubkey)
+        : null;
+    final profile = ref.watch(
+      userCacheProvider.select(
+        (profiles) => otherPubkey == null ? null : profiles[otherPubkey],
+      ),
+    );
+    final presence = ref.watch(
+      presenceCacheProvider.select(
+        (presenceMap) => otherPubkey == null
+            ? 'offline'
+            : (presenceMap[otherPubkey] ?? 'offline'),
+      ),
+    );
+    if (otherPubkey != null) {
+      if (profile == null) {
+        ref.read(userCacheProvider.notifier).preload([otherPubkey]);
+      }
+      ref.read(presenceCacheProvider.notifier).track([otherPubkey]);
+    }
+
+    final displayLabel = channel.isDm
+        ? resolveDmChannelDisplayLabel(channel, currentPubkey: currentPubkey)
+        : channel.name;
+    final subtitle = channel.isDm
+        ? switch (presence) {
+            'online' => 'Online',
+            'away' => 'Away',
+            _ => 'Offline',
+          }
+        : memberLabel;
+    final avatarUrl = profile?.avatarUrl;
+    final animatedAvatar = parseAnimatedAvatarUrl(avatarUrl);
+    final avatarFallback =
+        profile?.initial ??
+        (channel.participants.isNotEmpty
+            ? channel.participants.first[0].toUpperCase()
+            : '?');
+    final huddleAction = _resolveHuddleAction(
+      context: context,
+      ref: ref,
+      channel: channel,
+      events: huddleEvents,
+    );
+
+    Future<void> openChannelDetails() async {
+      final shouldClose = await showChannelDetailsPage(
+        context: context,
+        channel: channel,
+        currentPubkey: currentPubkey,
+        onMemberTap: showUserProfileSheet,
+        sectionId: ref
+            .read(channelSectionsProvider)
+            .store
+            .assignments[channel.id],
+      );
+      if (shouldClose == true && context.mounted) {
+        Navigator.of(context).pop();
+      }
+    }
+
+    void openIdentity() {
+      if (channel.participantPubkeys.length == 2 && otherPubkey != null) {
+        showUserProfileSheet(context, otherPubkey);
+        return;
+      }
+      showBuzzModalBottomSheet<void>(
+        context: context,
+        title: 'Members',
+        isScrollControlled: true,
+        showDragHandle: true,
+        builder: (_) =>
+            MembersSheet(channel: channel, currentPubkey: currentPubkey),
+      );
+    }
+
+    void showMembers() {
+      showBuzzModalBottomSheet<void>(
+        context: context,
+        title: 'Members',
+        isScrollControlled: true,
+        showDragHandle: true,
+        builder: (_) =>
+            MembersSheet(channel: channel, currentPubkey: currentPubkey),
+      );
+    }
+
+    Future<void> showActions() async {
+      final shouldClose = await showChannelActionsSheet(
+        context: context,
+        channel: channel,
+        isUnread: false,
+        sectionId: ref
+            .read(channelSectionsProvider)
+            .store
+            .assignments[channel.id],
+      );
+      if (shouldClose == true && context.mounted) {
+        Navigator.of(context).pop();
+      }
+    }
+
+    final systemIconName = channel.isPrivate
+        ? 'lock.fill'
+        : channel.isForum
+        ? 'bubble.left.and.bubble.right.fill'
+        : 'number';
+    return IosNativeNavigationShellBinding(
+      configuration: IosNativeNavigationConfiguration(
+        title: displayLabel,
+        subtitle: subtitle,
+        semanticLabel: channel.isDm
+            ? '$displayLabel, $subtitle'
+            : 'Open settings for $displayLabel, $subtitle',
+        foregroundColor: context.colors.primary,
+        brightness: context.theme.brightness,
+        avatarImageUrl: channel.isDm
+            ? animatedAvatar?.posterUrl ?? avatarUrl
+            : null,
+        avatarFallback: channel.isDm ? avatarFallback : null,
+        systemIconName: channel.isDm ? null : systemIconName,
+        onBack: () => Navigator.of(context).maybePop(),
+        onTitle: channel.isDm
+            ? openIdentity
+            : () => unawaited(openChannelDetails()),
+        showsHuddle: showsHuddleAction || (!channel.isDm && showsComposer),
+        onHuddle: huddleAction.onPressed,
+        huddleLabel: huddleAction.label,
+        onMembers: channel.isDm && _showsMembersAction(channel)
+            ? showMembers
+            : null,
+        onMore: channel.isDm ? () => unawaited(showActions()) : null,
+      ),
+    );
+  }
+}
+
 double _scaledTextHeight(BuildContext context, TextStyle style) {
   final scaledFontSize = MediaQuery.textScalerOf(
     context,
