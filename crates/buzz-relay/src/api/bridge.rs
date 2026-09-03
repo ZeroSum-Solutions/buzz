@@ -4639,8 +4639,8 @@ mod postgres_tests {
             .expect("ensure community");
 
         let keys = Keys::generate();
-        let url = "wss://nip-fi-test.local/events";
-        let auth_headers = make_nip98_headers(&keys, url, "POST", b"{}");
+        let url = format!("https://{host}/events");
+        let auth_headers = make_nip98_headers(&keys, &url, "POST", b"{}");
 
         let status = rt.block_on(oneshot_request(
             state,
@@ -4677,8 +4677,8 @@ mod postgres_tests {
             .expect("ensure community");
 
         let keys = Keys::generate();
-        let url = "wss://nip-fi-test.local/query";
-        let auth_headers = make_nip98_headers(&keys, url, "POST", b"[]");
+        let url = format!("https://{host}/query");
+        let auth_headers = make_nip98_headers(&keys, &url, "POST", b"[]");
 
         let status = rt.block_on(oneshot_request(
             state,
@@ -4715,8 +4715,8 @@ mod postgres_tests {
             .expect("ensure community");
 
         let keys = Keys::generate();
-        let url = "wss://nip-fi-test.local/count";
-        let auth_headers = make_nip98_headers(&keys, url, "POST", b"[]");
+        let url = format!("https://{host}/count");
+        let auth_headers = make_nip98_headers(&keys, &url, "POST", b"[]");
 
         let status = rt.block_on(oneshot_request(
             state,
@@ -4758,8 +4758,8 @@ mod postgres_tests {
             .expect("ensure community");
 
         let keys = Keys::generate();
-        let url = "wss://nip-fi-test.local/moderation/reports";
-        let auth_headers = make_nip98_headers(&keys, url, "GET", b"");
+        let url = format!("https://{host}/moderation/reports");
+        let auth_headers = make_nip98_headers(&keys, &url, "GET", b"");
 
         let status = rt.block_on(oneshot_request(
             state,
@@ -4803,7 +4803,7 @@ mod postgres_tests {
             .expect("ensure community");
 
         let keys = Keys::generate();
-        let url = format!("wss://nip-fi-test.local{}", crate::api::gifs::SEARCH_PATH);
+        let url = format!("https://{host}{}", crate::api::gifs::SEARCH_PATH);
         let auth_headers = make_nip98_headers(&keys, &url, "POST", b"{}");
 
         let status = rt.block_on(oneshot_request(
@@ -4851,7 +4851,7 @@ mod postgres_tests {
         let workflow_id = uuid::Uuid::new_v4();
         let keys = Keys::generate();
         let path = format!("/workflows/{workflow_id}/runs");
-        let url = format!("wss://nip-fi-test.local{path}");
+        let url = format!("https://{host}{path}");
         let auth_headers = make_nip98_headers(&keys, &url, "GET", b"");
 
         let status = rt.block_on(oneshot_request(
@@ -4903,28 +4903,41 @@ mod postgres_tests {
         rt.block_on(state.db.ensure_configured_community(&host))
             .expect("ensure community");
 
-        // No auth at all (no NIP-98, no assertion) — Off mode must pass through.
+        // X-Pubkey dev-mode auth: passes verify_bridge_auth (require_auth_token=false
+        // in Off state) and reaches check_nip_fi_http_on_state, which MUST admit
+        // unconditionally in Off mode.
+        //
+        // We cannot use no-auth-at-all because verify_bridge_auth returns 401
+        // ("missing Nostr auth") before the NIP-FI gate is reached, making the
+        // assert_ne!(_, UNAUTHORIZED) trivially falsifiable for the wrong reason.
+        // X-Pubkey is the correct dev-mode bypass when require_auth_token=false.
+        let keys = nostr::Keys::generate();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-pubkey",
+            keys.public_key().to_hex().parse().expect("valid header"),
+        );
+
         let status = rt.block_on(oneshot_request(
-            state,
-            "POST",
-            "/query",
-            &host,
-            axum::http::HeaderMap::new(),
-            b"[]",
+            state, "POST", "/query", &host, headers, b"[]",
         ));
 
-        // In Off mode, an unauthenticated request may get any downstream status.
-        // The one forbidden status is 401 from the NIP-FI gate ("authentication required").
-        // (It could also be 200/400/etc. depending on relay config.)
-        // We verify the status is NOT 401 from the NIP-FI contract.
+        // In Off mode the NIP-FI gate is transparent — any downstream status
+        // (200, 400, 500) is acceptable.  The forbidden outcomes are NIP-FI
+        // gate denials: 401 (Enforce missing_evidence) and 503 (DenyProtected).
         //
-        // Mutation evidence: switching the off state to Enforce causes the gate
-        // to fire with 401 ("authentication required"), making this assert fail.
+        // Mutation evidence: changing the test state to Enforce mode causes the
+        // gate to fire (no Nostr-Federated-Identity header) returning 401, which
+        // falsifies the first assert_ne.
         assert_ne!(
             status,
             axum::http::StatusCode::UNAUTHORIZED,
-            "NIP-FI Off mode MUST NOT deny /query — gate was either enabled or mode mismatch \
-             [FI-INV-15]"
+            "NIP-FI Off mode MUST NOT produce 401 from the gate [FI-INV-15]"
+        );
+        assert_ne!(
+            status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "NIP-FI Off mode MUST NOT produce 503 from the gate [FI-INV-15]"
         );
     }
 
@@ -4951,9 +4964,17 @@ mod postgres_tests {
         rt.block_on(state.db.ensure_configured_community(&host))
             .expect("ensure community");
 
+        // DenyProtected mode has nip_fi_active=true, which forces require_auth_token
+        // || nip_fi_active = true in verify_bridge_auth.  The NIP-98 event MUST be
+        // signed for the community's actual URL (https://{host}/query), not the
+        // config relay_url, because nip98_expected_url uses the tenant host.
+        //
+        // After verify_bridge_auth succeeds, check_nip_fi_http_on_state fires with
+        // DenyProtected mode and returns 503 unconditionally — the assertion verifier
+        // is never consulted.
         let keys = Keys::generate();
-        let url = "wss://nip-fi-test.local/query";
-        let auth_headers = make_nip98_headers(&keys, url, "POST", b"[]");
+        let url = format!("https://{host}/query");
+        let auth_headers = make_nip98_headers(&keys, &url, "POST", b"[]");
 
         let status = rt.block_on(oneshot_request(
             state,
@@ -4964,6 +4985,10 @@ mod postgres_tests {
             b"[]",
         ));
 
+        // Mutation evidence: switching DenyProtected to Enforce causes the gate
+        // to return 401 (no Nostr-Federated-Identity header present); switching
+        // to Off causes the gate to admit and return a downstream status.  Either
+        // change falsifies this assert_eq.
         assert_eq!(
             status,
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
