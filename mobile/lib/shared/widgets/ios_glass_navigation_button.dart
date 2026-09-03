@@ -31,6 +31,8 @@ enum IosGlassNavigationIcon {
   avatar,
   channel,
   headphones,
+  users,
+  more,
 }
 
 /// A native contextual-menu item attached to an iOS glass navigation button.
@@ -321,6 +323,8 @@ class IosGlassNavigationButton extends HookWidget {
             _ => Icons.tag_rounded,
           },
           IosGlassNavigationIcon.headphones => Icons.headphones_rounded,
+          IosGlassNavigationIcon.users => Icons.group_rounded,
+          IosGlassNavigationIcon.more => Icons.more_vert_rounded,
         };
         return Semantics(
           container: true,

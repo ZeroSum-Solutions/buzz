@@ -597,6 +597,7 @@ class ChannelDetailPage extends HookConsumerWidget {
               ? _DmAppBarTitle(
                   channel: resolvedChannel,
                   currentPubkey: currentPubkey,
+                  nativeViewSuppressed: messageActionBackdropActive,
                 )
               : _ChannelAppBarTitle(
                   channel: resolvedChannel,
@@ -634,25 +635,11 @@ class ChannelDetailPage extends HookConsumerWidget {
                     channelId: resolvedChannel.id,
                     channel: resolvedChannel,
                     currentPubkey: currentPubkey,
+                    nativeViewSuppressed: messageActionBackdropActive,
                   ),
-                IconButton(
-                  color: context.colors.primary,
-                  onPressed: () async {
-                    final shouldClose = await showChannelActionsSheet(
-                      context: context,
-                      channel: resolvedChannel,
-                      isUnread: false,
-                      sectionId: ref
-                          .read(channelSectionsProvider)
-                          .store
-                          .assignments[resolvedChannel.id],
-                    );
-                    if (shouldClose == true && context.mounted) {
-                      Navigator.of(context).pop();
-                    }
-                  },
-                  tooltip: 'Channel actions',
-                  icon: const Icon(LucideIcons.ellipsisVertical, size: 22),
+                _ChannelActionsButton(
+                  channel: resolvedChannel,
+                  nativeViewSuppressed: messageActionBackdropActive,
                 ),
               ]
             : [

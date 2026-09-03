@@ -581,6 +581,80 @@ void main() {
       expect(find.byTooltip('Start Huddle'), findsOneWidget);
     });
 
+    testWidgets('uses native glass for the iOS DM header and actions', (
+      tester,
+    ) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+      final dmChannel = Channel(
+        id: _channelId,
+        name: 'DM',
+        channelType: 'dm',
+        visibility: 'private',
+        description: 'Group direct message',
+        createdBy: 'self',
+        createdAt: DateTime(2025),
+        memberCount: 3,
+        participants: const ['Self', 'Alice', 'Bob'],
+        participantPubkeys: const ['self', 'alice', 'bob'],
+        isMember: true,
+      );
+
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: const [],
+          channel: dmChannel,
+          users: const {
+            'alice': UserProfile(
+              pubkey: 'alice',
+              displayName: 'Alice',
+              avatarUrl: 'https://example.com/alice.png',
+            ),
+            'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
+          },
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      Map<String, Object> nativeParams(ValueKey<String> key) {
+        final control = find.byKey(key);
+        expect(control, findsOneWidget);
+        return tester
+                .widget<UiKitView>(
+                  find.descendant(
+                    of: control,
+                    matching: find.byType(UiKitView),
+                  ),
+                )
+                .creationParams
+            as Map<String, Object>;
+      }
+
+      final titleParams = nativeParams(
+        const ValueKey('dm-header-glass-trigger'),
+      );
+      expect(titleParams['icon'], 'avatar');
+      expect(titleParams['label'], contains('Alice'));
+      expect(titleParams['subtitle'], 'Offline');
+      expect(titleParams['avatarImageUrl'], 'https://example.com/alice.png');
+      expect(titleParams['fillWidth'], isTrue);
+      expect(
+        nativeParams(const ValueKey('channel-huddle-button'))['icon'],
+        'headphones',
+      );
+      expect(
+        nativeParams(const ValueKey('channel-members-button'))['icon'],
+        'users',
+      );
+      expect(
+        nativeParams(const ValueKey('channel-actions-button'))['icon'],
+        'more',
+      );
+      expect(find.byIcon(LucideIcons.ellipsisVertical), findsNothing);
+      expect(tester.takeException(), isNull);
+      debugDefaultTargetPlatformOverride = null;
+    });
+
     testWidgets('uses a fallback squircle for bot-role DM participants', (
       tester,
     ) async {

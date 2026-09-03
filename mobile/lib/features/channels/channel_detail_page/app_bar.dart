@@ -208,11 +208,13 @@ class _MembersButton extends ConsumerWidget {
   final String channelId;
   final Channel channel;
   final String? currentPubkey;
+  final ValueListenable<bool>? nativeViewSuppressed;
 
   const _MembersButton({
     required this.channelId,
     required this.channel,
     required this.currentPubkey,
+    this.nativeViewSuppressed,
   });
 
   @override
@@ -221,18 +223,33 @@ class _MembersButton extends ConsumerWidget {
         .watch(workingBotPubkeysProvider(channelId))
         .isNotEmpty;
 
+    void showMembers() {
+      showBuzzModalBottomSheet<void>(
+        context: context,
+        title: 'Members',
+        isScrollControlled: true,
+        showDragHandle: true,
+        builder: (_) =>
+            MembersSheet(channel: channel, currentPubkey: currentPubkey),
+      );
+    }
+
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
+      return IosGlassNavigationButton(
+        key: const ValueKey('channel-members-button'),
+        icon: IosGlassNavigationIcon.users,
+        semanticLabel: 'View members',
+        onPressed: showMembers,
+        controlSize: buzzNavigationActionSize,
+        foregroundColor: context.colors.primary,
+        nativeViewSuppressed: nativeViewSuppressed,
+      );
+    }
+
     return IconButton(
+      key: const ValueKey('channel-members-button'),
       color: context.colors.primary,
-      onPressed: () {
-        showBuzzModalBottomSheet<void>(
-          context: context,
-          title: 'Members',
-          isScrollControlled: true,
-          showDragHandle: true,
-          builder: (_) =>
-              MembersSheet(channel: channel, currentPubkey: currentPubkey),
-        );
-      },
+      onPressed: showMembers,
       tooltip: 'View members',
       icon: Stack(
         clipBehavior: Clip.none,
@@ -258,11 +275,64 @@ class _MembersButton extends ConsumerWidget {
   }
 }
 
+class _ChannelActionsButton extends ConsumerWidget {
+  const _ChannelActionsButton({
+    required this.channel,
+    this.nativeViewSuppressed,
+  });
+
+  final Channel channel;
+  final ValueListenable<bool>? nativeViewSuppressed;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    Future<void> showActions() async {
+      final shouldClose = await showChannelActionsSheet(
+        context: context,
+        channel: channel,
+        isUnread: false,
+        sectionId: ref
+            .read(channelSectionsProvider)
+            .store
+            .assignments[channel.id],
+      );
+      if (shouldClose == true && context.mounted) {
+        Navigator.of(context).pop();
+      }
+    }
+
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
+      return IosGlassNavigationButton(
+        key: const ValueKey('channel-actions-button'),
+        icon: IosGlassNavigationIcon.more,
+        semanticLabel: 'Channel actions',
+        onPressed: showActions,
+        controlSize: buzzNavigationActionSize,
+        foregroundColor: context.colors.primary,
+        nativeViewSuppressed: nativeViewSuppressed,
+      );
+    }
+
+    return IconButton(
+      key: const ValueKey('channel-actions-button'),
+      color: context.colors.primary,
+      onPressed: showActions,
+      tooltip: 'Channel actions',
+      icon: const Icon(LucideIcons.ellipsisVertical, size: 22),
+    );
+  }
+}
+
 class _DmAppBarTitle extends ConsumerWidget {
   final Channel channel;
   final String? currentPubkey;
+  final ValueListenable<bool>? nativeViewSuppressed;
 
-  const _DmAppBarTitle({required this.channel, required this.currentPubkey});
+  const _DmAppBarTitle({
+    required this.channel,
+    required this.currentPubkey,
+    this.nativeViewSuppressed,
+  });
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -314,6 +384,66 @@ class _DmAppBarTitle extends ConsumerWidget {
       'away' => 'Away',
       _ => 'Offline',
     };
+    final displayLabel = resolveDmChannelDisplayLabel(
+      channel,
+      currentPubkey: currentPubkey,
+    );
+
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
+      void openIdentity() {
+        if (channel.participantPubkeys.length == 2 && otherPubkey != null) {
+          showUserProfileSheet(context, otherPubkey);
+          return;
+        }
+        showBuzzModalBottomSheet<void>(
+          context: context,
+          title: 'Members',
+          isScrollControlled: true,
+          showDragHandle: true,
+          builder: (_) =>
+              MembersSheet(channel: channel, currentPubkey: currentPubkey),
+        );
+      }
+
+      return LayoutBuilder(
+        builder: (context, constraints) {
+          double measure(String text, TextStyle? style) {
+            final painter = TextPainter(
+              text: TextSpan(text: text, style: style),
+              maxLines: 1,
+              textDirection: Directionality.of(context),
+              textScaler: MediaQuery.textScalerOf(context),
+            )..layout();
+            return painter.width;
+          }
+
+          final textWidth = max(
+            measure(displayLabel, context.textTheme.titleMedium),
+            measure(presenceLabel, context.textTheme.bodySmall),
+          );
+          final naturalWidth = 54.0 + textWidth;
+          return Align(
+            alignment: Alignment.centerLeft,
+            child: IosGlassNavigationButton(
+              key: const ValueKey('dm-header-glass-trigger'),
+              icon: IosGlassNavigationIcon.avatar,
+              label: displayLabel,
+              subtitle: presenceLabel,
+              semanticLabel: '$displayLabel, $presenceLabel',
+              onPressed: openIdentity,
+              width: min(naturalWidth, constraints.maxWidth),
+              height: constraints.maxHeight,
+              controlSize: buzzNavigationActionSize,
+              fillWidth: true,
+              foregroundColor: context.colors.primary,
+              avatarImageUrl: animatedAvatar?.posterUrl ?? avatarUrl,
+              avatarFallback: initial,
+              nativeViewSuppressed: nativeViewSuppressed,
+            ),
+          );
+        },
+      );
+    }
 
     return Row(
       children: [
@@ -369,10 +499,7 @@ class _DmAppBarTitle extends ConsumerWidget {
                 children: [
                   Flexible(
                     child: Text(
-                      resolveDmChannelDisplayLabel(
-                        channel,
-                        currentPubkey: currentPubkey,
-                      ),
+                      displayLabel,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       key: const ValueKey('dm-header-name'),

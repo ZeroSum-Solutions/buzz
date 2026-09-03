@@ -432,6 +432,8 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
     case "colorSwatch": buttonIconName = "circle.fill"
     case "channel": buttonIconName = arguments?["systemIconName"] as? String ?? "number"
     case "headphones": buttonIconName = "headphones"
+    case "users": buttonIconName = "person.2"
+    case "more": buttonIconName = "ellipsis"
     default: buttonIconName = "chevron.backward"
     }
     if contentIcon == "avatar" || contentIcon == "channel" {
