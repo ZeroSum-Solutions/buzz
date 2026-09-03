@@ -238,7 +238,7 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
         // value is intentionally discarded — pubkey came from NIP-98 above.
         // [FI-TRACE-AUTHORITY-UNIFORM]
         let _ = crate::nip_fi_http::admit_nip_fi_http_on_state(state, &parts.headers, || {
-            Ok((pubkey, ()))
+            Ok(crate::nip_fi_http::Nip98Proof::new(pubkey, ()))
         })?;
 
         Ok(GitAuth { pubkey, tenant })

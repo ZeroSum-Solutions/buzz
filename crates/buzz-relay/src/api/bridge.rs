@@ -17,7 +17,7 @@ use buzz_auth::{LimitType, Nip98ReplayGuard, NipFiMode, DEFAULT_REPLAY_TTL_SECS}
 use buzz_core::TenantContext;
 
 use crate::handlers::ingest::{IngestAuth, IngestError};
-use crate::nip_fi_http::admit_nip_fi_http_on_state;
+use crate::nip_fi_http::{admit_nip_fi_http_on_state, Nip98Proof};
 use crate::state::AppState;
 
 use super::{api_error, internal_error, not_found, parse_query_or_400};
@@ -190,10 +190,8 @@ pub(crate) fn make_nip98_closure_for_admission(
     body: Option<Vec<u8>>,
     require_auth_token: bool,
     require_payload: bool,
-) -> impl FnOnce() -> Result<
-    (nostr::PublicKey, ([u8; 32], Option<u64>)),
-    axum::http::Response<axum::body::Body>,
-> {
+) -> impl FnOnce() -> Result<Nip98Proof<([u8; 32], Option<u64>)>, axum::http::Response<axum::body::Body>>
+{
     move || {
         verify_bridge_auth_with_options(
             &headers,
@@ -203,7 +201,7 @@ pub(crate) fn make_nip98_closure_for_admission(
             require_auth_token,
             require_payload,
         )
-        .map(|auth| (auth.pubkey, (auth.event_id_bytes, auth.signed_created_at)))
+        .map(|auth| Nip98Proof::new(auth.pubkey, (auth.event_id_bytes, auth.signed_created_at)))
         .map_err(|e| e.into_response())
     }
 }
@@ -866,7 +864,7 @@ pub async fn submit_event(
             state.config.require_auth_token || nip_fi_active,
             nip_fi_enforce,
         )
-        .map(|auth| (auth.pubkey, (auth.event_id_bytes, auth.signed_created_at)))
+        .map(|auth| Nip98Proof::new(auth.pubkey, (auth.event_id_bytes, auth.signed_created_at)))
         .map_err(|e| e.into_response())
     })?;
     let pubkey = *admission.proven_pubkey();
@@ -1170,7 +1168,7 @@ pub async fn query_events(
             state.config.require_auth_token || nip_fi_active,
             nip_fi_enforce,
         )
-        .map(|auth| (auth.pubkey, (auth.event_id_bytes, auth.signed_created_at)))
+        .map(|auth| Nip98Proof::new(auth.pubkey, (auth.event_id_bytes, auth.signed_created_at)))
         .map_err(|e| e.into_response())
     })?;
     let pubkey = *admission.proven_pubkey();
@@ -1728,7 +1726,7 @@ pub async fn count_events(
             state.config.require_auth_token || nip_fi_active,
             nip_fi_enforce,
         )
-        .map(|auth| (auth.pubkey, (auth.event_id_bytes, auth.signed_created_at)))
+        .map(|auth| Nip98Proof::new(auth.pubkey, (auth.event_id_bytes, auth.signed_created_at)))
         .map_err(|e| e.into_response())
     })?;
     let pubkey = *admission.proven_pubkey();
@@ -2538,7 +2536,7 @@ async fn authorize_moderation_read(
             None,
             state.config.require_auth_token || nip_fi_active,
         )
-        .map(|auth| (auth.pubkey, auth.event_id_bytes))
+        .map(|auth| Nip98Proof::new(auth.pubkey, auth.event_id_bytes))
         .map_err(|e| e.into_response())
     })?;
     let pubkey = *admission.proven_pubkey();

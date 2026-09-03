@@ -325,14 +325,14 @@ pub async fn upload_blob(
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> axum::response::Response {
-    use crate::nip_fi_http::admit_nip_fi_http_on_state;
+    use crate::nip_fi_http::{admit_nip_fi_http_on_state, Nip98Proof};
 
     // NIP-FI admission: the Blossom extractor already verified the NIP-98
     // auth event; the closure supplies the proven pubkey.  The admission
     // function then runs assertion verify → pair → deny-map in fixed order.
     // [FI-TRACE-AUTHORITY-UNIFORM]
     let proven_pubkey = auth.auth_event.pubkey;
-    match admit_nip_fi_http_on_state(&state, &headers, || Ok((proven_pubkey, ()))) {
+    match admit_nip_fi_http_on_state(&state, &headers, || Ok(Nip98Proof::new(proven_pubkey, ()))) {
         Ok(_) => {}
         Err(resp) => return resp,
     }
@@ -677,10 +677,11 @@ pub async fn get_blob(
     validate_media_path(&sha256_ext)?;
     let media_auth = authenticate_media_read(&state, &req_headers, &sha256_ext).await?;
     // NIP-FI admission. [FI-TRACE-AUTHORITY-UNIFORM]
-    use crate::nip_fi_http::admit_nip_fi_http_on_state;
+    use crate::nip_fi_http::{admit_nip_fi_http_on_state, Nip98Proof};
     let proven_pubkey = media_auth.pubkey;
-    if let Err(resp) = admit_nip_fi_http_on_state(&state, &req_headers, || Ok((proven_pubkey, ())))
-    {
+    if let Err(resp) = admit_nip_fi_http_on_state(&state, &req_headers, || {
+        Ok(Nip98Proof::new(proven_pubkey, ()))
+    }) {
         return Ok(resp);
     }
     serve_blob_for_tenant(&state, &media_auth.tenant, &sha256_ext, &req_headers).await
@@ -950,9 +951,11 @@ pub async fn head_blob(
     validate_media_path(&sha256_ext)?;
     let media_auth = authenticate_media_read(&state, &headers, &sha256_ext).await?;
     // NIP-FI admission. [FI-TRACE-AUTHORITY-UNIFORM]
-    use crate::nip_fi_http::admit_nip_fi_http_on_state;
+    use crate::nip_fi_http::{admit_nip_fi_http_on_state, Nip98Proof};
     let proven_pubkey = media_auth.pubkey;
-    if let Err(resp) = admit_nip_fi_http_on_state(&state, &headers, || Ok((proven_pubkey, ()))) {
+    if let Err(resp) =
+        admit_nip_fi_http_on_state(&state, &headers, || Ok(Nip98Proof::new(proven_pubkey, ())))
+    {
         return Ok(resp);
     }
     let tenant = media_auth.tenant;

@@ -106,6 +106,38 @@ impl HttpDenyMap for AlwaysAdmitStubDenyMap {
 
 // ── Admission type ────────────────────────────────────────────────────────────
 
+/// Opaque NIP-98 proof produced by a NIP-98 extraction closure.
+///
+/// The `pubkey` field is private to this module.  Code that calls
+/// `bridge::make_nip98_closure_for_admission`—or any other closure that yields
+/// this type—cannot read the proven key directly; it must pass the closure to
+/// [`admit_nip_fi_http`], which opens the proof internally and returns the key
+/// only through the private-constructor `NipFiAdmission`.
+///
+/// ## Falsifier
+///
+/// Invoking the closure directly (`make_nip98_closure_for_admission(...)()`)
+/// returns `Ok(Nip98Proof { .. })`.  Without the private `pubkey` accessor,
+/// the call site cannot project the key — any attempt to destructure or call
+/// `.pubkey` fails to compile.
+///
+/// `X` is caller-supplied side-data (e.g. replay-detection fields).
+pub(crate) struct Nip98Proof<X = ()> {
+    /// Private: only `admit_nip_fi_http` may read this field.
+    pubkey: PublicKey,
+    /// Side-data threaded through from the extraction closure.
+    pub(crate) extra: X,
+}
+
+impl<X> Nip98Proof<X> {
+    /// Construct a proof.  `pub(crate)` so that both bridge-internal closures
+    /// and the media/git surfaces (which already hold a proven pubkey from a
+    /// prior extractor) can build the token without leaking the key.
+    pub(crate) fn new(pubkey: PublicKey, extra: X) -> Self {
+        Self { pubkey, extra }
+    }
+}
+
 /// Proof that the full NIP-FI admission sequence completed for one HTTP request.
 ///
 /// Construction is private to [`admit_nip_fi_http`].  **No other code path
@@ -220,10 +252,13 @@ pub(crate) fn admit_nip_fi_http<D, X, F>(
 ) -> Result<NipFiAdmission<X>, Response<Body>>
 where
     D: HttpDenyMap,
-    F: FnOnce() -> Result<(PublicKey, X), Response<Body>>,
+    F: FnOnce() -> Result<Nip98Proof<X>, Response<Body>>,
 {
     // Step 1: run NIP-98 extraction.  Always runs regardless of mode.
-    let (proven_pubkey, extra) = extract_nip98()?;
+    let Nip98Proof {
+        pubkey: proven_pubkey,
+        extra,
+    } = extract_nip98()?;
 
     // Step 2 — Off mode: NIP-FI not required.  Return admission immediately.
     // The NIP-98 closure already enforced whatever auth the surface required.
@@ -382,7 +417,7 @@ pub(crate) fn admit_nip_fi_http_on_state<X, F>(
     extract_nip98: F,
 ) -> Result<NipFiAdmission<X>, Response<Body>>
 where
-    F: FnOnce() -> Result<(PublicKey, X), Response<Body>>,
+    F: FnOnce() -> Result<Nip98Proof<X>, Response<Body>>,
 {
     let mode = state.config.nip_fi.mode;
     let verifier = state.nip_fi_verifier.as_deref();
@@ -601,7 +636,7 @@ mod tests {
         let ep = expected_pubkey;
         let outcome = admit_nip_fi_http(
             &headers,
-            || Ok((ep, ())),
+            || Ok(Nip98Proof::new(ep, ())),
             None::<&dyn VerifyAssertion>,
             NipFiMode::Off,
             &AlwaysAdmitStubDenyMap,
@@ -644,7 +679,7 @@ mod tests {
         let pubkey = any_pubkey();
         let outcome = admit_nip_fi_http(
             &headers,
-            || Ok((pubkey, ())),
+            || Ok(Nip98Proof::new(pubkey, ())),
             None::<&dyn VerifyAssertion>,
             NipFiMode::DenyProtected,
             &AlwaysAdmitStubDenyMap,
@@ -670,7 +705,7 @@ mod tests {
         let pubkey = any_pubkey();
         let outcome = admit_nip_fi_http(
             &headers,
-            || Ok((pubkey, ())),
+            || Ok(Nip98Proof::new(pubkey, ())),
             None::<&dyn VerifyAssertion>,
             NipFiMode::Enforce,
             &AlwaysAdmitStubDenyMap,
@@ -701,7 +736,7 @@ mod tests {
         let pubkey = any_pubkey();
         let outcome = admit_nip_fi_http(
             &headers,
-            || Ok((pubkey, ())),
+            || Ok(Nip98Proof::new(pubkey, ())),
             None::<&dyn VerifyAssertion>,
             NipFiMode::Enforce,
             &AlwaysAdmitStubDenyMap,
@@ -759,7 +794,7 @@ mod tests {
 
         let outcome = admit_nip_fi_http(
             &headers,
-            || Ok((pubkey_b, ())),
+            || Ok(Nip98Proof::new(pubkey_b, ())),
             Some(&verifier as &dyn VerifyAssertion),
             NipFiMode::Enforce,
             &AlwaysAdmitStubDenyMap,
