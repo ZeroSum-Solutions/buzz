@@ -307,7 +307,6 @@ class ChannelsPage extends HookConsumerWidget {
 
     void openCommunitySwitcher() {
       unawaited(HapticFeedback.selectionClick());
-      nativeHeaderControlsSuppressed.value = true;
       final communities = ref.read(communityListProvider).value ?? const [];
       for (final community in communities) {
         final icon = ref.read(communityIconProvider(community.relayUrl));
@@ -321,9 +320,7 @@ class ChannelsPage extends HookConsumerWidget {
           showCloseButton: false,
           showDragHandle: false,
           builder: (_) => const _CommunitySwitcherSheet(),
-        ).whenComplete(() {
-          if (context.mounted) nativeHeaderControlsSuppressed.value = false;
-        }),
+        ),
       );
     }
 

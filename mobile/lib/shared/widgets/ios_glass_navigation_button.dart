@@ -399,7 +399,9 @@ class IosGlassNavigationButton extends HookWidget {
                             ? Padding(
                                 padding: EdgeInsetsDirectional.only(
                                   start: isAvatarContent ? 6 : 12,
-                                  end: isAvatarContent ? 8 : 16,
+                                  end: isAvatarContent
+                                      ? (label == null ? 6 : 8)
+                                      : 16,
                                 ),
                                 child: Row(
                                   key: const ValueKey(

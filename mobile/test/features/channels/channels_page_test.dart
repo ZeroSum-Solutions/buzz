@@ -845,7 +845,7 @@ void main() {
     debugDefaultTargetPlatformOverride = null;
   });
 
-  testWidgets('suppresses native header glass beneath the community sheet', (
+  testWidgets('preserves native header glass beneath the community sheet', (
     tester,
   ) async {
     debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
@@ -868,14 +868,22 @@ void main() {
 
     expect(
       find.descendant(of: controlFinder, matching: find.byType(UiKitView)),
-      findsNothing,
-    );
-    expect(
-      find.descendant(of: controlFinder, matching: find.byType(AvatarImage)),
       findsOneWidget,
     );
+    final fallbackOpacity = tester.widget<AnimatedOpacity>(
+      find.descendant(
+        of: controlFinder,
+        matching: find.byKey(
+          const ValueKey('ios-glass-navigation-fallback-layer'),
+        ),
+      ),
+    );
+    expect(fallbackOpacity.opacity, 0);
     expect(
-      find.descendant(of: controlFinder, matching: find.byType(BackdropFilter)),
+      find.descendant(
+        of: find.byKey(const ValueKey('profile-header-glass-control')),
+        matching: find.byType(UiKitView),
+      ),
       findsOneWidget,
     );
     expect(find.byKey(const Key('community-switcher-sheet')), findsOneWidget);
