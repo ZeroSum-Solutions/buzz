@@ -81,6 +81,7 @@ worktree builds, set an explicit launcher name and package suffix when invoking
 the generator or a recipe that invokes it:
 
 ```bash
+BUZZ_PUSH_GATEWAY_URL="https://push.example" \
 BUZZ_ANDROID_DEBUG_APP_NAME="Buzz Huddles" \
 BUZZ_ANDROID_DEBUG_ID_SUFFIX=".huddles_829c" \
 ./bin/just mobile-build-android
