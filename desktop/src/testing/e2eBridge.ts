@@ -922,7 +922,7 @@ type RawRelayAgent = {
   channels: string[];
   channel_ids: string[];
   capabilities: string[];
-  status: PresenceStatus;
+  status: PresenceStatus | "unknown";
   respond_to?: "owner-only" | "allowlist" | "anyone";
   respond_to_allowlist?: string[];
 };
@@ -2475,6 +2475,7 @@ function resetMockRelayAgents(config?: E2eConfig) {
 
 function resetMockManagedAgents(config?: E2eConfig) {
   mockManagedAgents = [];
+  mockBestieAssignment = null;
   mockManagedAgentRuntimes = (config?.mock?.managedAgentRuntimes ?? []).map(
     (seed) => ({
       pubkey: seed.pubkey,
@@ -3225,6 +3226,9 @@ let mockClosedChannelLiveSubscription = false;
 const realSockets = new Map<number, WebSocket>();
 let mockManagedAgents: MockManagedAgent[] = [];
 let mockManagedAgentRuntimes: MockManagedAgentRuntimeRow[] = [];
+let mockBestieAssignment: {
+  agent_pubkey: string;
+} | null = null;
 
 // Mutable `save_subscriptions` table mirror — TEST-ONLY.
 //
@@ -9694,6 +9698,9 @@ async function handleDeleteManagedAgent(args: {
   mockManagedAgents = mockManagedAgents.filter(
     (candidate) => candidate.pubkey !== args.pubkey,
   );
+  if (mockBestieAssignment?.agent_pubkey === args.pubkey) {
+    mockBestieAssignment = null;
+  }
   syncMockRelayAgentsFromManagedAgents();
 }
 
@@ -13734,6 +13741,32 @@ export function maybeInstallE2eTauriMocks() {
         );
       case "list_managed_agent_runtimes":
         return mockManagedAgentRuntimes.map((row) => ({ ...row }));
+      case "get_bestie_assignment":
+        return mockBestieAssignment ? { ...mockBestieAssignment } : null;
+      case "assign_bestie": {
+        const agentPubkey = (payload as { agentPubkey: string }).agentPubkey;
+        const agent = getMockManagedAgent(agentPubkey);
+        if (agent.backend.type !== "local") {
+          throw new Error("only a local managed agent can be your Bestie");
+        }
+        mockBestieAssignment = {
+          agent_pubkey: agent.pubkey,
+        };
+        return { ...mockBestieAssignment };
+      }
+      case "clear_bestie_assignment":
+        mockBestieAssignment = null;
+        return undefined;
+      case "resolve_bestie_conversation": {
+        if (!mockBestieAssignment) {
+          throw new Error("choose an agent before opening Bestie");
+        }
+        const channel = await handleOpenDm(
+          { pubkeys: [mockBestieAssignment.agent_pubkey] },
+          activeConfig,
+        );
+        return channel;
+      }
       case "start_managed_agent_runtime":
         return handleManagedAgentRuntimeAction(
           "start",
