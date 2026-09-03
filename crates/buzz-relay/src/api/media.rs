@@ -19,8 +19,12 @@ use axum::{
 };
 use base64::Engine;
 use buzz_audit::{AuditAction, NewAuditEntry};
+use buzz_auth::DenialClass;
 use buzz_core::tenant::TenantContext;
-use buzz_media::{BlobDescriptor, MediaError, UploadAttribution, UploadNetworkInfo};
+use buzz_media::auth::BlossomStrictness;
+use buzz_media::{
+    BlobDescriptor, BlossomDenialKind, MediaError, UploadAttribution, UploadNetworkInfo,
+};
 
 use crate::state::AppState;
 
@@ -45,6 +49,62 @@ pub(crate) struct AuthenticatedUpload {
 enum UploadRouteMode {
     Upload,
     LegacyMedia,
+}
+
+/// Mode-aware Blossom auth rejection for the relay layer.
+///
+/// In `Strict` mode, Blossom denial errors map to the NIP-FI fixed
+/// text/plain responses (`DenialClass` byte contract). In `Permissive` mode
+/// (Off-mode deployments), the legacy JSON 401 shape is preserved unchanged
+/// [FI-INV-15].
+///
+/// Non-Blossom errors (`blossom_denial_kind()` returns `None`) always fall
+/// through to `MediaError::into_response()` regardless of mode.
+struct MediaDenial(MediaError, BlossomStrictness);
+
+impl IntoResponse for MediaDenial {
+    fn into_response(self) -> Response {
+        let MediaDenial(error, strictness) = self;
+        if strictness == BlossomStrictness::Strict {
+            if let Some(kind) = error.blossom_denial_kind() {
+                let class = match kind {
+                    BlossomDenialKind::MissingEvidence => DenialClass::MissingEvidence,
+                    BlossomDenialKind::EvidenceRejected => DenialClass::EvidenceRejected,
+                };
+                tracing::warn!(
+                    error = %error,
+                    denial_class = ?class,
+                    "Blossom auth denial (strict)"
+                );
+                let mut builder = axum::http::Response::builder()
+                    .status(class.http_status())
+                    .header(header::CONTENT_TYPE, class.content_type());
+                if let Some(challenge) = class.www_authenticate() {
+                    builder = builder.header("WWW-Authenticate", challenge);
+                }
+                return builder
+                    .body(axum::body::Body::from(class.http_body()))
+                    .expect("NIP-FI denial response is always valid");
+            }
+        }
+        error.into_response()
+    }
+}
+
+/// Wrap a `MediaError` with the active strictness to produce the correct
+/// response shape at the relay boundary.
+fn media_denial(error: MediaError, strictness: BlossomStrictness) -> MediaDenial {
+    MediaDenial(error, strictness)
+}
+
+impl From<MediaError> for MediaDenial {
+    /// Default conversion uses Permissive mode — non-auth errors always fall
+    /// through to `MediaError::into_response()` regardless of mode, so the
+    /// strictness value is irrelevant. Auth errors at the extractor boundary
+    /// use explicit `media_denial(e, strictness)` calls instead.
+    fn from(e: MediaError) -> Self {
+        MediaDenial(e, BlossomStrictness::Permissive)
+    }
 }
 
 fn should_stream_as_video(sniff: &[u8]) -> bool {
@@ -138,7 +198,7 @@ fn acquire_upload_permit(
 }
 
 impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
-    type Rejection = MediaError;
+    type Rejection = MediaDenial;
 
     async fn from_request_parts(
         parts: &mut Parts,
@@ -172,11 +232,16 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
         // 2. Extract and validate Blossom auth event against the bound host.
         // Derive strictness from NIP-FI mode: strict rules apply in active (non-Off) modes.
         // Off mode preserves the pre-NIP-FI permissive behavior [FI-INV-15].
-        let auth_event = extract_blossom_auth(headers)?;
+        //
+        // Auth errors are wrapped with `media_denial(e, strictness)` so that
+        // Strict mode produces NIP-FI fixed text/plain responses; Permissive
+        // mode falls through to the legacy JSON 401 shape [FI-INV-15].
         let strictness = blossom_strictness_from_state(state);
+        let auth_event = extract_blossom_auth(headers).map_err(|e| media_denial(e, strictness))?;
         // Pre-body strictness check: verify freshness, cardinality, and server tag before
         // the body is consumed. The x-tag hash binding is checked after body completion.
-        buzz_media::auth::verify_blossom_auth_event(&auth_event, Some(tenant.host()), strictness)?;
+        buzz_media::auth::verify_blossom_auth_event(&auth_event, Some(tenant.host()), strictness)
+            .map_err(|e| media_denial(e, strictness))?;
 
         // 3. Require X-SHA-256 header (BUD-11: mandatory for PUT /upload)
         let claimed_hash = headers
@@ -190,7 +255,7 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
                 .chars()
                 .all(|c| matches!(c, '0'..='9' | 'a'..='f'))
         {
-            return Err(MediaError::HashMismatch);
+            return Err(MediaError::HashMismatch.into());
         }
 
         // 4. Validate X-SHA-256 matches at least one x tag in the auth event
@@ -199,7 +264,7 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
             .iter()
             .any(|tag| tag.kind().to_string() == "x" && (tag.content() == Some(claimed_hash)));
         if !has_matching_x {
-            return Err(MediaError::HashMismatch);
+            return Err(MediaError::HashMismatch.into());
         }
 
         // 5. Relay membership gate (NIP-43). Blossom auth proves the signer
@@ -223,13 +288,14 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
         if upload_rate_limited(state, tenant.community(), &auth_event.pubkey) {
             metrics::counter!("buzz_media_upload_rejections_total", "reason" => "rate_limit")
                 .increment(1);
-            return Err(MediaError::UploadRateLimitExceeded);
+            return Err(MediaError::UploadRateLimitExceeded.into());
         }
         let upload_permit = acquire_upload_permit(state, tenant.community(), &auth_event.pubkey)
             .inspect_err(|_| {
                 metrics::counter!("buzz_media_upload_rejections_total", "reason" => "concurrency")
                     .increment(1);
-            })?;
+            })
+            .map_err(MediaDenial::from)?;
 
         Ok(AuthenticatedUpload {
             auth_event,
@@ -529,18 +595,14 @@ async fn authenticate_media_read(
     state: &AppState,
     headers: &HeaderMap,
     sha256_ext: &str,
-) -> Result<MediaReadAuth, MediaError> {
+) -> Result<MediaReadAuth, MediaDenial> {
     let tenant = bind_media_read_tenant(state, headers).await?;
 
-    let auth_event = extract_blossom_auth(headers)?;
-    let sha256 = sha256_ext.split('.').next().unwrap_or(sha256_ext);
     let strictness = blossom_strictness_from_state(state);
-    buzz_media::auth::verify_blossom_get_auth(
-        &auth_event,
-        sha256,
-        Some(tenant.host()),
-        strictness,
-    )?;
+    let auth_event = extract_blossom_auth(headers).map_err(|e| media_denial(e, strictness))?;
+    let sha256 = sha256_ext.split('.').next().unwrap_or(sha256_ext);
+    buzz_media::auth::verify_blossom_get_auth(&auth_event, sha256, Some(tenant.host()), strictness)
+        .map_err(|e| media_denial(e, strictness))?;
 
     let auth_tag = crate::api::relay_members::extract_auth_tag_header(headers);
     crate::api::relay_members::enforce_relay_membership(
@@ -643,10 +705,12 @@ pub async fn get_blob(
     State(state): State<Arc<AppState>>,
     Path(sha256_ext): Path<String>,
     req_headers: HeaderMap,
-) -> Result<Response, MediaError> {
+) -> Result<Response, MediaDenial> {
     validate_media_path(&sha256_ext)?;
     let media_auth = authenticate_media_read(&state, &req_headers, &sha256_ext).await?;
-    serve_blob_for_tenant(&state, &media_auth.tenant, &sha256_ext, &req_headers).await
+    serve_blob_for_tenant(&state, &media_auth.tenant, &sha256_ext, &req_headers)
+        .await
+        .map_err(MediaDenial::from)
 }
 
 /// Serve a validated blob from an already-authorized tenant context.
@@ -908,7 +972,7 @@ pub async fn head_blob(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(sha256_ext): Path<String>,
-) -> Result<Response, MediaError> {
+) -> Result<Response, MediaDenial> {
     validate_media_path(&sha256_ext)?;
     let media_auth = authenticate_media_read(&state, &headers, &sha256_ext).await?;
     let tenant = media_auth.tenant;
@@ -937,7 +1001,7 @@ pub async fn head_blob(
                 .await
                 .map_err(|_| MediaError::NotFound)?;
             if requested_ext != sidecar.ext {
-                return Err(MediaError::NotFound);
+                return Err(MediaError::NotFound.into());
             }
         }
         sidecar_mime
@@ -1054,7 +1118,7 @@ mod tests {
     use std::sync::Arc;
 
     use axum::{
-        body::Body,
+        body::{to_bytes, Body},
         http::{header, Request, StatusCode},
     };
     use nostr::{EventBuilder, JsonUtil, Keys, Kind, Tag, Timestamp};
@@ -1062,6 +1126,149 @@ mod tests {
     use uuid::Uuid;
 
     const VALID_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    // ── MediaDenial response-shape tests (NIP-FI §755-773) ──────────────────
+    // These tests pin the byte-exact response contract for Strict mode and
+    // confirm Permissive mode produces the unchanged legacy JSON 401 shape.
+
+    #[tokio::test]
+    async fn strict_missing_auth_produces_nip_fi_401_with_www_authenticate() {
+        let denial = MediaDenial(MediaError::MissingAuth, BlossomStrictness::Strict);
+        let resp = denial.into_response();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("text/plain"),
+            "expected text/plain CT, got: {ct}"
+        );
+
+        let www_auth = resp
+            .headers()
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(
+            www_auth, "Nostr",
+            "expected 'Nostr' WWW-Authenticate challenge"
+        );
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"authentication required\n");
+    }
+
+    #[tokio::test]
+    async fn strict_evidence_rejected_produces_nip_fi_403_text_plain() {
+        for error in [
+            MediaError::InvalidSignature,
+            MediaError::TokenExpired,
+            MediaError::TimestampOutOfWindow,
+            MediaError::HashMismatch,
+            MediaError::ServerMismatch,
+            MediaError::MissingTag("server"),
+            MediaError::DuplicateTag("Authorization"),
+            MediaError::InvalidAuthScheme,
+        ] {
+            let denial = MediaDenial(error, BlossomStrictness::Strict);
+            let resp = denial.into_response();
+
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "expected 403 for Strict {error:?}"
+            );
+
+            let ct = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            assert!(
+                ct.contains("text/plain"),
+                "expected text/plain CT for {error:?}, got: {ct}"
+            );
+
+            assert!(
+                resp.headers().get("www-authenticate").is_none(),
+                "403 must not have WWW-Authenticate for {error:?}"
+            );
+
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(
+                body.as_ref(),
+                b"evidence rejected\n",
+                "wrong body for {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn permissive_missing_auth_keeps_legacy_json_401() {
+        let denial = MediaDenial(MediaError::MissingAuth, BlossomStrictness::Permissive);
+        let resp = denial.into_response();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("application/json"),
+            "Permissive must keep JSON CT, got: {ct}"
+        );
+
+        assert!(
+            resp.headers().get("www-authenticate").is_none(),
+            "Permissive must not add WWW-Authenticate"
+        );
+    }
+
+    #[tokio::test]
+    async fn permissive_evidence_rejected_keeps_legacy_json_401() {
+        for error in [
+            MediaError::InvalidSignature,
+            MediaError::TokenExpired,
+            MediaError::HashMismatch,
+            MediaError::MissingTag("t"),
+        ] {
+            let denial = MediaDenial(error, BlossomStrictness::Permissive);
+            let resp = denial.into_response();
+
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "Permissive: expected 401 for {error:?}"
+            );
+
+            let ct = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            assert!(
+                ct.contains("application/json"),
+                "Permissive must keep JSON CT for {error:?}, got: {ct}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn non_auth_errors_always_fall_through_regardless_of_mode() {
+        for strictness in [BlossomStrictness::Strict, BlossomStrictness::Permissive] {
+            let denial = MediaDenial(MediaError::NotFound, strictness);
+            assert_eq!(denial.into_response().status(), StatusCode::NOT_FOUND);
+
+            let denial = MediaDenial(MediaError::Internal, strictness);
+            assert!(denial.into_response().status().is_server_error());
+        }
+    }
 
     #[test]
     fn serving_write_error_taxonomy_separates_fence_from_backend_failure() {
@@ -1237,7 +1444,7 @@ mod tests {
 
     fn media_get_tags_for(host: &str, sha256: Option<&str>) -> Vec<Tag> {
         let now = Timestamp::now().as_secs();
-        let expiration = (now + 300).to_string();
+        let expiration = (now + 55).to_string();
         let mut tags = vec![
             Tag::parse(["t", "get"]).expect("t tag"),
             Tag::parse(["expiration", &expiration]).expect("expiration tag"),
@@ -1290,7 +1497,7 @@ mod tests {
     async fn media_read_rejects_upload_verb_wrong_server_and_wrong_x() {
         let keys = Keys::generate();
         let now = Timestamp::now().as_secs();
-        let expiration = (now + 300).to_string();
+        let expiration = (now + 55).to_string();
         let cases = [
             vec![
                 Tag::parse(["t", "upload"]).expect("t tag"),

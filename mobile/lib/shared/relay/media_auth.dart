@@ -7,10 +7,12 @@ import 'package:nostr/nostr.dart' as nostr;
 import 'relay_provider.dart';
 
 const _mediaGetAuthKind = 24242;
-const _mediaGetAuthLifetimeSeconds = 600;
+const _mediaGetAuthLifetimeSeconds = 60;
 
 /// Re-sign this long before the cached auth event expires, so an in-flight
 /// request signed just before the boundary still lands well within validity.
+/// With a 60-second lifetime, the margin equals the lifetime: each request
+/// mints a fresh token (mint-per-request pattern for NIP-FI compliance).
 const _mediaGetAuthRefreshMarginSeconds = 60;
 
 /// Builds BUD-01 Blossom `t=get` auth headers for relay-host media URLs.

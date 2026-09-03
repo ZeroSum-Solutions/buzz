@@ -3,6 +3,21 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
+/// Coarse Blossom denial kind for NIP-FI response shaping.
+///
+/// Callers that know the active [`crate::auth::BlossomStrictness`] use this to
+/// choose the correct HTTP response shape — NIP-FI fixed text/plain in Strict
+/// mode, legacy JSON in Permissive mode — without requiring `buzz-media` to
+/// depend on `buzz-auth`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlossomDenialKind {
+    /// `Authorization` header was absent. Maps to HTTP 401 + `WWW-Authenticate: Nostr`.
+    MissingEvidence,
+    /// Authorization header or proof was present but structurally invalid,
+    /// malformed, expired, or otherwise rejected. Maps to HTTP 403.
+    EvidenceRejected,
+}
+
 /// Errors from media operations.
 #[derive(Debug, thiserror::Error)]
 pub enum MediaError {
@@ -112,6 +127,40 @@ impl From<serde_json::Error> for MediaError {
     }
 }
 
+impl MediaError {
+    /// Classify this error as a Blossom denial kind for response-shape selection.
+    ///
+    /// Returns `Some(BlossomDenialKind::MissingEvidence)` when the
+    /// `Authorization` header was absent, `Some(BlossomDenialKind::EvidenceRejected)`
+    /// for any structurally present but invalid/malformed/expired proof, and
+    /// `None` for non-auth errors.
+    ///
+    /// Relay call sites that know the active `BlossomStrictness` use this to
+    /// select the appropriate response shape: NIP-FI fixed text/plain in Strict
+    /// mode, legacy JSON 401 in Permissive mode.
+    pub fn blossom_denial_kind(&self) -> Option<BlossomDenialKind> {
+        match self {
+            Self::MissingAuth => Some(BlossomDenialKind::MissingEvidence),
+            Self::InvalidAuthScheme
+            | Self::InvalidBase64
+            | Self::InvalidAuthEvent
+            | Self::InvalidAuthKind
+            | Self::InvalidAuthVerb
+            | Self::DuplicateTag(_)
+            | Self::InvalidSignature
+            | Self::TokenExpired
+            | Self::TimestampOutOfWindow
+            | Self::Unauthorized
+            | Self::TokenRevoked
+            | Self::PubkeyMismatch
+            | Self::HashMismatch
+            | Self::ServerMismatch
+            | Self::MissingTag(_) => Some(BlossomDenialKind::EvidenceRejected),
+            _ => None,
+        }
+    }
+}
+
 impl IntoResponse for MediaError {
     fn into_response(self) -> Response {
         let (status, msg) = match &self {
@@ -191,6 +240,115 @@ impl IntoResponse for MediaError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── BlossomDenialKind classification ─────────────────────────────────────
+
+    #[test]
+    fn missing_auth_is_missing_evidence() {
+        assert_eq!(
+            MediaError::MissingAuth.blossom_denial_kind(),
+            Some(BlossomDenialKind::MissingEvidence)
+        );
+    }
+
+    #[test]
+    fn structural_proof_errors_are_evidence_rejected() {
+        for error in [
+            MediaError::InvalidAuthScheme,
+            MediaError::InvalidBase64,
+            MediaError::InvalidAuthEvent,
+            MediaError::InvalidAuthKind,
+            MediaError::InvalidAuthVerb,
+            MediaError::DuplicateTag("Authorization"),
+            MediaError::InvalidSignature,
+            MediaError::TokenExpired,
+            MediaError::TimestampOutOfWindow,
+            MediaError::Unauthorized,
+            MediaError::TokenRevoked,
+            MediaError::PubkeyMismatch,
+            MediaError::HashMismatch,
+            MediaError::ServerMismatch,
+            MediaError::MissingTag("t"),
+        ] {
+            assert_eq!(
+                error.blossom_denial_kind(),
+                Some(BlossomDenialKind::EvidenceRejected),
+                "expected EvidenceRejected for {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_auth_errors_have_no_denial_kind() {
+        for error in [
+            MediaError::NotFound,
+            MediaError::FileTooLarge { size: 1, max: 0 },
+            MediaError::Internal,
+            MediaError::ServiceUnavailable,
+            MediaError::InsufficientScope,
+        ] {
+            assert_eq!(
+                error.blossom_denial_kind(),
+                None,
+                "expected None for {error:?}"
+            );
+        }
+    }
+
+    // ── Legacy IntoResponse shapes (Permissive regression pins) ─────────────
+    // These pins ensure MediaError::into_response() keeps the old JSON 401
+    // shape so Off-mode deployments remain unaffected [FI-INV-15].
+
+    #[test]
+    fn missing_auth_permissive_shape_is_json_401() {
+        let resp = MediaError::MissingAuth.into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // Content-type must be JSON (application/json), not text/plain.
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("application/json"),
+            "expected JSON content-type, got: {ct}"
+        );
+        // No WWW-Authenticate header in the legacy JSON response.
+        assert!(
+            resp.headers().get("www-authenticate").is_none(),
+            "Permissive shape must not include WWW-Authenticate"
+        );
+    }
+
+    #[test]
+    fn evidence_rejected_errors_permissive_shape_is_json_401() {
+        // In Permissive mode, proof failures also return JSON 401 (no 403 distinction).
+        for error in [
+            MediaError::InvalidSignature,
+            MediaError::TokenExpired,
+            MediaError::HashMismatch,
+            MediaError::ServerMismatch,
+            MediaError::MissingTag("server"),
+        ] {
+            let resp = error.into_response();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "Permissive: expected 401 for {error:?}"
+            );
+            let ct = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            assert!(
+                ct.contains("application/json"),
+                "expected JSON CT for {error:?}, got: {ct}"
+            );
+        }
+    }
+
+    // ── Existing non-auth response map tests ────────────────────────────────
 
     #[test]
     fn serving_backend_failures_map_to_5xx_but_fences_remain_403() {
