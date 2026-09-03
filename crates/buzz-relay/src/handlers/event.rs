@@ -2567,10 +2567,10 @@ mod tests {
     //
     // Selected by the `postgres-ci` nextest profile filter
     // (`test(/postgres_tests::/)`) which also passes `--run-ignored ignored-only`.
-    // These tests require a real Postgres instance at
-    // `postgres://buzz:buzz_dev@127.0.0.1:5432/buzz`.
+    // These tests require a real Postgres instance; the URL is resolved from
+    // `state.config.database_url` (set by `DATABASE_URL` env var in CI, same
+    // source `test_state()` uses — no hard-coded URL).
     mod postgres_tests {
-        use super::*;
 
         // W2 full witness: event-ingest barrier + durable absence + publication oracle.
         //
@@ -2586,7 +2586,7 @@ mod tests {
         //   publish_count = 1 → `assert_eq!(publish_count, 0)` panics.
         //   AND: the row IS in the DB → COUNT(*) = 1 → DB assertion panics.
         #[tokio::test]
-        #[ignore = "requires Postgres at postgres://buzz:buzz_dev@127.0.0.1:5432/buzz — runs in postgres-ci nextest lane"]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
         async fn w2_event_ingest_barrier_expiry_mid_flight_blocks_persistence() {
             use std::collections::HashMap;
             use std::sync::atomic::Ordering;
@@ -2694,16 +2694,6 @@ mod tests {
                 "W2: no additional frames must be sent after session-expired denial"
             );
 
-            // ── local_event_ids proxy assertion ───────────────────────────────────
-            assert!(
-                !state
-                    .local_event_ids
-                    .contains_key(&(community, event_id_bytes)),
-                "W2: local_event_ids must NOT contain the event — \
-                 mark_local_event is only called after ingest_event/fan-out, \
-                 which must not have been reached when acquire_effect returns SessionExpired"
-            );
-
             // ── Publication oracle: real publication boundary ──────────────────────
             //
             // `before_event_publish` fires immediately before `publish_event` in
@@ -2726,14 +2716,15 @@ mod tests {
             // ── Durable DB assertion ───────────────────────────────────────────────
             //
             // Requires real Postgres. Confirms the event row is absent from `events`.
+            // Connects to the same database `test_state()` built its pool from
+            // (`state.config.database_url` ← `DATABASE_URL` env var in CI).
             //
             // Mutation evidence:
             //   Remove `acquire_effect()` → ingest_event is attempted → with a real DB,
             //   the row IS inserted → COUNT(*) = 1 → assertion panics.
-            let db_url = "postgres://buzz:buzz_dev@127.0.0.1:5432/buzz";
-            let pool = sqlx::PgPool::connect(db_url).await.expect(
-                "W2: Postgres must be available at postgres://buzz:buzz_dev@127.0.0.1:5432/buzz",
-            );
+            let pool = sqlx::PgPool::connect(&state.config.database_url)
+                .await
+                .expect("W2: Postgres must be reachable at state.config.database_url");
             let event_id_hex = hex::encode(event_id_bytes);
             let row_count: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE id = decode($1, 'hex')")

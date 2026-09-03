@@ -892,23 +892,22 @@ pub(crate) async fn handle_active_audio_connection(
         "audio peer joined"
     );
 
-    // Owner path: install (or reuse) this room's single lease renewer now that
-    // a peer is admitted, and capture its owner-loss signal. The connection
-    // that won the CAS holds the lease in the guard; it installs the renewer
-    // here, after add_peer succeeded, and transfers the lease into the registry.
+    // Owner path: record the owner generation and (for the steady-state reuse
+    // arm) subscribe to the existing owner-loss signal. The lease is NOT
+    // transferred here — `guard` still holds it so every pre-commit exit goes
+    // through `guard.release_before_commit()` which directly awaits
+    // `directory.release()`. The lease transfers into `HuddleOwnerRegistry`
+    // only after commit succeeds (I1 mandated: transfer-after-commit-won).
     //
-    // I1 invariant: the lease must be released on every pre-commit exit after
-    // this point. `attach_signals` consumes the lease into the registry renewer,
-    // so `guard.release_before_commit()` can no longer release it — instead,
-    // every post-attach pre-commit failure must call
-    // `mesh.owners.release(channel_id, generation)` (generation-fenced) to
-    // cancel the renewer and release the Redis lease. `owner_generation` carries
-    // the generation for this purpose.
+    // Acquire arm (new CAS winner): the lease stays in the guard through all
+    // pre-commit exits. `owner_lost` / `owner_draining` are populated at the
+    // commit-won point below when `attach_signals` is called.
     //
-    // A steady-state owner (an earlier joiner installed it) reuses the room's
-    // existing signal. `owner_lost` drives this connection's own teardown;
-    // `owner_generation` also fences room-empty release so a stale teardown
-    // cannot release a newer epoch a re-acquire installed.
+    // Reuse arm (steady-state owner): the registry entry is already live.
+    // Subscribe to the existing signals here so that a pre-commit cancel
+    // (expiry, version mismatch, etc.) still tears down this connection
+    // correctly. `owner_generation` fences room-empty release so a stale
+    // teardown cannot release a newer epoch a re-acquire installed.
     //
     // The reuse arm's live entry is guaranteed by `resolve_join_owner_ready`:
     // it re-resolves until the CAS winner has installed (reuse) or a fresh CAS
@@ -922,17 +921,15 @@ pub(crate) async fn handle_active_audio_connection(
     let mut owner_draining: Option<CancellationToken> = None;
     let mut owner_generation: Option<u64> = None;
     if let Some(mesh) = state.mesh() {
-        match (pending_remote, guard.take_lease()) {
-            (
-                Some(crate::audio::join::JoinOutcome::LocalOwner { generation }),
-                Some((lease, directory)),
-            ) => {
-                let signals = mesh.owners.attach_signals(channel_id, directory, lease);
-                owner_lost = Some(signals.lost);
-                owner_draining = Some(signals.draining);
+        match pending_remote {
+            Some(crate::audio::join::JoinOutcome::LocalOwner { generation })
+                if guard.lease.is_some() =>
+            {
+                // Acquire arm: lease stays in guard; signals populated post-commit.
                 owner_generation = Some(generation);
             }
-            (Some(crate::audio::join::JoinOutcome::LocalOwner { generation }), None) => {
+            Some(crate::audio::join::JoinOutcome::LocalOwner { generation }) => {
+                // Reuse arm: subscribe to the existing registry signals.
                 owner_lost = mesh.owners.lost_for(channel_id);
                 owner_draining = mesh.owners.drain_for(channel_id);
                 owner_generation = Some(generation);
@@ -1034,6 +1031,11 @@ pub(crate) async fn handle_active_audio_connection(
             // Committed but the joining peer's ctrl channel was saturated.
             // Route through normal admitted teardown: remove peer, emit 48102,
             // send remote close. Committed join => exactly one leave.
+            //
+            // I1: the lease is still guard-owned (attach_signals was not called).
+            // Take the peer_id from the guard now so release_before_commit does
+            // not double-remove, then release the lease at the end of this arm.
+            let _ = guard.take_peer_id();
             room.remove_peer(peer_id);
             state
                 .audio_rooms
@@ -1063,6 +1065,8 @@ pub(crate) async fn handle_active_audio_connection(
             state
                 .audio_rooms
                 .cleanup_if_empty(tenant.community(), channel_id);
+            // Release the guard-owned lease (peer_id and remote already taken above).
+            guard.release_before_commit().await;
             return;
         }
         Err(JoinCommitError::Expired) => {
@@ -1077,12 +1081,8 @@ pub(crate) async fn handle_active_audio_connection(
             if let Some(t) = _nip_fi_admission_expiry.take() {
                 let _ = t.await;
             }
-            // I1 invariant: attach_signals transferred the lease to the registry.
-            // Release the registry-owned lease (generation-fenced) so the renewer
-            // cancels and the Redis lease is freed before peer/room teardown.
-            if let (Some(mesh), Some(gen)) = (state.mesh(), owner_generation) {
-                mesh.owners.release(channel_id, gen);
-            }
+            // I1: lease is still guard-owned (attach_signals not yet called).
+            // `guard.release_before_commit()` directly awaits directory.release().
             guard.release_before_commit().await;
             // Drain the terminal denial frame (already queued by expiry task).
             use futures_util::SinkExt as _;
@@ -1100,10 +1100,7 @@ pub(crate) async fn handle_active_audio_connection(
             if let Some(t) = _nip_fi_admission_expiry.take() {
                 let _ = t.await;
             }
-            // I1 invariant: release the registry-owned lease (generation-fenced).
-            if let (Some(mesh), Some(gen)) = (state.mesh(), owner_generation) {
-                mesh.owners.release(channel_id, gen);
-            }
+            // I1: lease is still guard-owned; guard.release_before_commit() releases it.
             guard.release_before_commit().await;
             let _ = ws_send
                 .send(WsMessage::Text(
@@ -1123,10 +1120,7 @@ pub(crate) async fn handle_active_audio_connection(
             if let Some(t) = _nip_fi_admission_expiry.take() {
                 let _ = t.await;
             }
-            // I1 invariant: release the registry-owned lease (generation-fenced).
-            if let (Some(mesh), Some(gen)) = (state.mesh(), owner_generation) {
-                mesh.owners.release(channel_id, gen);
-            }
+            // I1: lease is still guard-owned; guard.release_before_commit() releases it.
             guard.release_before_commit().await;
             let _ = ws_send
                 .send(WsMessage::Text(
@@ -1147,10 +1141,7 @@ pub(crate) async fn handle_active_audio_connection(
             if let Some(t) = _nip_fi_admission_expiry.take() {
                 let _ = t.await;
             }
-            // I1 invariant: release the registry-owned lease (generation-fenced).
-            if let (Some(mesh), Some(gen)) = (state.mesh(), owner_generation) {
-                mesh.owners.release(channel_id, gen);
-            }
+            // I1: lease is still guard-owned; guard.release_before_commit() releases it.
             guard.release_before_commit().await;
             let _ = ws_send
                 .send(WsMessage::Text(
@@ -1170,10 +1161,7 @@ pub(crate) async fn handle_active_audio_connection(
             if let Some(t) = _nip_fi_admission_expiry.take() {
                 let _ = t.await;
             }
-            // I1 invariant: release the registry-owned lease (generation-fenced).
-            if let (Some(mesh), Some(gen)) = (state.mesh(), owner_generation) {
-                mesh.owners.release(channel_id, gen);
-            }
+            // I1: lease is still guard-owned; guard.release_before_commit() releases it.
             guard.release_before_commit().await;
             let _ = ws_send
                 .send(WsMessage::Text(
@@ -1192,6 +1180,17 @@ pub(crate) async fn handle_active_audio_connection(
     let mut remote_session = guard.take_remote_session();
     let remote_stream = guard.take_remote_stream();
     let _ = guard.take_peer_id(); // peer_id was taken for the commit path
+
+    // I1 mandated: transfer-after-commit-won. Now that the join is committed,
+    // take the lease from the guard and install the registry renewer. Every
+    // exit after this point is in the live runtime (no pre-commit resources
+    // to unwind). The room-empty release below (fenced by `owner_generation`)
+    // is the only release path from here.
+    if let (Some(mesh), Some((lease, directory))) = (state.mesh(), guard.take_lease()) {
+        let signals = mesh.owners.attach_signals(channel_id, directory, lease);
+        owner_lost = Some(signals.lost);
+        owner_draining = Some(signals.draining);
+    }
 
     // B1: After commit_participant_join, the admission is committed. No further
     // check_cancel! is needed — the send_loop owns terminal_ctrl_rx from here.
@@ -1808,6 +1807,12 @@ pub(crate) enum MembershipAdmission {
 /// becomes `None` after the first call. After a commit-won, the caller calls
 /// `take_*` methods to extract the committed state; any field that was not taken
 /// is auto-released when the guard drops (unreachable in normal flow).
+///
+/// I1 invariant (transfer-after-commit-won): the `lease` field is held by the
+/// guard for the entire pre-commit window. `guard.release_before_commit()` is
+/// therefore the single release path for every pre-commit exit — no separate
+/// registry call is needed. `take_lease()` is called only at commit-won, and the
+/// lease is transferred into `HuddleOwnerRegistry::attach_signals` at that point.
 ///
 /// This guard satisfies IMPORTANT 1-2 from the pass-3 review: every pre-commit
 /// exit uses a single release path so no exit can skip lease release, remote
