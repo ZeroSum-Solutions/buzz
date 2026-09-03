@@ -4,13 +4,30 @@ import type { MarketProjection } from "@/features/market/lib/marketProtocol";
 import { parseMarketEnvelope } from "@/features/market/lib/marketProtocol";
 import type { TimelineMessage } from "@/features/messages/types";
 
+export function isMarketProtocolMessage(
+  message: Pick<TimelineMessage, "body">,
+): boolean {
+  return parseMarketEnvelope(message.body) !== null;
+}
+
+export function marketTimelineAnchor(
+  messages: TimelineMessage[],
+  isChannelCreated: (message: TimelineMessage) => boolean,
+): TimelineMessage | null {
+  return (
+    messages.find(
+      (message) => message.parentId == null && isChannelCreated(message),
+    ) ?? null
+  );
+}
+
 /** Keep protocol state out of the market's main chat; negotiation stays in threads. */
 export function selectMarketTimelineMessages(
   messages: TimelineMessage[],
   projection: MarketProjection | null,
 ): TimelineMessage[] {
   if (!projection) return messages;
-  return messages.filter((message) => !parseMarketEnvelope(message.body));
+  return messages.filter((message) => !isMarketProtocolMessage(message));
 }
 
 export function useMarketTimelineMessages(messages: TimelineMessage[]) {

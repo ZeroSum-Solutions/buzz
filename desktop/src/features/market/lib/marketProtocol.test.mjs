@@ -147,6 +147,7 @@ test("projectMarketChannel folds a channel contract through fake settlement", ()
       actorName: "Buyer Agent",
       amountSats: 50,
       bidderPubkey: BUYER,
+      createdAt: 101,
       message: "I reserve the report.",
       quantity: 1,
     },

@@ -111,6 +111,7 @@ export type MarketBid = {
   actorName: string;
   amountSats?: number;
   bidderPubkey: string;
+  createdAt: number;
   message: string;
   quantity: number;
 };
@@ -510,16 +511,21 @@ export function projectMarketChannel(
     .reverse();
 
   const settled = settlements.size > 0;
-  const bids: MarketBid[] = [...responses.entries()].map(
-    ([eventId, { envelope, note }]) => ({
+  const bids: MarketBid[] = [...responses.entries()]
+    .map(([eventId, { envelope, note }]) => ({
       eventId,
       actorName: envelope.actorName,
       amountSats: envelope.amountSats,
       bidderPubkey: note.pubkey,
+      createdAt: note.createdAt,
       message: envelope.message,
       quantity: envelope.quantity,
-    }),
-  );
+    }))
+    .sort(
+      (left, right) =>
+        left.createdAt - right.createdAt ||
+        left.eventId.localeCompare(right.eventId),
+    );
   const fulfilled = fulfillments.size;
   const scenarioId = scenarioIdForListing(listing.listing, settled);
   const quantity = listing.listing.quantity;

@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { selectMarketTimelineMessages } from "./marketTimeline.ts";
+import {
+  isMarketProtocolMessage,
+  marketTimelineAnchor,
+  selectMarketTimelineMessages,
+} from "./marketTimeline.ts";
+import { KIND_SYSTEM_MESSAGE } from "@/shared/constants/kinds";
+import { isChannelCreatedSystemMessage } from "@/features/channels/ui/ChannelPane.helpers";
 import { buildIndependentThreadPanel } from "@/features/messages/lib/independentThreadPanel";
 
 const PUBKEY = "f".repeat(64);
@@ -32,11 +38,42 @@ const envelope = (type) =>
           message: "I bid",
         }),
   });
-const message = (id, body, parentId = null, rootId = null) => ({
+const message = (id, body, parentId = null, rootId = null, fields = {}) => ({
   id,
   body,
   parentId,
   rootId,
+  ...fields,
+});
+
+test("the market board anchors to channel creation, not above history", () => {
+  const contract = message("1".repeat(64), envelope("contract"), null, null, {
+    createdAt: 10,
+  });
+  const created = message(
+    "2".repeat(64),
+    JSON.stringify({ type: "channel_created" }),
+    null,
+    null,
+    { createdAt: 11, kind: KIND_SYSTEM_MESSAGE },
+  );
+  const joined = message(
+    "3".repeat(64),
+    JSON.stringify({ type: "member_joined" }),
+    null,
+    null,
+    { createdAt: 12, kind: KIND_SYSTEM_MESSAGE },
+  );
+
+  assert.equal(
+    marketTimelineAnchor(
+      [contract, created, joined],
+      isChannelCreatedSystemMessage,
+    )?.id,
+    created.id,
+  );
+  assert.equal(isMarketProtocolMessage(contract), true);
+  assert.equal(isMarketProtocolMessage(created), false);
 });
 
 test("market timeline hides protocol events but leaves negotiation in its bid thread", () => {
