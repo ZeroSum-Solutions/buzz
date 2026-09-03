@@ -9614,11 +9614,11 @@ void main() {
         expect(nativeView.viewType, 'buzz/navigation_glass');
         expect(backParams['icon'], 'back');
         expect(backParams['brightness'], 'light');
-        expect(backParams['buttonCenterX'], 38.0);
+        expect(backParams['buttonCenterX'], iosGlassChannelHeaderButtonCenterX);
         final backButtonRect = tester.getRect(
           find.byKey(const ValueKey('channel-ios-glass-back')),
         );
-        expect(backButtonRect.width, 58);
+        expect(backButtonRect.width, iosGlassChannelHeaderLeadingWidth);
         final channelIdentity = find.byKey(
           const ValueKey('channel-header-settings-trigger'),
         );
@@ -9655,6 +9655,25 @@ void main() {
         final huddleParams =
             huddleNativeView.creationParams as Map<String, Object>;
         expect(channelParams['controlSize'], huddleParams['controlSize']);
+        final huddleButtonRect = tester.getRect(
+          find.byKey(const ValueKey('channel-huddle-button')),
+        );
+        final controlRadius = (backParams['controlSize']! as double) / 2;
+        final backVisualLeft =
+            backButtonRect.left +
+            (backParams['buttonCenterX']! as double) -
+            controlRadius;
+        final huddleVisualRight =
+            huddleButtonRect.left +
+            (huddleParams['buttonCenterX']! as double) +
+            controlRadius;
+        expect(
+          backVisualLeft,
+          moreOrLessEquals(
+            tester.view.physicalSize.width / tester.view.devicePixelRatio -
+                huddleVisualRight,
+          ),
+        );
         expect(tester.takeException(), isNull);
         debugDefaultTargetPlatformOverride = null;
       },

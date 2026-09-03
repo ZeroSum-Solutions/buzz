@@ -71,10 +71,11 @@ class IosGlassNavigationMenuItem {
 }
 
 /// Leading width used by iOS channel-style headers.
-const iosGlassChannelHeaderLeadingWidth = 58.0;
+const iosGlassChannelHeaderLeadingWidth = 48.0;
 
 /// Horizontal center of the native button inside a channel-style leading.
-const iosGlassChannelHeaderButtonCenterX = 38.0;
+const iosGlassChannelHeaderButtonCenterX =
+    iosGlassChannelHeaderLeadingWidth / 2;
 
 /// Space between the leading region and a channel-style title.
 const iosGlassChannelHeaderTitleSpacing = Grid.xs;
