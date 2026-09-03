@@ -60,7 +60,7 @@ enum UploadRouteMode {
 ///
 /// Non-Blossom errors (`blossom_denial_kind()` returns `None`) always fall
 /// through to `MediaError::into_response()` regardless of mode.
-struct MediaDenial(MediaError, BlossomStrictness);
+pub(crate) struct MediaDenial(MediaError, BlossomStrictness);
 
 impl IntoResponse for MediaDenial {
     fn into_response(self) -> Response {
