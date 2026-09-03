@@ -101,26 +101,43 @@ pub(crate) async fn recover_one(state: &Arc<AppState>, claim: StrandedActionClai
         "Action recovery worker re-driving stranded action"
     );
 
-    // Decode the target from the report row.
-    let report = match state.db.admin_get_report(rec.report_id).await {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            warn!(action_id = %action_id, "Action recovery: report not found");
-            return;
-        }
-        Err(e) => {
-            warn!(action_id = %action_id, "Action recovery: report lookup failed: {e}");
-            return;
-        }
-    };
-
-    let (target_pubkey_opt, target_event_id_opt) =
-        match crate::handlers::report_resolution::derive_enforcement_target_pub(&report) {
-            Ok(pair) => pair,
-            Err(e) => {
-                warn!(action_id = %action_id, "Action recovery: target derive failed: {e:?}");
-                return;
-            }
+    // Use the target context persisted at claim time. These columns were added
+    // in migration 0045; existing rows that pre-date the migration will have
+    // NULL here, in which case we fall back to report re-derivation so that
+    // pre-migration stranded actions still converge.
+    let (target_pubkey_opt, target_event_id_opt, channel_id) =
+        if rec.enforcement_target_pubkey.is_some() || rec.enforcement_channel_id.is_some() {
+            // Persisted context available — use it unconditionally.
+            (
+                rec.enforcement_target_pubkey.clone(),
+                None::<Vec<u8>>,
+                rec.enforcement_channel_id,
+            )
+        } else {
+            // Pre-migration row or non-pubkey-targeted action: re-derive from report.
+            let report = match state.db.admin_get_report(rec.report_id).await {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    warn!(action_id = %action_id, "Action recovery: report not found");
+                    return;
+                }
+                Err(e) => {
+                    warn!(action_id = %action_id, "Action recovery: report lookup failed: {e}");
+                    return;
+                }
+            };
+            let (pk, eid) =
+                match crate::handlers::report_resolution::derive_enforcement_target_pub(&report) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        warn!(
+                            action_id = %action_id,
+                            "Action recovery: target derive failed: {e:?}"
+                        );
+                        return;
+                    }
+                };
+            (pk, eid, report.report.channel_id)
         };
 
     let timeout_until = rec.timeout_until;
@@ -128,7 +145,6 @@ pub(crate) async fn recover_one(state: &Arc<AppState>, claim: StrandedActionClai
     let reason = rec.reason.clone();
     let actor_pubkey = rec.actor_pubkey.clone();
     let report_id = rec.report_id;
-    let channel_id = report.report.channel_id;
 
     match crate::handlers::report_resolution::drive_enforcement_pub(
         state,

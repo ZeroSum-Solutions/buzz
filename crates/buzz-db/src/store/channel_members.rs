@@ -687,6 +687,59 @@ pub async fn is_member(
     Ok(cnt > 0)
 }
 
+/// Verify that a member is still removed under the channel-membership lock,
+/// serializing with any concurrent [`add_member`] call on the same channel.
+///
+/// Returns `true` when `removed_at IS NOT NULL` for `(community_id, channel_id,
+/// pubkey)` — i.e., the removal that crash-recovery is re-applying is still the
+/// current state and no re-add has reversed it.
+///
+/// Uses the same `pg_advisory_xact_lock` key as [`add_member`] so that a
+/// concurrent re-add either sees this check complete (and then sets `removed_at
+/// = NULL` after recovery finishes) or serializes before it (in which case this
+/// check observes the re-add and returns `false`, preventing stale eviction).
+///
+/// Designed for use in crash-recovery before firing subscription eviction and
+/// workflow disablement: cache invalidation is always safe (it only drops a
+/// stale positive), but eviction and workflow-disable must not target a member
+/// who was legitimately re-added after the kick committed.
+pub async fn verify_member_still_removed(
+    pool: &PgPool,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    pubkey: &[u8],
+) -> Result<bool> {
+    let connection = crate::observability::acquire_writer(
+        pool,
+        crate::observability::WriterOperation::Authorization,
+    )
+    .await?;
+    let mut tx = sqlx::Transaction::begin(connection, None).await?;
+    acquire_channel_membership_lock(&mut tx, community_id, channel_id).await?;
+
+    let row = sqlx::query(
+        "SELECT removed_at FROM channel_members \
+         WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3",
+    )
+    .bind(community_id.as_uuid())
+    .bind(channel_id)
+    .bind(pubkey)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    // Row absent → never joined or hard-deleted; treat as removed (safe to skip
+    // eviction for someone who isn't and wasn't a member).
+    let still_removed = match row {
+        None => true,
+        Some(r) => {
+            let removed_at: Option<chrono::DateTime<Utc>> = r.try_get("removed_at")?;
+            removed_at.is_some()
+        }
+    };
+    tx.rollback().await?;
+    Ok(still_removed)
+}
+
 /// Return which of the given (channel, pubkey) combinations are active
 /// memberships, restricted to non-deleted channels — one statement for any
 /// batch size (T2b). Semantics per pair match [`is_member`].
@@ -1362,6 +1415,23 @@ impl Db {
         pubkey: &[u8],
     ) -> Result<bool> {
         is_member(&self.pool, community_id, channel_id, pubkey).await
+    }
+
+    /// Returns `true` when the member row still has `removed_at IS NOT NULL`,
+    /// holding the channel-membership advisory lock so the check serializes
+    /// with concurrent [`add_member`] calls.
+    ///
+    /// Use this in crash-recovery before firing subscription eviction and
+    /// workflow disablement to guard against the kick-commit → re-add → recover
+    /// race (IMPORTANT 3).
+    #[datastore_span(name = "verify_member_still_removed", system = "postgresql")]
+    pub async fn verify_member_still_removed(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        pubkey: &[u8],
+    ) -> Result<bool> {
+        verify_member_still_removed(&self.pool, community_id, channel_id, pubkey).await
     }
 
     /// Return the active (channel, pubkey) membership pairs among the given

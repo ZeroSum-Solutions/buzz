@@ -6029,17 +6029,15 @@ mod postgres_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Postgres — stranded kick re-drive converges after mid-flight event purge"]
+    #[ignore = "requires Postgres — stranded kick re-drive converges and fires live side effects after mid-flight event purge"]
     async fn worker_redrive_of_event_kick_converges_after_event_purged_mid_flight() {
         // Criterion 3 + Paul's mid-flight edge: a kick on an event report claims,
         // commits its mutation+marker, then the event row is HARD-purged before a
-        // stranded re-drive. The worker re-derives from the (now author-less)
-        // report row; because the target is not persisted, the pubkey re-derives
-        // to None. The action is already past `mutation_committed`, so the driver
-        // skips the mutation and finalizes: action → succeeded, report → resolved.
-        // The kick already landed (member removed at commit time); only the
-        // system_message artifact (which needs the target pubkey) is dropped —
-        // the action does NOT strand permanently.
+        // stranded re-drive. Because target_pubkey and channel_id are now persisted
+        // in relay_admin_actions at claim time (migration 0045), recovery no longer
+        // re-derives them from the mutable event/report rows. All three live side
+        // effects fire on re-drive: cache invalidation, subscription eviction, and
+        // workflow disablement. The action converges to succeeded and report → resolved.
         let pool = e2e_pool().await;
         let (community_id, _host) = e2e_community(&pool, "worker-midflight-purge").await;
         let author = vec![0x71u8; 32];
@@ -6118,6 +6116,53 @@ mod postgres_tests {
             "kick must commit its mutation + marker before the crash"
         );
 
+        // Seed in-process state that simulates a live session after the crash:
+        // a stale membership cache entry and an active channel subscription.
+        // These are what the crash-recovery live side effects must clear.
+        let cid = buzz_core::CommunityId::from_uuid(community_id);
+        let tenant = e2e_tenant(community_id, "worker-midflight-purge.example");
+        state
+            .membership_cache
+            .insert((cid, channel_id, author.clone()), true);
+        let conn_id = uuid::Uuid::new_v4();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel(1);
+        state.conn_manager.register(
+            conn_id,
+            tx,
+            ctrl_tx,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            cid,
+            std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            3,
+        );
+        state
+            .conn_manager
+            .set_authenticated_pubkey(conn_id, author.clone());
+        state.sub_registry.register_channels_scoped(
+            cid,
+            conn_id,
+            "purge-test-sub".to_string(),
+            vec![nostr::Filter::new()],
+            vec![channel_id],
+        );
+
+        // Seed an enabled workflow owned by the kicked user so we can verify disable.
+        let workflow_id = state
+            .db
+            .create_workflow(
+                cid,
+                Some(channel_id),
+                &author,
+                "purge-test-workflow",
+                r#"{"kind":"workflow"}"#,
+                &[0u8; 32],
+            )
+            .await
+            .expect("create workflow");
+
         // Mid-flight disappearance: HARD-purge the stored event (community purge),
         // then expire the lease so the recovery worker can re-claim.
         sqlx::query("DELETE FROM events WHERE community_id = $1 AND id = $2")
@@ -6135,7 +6180,9 @@ mod postgres_tests {
         .await
         .expect("expire lease");
 
-        // Re-derive now yields no author — the exact divergence Paul flagged.
+        // Verify: re-deriving from the now-author-less report yields None (event
+        // is purged), but recovery does NOT depend on re-derivation — it reads
+        // the persisted enforcement_target_pubkey / enforcement_channel_id columns.
         let report_after = state
             .db
             .admin_get_report(report_id)
@@ -6145,7 +6192,10 @@ mod postgres_tests {
         let (target_after, _e) =
             crate::handlers::report_resolution::derive_enforcement_target(&report_after)
                 .expect("derive after purge");
-        assert_eq!(target_after, None, "author unresolvable after purge");
+        assert_eq!(
+            target_after, None,
+            "confirm: re-derivation path yields None after purge (recovery must NOT use this path)"
+        );
 
         // Re-drive through the REAL recovery worker entry point.
         let batch = buzz_db::relay_admin_actions::claim_stranded_action_batch(
@@ -6162,8 +6212,41 @@ mod postgres_tests {
             .expect("stranded action must appear in batch");
         crate::handlers::admin_action_worker::recover_one(&state, claim).await;
 
+        // ── Assertions: all three live side effects fired ─────────────────────
         // Convergence: action succeeded (marker was already committed), report
-        // resolved. No permanent strand despite the vanished target.
+        // resolved. Persisted target context means the event purge no longer
+        // prevents live side effects from firing.
+
+        // 1. Membership cache cleared.
+        assert!(
+            state
+                .membership_cache
+                .get(&(cid, channel_id, author.clone()))
+                .is_none(),
+            "crash-recovery must clear membership cache after purged-event kick re-drive"
+        );
+
+        // 2. Channel subscription evicted.
+        assert!(
+            !state
+                .sub_registry
+                .channel_subscriber_conns_scoped(cid, channel_id)
+                .contains(&conn_id),
+            "crash-recovery must evict channel subscription after purged-event kick re-drive"
+        );
+
+        // 3. Workflow disabled.
+        let wf = state
+            .db
+            .get_workflow(cid, workflow_id)
+            .await
+            .expect("get_workflow");
+        assert!(
+            !wf.enabled,
+            "crash-recovery must disable target's workflows after purged-event kick re-drive"
+        );
+
+        // 4. DB state.
         let final_rec = buzz_db::relay_admin_actions::get_action(&pool, action_id)
             .await
             .expect("get_action")
@@ -7600,6 +7683,467 @@ mod postgres_tests {
         assert_eq!(
             row_token, token_b,
             "row claim token must belong to worker B (stale A token must not rewrite)"
+        );
+    }
+
+    // ── Kick live side effects: crash-recovery and re-add race ────────────────
+
+    /// Recovery seam: commit kick marker, simulate crash, re-drive via the real
+    /// recovery worker entry point and assert all three live side effects fire:
+    /// membership cache cleared, channel subscription evicted, workflow disabled.
+    ///
+    /// The test is falsifiable: deleting the convergence-point call to
+    /// `apply_kick_live_side_effects` in `drive_enforcement` would leave the
+    /// helper-direct test green but fail this test (recovery would finalize
+    /// without clearing cache, evicting, or disabling).
+    #[tokio::test]
+    #[ignore = "requires Postgres — crash recovery re-drive fires all three kick live side effects"]
+    async fn crash_recovery_redrive_fires_kick_live_side_effects() {
+        let pool = e2e_pool().await;
+        let (community_id, host) = e2e_community(&pool, "kick-crash-recovery").await;
+        let cid = buzz_core::CommunityId::from_uuid(community_id);
+        let target = vec![0xAAu8; 32];
+        let actor = vec![0xBBu8; 32];
+
+        // Seed channel + member.
+        let channel_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO channels (id, community_id, name, channel_type, visibility, created_by)
+               VALUES ($1, $2, 'recovery-test-ch', 'stream', 'open', $3)"#,
+        )
+        .bind(channel_id)
+        .bind(community_id)
+        .bind(&actor)
+        .execute(&pool)
+        .await
+        .expect("create channel");
+        sqlx::query(
+            "INSERT INTO channel_members (community_id, channel_id, pubkey, role) VALUES ($1, $2, $3, 'member')",
+        )
+        .bind(community_id)
+        .bind(channel_id)
+        .bind(&target)
+        .execute(&pool)
+        .await
+        .expect("add member");
+
+        let report_id = e2e_report_pubkey(&pool, community_id, &target).await;
+
+        // Claim → enforcing → lease → kick + commit marker (simulates process
+        // that committed the kick but crashed before live side effects ran).
+        let action_id = match buzz_db::relay_admin_actions::claim_report(
+            &pool,
+            cid,
+            report_id,
+            uuid::Uuid::new_v4(),
+            &actor,
+            "operator",
+            "kick",
+            None,
+            None,
+            "resolve:kick",
+            "relay_operator",
+            Some(&target),
+            None,
+            Some(channel_id),
+        )
+        .await
+        .expect("claim")
+        {
+            buzz_db::relay_admin_actions::ClaimResult::Claimed(a) => a.id,
+            other => panic!("expected Claimed, got {other:?}"),
+        };
+        let _ = buzz_db::relay_admin_actions::begin_enforcing(&pool, action_id)
+            .await
+            .expect("begin_enforcing");
+        let lease_until = chrono::Utc::now() + chrono::Duration::seconds(60);
+        let lease_token =
+            match buzz_db::relay_admin_actions::acquire_action_lease(&pool, action_id, lease_until)
+                .await
+                .expect("acquire lease")
+            {
+                buzz_db::relay_admin_actions::LeaseResult::Acquired(t) => t,
+                other => panic!("expected Acquired, got {other:?}"),
+            };
+        let kick_result = buzz_db::relay_admin_actions::execute_kick_with_marker(
+            &pool,
+            action_id,
+            lease_token,
+            cid,
+            channel_id,
+            &target,
+            &actor,
+        )
+        .await
+        .expect("execute_kick_with_marker");
+        assert!(
+            matches!(
+                kick_result,
+                buzz_db::relay_admin_actions::KickWithMarkerResult::Removed
+            ),
+            "kick must commit before the simulated crash"
+        );
+
+        // Expire the lease so the recovery worker can re-claim.
+        sqlx::query(
+            "UPDATE relay_admin_actions SET action_lease_expires_at = $2, action_lease_token = NULL WHERE id = $1",
+        )
+        .bind(action_id)
+        .bind(chrono::Utc::now() - chrono::Duration::seconds(300))
+        .execute(&pool)
+        .await
+        .expect("expire lease");
+
+        // Build state with real DB. Seed stale in-process entries.
+        let state = state_from_pool(pool.clone()).await;
+        let tenant = e2e_tenant(community_id, &host);
+
+        state
+            .membership_cache
+            .insert((cid, channel_id, target.clone()), true);
+
+        let conn_id = uuid::Uuid::new_v4();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel(1);
+        state.conn_manager.register(
+            conn_id,
+            tx,
+            ctrl_tx,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            cid,
+            std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            3,
+        );
+        state
+            .conn_manager
+            .set_authenticated_pubkey(conn_id, target.clone());
+        state.sub_registry.register_channels_scoped(
+            cid,
+            conn_id,
+            "recovery-seam-sub".to_string(),
+            vec![nostr::Filter::new()],
+            vec![channel_id],
+        );
+
+        // Seed an enabled owned workflow; disable must be asserted after recovery.
+        let workflow_id = state
+            .db
+            .create_workflow(
+                cid,
+                Some(channel_id),
+                &target,
+                "recovery-test-workflow",
+                r#"{"kind":"workflow"}"#,
+                &[0u8; 32],
+            )
+            .await
+            .expect("create workflow");
+
+        // Pre-conditions.
+        assert!(
+            state
+                .membership_cache
+                .get(&(cid, channel_id, target.clone()))
+                .is_some(),
+            "pre-condition: membership cache entry must exist before recovery"
+        );
+        assert!(
+            state
+                .sub_registry
+                .channel_subscriber_conns_scoped(cid, channel_id)
+                .contains(&conn_id),
+            "pre-condition: subscription must be registered before recovery"
+        );
+        assert!(
+            state
+                .db
+                .get_workflow(cid, workflow_id)
+                .await
+                .expect("get workflow")
+                .enabled,
+            "pre-condition: workflow must be enabled before recovery"
+        );
+
+        // Re-drive via the real recovery worker path.
+        let batch = buzz_db::relay_admin_actions::claim_stranded_action_batch(
+            &pool,
+            "e2e-kick-recovery",
+            chrono::Utc::now() + chrono::Duration::seconds(120),
+            1000,
+        )
+        .await
+        .expect("claim_stranded_action_batch");
+        let claim = batch
+            .into_iter()
+            .find(|c| c.record.id == action_id)
+            .expect("stranded action must appear in batch");
+        crate::handlers::admin_action_worker::recover_one(&state, claim).await;
+
+        // ── Assertions ───────────────────────────────────────────────────────
+
+        // 1. Membership cache cleared.
+        assert!(
+            state
+                .membership_cache
+                .get(&(cid, channel_id, target.clone()))
+                .is_none(),
+            "crash-recovery re-drive must clear the membership cache"
+        );
+
+        // 2. Channel subscription evicted.
+        assert!(
+            !state
+                .sub_registry
+                .channel_subscriber_conns_scoped(cid, channel_id)
+                .contains(&conn_id),
+            "crash-recovery re-drive must evict the kicked user's channel subscription"
+        );
+
+        // 3. Workflow disabled.
+        assert!(
+            !state
+                .db
+                .get_workflow(cid, workflow_id)
+                .await
+                .expect("get workflow")
+                .enabled,
+            "crash-recovery re-drive must disable the kicked user's workflows"
+        );
+
+        // 4. Action reached succeeded.
+        let final_rec = buzz_db::relay_admin_actions::get_action(&pool, action_id)
+            .await
+            .expect("get_action")
+            .expect("record must still exist");
+        assert_eq!(
+            final_rec.state, "succeeded",
+            "action must reach succeeded after crash-recovery re-drive"
+        );
+    }
+
+    /// Re-add race: kick commits → crash → `add_member` re-adds → recovery fires.
+    ///
+    /// Asserts that after a post-kick re-add, the recovery worker does NOT evict
+    /// subscriptions or disable workflows for the now-valid member. Cache
+    /// invalidation (stale positive) is always safe and may still fire.
+    ///
+    /// This test is falsifiable: removing the `verify_member_still_removed` fence
+    /// from `apply_kick_live_side_effects` would cause this test to fail because
+    /// the re-added member's subscription and workflow would be wrongly revoked.
+    #[tokio::test]
+    #[ignore = "requires Postgres — post-kick re-add survives crash recovery"]
+    async fn crash_recovery_after_readd_preserves_membership_subscriptions_and_workflows() {
+        let pool = e2e_pool().await;
+        let (community_id, host) = e2e_community(&pool, "kick-readd-race").await;
+        let cid = buzz_core::CommunityId::from_uuid(community_id);
+        let target = vec![0xCCu8; 32];
+        let actor = vec![0xDDu8; 32];
+
+        // Seed channel + member.
+        let channel_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO channels (id, community_id, name, channel_type, visibility, created_by)
+               VALUES ($1, $2, 'readd-race-ch', 'stream', 'open', $3)"#,
+        )
+        .bind(channel_id)
+        .bind(community_id)
+        .bind(&actor)
+        .execute(&pool)
+        .await
+        .expect("create channel");
+        sqlx::query(
+            "INSERT INTO channel_members (community_id, channel_id, pubkey, role) VALUES ($1, $2, $3, 'member')",
+        )
+        .bind(community_id)
+        .bind(channel_id)
+        .bind(&target)
+        .execute(&pool)
+        .await
+        .expect("add member");
+
+        let report_id = e2e_report_pubkey(&pool, community_id, &target).await;
+
+        // Claim → enforcing → kick + commit marker.
+        let action_id = match buzz_db::relay_admin_actions::claim_report(
+            &pool,
+            cid,
+            report_id,
+            uuid::Uuid::new_v4(),
+            &actor,
+            "operator",
+            "kick",
+            None,
+            None,
+            "resolve:kick",
+            "relay_operator",
+            Some(&target),
+            None,
+            Some(channel_id),
+        )
+        .await
+        .expect("claim")
+        {
+            buzz_db::relay_admin_actions::ClaimResult::Claimed(a) => a.id,
+            other => panic!("expected Claimed, got {other:?}"),
+        };
+        let _ = buzz_db::relay_admin_actions::begin_enforcing(&pool, action_id)
+            .await
+            .expect("begin_enforcing");
+        let lease_until = chrono::Utc::now() + chrono::Duration::seconds(60);
+        let lease_token =
+            match buzz_db::relay_admin_actions::acquire_action_lease(&pool, action_id, lease_until)
+                .await
+                .expect("acquire lease")
+            {
+                buzz_db::relay_admin_actions::LeaseResult::Acquired(t) => t,
+                other => panic!("expected Acquired, got {other:?}"),
+            };
+        buzz_db::relay_admin_actions::execute_kick_with_marker(
+            &pool,
+            action_id,
+            lease_token,
+            cid,
+            channel_id,
+            &target,
+            &actor,
+        )
+        .await
+        .expect("execute_kick_with_marker");
+
+        // Expire lease so recovery worker can reclaim.
+        sqlx::query(
+            "UPDATE relay_admin_actions SET action_lease_expires_at = $2, action_lease_token = NULL WHERE id = $1",
+        )
+        .bind(action_id)
+        .bind(chrono::Utc::now() - chrono::Duration::seconds(300))
+        .execute(&pool)
+        .await
+        .expect("expire lease");
+
+        // Re-add the member (simulates `add_member` re-granting access after kick).
+        sqlx::query(
+            "UPDATE channel_members SET removed_at = NULL, removed_by = NULL \
+             WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3",
+        )
+        .bind(community_id)
+        .bind(channel_id)
+        .bind(&target)
+        .execute(&pool)
+        .await
+        .expect("re-add member");
+
+        // Verify pre-condition: member is active again.
+        let still_member = state_from_pool(pool.clone())
+            .await
+            .db
+            .is_member(cid, channel_id, &target)
+            .await
+            .expect("is_member");
+        assert!(
+            still_member,
+            "pre-condition: member must be active after re-add"
+        );
+
+        // Build state with real DB. Register a live subscription and workflow
+        // for the re-added member — recovery must NOT revoke these.
+        let state = state_from_pool(pool.clone()).await;
+        let tenant = e2e_tenant(community_id, &host);
+
+        let conn_id = uuid::Uuid::new_v4();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel(1);
+        state.conn_manager.register(
+            conn_id,
+            tx,
+            ctrl_tx,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            cid,
+            std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            3,
+        );
+        state
+            .conn_manager
+            .set_authenticated_pubkey(conn_id, target.clone());
+        state.sub_registry.register_channels_scoped(
+            cid,
+            conn_id,
+            "readd-race-sub".to_string(),
+            vec![nostr::Filter::new()],
+            vec![channel_id],
+        );
+
+        let workflow_id = state
+            .db
+            .create_workflow(
+                cid,
+                Some(channel_id),
+                &target,
+                "readd-race-workflow",
+                r#"{"kind":"workflow"}"#,
+                &[0u8; 32],
+            )
+            .await
+            .expect("create workflow");
+
+        // Re-drive via the real recovery worker.
+        let batch = buzz_db::relay_admin_actions::claim_stranded_action_batch(
+            &pool,
+            "e2e-readd-race",
+            chrono::Utc::now() + chrono::Duration::seconds(120),
+            1000,
+        )
+        .await
+        .expect("claim_stranded_action_batch");
+        let claim = batch
+            .into_iter()
+            .find(|c| c.record.id == action_id)
+            .expect("stranded action must appear in batch");
+        crate::handlers::admin_action_worker::recover_one(&state, claim).await;
+
+        // ── Assertions: re-added member's live session must survive ──────────
+
+        // 1. Subscription NOT evicted: re-added member still has a live session.
+        assert!(
+            state
+                .sub_registry
+                .channel_subscriber_conns_scoped(cid, channel_id)
+                .contains(&conn_id),
+            "recovery must NOT evict the subscription of a re-added member"
+        );
+
+        // 2. Workflow NOT disabled: re-added member's workflow remains active.
+        assert!(
+            state
+                .db
+                .get_workflow(cid, workflow_id)
+                .await
+                .expect("get workflow")
+                .enabled,
+            "recovery must NOT disable workflows of a re-added member"
+        );
+
+        // 3. DB membership active after re-add (not further altered by recovery).
+        assert!(
+            state
+                .db
+                .is_member(cid, channel_id, &target)
+                .await
+                .expect("is_member"),
+            "recovery must NOT remove the re-added membership row"
+        );
+
+        // 4. Action still converges to succeeded (the kick itself already landed).
+        let final_rec = buzz_db::relay_admin_actions::get_action(&pool, action_id)
+            .await
+            .expect("get_action")
+            .expect("exists");
+        assert_eq!(
+            final_rec.state, "succeeded",
+            "action must reach succeeded even when re-add fence suppresses eviction"
         );
     }
 }

@@ -36,6 +36,85 @@ pub fn is_side_effect_kind(kind: u32) -> bool {
     matches!(kind, 0 | 5 | 9000..=9022 | KIND_GIT_REPO_ANNOUNCEMENT | KIND_AGENT_PROFILE | 41001..=41003 | 40099)
 }
 
+/// Apply the three live side effects that must follow a successful admin kick:
+///
+/// 1. `invalidate_membership` — drops the 10 s membership-cache entry locally
+///    AND cross-pod, so subsequent REQ/fan-out checks see the removal immediately.
+/// 2. `evict_live_channel_subscriptions` — closes every open channel subscription
+///    for the kicked pubkey so they stop receiving messages from this channel.
+/// 3. `disable_departed_member_workflows` — durably disables any workflows the
+///    kicked user owned in this channel (SEC-006).
+///
+/// These are identical to what `handle_remove_user` (kind 9001 path) fires after
+/// removing a member. Without them a kicked user's live WebSocket session retains
+/// full channel access: the `channel_members.removed_at` write is invisible to
+/// the running subscription and the membership cache until natural expiry, which
+/// is exactly the "kick reported success but user still in channel" symptom.
+///
+/// Failures are logged, not propagated: the kick DB mutation has already
+/// committed and the report is finalized. Best-effort live enforcement matches
+/// the notice-delivery contract: the enforcement is the promise; live revocation
+/// is the courtesy.
+///
+/// `is_recovery` must be `true` when called on the crash-recovery path (i.e., the
+/// step marker was already set before this drive iteration began). On that path,
+/// eviction and workflow-disable are fenced behind a `verify_member_still_removed`
+/// check that serializes with any concurrent `add_member` call; if the member was
+/// legitimately re-added after the original kick committed the side effects are
+/// suppressed (cache invalidation still fires — stale-positive is always safe to
+/// drop). On the fresh path (`is_recovery = false`) the removal just committed in
+/// the same transaction and no re-add can have happened yet, so the guard is skipped.
+pub(crate) async fn apply_kick_live_side_effects(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    channel_id: Uuid,
+    target_pubkey: &[u8],
+    is_recovery: bool,
+) {
+    // Cache invalidation is unconditionally safe — drops a stale positive.
+    state.invalidate_membership(tenant, channel_id, target_pubkey);
+
+    if is_recovery {
+        // Fence eviction and workflow-disable against a post-kick re-add.
+        // Acquire the membership lock and verify removed_at IS NOT NULL.
+        match state
+            .db
+            .verify_member_still_removed(tenant.community(), channel_id, target_pubkey)
+            .await
+        {
+            Ok(true) => {
+                // Still removed — safe to proceed.
+                evict_live_channel_subscriptions(tenant, state, channel_id, target_pubkey).await;
+                disable_departed_member_workflows(tenant, state, channel_id, target_pubkey).await;
+            }
+            Ok(false) => {
+                // Member was re-added after the kick committed; skip eviction and
+                // workflow-disable so the re-add is not silently undone.
+                tracing::info!(
+                    channel = %channel_id,
+                    target = %hex::encode(target_pubkey),
+                    "crash-recovery kick: member re-added since kick committed; \
+                     skipping eviction and workflow-disable"
+                );
+            }
+            Err(e) => {
+                // DB error in the fence check. Err on the side of not revoking
+                // a potentially valid membership: skip eviction/disable and log.
+                warn!(
+                    channel = %channel_id,
+                    target = %hex::encode(target_pubkey),
+                    error = %e,
+                    "crash-recovery kick: verify_member_still_removed failed; \
+                     skipping eviction and workflow-disable"
+                );
+            }
+        }
+    } else {
+        evict_live_channel_subscriptions(tenant, state, channel_id, target_pubkey).await;
+        disable_departed_member_workflows(tenant, state, channel_id, target_pubkey).await;
+    }
+}
+
 async fn evict_live_channel_subscriptions(
     tenant: &TenantContext,
     state: &Arc<AppState>,
