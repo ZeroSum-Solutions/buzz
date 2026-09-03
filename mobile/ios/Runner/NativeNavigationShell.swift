@@ -151,7 +151,10 @@ private final class NativeNavigationShellPlatformView: NSObject,
     _ item: UINavigationItem,
     from arguments: [String: Any]
   ) {
-    item.titleView = makeTitleButton(from: arguments)
+    let titleButton = makeTitleButton(from: arguments)
+    item.titleView = nil
+    item.leftItemsSupplementBackButton = true
+    item.leftBarButtonItems = [UIBarButtonItem(customView: titleButton)]
     item.rightBarButtonItems = makeActions(from: arguments)
     item.backButtonDisplayMode = .minimal
   }
