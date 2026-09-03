@@ -408,6 +408,37 @@ import os.log
           )
         )
       }
+    case "checkpointGatewayReplacement":
+      guard let arguments = call.arguments as? [String: Any],
+        let relayOrigin = arguments["relayOrigin"] as? String,
+        !relayOrigin.isEmpty,
+        let generation = (arguments["generation"] as? NSNumber)?.int64Value
+      else {
+        result(
+          FlutterError(
+            code: "invalid_arguments",
+            message: "Gateway replacement checkpoint requires relayOrigin.",
+            details: nil
+          )
+        )
+        return
+      }
+      do {
+        result(
+          try endpointGrantStore.checkpointReplacementRelayOrigin(
+            relayOrigin,
+            expectedGeneration: generation
+          )
+        )
+      } catch {
+        result(
+          FlutterError(
+            code: "push_gateway_checkpoint_failed",
+            message: "Push gateway replacement checkpoint failed.",
+            details: error.localizedDescription
+          )
+        )
+      }
     case "startRegistration":
       guard let gatewayURL = gatewayURL(from: call) else {
         result(
@@ -661,9 +692,11 @@ import os.log
           .flatMap { $0.grants.map(\.relayOrigin) + $0.pendingEnrollments.map(\.relayOrigin) }
       )
     ).sorted()
+    let replacementState = try endpointGrantStore.replacementQueueState()
     return [
       "retiredRelayOrigins": retiredRelayOrigins,
-      "replacementRelayOrigins": try endpointGrantStore.replacementRelayOrigins(),
+      "replacementRelayOrigins": replacementState.relayOrigins,
+      "replacementGeneration": replacementState.generation,
     ]
   }
 

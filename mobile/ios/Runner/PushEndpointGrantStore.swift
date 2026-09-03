@@ -166,18 +166,55 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
     try replace(states, account: Self.cleanupAccount)
   }
 
-  func replacementRelayOrigins() throws -> [String] {
-    guard let data = try data(account: Self.replacementRelaysAccount) else { return [] }
-    return try JSONDecoder().decode([String].self, from: data)
+  func replacementQueueState() throws -> BuzzPushReplacementQueueState {
+    guard let data = try data(account: Self.replacementRelaysAccount) else {
+      return BuzzPushReplacementQueueState(generation: 0, relayOrigins: [])
+    }
+    return try JSONDecoder().decode(BuzzPushReplacementQueueState.self, from: data)
   }
 
   func queueReplacementRelayOrigins(_ relayOrigins: [String]) throws {
-    let merged = Array(Set(try replacementRelayOrigins() + relayOrigins)).sorted()
-    try replace(merged, account: Self.replacementRelaysAccount)
+    let current = try replacementQueueState()
+    let (generation, overflow) = current.generation.addingReportingOverflow(1)
+    guard !overflow else {
+      throw NSError(
+        domain: "BuzzPushEndpointGrantStore",
+        code: 3,
+        userInfo: [NSLocalizedDescriptionKey: "Replacement queue generation exhausted."]
+      )
+    }
+    let state = BuzzPushReplacementQueueState(
+      generation: generation,
+      relayOrigins: Array(Set(current.relayOrigins + relayOrigins)).sorted()
+    )
+    try replaceValue(state, account: Self.replacementRelaysAccount)
+  }
+
+  func checkpointReplacementRelayOrigin(
+    _ relayOrigin: String,
+    expectedGeneration: Int64
+  ) throws -> Bool {
+    var state = try replacementQueueState()
+    guard state.generation == expectedGeneration else { return false }
+    state.relayOrigins.removeAll { $0 == relayOrigin }
+    try replaceValue(state, account: Self.replacementRelaysAccount)
+    return true
   }
 
   func clearReplacementRelayOrigins() throws {
-    try replace([String](), account: Self.replacementRelaysAccount)
+    let current = try replacementQueueState()
+    let (generation, overflow) = current.generation.addingReportingOverflow(1)
+    guard !overflow else {
+      throw NSError(
+        domain: "BuzzPushEndpointGrantStore",
+        code: 3,
+        userInfo: [NSLocalizedDescriptionKey: "Replacement queue generation exhausted."]
+      )
+    }
+    try replaceValue(
+      BuzzPushReplacementQueueState(generation: generation, relayOrigins: []),
+      account: Self.replacementRelaysAccount
+    )
   }
 
   private func pendingEnrollments() throws -> [BuzzPushPendingEnrollmentRecord] {
@@ -215,7 +252,11 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
   }
 
   private func replace<T: Encodable>(_ values: [T], account: String) throws {
-    let data = try JSONEncoder().encode(values)
+    try replaceValue(values, account: account)
+  }
+
+  private func replaceValue<T: Encodable>(_ value: T, account: String) throws {
+    let data = try JSONEncoder().encode(value)
     let updateStatus = SecItemUpdate(
       baseQuery(account: account) as CFDictionary,
       [kSecValueData as String: data] as CFDictionary

@@ -96,6 +96,7 @@ final pushEndpointGrants = ValueNotifier<List<BuzzPushEndpointGrant>>([]);
 final pushEndpointGrantError = ValueNotifier<String?>(null);
 final retiredBuzzPushRelayOrigins = ValueNotifier<Set<String>>(const {});
 final replacementBuzzPushRelayOrigins = ValueNotifier<Set<String>>(const {});
+final replacementBuzzPushGeneration = ValueNotifier<int>(0);
 
 /// The most recent notification response waiting for app navigation.
 ///
@@ -153,6 +154,8 @@ Future<Set<String>> initializeBuzzPushGateway() async {
     final replacements = _relayOriginSet(inventory?['replacementRelayOrigins']);
     retiredBuzzPushRelayOrigins.value = retired;
     replacementBuzzPushRelayOrigins.value = replacements;
+    replacementBuzzPushGeneration.value =
+        inventory?['replacementGeneration'] as int? ?? 0;
     return retired.union(replacements);
   } on MissingPluginException {
     // Flutter tests and non-Runner embeddings do not install the native bridge.
@@ -170,6 +173,30 @@ Future<void> completeBuzzPushGatewayMigration() async {
     });
     retiredBuzzPushRelayOrigins.value = const {};
     replacementBuzzPushRelayOrigins.value = const {};
+    replacementBuzzPushGeneration.value = 0;
+  } on MissingPluginException {
+    // Flutter tests and non-Runner embeddings do not install the native bridge.
+  }
+}
+
+/// Removes one same-gateway relay origin only after all of its community
+/// replacement leases have been durably accepted.
+Future<void> checkpointBuzzPushGatewayReplacement(
+  String relayOrigin,
+  int generation,
+) async {
+  if (defaultTargetPlatform != TargetPlatform.iOS) return;
+  try {
+    final checkpointed = await _channel.invokeMethod<bool>(
+      'checkpointGatewayReplacement',
+      {'relayOrigin': relayOrigin, 'generation': generation},
+    );
+    if (checkpointed != true) {
+      throw StateError('Push replacement inventory changed before checkpoint.');
+    }
+    replacementBuzzPushRelayOrigins.value = {
+      ...replacementBuzzPushRelayOrigins.value,
+    }..remove(relayOrigin);
   } on MissingPluginException {
     // Flutter tests and non-Runner embeddings do not install the native bridge.
   }
@@ -267,6 +294,8 @@ Future<BuzzPushEndpointGrant> enrollBuzzPush(
   replacementBuzzPushRelayOrigins.value = _relayOriginSet(
     raw['replacementRelayOrigins'],
   );
+  replacementBuzzPushGeneration.value =
+      raw['replacementGeneration'] as int? ?? 0;
   final grant = BuzzPushEndpointGrant.fromMap(raw);
   await readBuzzPushEndpointGrants();
   if (communitiesForSnapshotRefresh != null) {

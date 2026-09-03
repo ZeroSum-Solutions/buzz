@@ -23,6 +23,7 @@ void main() {
     pushEndpointGrantError.value = null;
     retiredBuzzPushRelayOrigins.value = const {};
     replacementBuzzPushRelayOrigins.value = const {};
+    replacementBuzzPushGeneration.value = 0;
     pushCommunitySnapshotError.value = null;
     pendingPushNotificationLink.value = null;
     installBuzzPushMethodHandler();
@@ -59,6 +60,7 @@ void main() {
             return {
               'retiredRelayOrigins': ['wss://old-relay.example'],
               'replacementRelayOrigins': ['wss://rotated-relay.example'],
+              'replacementGeneration': 4,
             };
           });
 
@@ -70,6 +72,7 @@ void main() {
       expect(replacementBuzzPushRelayOrigins.value, {
         'wss://rotated-relay.example',
       });
+      expect(replacementBuzzPushGeneration.value, 4);
     },
   );
 
@@ -89,8 +92,54 @@ void main() {
 
       expect(retiredBuzzPushRelayOrigins.value, isEmpty);
       expect(replacementBuzzPushRelayOrigins.value, isEmpty);
+      expect(replacementBuzzPushGeneration.value, 0);
     },
   );
+
+  test('checkpoints one completed same-gateway relay origin', () async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    replacementBuzzPushRelayOrigins.value = {
+      'wss://done.example',
+      'wss://pending.example',
+    };
+    replacementBuzzPushGeneration.value = 7;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(_channel, (call) async {
+          expect(call.method, 'checkpointGatewayReplacement');
+          expect(call.arguments, {
+            'relayOrigin': 'wss://done.example',
+            'generation': 7,
+          });
+          return true;
+        });
+
+    await checkpointBuzzPushGatewayReplacement('wss://done.example', 7);
+
+    expect(replacementBuzzPushRelayOrigins.value, {'wss://pending.example'});
+  });
+
+  test('preserves replacement inventory after a stale checkpoint', () async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    replacementBuzzPushRelayOrigins.value = {'wss://pending.example'};
+    replacementBuzzPushGeneration.value = 7;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(_channel, (call) async {
+          expect(call.method, 'checkpointGatewayReplacement');
+          expect(call.arguments, {
+            'relayOrigin': 'wss://pending.example',
+            'generation': 7,
+          });
+          return false;
+        });
+
+    await expectLater(
+      checkpointBuzzPushGatewayReplacement('wss://pending.example', 7),
+      throwsStateError,
+    );
+
+    expect(replacementBuzzPushRelayOrigins.value, {'wss://pending.example'});
+    expect(replacementBuzzPushGeneration.value, 7);
+  });
 
   test(
     'starts native permission and APNs registration without a result gate',
@@ -228,6 +277,7 @@ void main() {
             ..._grantMap('new-grant'),
             'retiredRelayOrigins': ['wss://retired.example'],
             'replacementRelayOrigins': ['wss://sibling.example'],
+            'replacementGeneration': 8,
           };
         }
         if (call.method == 'endpointGrants') {
@@ -263,6 +313,7 @@ void main() {
       expect(secondGrant.endpointGrant, 'new-grant');
       expect(retiredBuzzPushRelayOrigins.value, {'wss://retired.example'});
       expect(replacementBuzzPushRelayOrigins.value, {'wss://sibling.example'});
+      expect(replacementBuzzPushGeneration.value, 8);
       expect(enrollmentArguments, [
         {
           'relayUrl': 'wss://relay.example/',

@@ -2334,6 +2334,7 @@ private final class MemoryGrantStore: BuzzPushEndpointGrantStore {
   var pending: [BuzzPushPendingEnrollmentRecord] = []
   var cleanup: [BuzzPushGatewayCleanupState] = []
   var replacementOrigins: [String] = []
+  var replacementGeneration: Int64 = 0
   var resetOperations: [String] = []
   var grantSaveFailuresRemaining: Int
   var cleanupSaveFailureCalls: Set<Int>
@@ -2454,11 +2455,28 @@ private final class MemoryGrantStore: BuzzPushEndpointGrantStore {
   func removeGatewayCleanupState(gatewayOrigin: String) throws {
     cleanup.removeAll { $0.gatewayOrigin == gatewayOrigin }
   }
-  func replacementRelayOrigins() throws -> [String] { replacementOrigins }
+  func replacementQueueState() throws -> BuzzPushReplacementQueueState {
+    BuzzPushReplacementQueueState(
+      generation: replacementGeneration,
+      relayOrigins: replacementOrigins
+    )
+  }
   func queueReplacementRelayOrigins(_ relayOrigins: [String]) throws {
+    replacementGeneration += 1
     replacementOrigins = Array(Set(replacementOrigins + relayOrigins)).sorted()
   }
-  func clearReplacementRelayOrigins() throws { replacementOrigins = [] }
+  func checkpointReplacementRelayOrigin(
+    _ relayOrigin: String,
+    expectedGeneration: Int64
+  ) throws -> Bool {
+    guard replacementGeneration == expectedGeneration else { return false }
+    replacementOrigins.removeAll { $0 == relayOrigin }
+    return true
+  }
+  func clearReplacementRelayOrigins() throws {
+    replacementGeneration += 1
+    replacementOrigins = []
+  }
 }
 
 private final class RecordingAppAttest: BuzzDevAppAttesting {

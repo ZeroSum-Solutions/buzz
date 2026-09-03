@@ -90,6 +90,18 @@ public struct BuzzPushGatewayCleanupState: Codable, Equatable, Sendable {
   }
 }
 
+/// Durable same-gateway lease replacement inventory with a compare-and-swap
+/// generation that fences checkpoints from newer endpoint mutations.
+public struct BuzzPushReplacementQueueState: Codable, Equatable, Sendable {
+  public let generation: Int64
+  public var relayOrigins: [String]
+
+  public init(generation: Int64, relayOrigins: [String]) {
+    self.generation = generation
+    self.relayOrigins = relayOrigins
+  }
+}
+
 /// Persistence boundary for endpoint grants. The Runner implementation stores
 /// records in its Keychain access group and exposes them over the Flutter bridge.
 public protocol BuzzPushEndpointGrantStore {
@@ -126,9 +138,14 @@ public protocol BuzzPushEndpointGrantStore {
   func removeGatewayCleanupState(gatewayOrigin: String) throws
   /// Relay origins whose leases must be republished after shared installation
   /// authority was revoked. The queue is persisted before the remote mutation.
-  func replacementRelayOrigins() throws -> [String]
+  func replacementQueueState() throws -> BuzzPushReplacementQueueState
   /// Atomically merges relay origins into the durable replacement queue.
   func queueReplacementRelayOrigins(_ relayOrigins: [String]) throws
+  /// Removes one relay origin after all of its community leases are durable.
+  func checkpointReplacementRelayOrigin(
+    _ relayOrigin: String,
+    expectedGeneration: Int64
+  ) throws -> Bool
   /// Clears the queue only after replacement publication has completed.
   func clearReplacementRelayOrigins() throws
 }

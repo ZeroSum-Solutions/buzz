@@ -207,6 +207,7 @@ class BuzzPushBootstrap extends HookConsumerWidget {
     useListenable(apnsDeviceToken);
     useListenable(retiredBuzzPushRelayOrigins);
     useListenable(replacementBuzzPushRelayOrigins);
+    useListenable(replacementBuzzPushGeneration);
     final gatewayInitializationAttempt = useMemoized(BuzzPushAttemptGate.new);
     final publicationAttempt = useMemoized(BuzzPushAttemptGate.new);
     final gatewayMigrationAttempt = useMemoized(BuzzPushAttemptGate.new);
@@ -228,6 +229,7 @@ class BuzzPushBootstrap extends HookConsumerWidget {
     final token = apnsDeviceToken.value;
     final retiredRelayOrigins = retiredBuzzPushRelayOrigins.value;
     final replacementRelayOrigins = replacementBuzzPushRelayOrigins.value;
+    final replacementGeneration = replacementBuzzPushGeneration.value;
     final migrationRelayOrigins = retiredRelayOrigins.union(
       replacementRelayOrigins,
     );
@@ -381,23 +383,49 @@ class BuzzPushBootstrap extends HookConsumerWidget {
           token,
           'retired:${(retiredRelayOrigins.toList()..sort()).join(',')}',
           'replacement:${(replacementRelayOrigins.toList()..sort()).join(',')}',
+          'replacement-generation:$replacementGeneration',
         ].join('|');
         if (!gatewayMigrationAttempt.tryBegin(attempt)) return null;
         unawaited(() async {
           try {
-            for (final candidate
-                in buzzPushCommunitiesRequiringGatewayMigration(
-                  communities: communities,
-                  retiredRelayOrigins: migrationRelayOrigins,
-                  replacementRelayOrigins: replacementRelayOrigins,
-                  targetGatewayOrigin: targetGatewayOrigin,
-                )) {
-              await _publishCommunityReplacement(
-                ref,
-                candidate,
-                communities,
-                targetGatewayOrigin,
-              );
+            final candidates = buzzPushCommunitiesRequiringGatewayMigration(
+              communities: communities,
+              retiredRelayOrigins: migrationRelayOrigins,
+              replacementRelayOrigins: replacementRelayOrigins,
+              targetGatewayOrigin: targetGatewayOrigin,
+            );
+            final candidateOrigins =
+                candidates
+                    .map(
+                      (candidate) =>
+                          buzzPushRelayWebSocketOrigin(candidate.relayUrl),
+                    )
+                    .toSet()
+                    .toList()
+                  ..sort();
+            for (final relayOrigin in candidateOrigins) {
+              for (final candidate in candidates.where(
+                (candidate) =>
+                    buzzPushRelayWebSocketOrigin(candidate.relayUrl) ==
+                    relayOrigin,
+              )) {
+                await _publishCommunityReplacement(
+                  ref,
+                  candidate,
+                  communities,
+                  targetGatewayOrigin,
+                );
+              }
+              if (replacementRelayOrigins.contains(relayOrigin)) {
+                await checkpointBuzzPushGatewayReplacement(
+                  relayOrigin,
+                  replacementGeneration,
+                );
+                // The checkpoint updates the listenable replacement inventory.
+                // Let the resulting rebuild own the next origin so two attempts
+                // cannot publish the remaining work concurrently.
+                return;
+              }
             }
             final latestRetiredRelayOrigins = retiredBuzzPushRelayOrigins.value;
             final latestReplacementRelayOrigins =
@@ -408,7 +436,8 @@ class BuzzPushBootstrap extends HookConsumerWidget {
                 !setEquals(
                   replacementRelayOrigins,
                   latestReplacementRelayOrigins,
-                )) {
+                ) ||
+                replacementGeneration != replacementBuzzPushGeneration.value) {
               return;
             }
             await completeBuzzPushGatewayMigration();
@@ -445,6 +474,7 @@ class BuzzPushBootstrap extends HookConsumerWidget {
         token,
         migrationRelayOrigins,
         replacementRelayOrigins,
+        replacementGeneration,
         communitiesAsync.hasValue,
         communities,
         gatewayMigrationRetry.value,
