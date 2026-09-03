@@ -5,7 +5,10 @@ import { MessageCircle } from "lucide-react";
 
 import { useMarketChannel } from "@/features/market/lib/MarketChannelContext";
 import type { MarketBid } from "@/features/market/lib/marketProtocol";
-import { isMarketProtocolMessage } from "@/features/market/lib/marketTimeline";
+import {
+  isMarketProtocolMessage,
+  marketBidsAfterAnchor,
+} from "@/features/market/lib/marketTimeline";
 import { MarketContractCard } from "@/features/market/ui/MarketContractCard";
 import type { TimelineMessage } from "@/features/messages/types";
 import { Button } from "@/shared/ui/button";
@@ -79,21 +82,18 @@ function BidList({
 
 export function MarketChannelIntro({
   anchorMessage,
+  bids,
 }: {
   anchorMessage: Pick<TimelineMessage, "body" | "createdAt" | "id">;
+  bids: MarketBid[];
 }): React.ReactNode {
   const projection = useMarketChannel();
   if (!projection || isMarketProtocolMessage(anchorMessage)) return undefined;
-  const bids = projection.bids.filter(
-    (bid) =>
-      bid.createdAt > anchorMessage.createdAt ||
-      (bid.createdAt === anchorMessage.createdAt &&
-        bid.eventId.localeCompare(anchorMessage.id) > 0),
-  );
+  const visibleBids = marketBidsAfterAnchor(bids, anchorMessage);
   return (
     <div className="mt-2">
       <MarketContractCard scenario={projection.scenario} />
-      <BidList bids={bids} channelId={projection.channelId} />
+      <BidList bids={visibleBids} channelId={projection.channelId} />
     </div>
   );
 }

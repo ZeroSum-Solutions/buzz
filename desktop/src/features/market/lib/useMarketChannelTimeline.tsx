@@ -20,10 +20,15 @@ export function useMarketChannelTimeline(messages: TimelineMessage[]) {
     () =>
       anchor
         ? {
-            [anchor.id]: <MarketChannelIntro anchorMessage={anchor} />,
+            [anchor.id]: (
+              <MarketChannelIntro
+                anchorMessage={anchor}
+                bids={projection?.bids ?? []}
+              />
+            ),
           }
         : undefined,
-    [anchor],
+    [anchor, projection?.bids],
   );
 
   return {

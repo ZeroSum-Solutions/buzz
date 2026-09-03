@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   isMarketProtocolMessage,
+  marketBidsAfterAnchor,
   marketTimelineAnchor,
   selectMarketTimelineMessages,
 } from "./marketTimeline.ts";
@@ -74,6 +75,18 @@ test("the market board anchors to channel creation, not above history", () => {
   );
   assert.equal(isMarketProtocolMessage(contract), true);
   assert.equal(isMarketProtocolMessage(created), false);
+  assert.deepEqual(
+    marketBidsAfterAnchor(
+      [
+        { createdAt: 9, eventId: "9".repeat(64) },
+        { createdAt: 11, eventId: "1".repeat(64) },
+        { createdAt: 11, eventId: "3".repeat(64) },
+        { createdAt: 12, eventId: "0".repeat(64) },
+      ],
+      created,
+    ).map(({ eventId }) => eventId),
+    ["3".repeat(64), "0".repeat(64)],
+  );
 });
 
 test("market timeline hides protocol events but leaves negotiation in its bid thread", () => {

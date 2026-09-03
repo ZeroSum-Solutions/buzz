@@ -1,6 +1,9 @@
 import * as React from "react";
 import { useMarketChannel } from "@/features/market/lib/MarketChannelContext";
-import type { MarketProjection } from "@/features/market/lib/marketProtocol";
+import type {
+  MarketBid,
+  MarketProjection,
+} from "@/features/market/lib/marketProtocol";
 import { parseMarketEnvelope } from "@/features/market/lib/marketProtocol";
 import type { TimelineMessage } from "@/features/messages/types";
 
@@ -18,6 +21,18 @@ export function marketTimelineAnchor(
     messages.find(
       (message) => message.parentId == null && isChannelCreated(message),
     ) ?? null
+  );
+}
+
+export function marketBidsAfterAnchor(
+  bids: MarketBid[],
+  anchor: Pick<TimelineMessage, "createdAt" | "id">,
+): MarketBid[] {
+  return bids.filter(
+    (bid) =>
+      bid.createdAt > anchor.createdAt ||
+      (bid.createdAt === anchor.createdAt &&
+        bid.eventId.localeCompare(anchor.id) > 0),
   );
 }
 
