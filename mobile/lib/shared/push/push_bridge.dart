@@ -168,12 +168,18 @@ Future<Set<String>> initializeBuzzPushGateway() async {
 Future<void> completeBuzzPushGatewayMigration() async {
   if (defaultTargetPlatform != TargetPlatform.iOS) return;
   try {
-    await _channel.invokeMethod<void>('completeGatewayMigration', {
-      'gatewayUrl': Env.pushGatewayUrl,
-    });
-    retiredBuzzPushRelayOrigins.value = const {};
-    replacementBuzzPushRelayOrigins.value = const {};
-    replacementBuzzPushGeneration.value = 0;
+    final inventory = await _channel.invokeMapMethod<dynamic, dynamic>(
+      'completeGatewayMigration',
+      {'gatewayUrl': Env.pushGatewayUrl},
+    );
+    retiredBuzzPushRelayOrigins.value = _relayOriginSet(
+      inventory?['retiredRelayOrigins'],
+    );
+    replacementBuzzPushRelayOrigins.value = _relayOriginSet(
+      inventory?['replacementRelayOrigins'],
+    );
+    replacementBuzzPushGeneration.value =
+        inventory?['replacementGeneration'] as int? ?? 0;
   } on MissingPluginException {
     // Flutter tests and non-Runner embeddings do not install the native bridge.
   }

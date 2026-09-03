@@ -85,7 +85,11 @@ void main() {
           .setMockMethodCallHandler(_channel, (call) async {
             expect(call.method, 'completeGatewayMigration');
             expect(call.arguments, {'gatewayUrl': Env.pushGatewayUrl});
-            return null;
+            return {
+              'retiredRelayOrigins': <String>[],
+              'replacementRelayOrigins': <String>[],
+              'replacementGeneration': 0,
+            };
           });
 
       await completeBuzzPushGatewayMigration();
@@ -93,6 +97,33 @@ void main() {
       expect(retiredBuzzPushRelayOrigins.value, isEmpty);
       expect(replacementBuzzPushRelayOrigins.value, isEmpty);
       expect(replacementBuzzPushGeneration.value, 0);
+    },
+  );
+
+  test(
+    'retains native migration inventory when cleanup token becomes stale',
+    () async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+      retiredBuzzPushRelayOrigins.value = {'wss://old-relay.example'};
+      replacementBuzzPushRelayOrigins.value = {'wss://old-relay.example'};
+      replacementBuzzPushGeneration.value = 4;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(_channel, (call) async {
+            expect(call.method, 'completeGatewayMigration');
+            return {
+              'retiredRelayOrigins': <String>[],
+              'replacementRelayOrigins': ['wss://old-relay.example'],
+              'replacementGeneration': 4,
+            };
+          });
+
+      await completeBuzzPushGatewayMigration();
+
+      expect(retiredBuzzPushRelayOrigins.value, isEmpty);
+      expect(replacementBuzzPushRelayOrigins.value, {
+        'wss://old-relay.example',
+      });
+      expect(replacementBuzzPushGeneration.value, 4);
     },
   );
 

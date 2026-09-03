@@ -388,7 +388,7 @@ import os.log
             if let cleanupTask {
               try await cleanupTask.value
             }
-            result(nil)
+            result(try pushGatewayMigrationInventory())
           } catch {
             result(
               FlutterError(

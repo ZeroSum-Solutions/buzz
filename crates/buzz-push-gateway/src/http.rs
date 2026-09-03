@@ -321,18 +321,22 @@ async fn recover_installation(State(s): State<AppState>, body: Bytes) -> Respons
     (StatusCode::OK, Json(MutationResponse { status: "revoked" })).into_response()
 }
 
+struct AssertionChallenge<'a> {
+    id: uuid::Uuid,
+    text: &'a str,
+}
+
 async fn verify_installation_assertion<T: serde::Serialize>(
     s: &AppState,
     installation_id: uuid::Uuid,
-    challenge_id: uuid::Uuid,
-    challenge_text: &str,
+    challenge: AssertionChallenge<'_>,
     assertion: &str,
     domain: &str,
     signed: &T,
     include_revoked: bool,
 ) -> Result<(), Response> {
     let now = (s.now)();
-    let challenge = decode_challenge(challenge_text)
+    let challenge_bytes = decode_challenge(challenge.text)
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "invalid_request"))?;
     let installation = if include_revoked {
         s.authority
@@ -355,12 +359,12 @@ async fn verify_installation_assertion<T: serde::Serialize>(
             transcript.as_bytes(),
             &installation.app_attest_public_key,
             installation.assertion_counter,
-            challenge_text,
-            challenge_text,
+            challenge.text,
+            challenge.text,
         )
         .map_err(|_| error(StatusCode::UNAUTHORIZED, "invalid_attestation"))?;
     s.authority
-        .consume_challenge(challenge_id, challenge, now)
+        .consume_challenge(challenge.id, challenge_bytes, now)
         .await
         .map_err(authority_error)?;
     s.authority
@@ -417,8 +421,10 @@ async fn delegate(State(s): State<AppState>, body: Bytes) -> Response {
     if let Err(e) = verify_installation_assertion(
         &s,
         r.installation_handle,
-        r.challenge_id,
-        &r.challenge,
+        AssertionChallenge {
+            id: r.challenge_id,
+            text: &r.challenge,
+        },
         &r.assertion,
         "buzz.push.delegate.v1",
         &t,
@@ -510,8 +516,10 @@ async fn rotate_endpoint(State(s): State<AppState>, body: Bytes) -> Response {
     if let Err(e) = verify_installation_assertion(
         &s,
         r.installation_handle,
-        r.challenge_id,
-        &r.challenge,
+        AssertionChallenge {
+            id: r.challenge_id,
+            text: &r.challenge,
+        },
         &r.assertion,
         "buzz.push.rotate-endpoint.v1",
         &t,
@@ -570,8 +578,10 @@ async fn revoke_delegation(State(s): State<AppState>, body: Bytes) -> Response {
     if let Err(e) = verify_installation_assertion(
         &s,
         r.installation_handle,
-        r.challenge_id,
-        &r.challenge,
+        AssertionChallenge {
+            id: r.challenge_id,
+            text: &r.challenge,
+        },
         &r.assertion,
         "buzz.push.revoke-delegation.v1",
         &t,
@@ -623,8 +633,10 @@ async fn revoke_installation(State(s): State<AppState>, body: Bytes) -> Response
     if let Err(e) = verify_installation_assertion(
         &s,
         r.installation_handle,
-        r.challenge_id,
-        &r.challenge,
+        AssertionChallenge {
+            id: r.challenge_id,
+            text: &r.challenge,
+        },
         &r.assertion,
         "buzz.push.revoke-installation.v1",
         &t,
