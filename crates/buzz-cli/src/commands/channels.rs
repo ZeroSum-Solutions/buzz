@@ -3888,12 +3888,11 @@ mod restore_canvas_tests {
     /// the canonical canvas-conflict body, but the event ID is still captured so
     /// the ancestry walk can return controlled streams that reflect whether the
     /// event was actually stored before the 409 reply.
-    async fn conflict_relay(
-        /// What the ancestry walk returns: `true` → our event is reachable
-        /// (commit happened, response lost), `false` → our event is absent
-        /// (genuine rejection), `None` → ancestry read fails (HTTP 500).
-        event_reachable: Option<bool>,
-    ) -> (String, Arc<Mutex<Option<Value>>>) {
+    ///
+    /// `event_reachable`: `Some(true)` → our event is reachable (commit
+    /// happened, response lost); `Some(false)` → our event is absent (genuine
+    /// rejection); `None` → ancestry read fails (HTTP 500).
+    async fn conflict_relay(event_reachable: Option<bool>) -> (String, Arc<Mutex<Option<Value>>>) {
         let submitted: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
         let submitted2 = submitted.clone();
         let reachable = event_reachable;
