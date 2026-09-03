@@ -659,70 +659,41 @@ public final class BuzzDevPushEnrollmentDriver {
         )
       }
     }
-    if !forceDelegationRenewal,
-      let current = storedForOrigin,
-      current.relayPubkey == relayPubkey,
-      current.endpointHash == endpointHash,
-      current.endpointEpoch == Self.endpointEpoch,
-      current.expiresAt > nowSeconds + 300
-    {
-      guard current.relayMetadataPubkey != relayKeys.metadataPubkey else {
-        try store.removePendingEnrollment(
-          gatewayOrigin: gatewayOrigin,
-          relayOrigin: relayOrigin.text,
-          appProfile: Self.appProfile
-        )
-        return current
-      }
-      let refreshed = BuzzPushEndpointGrantRecord(
-        gatewayOrigin: gatewayOrigin,
-        relayOrigin: current.relayOrigin,
-        relayPubkey: current.relayPubkey,
-        relayMetadataPubkey: relayKeys.metadataPubkey,
-        gatewayInstallationHandle: current.gatewayInstallationHandle,
-        appAttestKeyId: current.appAttestKeyId,
-        installationId: current.installationId,
-        endpointGrant: current.endpointGrant,
-        endpointHash: current.endpointHash,
-        appProfile: current.appProfile,
-        endpointEpoch: current.endpointEpoch,
-        generation: current.generation,
-        expiresAt: current.expiresAt
-      )
-      try store.save(refreshed)
-      try store.removePendingEnrollment(
-        gatewayOrigin: gatewayOrigin,
-        relayOrigin: relayOrigin.text,
-        appProfile: Self.appProfile
-      )
-      return refreshed
+    let reusableCurrent = storedForOrigin.flatMap { current in
+      current.relayPubkey == relayPubkey
+        && current.endpointHash == endpointHash
+        && current.endpointEpoch == Self.endpointEpoch
+        && current.expiresAt > nowSeconds + 300 ? current : nil
     }
-
-    // One gateway delegation is scoped to an installation and relay key, not
-    // to a Buzz community. A second origin served by the same relay therefore
-    // gets a fresh unlinkable NIP-PL address while reusing the opaque grant.
-    if storedForOrigin == nil,
-      let sharedGrant = storedRecords.first(where: {
-        $0.gatewayOrigin == gatewayOrigin && $0.relayPubkey == relayPubkey
-          && $0.appProfile == Self.appProfile
-          && $0.endpointHash == endpointHash && $0.endpointEpoch == Self.endpointEpoch
-          && $0.expiresAt > nowSeconds + 300
-      })
-    {
+    let newestSharedGrant = storedRecords.filter {
+      $0.gatewayOrigin == gatewayOrigin && $0.relayPubkey == relayPubkey
+        && $0.appProfile == Self.appProfile
+        && $0.endpointHash == endpointHash && $0.endpointEpoch == Self.endpointEpoch
+        && $0.expiresAt > nowSeconds + 300
+    }.max { $0.generation < $1.generation }
+    let newerSiblingGrant = reusableCurrent.flatMap { current in
+      newestSharedGrant.flatMap { shared in
+        shared.generation > current.generation ? shared : nil
+      }
+    }
+    if let reusableGrant = forceDelegationRenewal ? newerSiblingGrant : newestSharedGrant {
+      // Delegation authority is shared by installation and relay key. When a
+      // sibling origin has already renewed it, adopt that newest opaque grant
+      // even if this origin is still durably queued for forced replacement.
       let record = BuzzPushEndpointGrantRecord(
         gatewayOrigin: gatewayOrigin,
         relayOrigin: relayOrigin.text,
         relayPubkey: relayPubkey,
         relayMetadataPubkey: relayKeys.metadataPubkey,
-        gatewayInstallationHandle: sharedGrant.gatewayInstallationHandle,
-        appAttestKeyId: sharedGrant.appAttestKeyId,
-        installationId: try makeInstallationId(),
-        endpointGrant: sharedGrant.endpointGrant,
+        gatewayInstallationHandle: reusableGrant.gatewayInstallationHandle,
+        appAttestKeyId: reusableGrant.appAttestKeyId,
+        installationId: try reusableCurrent?.installationId ?? makeInstallationId(),
+        endpointGrant: reusableGrant.endpointGrant,
         endpointHash: endpointHash,
         appProfile: Self.appProfile,
-        endpointEpoch: sharedGrant.endpointEpoch,
-        generation: sharedGrant.generation,
-        expiresAt: sharedGrant.expiresAt
+        endpointEpoch: reusableGrant.endpointEpoch,
+        generation: reusableGrant.generation,
+        expiresAt: reusableGrant.expiresAt
       )
       try store.save(record)
       try store.removePendingEnrollment(

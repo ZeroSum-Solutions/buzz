@@ -151,6 +151,66 @@ typedef BuzzPushGatewayMigrationTarget = ({
 });
 
 @visibleForTesting
+class BuzzPushGatewayMigrationResolution {
+  BuzzPushGatewayMigrationResolution({
+    required this.targets,
+    required this.blockedOrigins,
+    this.firstError,
+    this.firstStack,
+  });
+
+  final List<BuzzPushGatewayMigrationTarget> targets;
+  final Set<String> blockedOrigins;
+  final Object? firstError;
+  final StackTrace? firstStack;
+
+  void throwIfFailed() {
+    if (firstError != null) {
+      Error.throwWithStackTrace(firstError!, firstStack!);
+    }
+  }
+}
+
+@visibleForTesting
+Future<BuzzPushGatewayMigrationResolution>
+resolveBuzzPushGatewayMigrationTargets({
+  required Iterable<Community> communities,
+  required Future<BuzzPushLeaseDescriptor> Function(String relayUrl)
+  fetchDescriptor,
+}) async {
+  final ordered = communities.toList()
+    ..sort(
+      (left, right) => buzzPushRelayWebSocketOrigin(
+        left.relayUrl,
+      ).compareTo(buzzPushRelayWebSocketOrigin(right.relayUrl)),
+    );
+  final targets = <BuzzPushGatewayMigrationTarget>[];
+  final blockedOrigins = <String>{};
+  Object? firstError;
+  StackTrace? firstStack;
+  for (final community in ordered) {
+    final relayOrigin = buzzPushRelayWebSocketOrigin(community.relayUrl);
+    try {
+      targets.add((
+        community: community,
+        relayOrigin: relayOrigin,
+        descriptor: await fetchDescriptor(community.relayUrl),
+      ));
+    } catch (error, stack) {
+      blockedOrigins.add(relayOrigin);
+      firstError ??= error;
+      firstStack ??= stack;
+    }
+  }
+  return BuzzPushGatewayMigrationResolution(
+    targets: targets,
+    blockedOrigins: blockedOrigins,
+    firstError: firstError,
+    firstStack: firstStack,
+  );
+}
+
+@visibleForTesting
 Map<String, List<BuzzPushGatewayMigrationTarget>>
 buzzPushGroupGatewayMigrationsByDelegationAuthority(
   Iterable<BuzzPushGatewayMigrationTarget> targets,
@@ -444,41 +504,21 @@ class BuzzPushBootstrap extends HookConsumerWidget {
               replacementRelayOrigins: replacementRelayOrigins,
               targetGatewayOrigin: targetGatewayOrigin,
             );
-            final candidateOrigins =
-                candidates
-                    .map(
-                      (candidate) =>
-                          buzzPushRelayWebSocketOrigin(candidate.relayUrl),
-                    )
-                    .toSet()
-                    .toList()
-                  ..sort();
-            final targets = <BuzzPushGatewayMigrationTarget>[];
-            for (final relayOrigin in candidateOrigins) {
-              final originCandidates = candidates
-                  .where(
-                    (candidate) =>
-                        buzzPushRelayWebSocketOrigin(candidate.relayUrl) ==
-                        relayOrigin,
-                  )
-                  .toList();
-              for (final originCandidate in originCandidates) {
-                final descriptor = await fetchBuzzPushLeaseDescriptor(
-                  originCandidate.relayUrl,
-                );
-                targets.add((
-                  community: originCandidate,
-                  relayOrigin: relayOrigin,
-                  descriptor: descriptor,
-                ));
-              }
-            }
+            final resolution = await resolveBuzzPushGatewayMigrationTargets(
+              communities: candidates,
+              fetchDescriptor: fetchBuzzPushLeaseDescriptor,
+            );
             final authorityGroups =
-                buzzPushGroupGatewayMigrationsByDelegationAuthority(targets);
+                buzzPushGroupGatewayMigrationsByDelegationAuthority(
+                  resolution.targets,
+                );
             for (final authorityTargets in authorityGroups.values) {
               final queuedOrigins = authorityTargets
                   .map((target) => target.relayOrigin)
                   .where(replacementRelayOrigins.contains)
+                  .where(
+                    (origin) => !resolution.blockedOrigins.contains(origin),
+                  )
                   .toSet();
               for (var index = 0; index < authorityTargets.length; index += 1) {
                 final target = authorityTargets[index];
@@ -505,6 +545,7 @@ class BuzzPushBootstrap extends HookConsumerWidget {
                 return;
               }
             }
+            resolution.throwIfFailed();
             if (!attemptIsCurrent()) return;
             await completeBuzzPushGatewayMigration();
             gatewayMigrationFailures.value = 0;

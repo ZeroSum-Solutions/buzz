@@ -191,16 +191,25 @@ impl AuthorityStore for PostgresAuthorityStore {
         }
         let replaced = existing
             .iter()
-            .map(|row| row.try_get::<Uuid, _>("id").map_err(db))
+            .map(|row| {
+                Ok((
+                    row.try_get::<Uuid, _>("id").map_err(db)?,
+                    row.try_get::<DateTime<Utc>, _>("expires_at").map_err(db)?,
+                ))
+            })
             .collect::<Result<Vec<_>, _>>()?;
-        if !replaced.is_empty() {
+        let expired = replaced
+            .into_iter()
+            .filter_map(|(id, expires_at)| (expires_at < now_at).then_some(id))
+            .collect::<Vec<_>>();
+        if !expired.is_empty() {
             sqlx::query("DELETE FROM push_gateway_delegations WHERE installation_id = ANY($1)")
-                .bind(&replaced)
+                .bind(&expired)
                 .execute(&mut *tx)
                 .await
                 .map_err(db)?;
             sqlx::query("DELETE FROM push_gateway_installations WHERE id = ANY($1)")
-                .bind(&replaced)
+                .bind(&expired)
                 .execute(&mut *tx)
                 .await
                 .map_err(db)?;
@@ -1004,6 +1013,56 @@ mod postgres_tests {
             .installation(Uuid::from_u128(3), now + 1_001)
             .await
             .is_ok());
+
+        pool.close().await;
+        drop_schema(&schema).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL"]
+    async fn replacement_installation_preserves_unexpired_revocation_tombstone() {
+        let (pool, schema) = full_schema(1).await;
+        let store = PostgresAuthorityStore::new(pool.clone());
+        let now = Utc::now().timestamp();
+        let installation = |id| NewInstallation {
+            id,
+            app_attest_key_id: vec![1],
+            app_attest_public_key: vec![2; 33],
+            assertion_counter: 0,
+            profile: AppProfile::BuzzIosDogfood,
+            token_ciphertext: vec![3],
+            token_fingerprint: [4; 32],
+            endpoint_epoch: 1,
+            expires_at: now + 2_592_000,
+        };
+        let original_id = Uuid::from_u128(1);
+
+        store
+            .create_installation(installation(original_id), now)
+            .await
+            .expect("create original installation");
+        store
+            .revoke_installation(original_id, 1, 2)
+            .await
+            .expect("revoke original installation");
+        store
+            .create_installation(installation(Uuid::from_u128(2)), now + 1)
+            .await
+            .expect("create replacement with the same key and token");
+
+        assert!(
+            store
+                .installation_for_revocation(original_id, now + 1)
+                .await
+                .expect("the original tombstone remains retryable")
+                .revoked
+        );
+        let installations: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM push_gateway_installations")
+                .fetch_one(&pool)
+                .await
+                .expect("count original tombstone and replacement");
+        assert_eq!(installations, 2);
 
         pool.close().await;
         drop_schema(&schema).await;

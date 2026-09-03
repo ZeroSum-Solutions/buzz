@@ -2016,6 +2016,73 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     XCTAssertEqual(record.endpointGrant, "replacement-grant")
   }
 
+  func testForcedReplacementAdoptsNewerSiblingGrantWithoutRenewingAgain() async throws {
+    let endpointHash = Self.hex(SHA256.hash(data: Data((1...32).map(UInt8.init))))
+    let stale = BuzzPushEndpointGrantRecord(
+      gatewayOrigin: Self.gatewayOrigin,
+      relayOrigin: "wss://relay.example",
+      relayPubkey: Self.relayPubkey,
+      relayMetadataPubkey: Self.relayPubkey,
+      gatewayInstallationHandle: Self.installationHandle,
+      appAttestKeyId: Self.keyId,
+      installationId: Self.installationId,
+      endpointGrant: "stale-grant",
+      endpointHash: endpointHash,
+      appProfile: "buzz-ios-dogfood",
+      endpointEpoch: 1,
+      generation: 4,
+      expiresAt: Self.expiresAt
+    )
+    let renewed = BuzzPushEndpointGrantRecord(
+      gatewayOrigin: Self.gatewayOrigin,
+      relayOrigin: "wss://sibling.example",
+      relayPubkey: Self.relayPubkey,
+      relayMetadataPubkey: Self.relayPubkey,
+      gatewayInstallationHandle: Self.installationHandle,
+      appAttestKeyId: Self.keyId,
+      installationId: "sibling-lease-address",
+      endpointGrant: "renewed-shared-grant",
+      endpointHash: endpointHash,
+      appProfile: "buzz-ios-dogfood",
+      endpointEpoch: 1,
+      generation: 5,
+      expiresAt: Self.expiresAt
+    )
+    let store = MemoryGrantStore(records: [stale, renewed])
+    let driver = try makeDriver(
+      store: store,
+      appAttest: RecordingAppAttest(),
+      installationIdBytes: {
+        XCTFail("A queued sibling must retain its existing lease address")
+        return Data(repeating: 0xFF, count: 16)
+      }
+    )
+    URLProtocolStub.handler = { request in
+      guard request.httpMethod == "GET" else {
+        XCTFail("A newer sibling grant must prevent another gateway renewal")
+        return Self.response(request, status: 500, json: [:])
+      }
+      return Self.response(
+        request,
+        status: 200,
+        json: [
+          "self": Self.relayPubkey,
+          "push": ["keys": [["pubkey": Self.relayPubkey, "current": true]]],
+        ]
+      )
+    }
+
+    let record = try await driver.enroll(
+      deviceToken: Data((1...32).map(UInt8.init)),
+      relayURL: Self.relayURL,
+      forceDelegationRenewal: true
+    )
+
+    XCTAssertEqual(record.installationId, Self.installationId)
+    XCTAssertEqual(record.generation, 5)
+    XCTAssertEqual(record.endpointGrant, "renewed-shared-grant")
+  }
+
   func testExpiringGrantRenewsExistingInstallationAndReusesRelayLeaseAddress() async throws {
     let existing = BuzzPushEndpointGrantRecord(
       gatewayOrigin: Self.gatewayOrigin,

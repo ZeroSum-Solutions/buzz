@@ -277,7 +277,7 @@ impl AuthorityStore for MemoryAuthorityStore {
         if s.installations.contains_key(&n.id) {
             return Err(AuthorityError::Rejected);
         }
-        let replaced = s
+        let matching = s
             .installations
             .values()
             .filter(|installation| {
@@ -287,7 +287,7 @@ impl AuthorityStore for MemoryAuthorityStore {
             })
             .map(|installation| installation.id)
             .collect::<Vec<_>>();
-        if replaced.iter().any(|id| {
+        if matching.iter().any(|id| {
             s.installations
                 .get(id)
                 .is_some_and(|installation| !installation.revoked && installation.expires_at >= now)
@@ -295,6 +295,14 @@ impl AuthorityStore for MemoryAuthorityStore {
             // App identity and token possession never supersede a live installation.
             return Err(AuthorityError::Conflict);
         }
+        let replaced = matching
+            .into_iter()
+            .filter(|id| {
+                s.installations
+                    .get(id)
+                    .is_some_and(|installation| installation.expires_at < now)
+            })
+            .collect::<Vec<_>>();
         for id in replaced {
             if let Some(old) = s.installations.remove(&id) {
                 s.token_owners.remove(&(old.profile, old.token_fingerprint));
@@ -936,6 +944,30 @@ mod tests {
             .revoke_installation(id, 1, 2)
             .await
             .expect("the exact installation revocation is idempotent");
+        store
+            .create_installation(
+                NewInstallation {
+                    id: Uuid::from_u128(5),
+                    app_attest_key_id: vec![1],
+                    app_attest_public_key: vec![5; 33],
+                    assertion_counter: 0,
+                    profile: AppProfile::BuzzIosDogfood,
+                    token_ciphertext: vec![6],
+                    token_fingerprint: [4; 32],
+                    endpoint_epoch: 1,
+                    expires_at: 3_000,
+                },
+                1_001,
+            )
+            .await
+            .expect("a replacement can reuse ownership without deleting the tombstone");
+        assert!(
+            store
+                .installation_for_revocation(id, 1_001)
+                .await
+                .expect("replacement preserves the prior revocation tombstone")
+                .revoked
+        );
         assert_eq!(
             store.revoke_installation(id, 2, 3).await,
             Err(AuthorityError::Rejected)

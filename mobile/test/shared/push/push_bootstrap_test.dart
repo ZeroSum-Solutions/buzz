@@ -308,6 +308,31 @@ void main() {
     ]);
   });
 
+  test('descriptor resolution preserves reachable migration work', () async {
+    final reachable = Community.create(
+      name: 'Reachable',
+      relayUrl: 'wss://reachable.example',
+    );
+    final offline = Community.create(
+      name: 'Offline',
+      relayUrl: 'wss://offline.example',
+    );
+
+    final resolution = await resolveBuzzPushGatewayMigrationTargets(
+      communities: [offline, reachable],
+      fetchDescriptor: (relayUrl) async {
+        if (relayUrl == offline.relayUrl) {
+          throw StateError('offline');
+        }
+        return _descriptor(keyId: 'reachable', pubkey: _hex('a'));
+      },
+    );
+
+    expect(resolution.targets.map((target) => target.community), [reachable]);
+    expect(resolution.blockedOrigins, {'wss://offline.example'});
+    expect(resolution.throwIfFailed, throwsStateError);
+  });
+
   test('pending opt-out tombstone keeps active push lifecycle disabled', () {
     final subscription = BuzzPushSubscription(
       filter: BuzzPushFilter(kinds: const [9], pTags: [_hex('a')]),
