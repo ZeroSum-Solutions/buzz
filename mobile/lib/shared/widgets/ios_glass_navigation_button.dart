@@ -105,6 +105,7 @@ class IosGlassNavigationButton extends HookWidget {
     this.fillWidth = false,
     this.buttonCenterX,
     this.foregroundColor,
+    this.selectionColor,
     this.swatchColor,
     this.isBusy = false,
     this.isSelected = false,
@@ -151,6 +152,9 @@ class IosGlassNavigationButton extends HookWidget {
   /// Optional foreground tint for the native control and Flutter fallback.
   final Color? foregroundColor;
 
+  /// Optional fill tint used while the control is selected.
+  final Color? selectionColor;
+
   /// Optional inset color swatch used by [IosGlassNavigationIcon.colorSwatch].
   final Color? swatchColor;
 
@@ -186,7 +190,9 @@ class IosGlassNavigationButton extends HookWidget {
     final onMenuSelectedRef = useRef(onMenuSelected)..value = onMenuSelected;
     final brightness = context.theme.brightness.name;
     final effectiveForeground = foregroundColor ?? context.colors.primary;
+    final effectiveSelection = selectionColor ?? effectiveForeground;
     final foregroundValue = effectiveForeground.toARGB32();
+    final selectionValue = effectiveSelection.toARGB32();
     final swatchColorValue = swatchColor?.toARGB32();
     final enabled = onPressed != null;
     final routeAnimation =
@@ -238,6 +244,7 @@ class IosGlassNavigationButton extends HookWidget {
             channel.invokeMethod<void>('setAppearance', <String, Object>{
               'brightness': brightness,
               'foregroundColor': foregroundValue,
+              'selectionColor': selectionValue,
               'enabled': enabled,
               'busy': isBusy,
               'selected': isSelected,
@@ -251,6 +258,7 @@ class IosGlassNavigationButton extends HookWidget {
         nativeChannel.value,
         brightness,
         foregroundValue,
+        selectionValue,
         enabled,
         isBusy,
         isSelected,
@@ -354,7 +362,9 @@ class IosGlassNavigationButton extends HookWidget {
                       filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
                       child: DecoratedBox(
                         decoration: BoxDecoration(
-                          color: context.colors.surface.withValues(alpha: 0.68),
+                          color: isSelected
+                              ? effectiveSelection
+                              : context.colors.surface.withValues(alpha: 0.68),
                           borderRadius: BorderRadius.circular(controlSize / 2),
                           border: Border.all(
                             color: context.colors.inverseSurface.withValues(
@@ -507,6 +517,7 @@ class IosGlassNavigationButton extends HookWidget {
         'accessibilityLabel': semanticLabel,
         'brightness': brightness,
         'foregroundColor': foregroundValue,
+        'selectionColor': selectionValue,
         'enabled': enabled,
         'busy': isBusy,
         'selected': isSelected,

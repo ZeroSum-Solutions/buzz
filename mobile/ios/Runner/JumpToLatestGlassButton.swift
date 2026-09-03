@@ -365,6 +365,9 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
     let interfaceStyle: UIUserInterfaceStyle = brightness == "dark" ? .dark : .light
     let colorValue = (arguments?["foregroundColor"] as? NSNumber)?.uint32Value
     let foregroundColor = colorValue.map(Self.color(from:))
+    let selectionColorValue =
+      (arguments?["selectionColor"] as? NSNumber)?.uint32Value
+    let selectionColor = selectionColorValue.map(Self.color(from:))
     resolvedForegroundColor = foregroundColor
     let enabled = arguments?["enabled"] as? Bool ?? true
     let busy = arguments?["busy"] as? Bool ?? false
@@ -385,7 +388,9 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
     if let foregroundColor {
       // Glass uses the view tint for its selected treatment. Keep it aligned
       // with the Buzz theme instead of falling back to the system blue tint.
-      button.tintColor = foregroundColor
+      button.tintColor = selected
+        ? (selectionColor ?? foregroundColor)
+        : foregroundColor
       button.configuration?.baseForegroundColor = foregroundColor
       button.configuration?.imageColorTransformer = contentIcon == "avatar"
         ? nil
