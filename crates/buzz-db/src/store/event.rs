@@ -341,6 +341,52 @@ async fn huddle_started_link_exists_with_operation(
         .any(|content| huddle_started_content_links(content, ephemeral_channel_id)))
 }
 
+/// Return whether a creator-signed huddle-start event links a parent channel
+/// to the requested ephemeral huddle channel — checked inside an open
+/// transaction, giving the caller serializable visibility of the link row.
+///
+/// Uses `tx.as_mut()` so the read participates in the caller's transaction
+/// isolation level (normally `REPEATABLE READ` for membership-lock
+/// transactions). A `false` return means the link was deleted or was never
+/// inserted, and the caller should abort the surrounding transaction.
+pub async fn huddle_started_link_exists_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    parent_channel_id: Uuid,
+    ephemeral_channel_id: Uuid,
+    creator_pubkey: &[u8],
+) -> Result<bool> {
+    let uuid_needle = format!("%{}%", ephemeral_channel_id);
+    let candidates: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT content
+        FROM events
+        WHERE deleted_at IS NULL
+          AND community_id = $1
+          AND channel_id = $2
+          AND kind = $3
+          AND pubkey = $4
+          AND octet_length(content) <= $5
+          AND content ILIKE $6
+        ORDER BY created_at DESC, id ASC
+        LIMIT $7
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(parent_channel_id)
+    .bind(KIND_HUDDLE_STARTED as i32)
+    .bind(creator_pubkey)
+    .bind(HUDDLE_LINK_CONTENT_MAX_BYTES)
+    .bind(uuid_needle)
+    .bind(HUDDLE_LINK_CANDIDATE_LIMIT)
+    .fetch_all(tx.as_mut())
+    .await?;
+
+    Ok(candidates
+        .iter()
+        .any(|content| huddle_started_content_links(content, ephemeral_channel_id)))
+}
+
 /// Insert a Nostr event. Rejects AUTH and ephemeral kinds.
 ///
 /// Returns `(StoredEvent, was_inserted)` — `was_inserted` is `false` on duplicate.

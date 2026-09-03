@@ -403,6 +403,26 @@ pub(crate) async fn handle_active_audio_connection(
                 return;
             }
         };
+        (release_lease: $lease:expr) => {
+            if cancel.is_cancelled() {
+                // Release any acquired lease before returning. Pre-guard path:
+                // staged_lease may hold a lease that must be released before we
+                // return, since the guard hasn't been built yet.
+                if let Some((lease, directory)) = ($lease).take() {
+                    match directory.release(&lease).await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!("pre-guard staged_lease release failed on cancel: {e}");
+                        }
+                    }
+                }
+                use futures_util::SinkExt as _;
+                while let Ok(msg) = terminal_ctrl_rx.try_recv() {
+                    let _ = ws_send.send(msg).await;
+                }
+                return;
+            }
+        };
     }
 
     if crate::api::relay_members::enforce_relay_membership(
@@ -533,7 +553,9 @@ pub(crate) async fn handle_active_audio_connection(
                     return;
                 }
             }
-            check_cancel!();
+            // I1 residual: staged_lease may now hold an acquired lease. Release
+            // it (awaited, not detached) before returning on cancel.
+            check_cancel!(release_lease: staged_lease);
         }
         None => {
             if !state.config.huddle_audio_available {
@@ -583,10 +605,11 @@ pub(crate) async fn handle_active_audio_connection(
                         .into(),
                 ))
                 .await;
+            // I1 residual: release lease with an awaited call, not a detached task.
             if let Some((lease, directory)) = staged_lease {
-                let c = tokio_util::sync::CancellationToken::new();
-                c.cancel();
-                crate::audio::join::spawn_observable_huddle_renewer(directory, lease, c);
+                if let Err(e) = directory.release(&lease).await {
+                    tracing::warn!(channel_id = %channel_id, "archived-exit lease release failed: {e}");
+                }
             }
             state
                 .audio_rooms
@@ -595,10 +618,11 @@ pub(crate) async fn handle_active_audio_connection(
         }
         Err(e) => {
             warn!(channel_id = %channel_id, "pre-join channel check failed (fail-closed): {e}");
+            // I1 residual: release lease with an awaited call, not a detached task.
             if let Some((lease, directory)) = staged_lease {
-                let c = tokio_util::sync::CancellationToken::new();
-                c.cancel();
-                crate::audio::join::spawn_observable_huddle_renewer(directory, lease, c);
+                if let Err(re) = directory.release(&lease).await {
+                    tracing::warn!(channel_id = %channel_id, "db-error-exit lease release failed: {re}");
+                }
             }
             state
                 .audio_rooms
@@ -607,7 +631,9 @@ pub(crate) async fn handle_active_audio_connection(
         }
         Ok(_) => {} // Channel exists and is not archived — proceed.
     }
-    check_cancel!();
+    // I1 residual: staged_lease may hold an acquired lease. Release it
+    // (awaited, not detached) before returning on cancel.
+    check_cancel!(release_lease: staged_lease);
 
     // Reject unsupported future versions up-front so we don't accidentally
     // pin a room to a version we can't speak. Versions 1..=CURRENT are OK.
@@ -635,9 +661,10 @@ pub(crate) async fn handle_active_audio_connection(
             ))
             .await;
         if let Some((lease, directory)) = staged_lease {
-            let c = tokio_util::sync::CancellationToken::new();
-            c.cancel();
-            crate::audio::join::spawn_observable_huddle_renewer(directory, lease, c);
+            // I1 residual: release lease with an awaited call, not a detached task.
+            if let Err(e) = directory.release(&lease).await {
+                tracing::warn!(channel_id = %channel_id, "version-mismatch-exit lease release failed: {e}");
+            }
         }
         return;
     }
@@ -695,6 +722,11 @@ pub(crate) async fn handle_active_audio_connection(
                         remote_rejection_ws_error(&reason).to_string().into(),
                     ))
                     .await;
+                // I3 residual: await expiry task before resource teardown.
+                cancel.cancel();
+                if let Some(t) = _nip_fi_admission_expiry.take() {
+                    let _ = t.await;
+                }
                 guard.release_before_commit().await;
                 state
                     .audio_rooms
@@ -713,6 +745,11 @@ pub(crate) async fn handle_active_audio_connection(
                         .into(),
                     ))
                     .await;
+                // I3 residual: await expiry task before resource teardown.
+                cancel.cancel();
+                if let Some(t) = _nip_fi_admission_expiry.take() {
+                    let _ = t.await;
+                }
                 guard.release_before_commit().await;
                 state
                     .audio_rooms
@@ -721,7 +758,13 @@ pub(crate) async fn handle_active_audio_connection(
             }
         }
         // B1: post-dial cancel check — guard runs clean-close + lease release.
+        // IMPORTANT 3 residual: await expiry task explicitly, do not infer
+        // completion from cancel.is_cancelled().
         if cancel.is_cancelled() {
+            cancel.cancel();
+            if let Some(t) = _nip_fi_admission_expiry.take() {
+                let _ = t.await;
+            }
             use futures_util::SinkExt as _;
             guard.release_before_commit().await;
             while let Ok(msg) = terminal_ctrl_rx.try_recv() {
@@ -740,6 +783,11 @@ pub(crate) async fn handle_active_audio_connection(
             Ok(p) => p,
             Err(crate::nip_fi_gate::SessionExpired) => {
                 // Expiry fired before we could add the peer. No peer, no commit.
+                // IMPORTANT 3 residual: await expiry task explicitly.
+                cancel.cancel();
+                if let Some(t) = _nip_fi_admission_expiry.take() {
+                    let _ = t.await;
+                }
                 use futures_util::SinkExt as _;
                 guard.release_before_commit().await;
                 while let Ok(msg) = terminal_ctrl_rx.try_recv() {
@@ -820,8 +868,15 @@ pub(crate) async fn handle_active_audio_connection(
     #[cfg(test)]
     crate::nip_fi_test_hooks::after_add_peer(tenant.community()).await;
     if cancel.is_cancelled() {
-        // IMPORTANT 3: cancel is set by the expiry task, which has already
-        // completed by the time it sets cancel. No need to await it.
+        // IMPORTANT 3 residual: do NOT infer expiry-task completion from
+        // cancel.is_cancelled(). `gate.expire()` calls cancel.cancel() *before*
+        // its write-lock quiescence barrier (nip_fi_gate.rs). Cancel + await
+        // the expiry task before releasing any resource so teardown cannot race
+        // outstanding pre-expiry permits.
+        cancel.cancel();
+        if let Some(t) = _nip_fi_admission_expiry.take() {
+            let _ = t.await;
+        }
         use futures_util::SinkExt as _;
         guard.release_before_commit().await;
         while let Ok(msg) = terminal_ctrl_rx.try_recv() {
@@ -1003,10 +1058,17 @@ pub(crate) async fn handle_active_audio_connection(
             return;
         }
         Err(JoinCommitError::Expired) => {
-            // Gate denied — expiry fired before commit. Expiry task is done.
-            // No `joined` frame was sent — commit-won invariant holds.
-            // IMPORTANT 3: Expired means the expiry task has completed (it fired
-            // the cancel and wrote the permit). No need to await it.
+            // Gate denied — expiry fired before commit. No `joined` frame was
+            // sent — commit-won invariant holds.
+            //
+            // IMPORTANT 3 residual: `acquire_effect()` can return `SessionExpired`
+            // via the deadline fast path (Utc::now() >= deadline) before the
+            // spawned expiry task completes. Cancel + await the task explicitly —
+            // do not infer task completion from SessionExpired.
+            cancel.cancel();
+            if let Some(t) = _nip_fi_admission_expiry.take() {
+                let _ = t.await;
+            }
             guard.release_before_commit().await;
             // Drain the terminal denial frame (already queued by expiry task).
             use futures_util::SinkExt as _;
@@ -1047,6 +1109,26 @@ pub(crate) async fn handle_active_audio_connection(
             let _ = ws_send
                 .send(WsMessage::Text(
                     serde_json::json!({"type":"error","message":"error: not a member"})
+                        .to_string()
+                        .into(),
+                ))
+                .await;
+            return;
+        }
+        Err(JoinCommitError::HuddleLinkGone) => {
+            // Creator-signed huddle_started link deleted between pre-join check
+            // and commit (IMPORTANT 4 residual: third carried fact).
+            // No `joined` frame was sent — commit-won invariant holds.
+            warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "huddle_started link gone before join commit");
+            // IMPORTANT 3: cancel + await expiry task before peer/room teardown.
+            cancel.cancel();
+            if let Some(t) = _nip_fi_admission_expiry.take() {
+                let _ = t.await;
+            }
+            guard.release_before_commit().await;
+            let _ = ws_send
+                .send(WsMessage::Text(
+                    serde_json::json!({"type":"error","message":"huddle has ended"})
                         .to_string()
                         .into(),
                 ))
@@ -1732,22 +1814,24 @@ impl HuddleAdmissionGuard {
     /// Release all still-held resources. Safe to call multiple times; each
     /// field becomes `None` on first release.
     ///
-    /// - Unattached lease: spawned with a pre-cancelled token so the renewer
-    ///   immediately releases the Redis fenced lease without installing a
-    ///   registry entry.
+    /// - Unattached lease: calls `directory.release(&lease)` directly and
+    ///   awaits the result before returning ("released before return" is
+    ///   literal — no detached task). Warns on release error.
     /// - Remote registration: UnregisterPeer + Goodbye(SessionEnded) on stream.
     /// - Peer in room: remove_peer + cleanup_if_empty.
     async fn release_before_commit(&mut self) {
-        // Release the unattached lease by spawning a renewer with a
-        // pre-cancelled caller token. The renewer loop immediately hits the
-        // cancel arm (break true) and calls `directory.release(&lease)` —
-        // the exact fenced release path — without ever installing an entry in
-        // HuddleOwnerRegistry. This is the same cleanup path `attach_signals`
-        // uses on the draining arm.
+        // Release the unattached lease by calling directory.release directly.
+        // This is an awaited call, so "release before return" is guaranteed —
+        // no detached renewer task that could outlive the caller.
         if let Some((lease, directory)) = self.lease.take() {
-            let cancel = tokio_util::sync::CancellationToken::new();
-            cancel.cancel(); // fires immediately so renewer releases on first tick
-            crate::audio::join::spawn_observable_huddle_renewer(directory, lease, cancel);
+            match directory.release(&lease).await {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "HuddleAdmissionGuard: lease release failed on pre-commit exit: {e}"
+                    );
+                }
+            }
         }
         // Close the remote registration.
         if let (Some(session), Some(ref mut stream)) =
@@ -1911,6 +1995,9 @@ pub(crate) enum JoinCommitError {
     Archived,
     /// Parent membership was revoked between pre-join check and commit (IMPORTANT 4).
     ParentMembershipLost,
+    /// Creator-signed huddle_started link was deleted between pre-join check
+    /// and commit (IMPORTANT 4 residual: third carried fact).
+    HuddleLinkGone,
 }
 
 impl std::fmt::Display for JoinCommitError {
@@ -1921,6 +2008,9 @@ impl std::fmt::Display for JoinCommitError {
             JoinCommitError::Archived => write!(f, "channel archived before commit"),
             JoinCommitError::ParentMembershipLost => {
                 write!(f, "parent membership revoked before commit")
+            }
+            JoinCommitError::HuddleLinkGone => {
+                write!(f, "huddle_started creator link gone before commit")
             }
         }
     }
@@ -1942,7 +2032,10 @@ impl From<buzz_db::DbError> for JoinCommitError {
 ///    a. Re-read channel archive state — fail `Archived` if now archived.
 ///    (IMPORTANT 4: closes the race between pre-join check and commit.)
 ///    b. Re-read parent membership — fail `ParentMembershipLost` if gone.
-///    c. Re-read child membership — skip auto-add insert if a concurrent
+///    c. Re-read creator-signed huddle_started link — fail `HuddleLinkGone`
+///    if the link was deleted between pre-join check and commit.
+///    (IMPORTANT 4 residual: third carried fact, alongside archive + parent.)
+///    d. Re-read child membership — skip auto-add insert if a concurrent
 ///    legitimate add is already present (concurrent-add preservation).
 /// 4. Insert kind `48101` in the same transaction (uncommitted).
 /// 5. Acquire a session effect permit (or rollback + return `Err(Expired)`).
@@ -2061,6 +2154,26 @@ async fn commit_participant_join(
         if !parent_still_member {
             let _ = tx.rollback().await;
             return Err(JoinCommitError::ParentMembershipLost);
+        }
+
+        // IMPORTANT 4 residual: Re-read the creator-signed huddle_started link
+        // inside the transaction. This is the third carried fact alongside the
+        // archive + parent-membership re-reads. The link could be deleted by a
+        // concurrent channel teardown after check_membership_for_admission ran
+        // but before this transaction acquires the lock; committing a join into
+        // an unlinked channel violates the "creator authority" invariant.
+        let link_still_exists = buzz_db::event::huddle_started_link_exists_in_transaction(
+            &mut tx,
+            tenant.community(),
+            *parent_id,
+            channel_id,
+            channel_created_by.as_slice(),
+        )
+        .await?;
+
+        if !link_still_exists {
+            let _ = tx.rollback().await;
+            return Err(JoinCommitError::HuddleLinkGone);
         }
 
         // Re-read child membership — a concurrent legitimate add may have
@@ -4018,6 +4131,27 @@ mod tests {
         .await
         .expect("CW5: seed child channel");
 
+        // Seed the huddle_started link event (kind 48100) required by the I4
+        // re-validation inside commit_participant_join. Links parent_channel_id
+        // → child_channel_id, signed by creator_bytes.
+        let huddle_link_content =
+            serde_json::json!({ "ephemeral_channel_id": child_channel_id.to_string() }).to_string();
+        sqlx::query(
+            "INSERT INTO events \
+             (community_id, id, pubkey, created_at, kind, tags, content, sig, channel_id) \
+             VALUES ($1, $2, $3, NOW(), $4, '[]', $5, $6, $7)",
+        )
+        .bind(community_uuid)
+        .bind(vec![0xBBu8; 32]) // fixed test event id
+        .bind(&creator_bytes)
+        .bind(48100_i32) // KIND_HUDDLE_STARTED
+        .bind(&huddle_link_content)
+        .bind(vec![0u8; 64]) // dummy sig (not validated in this path)
+        .bind(parent_channel_id)
+        .execute(&pool)
+        .await
+        .expect("CW5: seed huddle_started link");
+
         // Seed parent membership for the joiner.
         sqlx::query(
             "INSERT INTO channel_members (channel_id, community_id, pubkey, role, invited_by) \
@@ -4147,10 +4281,9 @@ mod tests {
     //
     // Mutation evidence (executed):
     //   CW5V-A) Delete `before_membership_lock(...)` → arrived_rx times out → panic.
-    //   CW5V-B) Remove the `still_absent` re-read and always insert → membership
-    //           is double-inserted (ON CONFLICT upserts) → row still = 1 but the
-    //           role/invited_by may be overwritten → we don't assert that here,
-    //           but the re-read path IS the contract seam.
+    //   CW5V-B) Remove the `still_absent` re-read and always insert → auto-add
+    //           fires → ON CONFLICT DO UPDATE SET role = 'member' clobbers the
+    //           externally-inserted 'admin' role → member.role assertion panics.
     //   CW5V-C) Remove the `if still_absent { insert }` guard → same as (B).
     #[tokio::test]
     async fn cw5_variant_concurrent_external_membership_add_preserved() {
@@ -4190,6 +4323,28 @@ mod tests {
         .execute(&pool)
         .await
         .expect("CW5-variant: seed channel");
+
+        // Seed the huddle_started link event (kind 48100) required by the I4
+        // re-validation inside commit_participant_join. The test uses
+        // parent_channel_id == channel_id (same UUID), so this event needs to
+        // link channel_id → channel_id from creator_bytes.
+        let huddle_link_content =
+            serde_json::json!({ "ephemeral_channel_id": channel_id.to_string() }).to_string();
+        sqlx::query(
+            "INSERT INTO events \
+             (community_id, id, pubkey, created_at, kind, tags, content, sig, channel_id) \
+             VALUES ($1, $2, $3, NOW(), $4, '[]', $5, $6, $7)",
+        )
+        .bind(community_uuid)
+        .bind(vec![0xAAu8; 32]) // fixed test event id
+        .bind(&creator_bytes)
+        .bind(48100_i32) // KIND_HUDDLE_STARTED
+        .bind(&huddle_link_content)
+        .bind(vec![0u8; 64]) // dummy sig (not validated in this path)
+        .bind(channel_id)
+        .execute(&pool)
+        .await
+        .expect("CW5-variant: seed huddle_started link");
 
         let joiner_key = nostr::Keys::generate();
         let joiner_bytes = joiner_key.public_key().to_bytes().to_vec();
@@ -4250,14 +4405,14 @@ mod tests {
 
         // External concurrent insert — simulates another legitimate path adding
         // the joiner to the channel before our transaction acquires the lock.
-        // Use a DISTINCT invited_by key to prove provenance preservation: if the
-        // auto-add fires instead of being skipped, it would overwrite invited_by
-        // with creator_bytes — the assertion below would catch that.
+        // Use role = 'admin' as the distinguishing marker: if auto-add fires,
+        // `ON CONFLICT DO UPDATE SET role = EXCLUDED.role` (which is 'member')
+        // clobbers the 'admin' role — the assertion below catches that.
         let external_inviter = nostr::Keys::generate();
         let external_inviter_bytes = external_inviter.public_key().to_bytes().to_vec();
         sqlx::query(
             "INSERT INTO channel_members (community_id, channel_id, pubkey, role, invited_by) \
-             VALUES ($1, $2, $3, 'member', $4)",
+             VALUES ($1, $2, $3, 'admin', $4)",
         )
         .bind(community_uuid)
         .bind(channel_id)
@@ -4281,9 +4436,9 @@ mod tests {
             "CW5-variant: join must succeed (external add observed, skip insert); got: {result:?}"
         );
 
-        // Verify membership via the normal API (role/provenance facts, not just count).
-        // This is the seam Thufir flagged: raw count allows an unconditional upsert
-        // to pass (overwrites provenance but count stays 1).
+        // Verify membership via the normal API: role must be 'admin' (the
+        // externally-inserted value). If auto-add fires, ON CONFLICT DO UPDATE
+        // SET role = 'member' clobbers it — this assertion catches that.
         let members =
             buzz_db::channel_members::get_members(state.db.pool(), community_id, channel_id)
                 .await
@@ -4301,15 +4456,9 @@ mod tests {
             "CW5-variant: membership row must be for the joiner"
         );
         assert_eq!(
-            member.role, "member",
-            "CW5-variant: membership role must be 'member' (external insert's role preserved)"
-        );
-        assert_eq!(
-            member.invited_by.as_deref(),
-            Some(external_inviter_bytes.as_slice()),
-            "CW5-variant: invited_by must match external inviter (not auto-add's creator_bytes) — \
-             proves auto-add was skipped, not that it overwrote provenance; \
-             mutation: if auto-add insert fires, invited_by would be creator_bytes and this panics"
+            member.role, "admin",
+            "CW5-variant: membership role must be 'admin' (external insert's role preserved — \
+             if auto-add fires, ON CONFLICT sets role='member' and this panics)"
         );
 
         // Exactly 1 committed 48101 row — the join event committed.
@@ -5134,16 +5283,13 @@ mod tests {
     // seam that makes this feasible without production infrastructure.
     //
     // The path under test is `HuddleAdmissionGuard::release_before_commit`, which
-    // calls `spawn_observable_huddle_renewer(directory, lease, pre_cancelled_token)`.
-    // The renewer loop immediately hits the cancel arm and calls
-    // `directory.release(&lease)` — this is the exact fenced release path.
+    // calls `directory.release(&lease)` directly and awaits the result. Release
+    // is guaranteed complete before `release_before_commit` returns — no detached
+    // renewer task.
     //
     // Mutation evidence (executed):
     //   CW6A) Remove `if let Some((lease, directory)) = self.lease.take()` block →
-    //         renewer never spawned → release_calls stays 0 → assertion panics.
-    //   CW6B) Remove the `cancel.cancel()` call inside `release_before_commit` →
-    //         renewer loop tries to renew (not release) → release_calls stays 0 →
-    //         assertion panics (the renewer will renew instead of releasing).
+    //         release is never called → release_calls stays 0 → assertion panics.
     #[tokio::test]
     async fn cw6_guard_release_before_commit_calls_directory_release_exactly_once() {
         use crate::audio::join::{
@@ -5153,7 +5299,6 @@ mod tests {
         use crate::tunnel::directory::SessionLease;
         use buzz_core::CommunityId;
         use buzz_relay_mesh::{wire::FencedHeader, MeshError, RuntimeId};
-        use chrono::Utc;
         use std::sync::{Arc, Mutex};
         use uuid::Uuid;
 
@@ -5243,22 +5388,9 @@ mod tests {
 
         guard.release_before_commit().await;
 
-        // Wait for the renewer task to run and call release.
-        // The renewer is spawned and runs its first tick (cancel arm) which calls
-        // release. Give the Tokio runtime time to schedule it.
-        let deadline = Utc::now() + chrono::Duration::milliseconds(500);
-        loop {
-            tokio::task::yield_now().await;
-            let calls = *dir.release_calls.lock().unwrap();
-            if calls >= 1 {
-                break;
-            }
-            if Utc::now() >= deadline {
-                panic!("CW6: directory.release was not called within 500ms — the renewer did not run or the cancel token was not pre-set; release_calls={calls}");
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-
+        // `release_before_commit` now calls `directory.release` directly and
+        // awaits it — no detached renewer task. Release is complete by the time
+        // `release_before_commit` returns.
         let release_calls = *dir.release_calls.lock().unwrap();
         assert_eq!(
             release_calls, 1,
@@ -5268,7 +5400,6 @@ mod tests {
         // Guard is idempotent — calling release_before_commit again must not
         // trigger a second release (lease field is now None).
         guard.release_before_commit().await;
-        tokio::task::yield_now().await;
         let release_calls_after = *dir.release_calls.lock().unwrap();
         assert_eq!(
             release_calls_after, 1,
@@ -5291,7 +5422,8 @@ mod tests {
     //         in `release_before_commit` → send_frame never called → frames_sent
     //         stays 0 → assertion panics.
     //   CW7B) Swap UnregisterPeer and Goodbye order → Goodbye arrives before
-    //         UnregisterPeer → MeshStreamFrame assertion order panics.
+    //         UnregisterPeer → frame[0] is Goodbye, not Data → first frame
+    //         assertion panics (expected Data, got Goodbye).
     #[tokio::test]
     async fn cw7_guard_release_before_commit_sends_clean_close_on_remote_stream() {
         use crate::audio::join::RemoteHuddleSession;
@@ -5366,6 +5498,46 @@ mod tests {
 
         guard.release_before_commit().await;
 
+        // Stream must have received UnregisterPeer (Data) then Goodbye, then finish.
+        let sent = frames.lock().unwrap().clone();
+        assert_eq!(
+            sent.len(),
+            2,
+            "CW7: send_clean_close must send exactly 2 frames (Data + Goodbye); got {}",
+            sent.len()
+        );
+
+        // Frame 0: Data with UnregisterPeer payload — exact pubkey.
+        match &sent[0] {
+            MeshStreamFrame::Data { payload, .. } => {
+                use crate::audio::join::{decode_control, HuddleControlMsg};
+                let msg = decode_control(payload)
+                    .expect("CW7: frame[0] Data payload must decode as HuddleControlMsg");
+                assert_eq!(
+                    msg,
+                    HuddleControlMsg::UnregisterPeer {
+                        pubkey: pubkey.clone()
+                    },
+                    "CW7: frame[0] must be UnregisterPeer with exact pubkey; got {msg:?}"
+                );
+            }
+            other => panic!(
+                "CW7: frame[0] must be Data (UnregisterPeer), got {other:?} — \
+                 swap-order mutation: Goodbye before UnregisterPeer"
+            ),
+        }
+
+        // Frame 1: Goodbye — order assertion: UnregisterPeer BEFORE Goodbye.
+        match &sent[1] {
+            MeshStreamFrame::Goodbye { .. } => {}
+            other => panic!("CW7: frame[1] must be Goodbye, got {other:?}"),
+        }
+
+        // Finish must have been called.
+        assert!(
+            *finished.lock().unwrap(),
+            "CW7: send_clean_close must call finish() on the stream"
+        );
         // remote_session and remote_stream must be cleared.
         assert!(
             guard.remote_session.is_none(),
@@ -5374,26 +5546,6 @@ mod tests {
         assert!(
             guard.remote_stream.is_none(),
             "CW7: remote_stream must be cleared after release_before_commit"
-        );
-
-        // Stream must have received UnregisterPeer + Goodbye, then finish.
-        let sent = frames.lock().unwrap().clone();
-        assert!(
-            !sent.is_empty(),
-            "CW7: send_clean_close must send at least one frame on remote stream; got 0"
-        );
-        // The last Data frame must be UnregisterPeer, followed by Goodbye.
-        let goodbye_sent = sent
-            .iter()
-            .any(|f| matches!(f, MeshStreamFrame::Goodbye { .. }));
-        assert!(
-            goodbye_sent,
-            "CW7: send_clean_close must send a Goodbye frame on pre-commit exit; frames={sent:?}"
-        );
-        // Finish must have been called.
-        assert!(
-            *finished.lock().unwrap(),
-            "CW7: send_clean_close must call finish() on the stream"
         );
     }
 }
