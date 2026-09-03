@@ -34,6 +34,10 @@
 //! | **W4** (COUNT barrier) | `handlers/count.rs:112` — immediately before `acquire_effect()` in COUNT path | Delete `before_count_query(...)` call | `arrived_rx` times out → test panics |
 //! | **W4** (COUNT barrier) | same | Remove `acquire_effect()` from count.rs | CLOSED message changes from "session expired" → assertion panics |
 //! | **W4** (COUNT barrier) | same | Change gate to `off_mode` | no CLOSED sent → `try_recv` returns `Err` → assertion panics |
+//! | **P1-a** (huddle-liveness REQ barrier) | `handlers/req.rs` — immediately before `acquire_effect()` in `filters_are_huddle_liveness_only` branch | Delete `before_liveness_req(...)` call | `arrived_rx` times out → test panics |
+//! | **P1-a** (huddle-liveness REQ barrier) | same | Remove `acquire_effect()` from liveness branch | CLOSED "session expired" not sent → `try_recv` returns `Err` → assertion panics |
+//! | **P1-b** (agent-observer EVENT barrier) | `handlers/event.rs` — immediately before `acquire_effect()` in `KIND_AGENT_OBSERVER_FRAME` branch | Delete `before_observer_event(...)` call | `arrived_rx` times out → test panics |
+//! | **P1-b** (agent-observer EVENT barrier) | same | Remove `acquire_effect()` from observer branch | OK(false) "session expired" not sent → first `try_recv` assertion panics |
 //! | **W5** (audio B1 expired-at-pairing) | `audio/handler.rs`, B1 deadline check after NIP-42 auth | Remove the already-expired deadline check | frame text changes to "not a relay member" → byte assertion panics |
 //! | **W6** (audio B1 mid-admission) | `audio/handler.rs`, biased `cancel.cancelled()` in auth select | Remove `_ = cancel.cancelled() => return` | handler proceeds to auth exchange; close assertion fires on 3s timeout |
 //! | **W7** (audio B3 expiry writer) | `nip_fi_session::spawn_nip_fi_expiry_task`, audio enqueue | Delete the audio denial enqueue | `frames[0]` is not the expected restricted JSON → assertion panics |
@@ -143,6 +147,8 @@ make_hook!(auth_commit_hook, before_auth_commit);
 make_hook!(event_ingest_hook, before_event_ingest);
 make_hook!(req_registration_hook, before_req_registration);
 make_hook!(count_query_hook, before_count_query);
+make_hook!(liveness_req_hook, before_liveness_req);
+make_hook!(observer_event_hook, before_observer_event);
 
 // ── Audio B1 hooks ─────────────────────────────────────────────────────────
 // `before_membership_check`: fires between NIP-42 pairing and the membership

@@ -211,6 +211,22 @@ pub async fn handle_req(
     }
 
     if filters_are_huddle_liveness_only(&filters) {
+        // P1-a: acquire an effect permit before the liveness query + emission,
+        // exactly as the search and normal REQ branches do. Without this, a
+        // frame accepted just before expiry can complete DB reads and sign
+        // EVENTs after the NIP-FI deadline. [FI-TRACE-LEASE-BOUND]
+        //
+        // Test hook: fires immediately before acquire_effect.
+        // [nip_fi_test_hooks::liveness_req_hook]
+        #[cfg(test)]
+        crate::nip_fi_test_hooks::before_liveness_req(conn.tenant.community()).await;
+        let _liveness_permit = match conn.nip_fi_gate.acquire_effect().await {
+            Ok(permit) => permit,
+            Err(crate::nip_fi_gate::SessionExpired) => {
+                conn.send(RelayMessage::closed(&sub_id, "restricted: session expired"));
+                return;
+            }
+        };
         handle_huddle_liveness_req(
             &sub_id,
             &filters,
@@ -2690,6 +2706,124 @@ mod tests {
                 );
             }
             other => panic!("W3: expected Text CLOSED frame, got {other:?}"),
+        }
+    }
+
+    // ── P1-a: huddle-liveness REQ gate — barrier expiry blocks query + emission ──────
+    //
+    // Arms `before_liveness_req` — the hook immediately before `acquire_effect()`
+    // in the `filters_are_huddle_liveness_only` branch of `handle_req`. Dispatches
+    // `handle_req` with a KIND_HUDDLE_LIVENESS filter and a live gate, waits for
+    // the hook, fires expiry, then releases. The handler must return CLOSED with
+    // \"session expired\" and must NOT have called any DB or emit path.
+    //
+    // Hook location: `handlers/req.rs`, immediately before `acquire_effect()`
+    // in the liveness branch.
+    //
+    // Mutation evidence:
+    //   A) Delete `#[cfg(test)] before_liveness_req(...)` from req.rs →
+    //      hook never fires → `arrived_rx` times out → test panics.
+    //   B) Remove `acquire_effect()` from the liveness branch →
+    //      handler proceeds to `handle_huddle_liveness_req` despite expired gate →
+    //      CLOSED \"session expired\" is not sent → `try_recv` returns `Err` →
+    //      assertion panics.
+    //   C) Change gate to `off_mode` → `acquire_effect()` always succeeds →
+    //      same as (B).
+    #[tokio::test]
+    async fn p1a_huddle_liveness_req_barrier_expiry_blocks_query_and_emission() {
+        use nostr::{Filter, Keys};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::{mpsc, RwLock};
+        use tokio_util::sync::CancellationToken;
+        use uuid::Uuid;
+
+        let keys = Keys::generate();
+        let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        let cancel = CancellationToken::new();
+        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel.clone());
+
+        // Use Uuid::nil() community — same as W3, so the accessible-channels
+        // cache hit/miss behaviour is identical and pre-existing.
+        let community = buzz_core::tenant::CommunityId::from_uuid(Uuid::nil());
+
+        let (send_tx, mut send_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = mpsc::channel::<axum::extract::ws::Message>(1);
+        let subscriptions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let conn = Arc::new(crate::connection::ConnectionState {
+            conn_id: Uuid::new_v4(),
+            tenant: buzz_core::tenant::TenantContext::resolved(community, "test.local".to_string()),
+            remote_addr: "127.0.0.1:1234".parse().unwrap(),
+            auth_state: RwLock::new(crate::connection::AuthState::Authenticated(
+                buzz_auth::AuthContext {
+                    pubkey: keys.public_key(),
+                    scopes: vec![],
+                    channel_ids: None,
+                    auth_method: buzz_auth::AuthMethod::Nip42,
+                    agent_owner_pubkey: None,
+                },
+            )),
+            subscriptions: Arc::clone(&subscriptions),
+            send_tx,
+            ctrl_tx,
+            terminal_ctrl_tx,
+            cancel: cancel.clone(),
+            backpressure_count: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            grace_limit: 3,
+            nip_fi_assertion: None,
+            session_deadline: Some(deadline),
+            nip_fi_gate: gate,
+        });
+
+        let state = crate::state::tests::test_state().await;
+        let sub_id = "p1a-liveness-barrier-test".to_string();
+
+        // KIND_HUDDLE_LIVENESS only — `filters_are_huddle_liveness_only` checks
+        // only the kinds field, not the #h tag.
+        let filters = vec![Filter::new().kind(nostr::Kind::Custom(
+            buzz_core::kind::KIND_HUDDLE_LIVENESS as u16,
+        ))];
+
+        // Arm the barrier: fires when handle_req reaches before_liveness_req.
+        let (arrived_rx, release) = crate::nip_fi_test_hooks::liveness_req_hook::arm(community);
+
+        let conn2 = Arc::clone(&conn);
+        let state2 = Arc::clone(&state);
+        let handle =
+            tokio::spawn(async move { handle_req(sub_id, filters, vec![], conn2, state2).await });
+
+        // Wait for the handler to reach the permit boundary.
+        tokio::time::timeout(std::time::Duration::from_secs(5), arrived_rx)
+            .await
+            .expect("P1-a: handler must reach before_liveness_req within 5s")
+            .expect("arrived channel closed");
+
+        // Fire expiry.
+        cancel.cancel();
+
+        // Release — handler tries acquire_effect(), gets SessionExpired.
+        release.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("P1-a: handle_req must return within 5s after hook release")
+            .expect("handle_req task must not panic");
+
+        // A CLOSED frame must have been sent with the session-expired message.
+        let frame = send_rx
+            .try_recv()
+            .expect("P1-a: handler must send CLOSED on expired gate");
+        match frame {
+            axum::extract::ws::Message::Text(t) => {
+                assert!(
+                    t.contains("session expired"),
+                    "P1-a: CLOSED message must contain 'session expired'; got: {t}"
+                );
+            }
+            other => panic!("P1-a: expected Text CLOSED frame, got {other:?}"),
         }
     }
 }

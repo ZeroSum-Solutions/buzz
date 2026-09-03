@@ -689,6 +689,27 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
             ));
             return;
         }
+        // P1-b: acquire an effect permit before the observer handler's
+        // side effects (owner/cache checks, local_event_ids update, Redis
+        // fan-out, OK ack). Without this, a frame accepted just before
+        // expiry can complete post-expiry effects past identity revocation.
+        // [FI-TRACE-LEASE-BOUND]
+        //
+        // Test hook: fires immediately before acquire_effect.
+        // [nip_fi_test_hooks::observer_event_hook]
+        #[cfg(test)]
+        crate::nip_fi_test_hooks::before_observer_event(conn.tenant.community()).await;
+        let _observer_permit = match conn.nip_fi_gate.acquire_effect().await {
+            Ok(permit) => permit,
+            Err(crate::nip_fi_gate::SessionExpired) => {
+                conn.send(RelayMessage::ok(
+                    &event_id_hex,
+                    false,
+                    "restricted: session expired",
+                ));
+                return;
+            }
+        };
         handle_agent_observer_event(event, conn_id, &event_id_hex, conn, state).await;
         return;
     }
@@ -2739,6 +2760,130 @@ mod tests {
                  ingest_event must not have been called when acquire_effect returns SessionExpired; \
                  found {row_count} row(s)"
             );
+        }
+    }
+
+    // ── P1-b: agent-observer EVENT gate — barrier expiry blocks fan-out + ack ─────
+    //
+    // Arms `before_observer_event` — the hook immediately before `acquire_effect()`
+    // in the `KIND_AGENT_OBSERVER_FRAME` branch of `handle_event`. Dispatches
+    // `handle_event` with a live gate, waits for the hook to signal the handler
+    // reached the permit boundary, fires expiry, then releases. The handler must
+    // return OK(false, "restricted: session expired") and must NOT have called
+    // `handle_agent_observer_event` (no owner/cache updates, no Redis fan-out).
+    //
+    // Hook location: `handlers/event.rs`, immediately before `acquire_effect()`
+    // in the KIND_AGENT_OBSERVER_FRAME branch.
+    //
+    // Mutation evidence:
+    //   A) Delete `#[cfg(test)] before_observer_event(...)` from event.rs →
+    //      hook never fires → `arrived_rx` times out → test panics.
+    //   B) Remove `acquire_effect()` from the observer branch →
+    //      handler proceeds to `handle_agent_observer_event` despite expired gate →
+    //      OK(false, "session expired") is not sent → `try_recv` returns `Err` →
+    //      assertion panics.
+    //   C) Change gate to `off_mode` → `acquire_effect()` always succeeds →
+    //      same as (B).
+    #[tokio::test]
+    async fn p1b_agent_observer_event_barrier_expiry_blocks_fanout_and_ack() {
+        use super::handle_event;
+        use buzz_core::kind::KIND_AGENT_OBSERVER_FRAME;
+        use nostr::{EventBuilder, Keys, Kind};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::{mpsc, RwLock};
+        use tokio_util::sync::CancellationToken;
+        use uuid::Uuid;
+
+        let keys = Keys::generate();
+        let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        let cancel = CancellationToken::new();
+        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel.clone());
+
+        // Use Uuid::nil() community — same convention as W3/P1-a.
+        let community = buzz_core::tenant::CommunityId::from_uuid(Uuid::nil());
+
+        let (send_tx, mut send_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = mpsc::channel::<axum::extract::ws::Message>(1);
+
+        let conn = Arc::new(crate::connection::ConnectionState {
+            conn_id: Uuid::new_v4(),
+            tenant: buzz_core::tenant::TenantContext::resolved(community, "test.local".to_string()),
+            remote_addr: "127.0.0.1:1234".parse().unwrap(),
+            auth_state: RwLock::new(crate::connection::AuthState::Authenticated(
+                buzz_auth::AuthContext {
+                    pubkey: keys.public_key(),
+                    scopes: vec![],
+                    channel_ids: None,
+                    auth_method: buzz_auth::AuthMethod::Nip42,
+                    agent_owner_pubkey: None,
+                },
+            )),
+            subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            send_tx,
+            ctrl_tx,
+            terminal_ctrl_tx,
+            cancel: cancel.clone(),
+            backpressure_count: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            grace_limit: 3,
+            nip_fi_assertion: None,
+            session_deadline: Some(deadline),
+            nip_fi_gate: gate,
+        });
+
+        // Build a minimal KIND_AGENT_OBSERVER_FRAME event (kind:24200).
+        // Scopes are empty → passes the scope check and reaches the permit boundary.
+        let event = EventBuilder::new(
+            Kind::Custom(KIND_AGENT_OBSERVER_FRAME as u16),
+            "p1b-observer-barrier-test",
+        )
+        .sign_with_keys(&keys)
+        .unwrap();
+
+        let state = crate::state::tests::test_state().await;
+
+        // Arm the barrier: fires when handle_event reaches before_observer_event.
+        let (arrived_rx, release) = crate::nip_fi_test_hooks::observer_event_hook::arm(community);
+
+        let conn2 = Arc::clone(&conn);
+        let state2 = Arc::clone(&state);
+        let handle = tokio::spawn(async move { handle_event(event, conn2, state2).await });
+
+        // Wait for the handler to reach the permit boundary.
+        tokio::time::timeout(std::time::Duration::from_secs(5), arrived_rx)
+            .await
+            .expect("P1-b: handler must reach before_observer_event within 5s")
+            .expect("arrived channel closed");
+
+        // Fire expiry.
+        cancel.cancel();
+
+        // Release — handler tries acquire_effect(), gets SessionExpired.
+        release.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("P1-b: handle_event must return within 5s after hook release")
+            .expect("handle_event task must not panic");
+
+        // An OK(false, "restricted: session expired") frame must have been sent.
+        let frame = send_rx
+            .try_recv()
+            .expect("P1-b: handler must send OK(false) on expired gate");
+        match frame {
+            axum::extract::ws::Message::Text(t) => {
+                assert!(
+                    t.contains("session expired"),
+                    "P1-b: OK frame must contain 'session expired'; got: {t}"
+                );
+                assert!(
+                    t.contains("false"),
+                    "P1-b: OK frame must be OK(false); got: {t}"
+                );
+            }
+            other => panic!("P1-b: expected Text OK frame, got {other:?}"),
         }
     }
 }

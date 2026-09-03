@@ -224,6 +224,67 @@ pub(crate) async fn handle_active_audio_connection(
     // instant, not the post-community-active-check instant. [FI-TRACE-LEASE-BOUND]
     let (mut ws_send, mut ws_recv) = socket.split();
 
+    // P2: Arm the NIP-FI session gate and expiry task BEFORE the NIP-42
+    // authentication select. The deadline is computed from `connection_time`
+    // (captured at HTTP upgrade) and `nip_fi_assertion` — both available
+    // without waiting for auth. Arming first ensures the deadline fences
+    // verify_auth_event (up to 5s) and all subsequent pre-session work.
+    // [FI-TRACE-LEASE-BOUND, NIP-FI §Admission pairing sequence]
+    //
+    // Partition is rooted at `connection_time` captured before NIP-42 auth
+    // (same three-term formula as main relay). [FI-TRACE-LEASE-BOUND]
+    let audio_session_deadline = nip_fi_assertion.as_ref().map(|a| {
+        crate::connection::compute_session_deadline(
+            a,
+            connection_time,
+            state.config.nip_fi.max_connection_lifetime(),
+        )
+    });
+
+    // B1: Arm the NIP-FI expiry task before any side effect — including the
+    // NIP-42 handshake. The terminal channel is created here so that a denial
+    // frame queued during auth can be drained via ws_send (still owned by this
+    // scope). Once the send_loop spawns at commit-won, it takes ownership of
+    // terminal_ctrl_rx and drains it on cancellation. [FI-TRACE-LEASE-BOUND]
+    let (terminal_ctrl_tx, mut terminal_ctrl_rx) =
+        tokio::sync::mpsc::channel::<axum::extract::ws::Message>(1);
+
+    // One gate per audio connection (one-gate-per-connection invariant).
+    // Enforce mode: gate has a deadline; expiry task fires at that deadline.
+    // Off-mode: off_mode() gate never self-expires; acquire_effect always succeeds.
+    let audio_gate = if let Some(deadline) = audio_session_deadline {
+        crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel.clone())
+    } else {
+        crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone())
+    };
+
+    let mut _nip_fi_admission_expiry = audio_session_deadline.map(|deadline| {
+        crate::nip_fi_session::spawn_nip_fi_expiry_task(
+            deadline,
+            std::sync::Arc::clone(&audio_gate),
+            terminal_ctrl_tx.clone(),
+            crate::nip_fi_session::NipFiWsRoute::Audio,
+        )
+    });
+
+    // Already-expired fast path: catch a deadline already past at upgrade time
+    // before spending the AUTH_TIMEOUT window. Drains the terminal channel
+    // (denial frame may already be queued by the expiry task racing above).
+    if let Some(deadline) = audio_session_deadline {
+        if chrono::Utc::now() >= deadline {
+            warn!(
+                channel_id = %channel_id,
+                "NIP-FI session deadline already expired at audio upgrade — rejecting before auth"
+            );
+            use futures_util::SinkExt as _;
+            while let Ok(msg) = terminal_ctrl_rx.try_recv() {
+                let _ = ws_send.send(msg).await;
+            }
+            cancel.cancel();
+            return;
+        }
+    }
+
     let challenge = generate_challenge();
     let challenge_msg =
         serde_json::json!({"type": "challenge", "challenge": challenge}).to_string();
@@ -237,7 +298,14 @@ pub(crate) async fn handle_active_audio_connection(
 
     let auth_result = tokio::select! {
         biased;
-        _ = cancel.cancelled() => return,
+        _ = cancel.cancelled() => {
+            // Gate or external cancel fired during auth. Drain denial frame.
+            use futures_util::SinkExt as _;
+            while let Ok(msg) = terminal_ctrl_rx.try_recv() {
+                let _ = ws_send.send(msg).await;
+            }
+            return;
+        },
         result = tokio::time::timeout(AUTH_TIMEOUT, async {
             while let Some(Ok(msg)) = ws_recv.next().await {
                 if let WsMessage::Text(text) = msg {
@@ -313,54 +381,10 @@ pub(crate) async fn handle_active_audio_connection(
         return;
     }
 
-    // Compute the NIP-FI session deadline (same three-term formula as main relay).
-    // Partition is rooted at `connection_time` captured before NIP-42 auth.
-    // [FI-TRACE-LEASE-BOUND]
-    let audio_session_deadline = nip_fi_assertion.as_ref().map(|a| {
-        crate::connection::compute_session_deadline(
-            a,
-            connection_time,
-            state.config.nip_fi.max_connection_lifetime(),
-        )
-    });
-
-    // B1: Arm the NIP-FI expiry task HERE — before any persisting side effect
-    // (relay membership, room join, roster events, PARTICIPANT_JOINED).
-    //
-    // Create the session admission gate when in enforce mode. The gate is the
-    // quiescence barrier: commit_participant_join acquires an effect permit
-    // before committing the 48101 + membership transaction. The expiry task's
-    // gate.expire() holds the write guard until all pre-expiry permits finish.
-    //
-    // The terminal channel is created before the send_loop exists so that the
-    // denial frame is available to drain via ws_send (still owned) if expiry
-    // fires during the admission sequence. Once the send_loop spawns, it owns
-    // the receiver and drains it on cancellation. [FI-TRACE-LEASE-BOUND]
-    let (terminal_ctrl_tx, mut terminal_ctrl_rx) =
-        tokio::sync::mpsc::channel::<axum::extract::ws::Message>(1);
-
-    // One gate per audio connection (one-gate-per-connection invariant).
-    // Enforce mode: gate has a deadline; expiry task fires at that deadline.
-    // Off-mode: off_mode() gate never self-expires; acquire_effect always succeeds.
-    let audio_gate = if let Some(deadline) = audio_session_deadline {
-        crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel.clone())
-    } else {
-        crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone())
-    };
-
-    let mut _nip_fi_admission_expiry = audio_session_deadline.map(|deadline| {
-        crate::nip_fi_session::spawn_nip_fi_expiry_task(
-            deadline,
-            std::sync::Arc::clone(&audio_gate),
-            terminal_ctrl_tx.clone(),
-            crate::nip_fi_session::NipFiWsRoute::Audio,
-        )
-    });
-
-    // Already-expired check: the synchronous guard catches a deadline that is
-    // already past at this instant, without relying on the async expiry task
-    // to execute first. Sends the denial frame directly on ws_send (still
-    // owned — send_loop has not started) then cancels and returns.
+    // Gate and expiry task are already armed (before auth). Perform a
+    // synchronous already-expired check at the pairing point too: this catches
+    // any remaining time that slipped past the pre-auth fast path after the
+    // 5s auth window and verify_auth_event latency.
     if let Some(deadline) = audio_session_deadline {
         if chrono::Utc::now() >= deadline {
             warn!(
