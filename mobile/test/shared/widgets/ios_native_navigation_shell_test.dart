@@ -2,6 +2,7 @@ import 'package:buzz/shared/theme/theme.dart';
 import 'package:buzz/shared/widgets/ios_native_navigation_shell.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart' show PlatformViewHitTestBehavior;
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -38,6 +39,10 @@ void main() {
 
       final nativeShell = tester.widget<UiKitView>(find.byType(UiKitView));
       expect(nativeShell.viewType, IosNativeNavigationShellHost.viewType);
+      expect(
+        nativeShell.hitTestBehavior,
+        PlatformViewHitTestBehavior.transparent,
+      );
       const viewId = 42;
       final channel = MethodChannel(
         '${IosNativeNavigationShellHost.viewType}/$viewId',
@@ -77,6 +82,11 @@ void main() {
       );
       await tester.pump();
 
+      expect(
+        tester.widget<UiKitView>(find.byType(UiKitView)).hitTestBehavior,
+        PlatformViewHitTestBehavior.opaque,
+      );
+
       final visibleCall = calls.last;
       expect(visibleCall.method, 'setNavigation');
       expect(visibleCall.arguments, containsPair('title', 'general'));
@@ -100,6 +110,10 @@ void main() {
       controller.hide(owner);
       await tester.pump();
       expect(calls.last.arguments, containsPair('visible', false));
+      expect(
+        tester.widget<UiKitView>(find.byType(UiKitView)).hitTestBehavior,
+        PlatformViewHitTestBehavior.transparent,
+      );
       debugDefaultTargetPlatformOverride = null;
     },
   );

@@ -174,7 +174,9 @@ class IosNativeNavigationShellHost extends HookWidget {
               ignoring: configuration == null,
               child: UiKitView(
                 viewType: viewType,
-                hitTestBehavior: PlatformViewHitTestBehavior.opaque,
+                hitTestBehavior: configuration == null
+                    ? PlatformViewHitTestBehavior.transparent
+                    : PlatformViewHitTestBehavior.opaque,
                 creationParams: <String, Object>{
                   'topInset': topInset,
                   'navigationHeight': buzzNavigationRowHeight,
