@@ -408,6 +408,7 @@ pub async fn cmd_restore_canvas(
     client: &BuzzClient,
     channel_id: &str,
     revision: &str,
+    out: &mut dyn std::io::Write,
 ) -> Result<(), CliError> {
     let channel_uuid = parse_uuid(channel_id)?;
     validate_hex64(revision)?;
@@ -438,7 +439,8 @@ pub async fn cmd_restore_canvas(
     // Desktop, which hides Restore on the current revision, by short-circuiting.
     if head_id.eq_ignore_ascii_case(revision) {
         eprintln!("revision {revision} is already the current revision");
-        println!(
+        let _ = writeln!(
+            out,
             "{}",
             serde_json::json!({
                 "event_id": revision,
@@ -469,7 +471,8 @@ pub async fn cmd_restore_canvas(
     // false rejection.
     let resp = match submit_result {
         Ok(resp) => resp,
-        Err(CliError::Relay { body, .. }) if body.contains("canvas changed") => {
+        Err(e @ CliError::Relay { status: 409, .. }) if matches!(&e, CliError::Relay { body, .. } if body.contains("canvas changed")) =>
+        {
             match fetch_canvas_ancestry(client, channel_id).await {
                 Ok(stream) => {
                     if buzz_sdk::canvas_write_survived(&our_id, &stream) {
@@ -480,15 +483,12 @@ pub async fn cmd_restore_canvas(
                             "canvas restore {our_id} was superseded by a concurrent write; it is preserved in history — re-run restore against the current head if you still want it"
                         )));
                     }
-                    // A is genuinely absent: the conflict was real.
-                    return Err(CliError::Relay {
-                        status: 409,
-                        body: "conflict: canvas changed since it was loaded".into(),
-                    });
+                    // A is genuinely absent: return the original relay error unchanged.
+                    return Err(e);
                 }
                 Err(_) => {
                     // Cannot confirm or deny whether A was stored.
-                    return Err(CliError::Other(format!(
+                    return Err(CliError::DeliveryUnknown(format!(
                         "canvas restore {our_id}: submit returned a conflict and the post-submit ancestry read failed; outcome unknown — check `buzz canvas history` before retrying"
                     )));
                 }
@@ -528,7 +528,7 @@ pub async fn cmd_restore_canvas(
         )));
     }
 
-    println!("{}", normalize_write_response(&resp));
+    let _ = writeln!(out, "{}", normalize_write_response(&resp));
     Ok(())
 }
 
@@ -1907,7 +1907,7 @@ pub async fn dispatch_canvas(cmd: crate::CanvasCmd, client: &BuzzClient) -> Resu
         CanvasCmd::Set { channel, content } => cmd_set_canvas(client, &channel, &content).await,
         CanvasCmd::History { channel, limit } => cmd_canvas_history(client, &channel, limit).await,
         CanvasCmd::Restore { channel, revision } => {
-            cmd_restore_canvas(client, &channel, &revision).await
+            cmd_restore_canvas(client, &channel, &revision, &mut std::io::stdout()).await
         }
     }
 }
@@ -3752,7 +3752,7 @@ mod restore_canvas_tests {
     #[tokio::test]
     async fn restore_survives_when_head_is_our_event() {
         let (url, submitted, _) = relay(PostHead::OurEvent).await;
-        cmd_restore_canvas(&client(&url), CHANNEL, REVISION)
+        cmd_restore_canvas(&client(&url), CHANNEL, REVISION, &mut vec![])
             .await
             .expect("restore that holds the head succeeds");
         assert!(submitted.lock().unwrap().is_some(), "restore must publish");
@@ -3763,7 +3763,7 @@ mod restore_canvas_tests {
     #[tokio::test]
     async fn restore_survives_when_head_builds_on_it() {
         let (url, submitted, _) = relay(PostHead::StrangerBuildsOnUs).await;
-        cmd_restore_canvas(&client(&url), CHANNEL, REVISION)
+        cmd_restore_canvas(&client(&url), CHANNEL, REVISION, &mut vec![])
             .await
             .expect("restore a later write built on succeeds");
         assert!(submitted.lock().unwrap().is_some(), "restore must publish");
@@ -3774,7 +3774,7 @@ mod restore_canvas_tests {
     #[tokio::test]
     async fn restore_survives_when_head_builds_on_it_transitively() {
         let (url, submitted, _) = relay(PostHead::StrangerBuildsOnUsTransitively).await;
-        cmd_restore_canvas(&client(&url), CHANNEL, REVISION)
+        cmd_restore_canvas(&client(&url), CHANNEL, REVISION, &mut vec![])
             .await
             .expect("a transitive descendant of our restore succeeds");
         assert!(submitted.lock().unwrap().is_some(), "restore must publish");
@@ -3785,7 +3785,7 @@ mod restore_canvas_tests {
     #[tokio::test]
     async fn restore_conflicts_when_head_is_a_stranger() {
         let (url, submitted, _) = relay(PostHead::Stranger).await;
-        let err = cmd_restore_canvas(&client(&url), CHANNEL, REVISION)
+        let err = cmd_restore_canvas(&client(&url), CHANNEL, REVISION, &mut vec![])
             .await
             .expect_err("a stranger head must be a supersession conflict");
 
@@ -3819,7 +3819,7 @@ mod restore_canvas_tests {
     #[tokio::test]
     async fn restore_succeeds_when_verification_read_fails() {
         let (url, submitted, _) = relay(PostHead::ReadFails).await;
-        cmd_restore_canvas(&client(&url), CHANNEL, REVISION)
+        cmd_restore_canvas(&client(&url), CHANNEL, REVISION, &mut vec![])
             .await
             .expect("an accepted restore whose verification read fails still succeeds");
         assert!(
@@ -3842,7 +3842,7 @@ mod restore_canvas_tests {
     #[tokio::test]
     async fn restore_write_influencing_reads_carry_strong_consistency() {
         let (url, _, query_bodies) = relay(PostHead::OurEvent).await;
-        cmd_restore_canvas(&client(&url), CHANNEL, REVISION)
+        cmd_restore_canvas(&client(&url), CHANNEL, REVISION, &mut vec![])
             .await
             .expect("restore succeeds");
 
@@ -3884,89 +3884,123 @@ mod restore_canvas_tests {
         }
     }
 
-    /// Relay for conflict-reconciliation tests: submit always returns 409 with
-    /// the canonical canvas-conflict body, but the event ID is still captured so
-    /// the ancestry walk can return controlled streams that reflect whether the
-    /// event was actually stored before the 409 reply.
+    /// Relay for conflict-reconciliation tests. Models the real ambiguous retry
+    /// seam in `submit_stored_event`:
     ///
-    /// `event_reachable`: `Some(true)` → our event is reachable (commit
-    /// happened, response lost); `Some(false)` → our event is absent (genuine
-    /// rejection); `None` → ancestry read fails (HTTP 500).
+    /// 1. Attempt 1 — POST /events: A is persisted on the relay; the relay then
+    ///    drops the TCP connection (no response body) so `with_retry_body` sees a
+    ///    network/body error and retries with the same bytes.
+    /// 2. A concurrent writer B (built on A) arrives and becomes the new head
+    ///    with `expected-revision = A`.
+    /// 3. Attempt 2 — POST /events: returns the canonical 409 conflict body
+    ///    because B is now the head. `cmd_restore_canvas` enters the reconciliation
+    ///    branch.
+    /// 4. Ancestry walk — POST /query (post-submit): returns a stream whose
+    ///    shape depends on `event_reachable`:
+    ///    - `Some(true)` → B(exp=A) is head, A is in the chain → reachable →
+    ///      `CliError::Conflict` (superseded, preserved in history).
+    ///    - `Some(false)` → only a stranger, A absent → genuine conflict →
+    ///      original `CliError::Relay { 409, .. }` returned unchanged.
+    ///    - `None` → ancestry read fails (HTTP 500) →
+    ///      `CliError::DeliveryUnknown`.
+    ///
+    /// The event ID is captured so tests can assert it appears in error messages.
     async fn conflict_relay(event_reachable: Option<bool>) -> (String, Arc<Mutex<Option<Value>>>) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
         let submitted: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
-        let submitted2 = submitted.clone();
+        let submitted_q = submitted.clone();
+        let submitted_ev = submitted.clone();
+        let events_attempt: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+        let events_attempt2 = events_attempt.clone();
         let reachable = event_reachable;
+
         let app = Router::new()
             .route(
                 "/query",
-                post(
-                    move |State(sub): State<Arc<Mutex<Option<Value>>>>, body: Bytes| {
-                        let sub = sub.clone();
-                        async move {
-                            use axum::http::StatusCode;
-                            let is_ids_query = std::str::from_utf8(&body)
-                                .map(|b| b.contains("\"ids\""))
-                                .unwrap_or(false);
-                            if is_ids_query {
-                                // Revision content fetch — always succeeds.
-                                return (
+                post(move |body: Bytes| {
+                    let sub = submitted_q.clone();
+                    async move {
+                        use axum::http::StatusCode;
+                        let is_ids_query = std::str::from_utf8(&body)
+                            .map(|b| b.contains("\"ids\""))
+                            .unwrap_or(false);
+                        if is_ids_query {
+                            // Revision content fetch — always succeeds.
+                            return (
+                                StatusCode::OK,
+                                json!([canvas_event(REVISION, 1_000, None)]).to_string(),
+                            );
+                        }
+                        // Distinguish pre-submit (no event captured yet) from
+                        // post-conflict ancestry walk.
+                        let our_id_opt = sub
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .and_then(|e| e.get("id"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        if our_id_opt.is_none() {
+                            // Pre-submit head read — REVISION ≠ HEAD so command proceeds.
+                            return (
+                                StatusCode::OK,
+                                json!([canvas_event(HEAD, 2_000, None)]).to_string(),
+                            );
+                        }
+                        // Post-conflict ancestry walk: shape per test scenario.
+                        match reachable {
+                            None => (StatusCode::INTERNAL_SERVER_ERROR, String::new()),
+                            Some(false) => {
+                                // A is absent — genuine conflict. Stream contains
+                                // only an unrelated stranger (no A, no B).
+                                (
                                     StatusCode::OK,
-                                    json!([canvas_event(REVISION, 1_000, None)]).to_string(),
-                                );
+                                    json!([canvas_event(STRANGER, 2_002, None)]).to_string(),
+                                )
                             }
-                            // Pre-write head query — returns the normal head so the
-                            // command does not short-circuit (revision ≠ HEAD).
-                            // Distinguish pre- vs post-submit by whether the event
-                            // has been submitted yet.
-                            let our_id_opt = sub
-                                .lock()
-                                .unwrap()
-                                .as_ref()
-                                .and_then(|e| e.get("id"))
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
-                            if our_id_opt.is_none() {
-                                // Pre-submit head read.
-                                return (
+                            Some(true) => {
+                                let our_id = our_id_opt.unwrap();
+                                // B built on A: B is head with expected-revision=A,
+                                // A is in the stream → A is reachable. This models
+                                // the concurrent write that arrived after A was
+                                // stored but before the 409 response.
+                                (
                                     StatusCode::OK,
-                                    json!([canvas_event(HEAD, 2_000, None)]).to_string(),
-                                );
-                            }
-                            // Post-conflict ancestry walk.
-                            match reachable {
-                                None => (StatusCode::INTERNAL_SERVER_ERROR, String::new()),
-                                Some(false) => {
-                                    // Our event is absent; return a stream with
-                                    // only an unrelated stranger.
-                                    (
-                                        StatusCode::OK,
-                                        json!([canvas_event(STRANGER, 2_002, None)]).to_string(),
-                                    )
-                                }
-                                Some(true) => {
-                                    let our_id = our_id_opt.unwrap();
-                                    // Our event is the head (committed but 409 response
-                                    // was lost before it reached the CLI).
-                                    (
-                                        StatusCode::OK,
-                                        json!([canvas_event(&our_id, 2_001, Some(HEAD))])
-                                            .to_string(),
-                                    )
-                                }
+                                    json!([
+                                        canvas_event(STRANGER, 2_002, Some(&our_id)),
+                                        canvas_event(&our_id, 2_001, Some(HEAD)),
+                                    ])
+                                    .to_string(),
+                                )
                             }
                         }
-                    },
-                ),
+                    }
+                }),
             )
             .route(
                 "/events",
                 post(move |body: Bytes| {
-                    let sub = submitted2.clone();
+                    let sub = submitted_ev.clone();
+                    let attempt_ctr = events_attempt2.clone();
                     async move {
                         use axum::http::StatusCode;
                         let event: Value = serde_json::from_slice(&body).expect("event json");
-                        *sub.lock().unwrap() = Some(event);
-                        // Return 409 with the canonical conflict body.
+                        let attempt = attempt_ctr.fetch_add(1, Ordering::SeqCst);
+                        if attempt == 0 {
+                            // Attempt 1: A is persisted; simulate a lost response by
+                            // returning 503 (retried by with_retry_body). This models
+                            // a network-level response loss where the relay stored the
+                            // event but the client never received confirmation.
+                            // We capture the event ID here for use in ancestry responses.
+                            *sub.lock().unwrap() = Some(event);
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                r#"{"error":"relay temporarily unavailable"}"#.to_string(),
+                            );
+                        }
+                        // Attempt 2 (same bytes — `submit_stored_event` retry):
+                        // A is already stored; B built on A; relay returns canonical 409.
                         (
                             StatusCode::CONFLICT,
                             r#"{"error":"conflict: canvas changed since it was loaded"}"#
@@ -3974,12 +4008,112 @@ mod restore_canvas_tests {
                         )
                     }
                 }),
-            )
-            .with_state(submitted.clone());
+            );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (format!("http://{addr}"), submitted)
+    }
+
+    /// A non-409 relay error whose body happens to contain "canvas changed"
+    /// must NOT enter the conflict-reconciliation branch — it must propagate
+    /// as a plain `CliError::Relay` without triggering an ancestry walk.
+    ///
+    /// Mutation oracle: removing the `status: 409` guard from the match arm
+    /// makes this return `CliError::Conflict` (ancestry walk finds our event
+    /// reachable, so reconciliation misclassifies it as a supersession) instead
+    /// of `CliError::Relay { status: 500, .. }`.
+    #[tokio::test]
+    async fn non_409_lookalike_with_conflict_phrase_is_not_reconciled() {
+        // Relay: /events returns 500 + conflict phrase but DOES capture the event
+        // ID. /query post-submit returns a stream where our event IS reachable
+        // (so that if the classifier incorrectly fires, it produces Conflict — a
+        // distinct, detectable outcome).
+        let submitted: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let submitted_q = submitted.clone();
+        let submitted_ev = submitted.clone();
+        let app = Router::new()
+            .route(
+                "/query",
+                post(move |body: Bytes| {
+                    let sub = submitted_q.clone();
+                    async move {
+                        use axum::http::StatusCode;
+                        let is_ids_query = std::str::from_utf8(&body)
+                            .map(|b| b.contains("\"ids\""))
+                            .unwrap_or(false);
+                        if is_ids_query {
+                            return (
+                                StatusCode::OK,
+                                json!([canvas_event(REVISION, 1_000, None)]).to_string(),
+                            );
+                        }
+                        let our_id_opt = sub
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .and_then(|e| e.get("id"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        if our_id_opt.is_none() {
+                            // Pre-submit head — REVISION ≠ HEAD so command proceeds.
+                            return (
+                                StatusCode::OK,
+                                json!([canvas_event(HEAD, 2_000, None)]).to_string(),
+                            );
+                        }
+                        // Post-error ancestry walk: our event IS reachable.
+                        // If the status guard is missing, reconciliation fires here
+                        // and returns CliError::Conflict — the oracle fires.
+                        let our_id = our_id_opt.unwrap();
+                        (
+                            StatusCode::OK,
+                            json!([
+                                canvas_event(STRANGER, 2_002, Some(&our_id)),
+                                canvas_event(&our_id, 2_001, Some(HEAD)),
+                            ])
+                            .to_string(),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/events",
+                post(move |body: Bytes| {
+                    let sub = submitted_ev.clone();
+                    async move {
+                        use axum::http::StatusCode;
+                        let event: Value = serde_json::from_slice(&body).expect("event json");
+                        *sub.lock().unwrap() = Some(event);
+                        // 500 with the conflict phrase in the body — a lookalike.
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            r#"{"error":"canvas changed — internal relay fault"}"#.to_string(),
+                        )
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}");
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let err = cmd_restore_canvas(&client(&url), CHANNEL, REVISION, &mut vec![])
+            .await
+            .expect_err("a 500 error must propagate as Relay, not enter reconciliation");
+
+        // With the 409 status guard: the 500 exits the match via Err(e) => return Err(e)
+        // and arrives here as Relay{500}.
+        // Without the guard: the body phrase matches → reconciliation fires →
+        // ancestry walk finds our event reachable → CliError::Conflict returned instead.
+        assert!(
+            !matches!(err, CliError::Conflict(_)),
+            "non-409 error with conflict phrase must not be classified as Conflict: {err:?}"
+        );
+        assert!(
+            matches!(err, CliError::Relay { status: 500, .. }),
+            "non-409 body-lookalike must propagate as Relay{{500}}, got {err:?}"
+        );
     }
 
     /// A conflict-shaped submit where the ancestry walk reveals our event IS
@@ -3994,7 +4128,7 @@ mod restore_canvas_tests {
     #[tokio::test]
     async fn conflict_shaped_submit_reconciled_as_supersession_when_our_event_reachable() {
         let (url, submitted) = conflict_relay(Some(true)).await;
-        let err = cmd_restore_canvas(&client(&url), CHANNEL, REVISION)
+        let err = cmd_restore_canvas(&client(&url), CHANNEL, REVISION, &mut vec![])
             .await
             .expect_err("a conflict with our event reachable must error");
 
@@ -4023,8 +4157,9 @@ mod restore_canvas_tests {
 
     /// A conflict-shaped submit where the ancestry walk shows our event is
     /// absent: the relay genuinely rejected the write (stale precondition, not
-    /// a lost response). The command must return `CliError::Relay` — a real
-    /// conflict, nothing was stored.
+    /// a lost response). The command must return the ORIGINAL `CliError::Relay`
+    /// unchanged — status 409, body as received from the relay — rather than a
+    /// fabricated replacement body.
     ///
     /// Mutation oracle: always returning `Conflict` from the reconciliation
     /// block (ignoring `canvas_write_survived`) makes this return `CliError::Conflict`
@@ -4032,33 +4167,46 @@ mod restore_canvas_tests {
     #[tokio::test]
     async fn conflict_shaped_submit_stays_relay_error_when_our_event_absent() {
         let (url, _) = conflict_relay(Some(false)).await;
-        let err = cmd_restore_canvas(&client(&url), CHANNEL, REVISION)
+        let err = cmd_restore_canvas(&client(&url), CHANNEL, REVISION, &mut vec![])
             .await
             .expect_err("a genuine conflict must error");
 
-        assert!(
-            matches!(err, CliError::Relay { .. }),
-            "expected Relay error (genuine conflict, nothing stored), got {err:?}"
-        );
+        // Must be the original Relay error (409) — not fabricated, not Conflict.
+        match &err {
+            CliError::Relay { status, body } => {
+                assert_eq!(
+                    *status, 409,
+                    "absent case must preserve the original 409 status"
+                );
+                assert!(
+                    body.contains("canvas changed"),
+                    "absent case must preserve the original conflict body: {body}"
+                );
+            }
+            other => {
+                panic!("expected Relay error (genuine conflict, nothing stored), got {other:?}")
+            }
+        }
     }
 
     /// A conflict-shaped submit where the ancestry walk itself fails. The
     /// outcome is genuinely unknown: the restore may or may not be stored.
-    /// The command must return `CliError::Other` with a message naming `our_id`
-    /// — not a false success, not a false conflict.
+    /// The command must return `CliError::DeliveryUnknown` (exit 2,
+    /// category `delivery_unknown`) — not a false success, not a false conflict,
+    /// and not the generic `CliError::Other` (exit 4, category `error`).
     ///
     /// Mutation oracle: returning `CliError::Conflict` when the ancestry read
-    /// fails makes this return `Conflict` instead of `Other`.
+    /// fails makes this return `Conflict` instead of `DeliveryUnknown`.
     #[tokio::test]
     async fn conflict_shaped_submit_with_failed_ancestry_read_returns_unknown_outcome() {
         let (url, submitted) = conflict_relay(None).await;
-        let err = cmd_restore_canvas(&client(&url), CHANNEL, REVISION)
+        let err = cmd_restore_canvas(&client(&url), CHANNEL, REVISION, &mut vec![])
             .await
             .expect_err("unknown outcome must error");
 
         assert!(
-            matches!(err, CliError::Other(_)),
-            "expected Other (unknown outcome), got {err:?}"
+            matches!(err, CliError::DeliveryUnknown(_)),
+            "expected DeliveryUnknown (exit 2, category delivery_unknown — outcome unknown), got {err:?}"
         );
         let our_id = submitted
             .lock()
@@ -4081,8 +4229,9 @@ mod restore_canvas_tests {
 }
 
 /// Item 4 regression: the already-current short-circuit must emit structured
-/// JSON on stdout (matching the JSON-only stdout contract) and an informational
-/// message on stderr. A bare prose `println!` violates VISION.md:163.
+/// JSON on stdout (matching the JSON-only stdout contract) with the fields
+/// `{event_id, accepted, message}`. A bare prose `println!` violates the
+/// JSON-only stdout contract.
 #[cfg(test)]
 mod restore_canvas_already_current_tests {
     use axum::body::Bytes;
@@ -4146,32 +4295,38 @@ mod restore_canvas_already_current_tests {
         BuzzClient::new(base_url.to_string(), Keys::generate(), None, None).unwrap()
     }
 
-    /// The already-current short-circuit must return Ok (exit 0).
+    /// The already-current short-circuit must return Ok (exit 0) AND emit
+    /// structured JSON on stdout with `event_id`, `accepted`, and `message`
+    /// fields. Captured via the injected `out` writer.
+    ///
+    /// Mutation oracle: reverting to `println!("revision {revision} is already
+    /// the current revision")` emits prose instead of JSON. Parsing the output
+    /// with `serde_json::from_str` would fail, and the `accepted` / `event_id` /
+    /// `message` field assertions would not hold.
     #[tokio::test]
-    async fn already_current_restore_succeeds() {
+    async fn already_current_restore_emits_json_with_required_fields() {
         let (url, _) = already_current_relay().await;
-        cmd_restore_canvas(&client(&url), CHANNEL, REVISION_EQ_HEAD)
+        let mut out: Vec<u8> = Vec::new();
+        cmd_restore_canvas(&client(&url), CHANNEL, REVISION_EQ_HEAD, &mut out)
             .await
             .expect("already-current restore must succeed");
-    }
 
-    /// The already-current short-circuit emits structured JSON, not prose.
-    /// Verify by calling the command with stdout not redirected (the test binary
-    /// captures stdout via the test harness) and asserting that the printed JSON
-    /// round-trips through serde_json. The invariant holds structurally: the
-    /// branch now calls `serde_json::json!({...}).to_string()`, which is always
-    /// valid JSON by construction.
-    ///
-    /// Mutation oracle: reverting to `println!("revision ... is already the
-    /// current revision")` would print prose instead of a JSON object, making
-    /// any downstream parser fail. The command-level assertion is that it
-    /// succeeds with exit 0; a CI integration test (`buzz canvas restore`) can
-    /// additionally pipe stdout through `jq` to assert parseability.
-    #[tokio::test]
-    async fn already_current_restore_does_not_panic() {
-        let (url, _) = already_current_relay().await;
-        cmd_restore_canvas(&client(&url), CHANNEL, REVISION_EQ_HEAD)
-            .await
-            .expect("already-current restore must succeed without panic");
+        let output = String::from_utf8(out).expect("stdout must be valid UTF-8");
+        let json: Value = serde_json::from_str(output.trim()).expect("stdout must be valid JSON");
+
+        assert_eq!(
+            json.get("event_id").and_then(|v| v.as_str()),
+            Some(REVISION_EQ_HEAD),
+            "event_id must match the revision: {json}"
+        );
+        assert_eq!(
+            json.get("accepted").and_then(|v| v.as_bool()),
+            Some(true),
+            "accepted must be true: {json}"
+        );
+        assert!(
+            json.get("message").and_then(|v| v.as_str()).is_some(),
+            "message field must be present: {json}"
+        );
     }
 }
