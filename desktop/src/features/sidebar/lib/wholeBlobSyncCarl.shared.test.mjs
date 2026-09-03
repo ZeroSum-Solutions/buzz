@@ -57,19 +57,20 @@ const { stubRelay } = makeHookStubs();
  * @param {object} opts
  * @param {string}   opts.label              "sections"|"sort"
  * @param {string}   opts.outboxKeyPrefix    e.g. "buzz-channel-sections-outbox.v1"
- * @param {string}   opts.storageKeyPrefix   localStorage key for the store
  * @param {Function} opts.storageKey         (pubkey, relayUrl) => string (store key)
  * @param {Function} opts.writeOutboxKey     (pubkey, relayUrl) => v2 outbox key
  *                                           (legacy shared key — pre-v2 nonce path)
+ * @param {Function} opts.readOutbox         (pubkey, relayUrl) => {store, queuedAt} | null
  * @param {Function} opts.useHook            the hook under test
  * @param {Function} opts.makeEditStore      () => store (the restored edit)
  * @param {Function} opts.makeRemoteStore    () => store (peer head content)
  */
 export function runWholeBlobCarlSuite({
   label,
-  outboxKeyPrefix,
+  outboxKeyPrefix: _outboxKeyPrefix,
   storageKey,
   writeOutboxKey,
+  readOutbox,
   useHook,
   makeEditStore,
   makeRemoteStore,
@@ -84,7 +85,8 @@ export function runWholeBlobCarlSuite({
   //      → publishSections(store, true, 200) → publish(_, true, 200)
   //      → publishBaseline = canonicalMax({0,""}, bootstrapResultHead={0,""}) = {0,""}
   //      → pendingRestoredQueuedAt = 200.
-  //   4. Debounce fires. fetchOwnBlobBeforePublish returns peerHead (createdAt=100).
+  //   4. writeOwnOutbox is called with nowSecs=200 — original stamp preserved.
+  //   5. Debounce fires. fetchOwnBlobBeforePublish returns peerHead (createdAt=100).
   //      remoteAdvancedSince(100, {0,""}) = true.
   //      Failed-bootstrap exception: !pendingIsRestoredReplay suppresses it.
   //      Restored-replay adopt-guard: remote.createdAt(100) <= queuedAt(200)
@@ -100,11 +102,14 @@ export function runWholeBlobCarlSuite({
   //   M2 (adopt-guard absent, C1): remove pendingRestoredQueuedAt guard
   //      → restored replay always adopts when remoteAdvancedSince=true
   //      → publish=0, adopted=1 → test FAILS.
-  test(`P1/C1 ${label}: failed-bootstrap hook replay — restored edit (queuedAt=200) must publish above older relay head (createdAt=100)`, async () => {
+  //
+  //   M3 (queuedAt remint): pass undefined instead of restoredQueuedAt to
+  //      writeOwnOutbox → v2 outbox stamped at Date.now()/1000=300, not 200
+  //      → queuedAt assertion below FAILS.
+  test(`P1/C1 ${label}: failed-bootstrap hook replay — restored edit (queuedAt=200) must publish above older relay head (createdAt=100) and preserve original queuedAt in transferred outbox`, async () => {
     const { act, cleanup, renderHook } = await import("@testing-library/react");
     const pubkey = `pk-c1-fail-${label}`;
     const relayUrl = `wss://r.c1fail.${label}`;
-    const encodedRelay = encodeURIComponent(relayUrl);
 
     const tauri = installEchoTauri(pubkey);
     const restoreRelay = stubRelay(relayClient);
@@ -156,6 +161,21 @@ export function runWholeBlobCarlSuite({
 
       // Bootstrap failed → hook .then() fired → shouldReplay=true (hold)
       // → publishSections(store, true, 200) called.
+      // IMPORTANT 2: before the debounce fires, the v2 outbox must carry the
+      // original queuedAt=200, NOT the reminted wall-clock value of 300.
+      // Mutation (M3): pass undefined for nowSecs → stamps 300 → assertion fails.
+      const outboxAfterTransfer = readOutbox(pubkey, relayUrl);
+      assert.ok(
+        outboxAfterTransfer !== null,
+        `P1/C1 ${label}: v2 outbox must exist after hook replay call`,
+      );
+      assert.equal(
+        outboxAfterTransfer.queuedAt,
+        200,
+        `P1/C1 ${label}: v2 outbox queuedAt must be the ORIGINAL 200, not the reminted wall-clock 300 — ` +
+          `drop restoredQueuedAt override in writeOwnOutbox call → queuedAt=300`,
+      );
+
       // Debounce scheduled. Fire it.
       await fireDelay(2000);
       for (let i = 0; i < 100; i++) await Promise.resolve();
@@ -177,6 +197,97 @@ export function runWholeBlobCarlSuite({
         makeEditStore(),
         `P1/C1 ${label}: published store must be the restored edit, not the peer head`,
       );
+      hook.unmount();
+    } finally {
+      cleanup();
+      Date.now = origDateNow;
+      tauri.restore();
+      restoreRelay();
+      restoreTimers();
+      window.localStorage.clear();
+      mock.reset();
+    }
+  });
+
+  // ── P1/C1-stale: failed bootstrap → restored outbox (queuedAt=100) →
+  //   relay head at createdAt=200 → MUST ADOPT (head is strictly newer).
+  //
+  // Production sequence:
+  //   1. Outbox seeded with queuedAt=100.
+  //   2. Bootstrap fails → result.action="hold" → shouldReplay=true.
+  //   3. hook .then(): publishSections(store, true, 100) → pendingRestoredQueuedAt=100.
+  //   4. Debounce. fetchOwnBlobBeforePublish returns peerHead (createdAt=200).
+  //      !pendingIsRestoredReplay guard suppresses the failed-bootstrap exception.
+  //      Restored adopt-guard: remote.createdAt(200) > queuedAt(100) → ADOPT.
+  //      Outbox is cleared (head supersedes old edit). Zero publishes.
+  //
+  // Causality mutation: remove !pendingIsRestoredReplay guard
+  //   → failed-bootstrap exception fires → publishBaseline absorbs 200
+  //   → returns {kind:"publish"} → publishes old stale edit OVER newer head
+  //   → test FAILS (publishCalls.length > 0, no adopt, outbox not cleared).
+  test(`P1/C1-stale ${label}: failed-bootstrap hook replay — stale restored edit (queuedAt=100) must ADOPT newer relay head (createdAt=200), not publish over it`, async () => {
+    const { act, cleanup, renderHook } = await import("@testing-library/react");
+    const pubkey = `pk-c1-stale-${label}`;
+    const relayUrl = `wss://r.c1stale.${label}`;
+
+    const tauri = installEchoTauri(pubkey);
+    const restoreRelay = stubRelay(relayClient);
+
+    // Seed legacy outbox: queuedAt=100 (stale — the relay head will be newer).
+    const legacyKey = writeOutboxKey(pubkey, relayUrl);
+    window.localStorage.setItem(
+      legacyKey,
+      JSON.stringify({ store: makeEditStore(), queuedAt: 100 }),
+    );
+    window.localStorage.setItem(
+      storageKey(pubkey, relayUrl),
+      JSON.stringify(makeEditStore()),
+    );
+
+    // newerHead: createdAt=200 (strictly newer than queuedAt=100).
+    const newerHead = tauri.mintHead(
+      makeRemoteStore(),
+      200,
+      `evt-c1-stale-head-${label}`,
+    );
+    newerHead.pubkey = pubkey;
+    newerHead.kind = 30078;
+
+    const publishCalls = [];
+    let fetchCalls = 0;
+    relayClient.fetchEvents = async () => {
+      fetchCalls++;
+      if (fetchCalls === 1) return Promise.reject(new Error("bootstrap fail"));
+      return [newerHead];
+    };
+    relayClient.publishEvent = async (evt) => {
+      publishCalls.push(evt);
+    };
+
+    const { fireDelay, restore: restoreTimers } = makeHookTimerBed();
+    const origDateNow = Date.now;
+    Date.now = () => 50 * 1_000; // well below queuedAt=100 so no clock confusion
+
+    let hook = null;
+    try {
+      await act(async () => {
+        hook = renderHook(() => useHook(pubkey, relayUrl));
+        for (let i = 0; i < 40; i++) await Promise.resolve();
+      });
+
+      await fireDelay(2000);
+      for (let i = 0; i < 100; i++) await Promise.resolve();
+
+      // With fix: stale edit (queuedAt=100) < head (createdAt=200) → ADOPT.
+      // Mutation (!pendingIsRestoredReplay removed): exception fires → publishes stale edit over newer head.
+      assert.equal(
+        publishCalls.length,
+        0,
+        `P1/C1-stale ${label}: stale restored edit (queuedAt=100) must be ADOPTED AWAY by newer head ` +
+          `(createdAt=200), not published over it — remove !pendingIsRestoredReplay guard → exception ` +
+          `fires → publishes stale edit`,
+      );
+
       hook.unmount();
     } finally {
       cleanup();
@@ -455,6 +566,158 @@ export function runWholeBlobP2a1Suite({
     } finally {
       tauri.restore();
       restore();
+      mock.reset();
+    }
+  });
+}
+
+/**
+ * Hook-layer P2a-1 regression (IMPORTANT 3).
+ *
+ * Drives the blocked-bootstrap sequence through the ACTUAL React hook so that
+ * shouldReplay, outbox read, queuedAt threading, and the real .then() callback
+ * are all exercised. The manager-layer test (runWholeBlobP2a1Suite) verifies
+ * the baseline state-machine; this test verifies the hook seam that feeds it.
+ *
+ * Sequence:
+ *   1. Block bootstrap fetch (park Promise).
+ *   2. Mount hook — bootstrap is pending.
+ *   3. Click through the hook API (makeEdit) — publishSections(store, false)
+ *      writes v2 outbox at Date.now()/1000.
+ *   4. Deliver H102 via subscribeLive — suppressed by hasPendingEdit.
+ *   5. Release bootstrap with H100 → hook .then() callback fires naturally:
+ *      readOutbox → shouldReplay=true → publishSections(outbox, true, queuedAt).
+ *   6. Fire debounce → pre-publish fetch returns H102 →
+ *      canonicalMax(publishBaseline, bootstrapResultHead=H100) = H100;
+ *      H102 is a genuine advance → ADOPT. publishCalls === 0.
+ *
+ * Causality mutation: set publishBaseline = lastRemoteHead in publish(_, true)
+ *   → publishBaseline = H102 → pre-publish sees equality → publishes over H102
+ *   → test FAILS.
+ */
+export function runWholeBlobP2a1HookSuite({
+  label,
+  useHook,
+  makeEdit,
+  makeRemoteStore,
+}) {
+  test(`P2a-1 ${label} (hook): blocked-bootstrap real hook replay — H102 must be adopted as genuine advance, not published over`, async () => {
+    const { act, cleanup, renderHook } = await import("@testing-library/react");
+    const pubkey = `pk-p2a1h-${label}`;
+    const relayUrl = `wss://r.p2a1h.${label}`;
+
+    const tauri = installEchoTauri(pubkey);
+    const restoreRelay = stubRelay(relayClient);
+
+    // Date.now frozen at t=50s so click writes queuedAt=50.
+    // H100: createdAt=30 (bootstrap head, shouldReplay = 50>=30 = true).
+    // H102: createdAt=200 (live head, a genuine advance over bootstrap).
+    const origDateNow = Date.now;
+    Date.now = () => 50 * 1_000;
+
+    const H100 = tauri.mintHead(
+      makeRemoteStore(),
+      30,
+      `evt-h100-p2a1h-${label}`,
+    );
+    H100.pubkey = pubkey;
+    H100.kind = 30078;
+    H100.tags = [
+      ["d", label === "sections" ? "channel-sections" : "channel-sort"],
+    ];
+
+    const H102 = tauri.mintHead(
+      makeRemoteStore(),
+      200,
+      `evt-h102-p2a1h-${label}`,
+    );
+    H102.pubkey = pubkey;
+    H102.kind = 30078;
+
+    const publishCalls = [];
+    let liveCallback = null;
+    let releaseBootstrap = null;
+    let fetchCalls = 0;
+
+    relayClient.subscribeLive = async (_f, cb) => {
+      liveCallback = cb;
+      return async () => {};
+    };
+    relayClient.fetchEvents = async () => {
+      fetchCalls++;
+      // Call 1 = bootstrap fetch: park until released.
+      if (fetchCalls === 1) {
+        return new Promise((res) => {
+          releaseBootstrap = () => res([H100]);
+        });
+      }
+      // Pre-publish fetch: H102 is now the relay head.
+      return [H102];
+    };
+    relayClient.publishEvent = async (evt) => {
+      publishCalls.push(evt);
+    };
+
+    const { fireDelay, restore: restoreTimers } = makeHookTimerBed();
+
+    let hook = null;
+    try {
+      await act(async () => {
+        hook = renderHook(() => useHook(pubkey, relayUrl));
+        for (let i = 0; i < 20; i++) await Promise.resolve();
+      });
+
+      // Bootstrap is parked. Make a click through the real hook API.
+      await act(async () => {
+        makeEdit(hook.result.current);
+        for (let i = 0; i < 20; i++) await Promise.resolve();
+      });
+
+      // Deliver H102 live — hasPendingEdit suppresses it, publishBaseline stays {0,""}.
+      while (liveCallback === null) await Promise.resolve();
+      await act(async () => {
+        liveCallback(H102);
+        for (let i = 0; i < 20; i++) await Promise.resolve();
+      });
+
+      // Release bootstrap with H100 → hook .then() fires:
+      //   result.action="apply-remote"; shouldReplay = (outbox.queuedAt=50 >= H100.createdAt=30) = true
+      //   → publishSections(outbox.store, true, 50) naturally, no manual call.
+      // Also bootstrapResultHead = H100 = {createdAt:30, ...}.
+      while (releaseBootstrap === null) await Promise.resolve();
+      await act(async () => {
+        releaseBootstrap();
+        for (let i = 0; i < 60; i++) await Promise.resolve();
+      });
+
+      // Fire debounce. publish(_, true, 50):
+      //   publishBaseline = canonicalMax({0,""}, bootstrapResultHead={30,H100}) = {30,H100}.
+      //   pre-publish fetch returns H102 (createdAt=200 > 30) → remoteAdvancedSince = true.
+      //   C1 adopt-guard: remote.createdAt(200) > queuedAt(50) → ADOPT H102.
+      //   publishCalls === 0.
+      //
+      // Mutation: set publishBaseline = lastRemoteHead in publish(_, true)
+      //   → lastRemoteHead = H102 (hasPendingEdit kept it, but recordRemoteHead ran at liveCallback)
+      //   → publishBaseline = H102 → pre-publish H102 == baseline → no advance → PUBLISH over H102.
+      await fireDelay(2000);
+      for (let i = 0; i < 100; i++) await Promise.resolve();
+
+      assert.equal(
+        publishCalls.length,
+        0,
+        `P2a-1 ${label} (hook): real .then() replay with bootstrapResultHead baseline — ` +
+          `H102 must be ADOPTED as a genuine advance, not published over — ` +
+          `set publishBaseline=lastRemoteHead in publish(_, true) → H102 folds into baseline → publishes over H102`,
+      );
+
+      hook.unmount();
+    } finally {
+      cleanup();
+      Date.now = origDateNow;
+      tauri.restore();
+      restoreRelay();
+      restoreTimers();
+      window.localStorage.clear();
       mock.reset();
     }
   });

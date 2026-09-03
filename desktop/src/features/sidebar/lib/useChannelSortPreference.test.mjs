@@ -10,6 +10,7 @@ import {
   runWholeBlobC2Suite,
   runWholeBlobC3Suite,
   runWholeBlobP2a1Suite,
+  runWholeBlobP2a1HookSuite,
   runWholeBlobP2bSuite,
 } from "./wholeBlobSyncCarl.shared.test.mjs";
 
@@ -159,6 +160,7 @@ runWholeBlobCarlSuite({
     );
     return `buzz-channel-sort-outbox.v1:${pubkey}:${encoded}`;
   },
+  readOutbox: readChannelSortOutbox,
   useHook: useChannelSortPreference,
   makeEditStore: () => ({ version: 1, groups: { click: "alpha" } }),
   makeRemoteStore: () => ({ version: 1, groups: { remote: "recent" } }),
@@ -198,6 +200,21 @@ runWholeBlobC3Suite({
   label: "sort",
   Manager: ChannelSortSyncManager,
   publishEdit: (m, store) => m.publishSortPrefs(store),
+  makeEditStore: () => ({ version: 1, groups: { click: "alpha" } }),
+  makeRemoteStore: () => ({ version: 1, groups: { remote: "recent" } }),
+});
+
+runWholeBlobP2a1HookSuite({
+  label: "sort",
+  writeOutboxKey: (pubkey, relayUrl) => {
+    const encoded = encodeURIComponent(
+      relayUrl.trim().replace(/\/$/, "").toLowerCase(),
+    );
+    return `buzz-channel-sort-outbox.v1:${pubkey}:${encoded}`;
+  },
+  storageKey,
+  useHook: useChannelSortPreference,
+  makeEdit: (r) => r.setSortModeFor("channels", "alpha"),
   makeEditStore: () => ({ version: 1, groups: { click: "alpha" } }),
   makeRemoteStore: () => ({ version: 1, groups: { remote: "recent" } }),
 });

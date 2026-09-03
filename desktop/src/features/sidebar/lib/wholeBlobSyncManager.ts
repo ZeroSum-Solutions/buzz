@@ -454,10 +454,21 @@ export class WholeBlobSyncManager<S> {
       this.foldSupersedingAttemptWinner(remote);
       return;
     }
-    this.pendingStore = null;
-    this.config.clearOutbox(this.pubkey, this.relayUrl);
+    this.clearPendingState();
     if (this.destroyed) return;
     this.onRemoteAdopted?.(remote);
+  }
+
+  /**
+   * Clear all pending-edit state for the current generation. Shared by
+   * `discardPending` (publish confirmed) and `adoptRemote` (remote wins) so
+   * restored-replay metadata is never stranded after an adopt.
+   */
+  private clearPendingState(): void {
+    this.pendingStore = null;
+    this.pendingIsRestoredReplay = false;
+    this.pendingRestoredQueuedAt = undefined;
+    this.config.clearOutbox(this.pubkey, this.relayUrl);
   }
 
   /**
@@ -466,10 +477,7 @@ export class WholeBlobSyncManager<S> {
    */
   private discardPending(gen: number): void {
     if (gen !== this.pendingGeneration) return;
-    this.pendingStore = null;
-    this.pendingIsRestoredReplay = false;
-    this.pendingRestoredQueuedAt = undefined;
-    this.config.clearOutbox(this.pubkey, this.relayUrl);
+    this.clearPendingState();
   }
 
   /**

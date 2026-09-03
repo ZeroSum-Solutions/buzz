@@ -10,6 +10,7 @@ import {
   runWholeBlobC2Suite,
   runWholeBlobC3Suite,
   runWholeBlobP2a1Suite,
+  runWholeBlobP2a1HookSuite,
   runWholeBlobP2bSuite,
 } from "./wholeBlobSyncCarl.shared.test.mjs";
 
@@ -244,6 +245,7 @@ runWholeBlobCarlSuite({
     );
     return `buzz-channel-sections-outbox.v1:${pubkey}:${encoded}`;
   },
+  readOutbox: readChannelSectionsOutbox,
   useHook: useChannelSections,
   makeEditStore: () => ({
     version: 1,
@@ -323,6 +325,29 @@ runWholeBlobP2bSuite({
   label: "sections",
   Manager: ChannelSectionSyncManager,
   publishEdit: (m, store) => m.publishSections(store),
+  makeEditStore: () => ({
+    version: 1,
+    sections: [{ id: "click", name: "Click", order: 0 }],
+    assignments: {},
+  }),
+  makeRemoteStore: () => ({
+    version: 1,
+    sections: [{ id: "remote", name: "Remote", order: 0 }],
+    assignments: {},
+  }),
+});
+
+runWholeBlobP2a1HookSuite({
+  label: "sections",
+  writeOutboxKey: (pubkey, relayUrl) => {
+    const encoded = encodeURIComponent(
+      relayUrl.trim().replace(/\/$/, "").toLowerCase(),
+    );
+    return `buzz-channel-sections-outbox.v1:${pubkey}:${encoded}`;
+  },
+  storageKey,
+  useHook: useChannelSections,
+  makeEdit: (r) => r.createSection("P2a1-Section"),
   makeEditStore: () => ({
     version: 1,
     sections: [{ id: "click", name: "Click", order: 0 }],
