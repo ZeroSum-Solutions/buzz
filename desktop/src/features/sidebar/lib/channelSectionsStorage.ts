@@ -240,12 +240,14 @@ export function writeChannelSectionsOutbox(
   pubkey: string,
   store: ChannelSectionStore,
   relayUrl: string,
+  nowSecs?: number,
 ): boolean {
   return writeOwnOutbox(
     OUTBOX_KEY_PREFIX,
     pubkey,
     relayUrl,
     boundChannelSectionsStore(store),
+    nowSecs,
   );
 }
 

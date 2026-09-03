@@ -60,8 +60,9 @@ export class ChannelSectionSyncManager extends WholeBlobSyncManager<ChannelSecti
   publishSections(
     store: ChannelSectionStore,
     isRestoredReplay = false,
+    restoredQueuedAt?: number,
   ): boolean {
-    return this.publish(store, isRestoredReplay);
+    return this.publish(store, isRestoredReplay, restoredQueuedAt);
   }
 
   /** Fetch the current remote head for this pubkey's sections blob. */

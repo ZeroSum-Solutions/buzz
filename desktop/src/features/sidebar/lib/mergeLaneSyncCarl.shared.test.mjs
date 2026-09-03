@@ -267,7 +267,11 @@ export function runMergeLaneCarlSuite({
 
     const { fireDelay, restore: restoreTimers } = makeHookTimerBed();
     const origDateNow = Date.now;
-    Date.now = () => 100 * 1_000;
+    // Clock at t=1s so the click produces updatedAt=1 — the oldest entry among
+    // all 500+1 channels (others are at updatedAt=100). This ensures the clicked
+    // channel is the one evicted by the capacity-bounded merge at 501 entries,
+    // making the pendingPreservedKey-drop mutation genuinely causal.
+    Date.now = () => 1 * 1_000;
 
     let hook = null;
     const v2Prefix = `${outboxKeyPrefix}:${pubkey}:${encodedRelay}:`;
@@ -298,6 +302,113 @@ export function runMergeLaneCarlSuite({
         v2Keys().length > 0,
         `P3-ack ${label}: outbox must be retained when relay head does not contain clicked channel — ` +
           `drop pendingPreservedKey from confirmRetainedHeadSubsumes → isSubsumedBy evicts click → discardPending clears outbox`,
+      );
+      hook.unmount();
+    } finally {
+      cleanup();
+      Date.now = origDateNow;
+      tauri.restore();
+      restoreRelay();
+      restoreTimers();
+      window.localStorage.clear();
+      mock.reset();
+    }
+  });
+
+  // P3-reclaim: reclaimSubsumedStarsOutbox (or mutes twin) calls
+  // reclaimSubsumedOutbox → isSubsumedBy(record.store, head). Before the fix
+  // record.preservedKey was discarded, so a foreign outbox with a clicked
+  // channel absent from a 500-entry head was deleted as "subsumed."
+  // Fix: reclaimSubsumedOutbox passes record.preservedKey to isSubsumedBy.
+  // Mutation: isSubsumedBy(record.store, head) without preservedKey
+  //   → 501-entry merge evicts clickedId → subsumed=true → record deleted.
+  test(`P3-reclaim ${label}: reclaimSubsumedOutbox must pass preservedKey; foreign outbox with clicked channel absent from 500-entry head must not be deleted`, async () => {
+    const { act, cleanup, renderHook } = await import("@testing-library/react");
+
+    const pubkey = `pk-p3-reclaim-${label}`;
+    const encodedRelay = encodeURIComponent(relayUrl);
+
+    // Relay head: 500 entries at updatedAt=100, none includes clickedId.
+    const headChannels = {};
+    for (let i = 0; i < MAX_ENTRIES; i++) {
+      headChannels[`ch-reclaim-${String(i).padStart(4, "0")}`] = {
+        [entryValueField]: false,
+        updatedAt: 100,
+        rev: 0,
+      };
+    }
+
+    // Foreign outbox (another window): 499 of the head entries + clickedId
+    // (updatedAt=1, oldest). preservedKey = clickedId.
+    const foreignChannels = {
+      [clickedId]: {
+        [entryValueField]: true,
+        updatedAt: 1,
+        rev: 1,
+      },
+    };
+    for (let i = 0; i < MAX_ENTRIES - 1; i++) {
+      foreignChannels[`ch-reclaim-${String(i).padStart(4, "0")}`] = {
+        [entryValueField]: false,
+        updatedAt: 100,
+        rev: 0,
+      };
+    }
+
+    // Seed local store (no pending edit on this window).
+    window.localStorage.setItem(
+      storageKey(pubkey, relayUrl),
+      JSON.stringify({ version: 1, channels: headChannels }),
+    );
+
+    // Seed a FOREIGN outbox key (different nonce so this window doesn't own it).
+    const foreignKey = `${outboxKeyPrefix}:${pubkey}:${encodedRelay}:foreign-p3-reclaim:0001`;
+    window.localStorage.setItem(
+      foreignKey,
+      JSON.stringify({
+        store: { version: 1, channels: foreignChannels },
+        queuedAt: 1,
+        preservedKey: clickedId,
+      }),
+    );
+
+    const tauri = installEchoTauri(pubkey);
+    const relayHead = tauri.mintHead(
+      { version: 1, channels: headChannels },
+      50,
+      `evt-p3-reclaim-${label}`,
+    );
+    relayHead.tags = [["d", dTag]];
+    relayHead.pubkey = pubkey;
+    relayHead.kind = 30078;
+
+    const restoreRelay = stubRelay(relayClient);
+    relayClient.fetchEvents = async () => [relayHead];
+    relayClient.publishEvent = async () => {};
+
+    const { restore: restoreTimers } = makeHookTimerBed();
+    const origDateNow = Date.now;
+    Date.now = () => 50 * 1_000;
+
+    let hook = null;
+    try {
+      await act(async () => {
+        hook = renderHook(() => useHook(pubkey, relayUrl));
+        for (let i = 0; i < 40; i++) await Promise.resolve();
+      });
+      // Let bootstrap and reclamation settle.
+      for (let i = 0; i < 100; i++) await Promise.resolve();
+
+      // With the fix: reclaimSubsumedOutbox calls isSubsumedBy(foreignStore, head, clickedId)
+      //   → direct check: head.channels[clickedId] = undefined → not subsumed → KEPT.
+      // Mutation: isSubsumedBy(foreignStore, head) without preservedKey
+      //   → 501-entry merge evicts clickedId → subsumed=true → foreignKey deleted.
+      const stillPresent = window.localStorage.getItem(foreignKey) !== null;
+      assert.ok(
+        stillPresent,
+        `P3-reclaim ${label}: foreign outbox with clicked channel absent from 500-entry ` +
+          `relay head must not be reclaimed — drop preservedKey from reclaimSubsumedOutbox ` +
+          `→ 501-entry merge evicts click → subsumed=true → record deleted`,
       );
       hook.unmount();
     } finally {

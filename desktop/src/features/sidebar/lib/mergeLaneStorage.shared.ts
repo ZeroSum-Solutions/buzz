@@ -250,13 +250,17 @@ export function clearOutbox(
  * Reclaim foreign outbox keys the fetched relay head already subsumes: a
  * record is redundant when merging it into `head` yields `head` unchanged.
  * Never touches this window's own key. Call only after a successful head fetch.
+ *
+ * The `isSubsumedBy` probe receives each record's `preservedKey` so a
+ * capacity-bounded proof can never evict the reserved channel and falsely
+ * certify retention of a click the relay has not yet kept (Carl P3 / C4).
  */
 export function reclaimSubsumedOutbox<S>(
   outboxPrefix: string,
   pubkey: string,
   relayUrl: string,
   parse: (json: unknown) => S | null,
-  isSubsumedBy: (candidate: S, head: S) => boolean,
+  isSubsumedBy: (candidate: S, head: S, preservedKey?: string) => boolean,
   head: S,
 ): void {
   reclaimOutbox(
@@ -265,6 +269,6 @@ export function reclaimSubsumedOutbox<S>(
     pubkey,
     relayUrl,
     parse,
-    (record) => isSubsumedBy(record.store, head),
+    (record) => isSubsumedBy(record.store, head, record.preservedKey),
   );
 }

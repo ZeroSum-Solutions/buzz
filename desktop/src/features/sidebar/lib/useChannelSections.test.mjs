@@ -7,6 +7,9 @@ import { runWholeBlobHookSuite } from "./wholeBlobHook.shared.test.mjs";
 import { runWholeBlobP2aSuite } from "./wholeBlobSyncP2a.shared.test.mjs";
 import {
   runWholeBlobCarlSuite,
+  runWholeBlobC2Suite,
+  runWholeBlobC3Suite,
+  runWholeBlobP2a1Suite,
   runWholeBlobP2bSuite,
 } from "./wholeBlobSyncCarl.shared.test.mjs";
 
@@ -233,6 +236,29 @@ runWholeBlobP2aSuite({
 
 runWholeBlobCarlSuite({
   label: "sections",
+  outboxKeyPrefix: "buzz-channel-sections-outbox.v1",
+  storageKey,
+  writeOutboxKey: (pubkey, relayUrl) => {
+    const encoded = encodeURIComponent(
+      relayUrl.trim().replace(/\/$/, "").toLowerCase(),
+    );
+    return `buzz-channel-sections-outbox.v1:${pubkey}:${encoded}`;
+  },
+  useHook: useChannelSections,
+  makeEditStore: () => ({
+    version: 1,
+    sections: [{ id: "click", name: "Click", order: 0 }],
+    assignments: {},
+  }),
+  makeRemoteStore: () => ({
+    version: 1,
+    sections: [{ id: "remote", name: "Remote", order: 0 }],
+    assignments: {},
+  }),
+});
+
+runWholeBlobP2a1Suite({
+  label: "sections",
   Manager: ChannelSectionSyncManager,
   publishEdit: (m, store) => m.publishSections(store),
   publishReplay: (m, store) => m.publishSections(store, true),
@@ -242,6 +268,45 @@ runWholeBlobCarlSuite({
     sections: [{ id: "s1", name: "Work", order: 0 }],
     assignments: {},
   }),
+  makeEditStore: () => ({
+    version: 1,
+    sections: [{ id: "click", name: "Click", order: 0 }],
+    assignments: {},
+  }),
+  makeRemoteStore: () => ({
+    version: 1,
+    sections: [{ id: "remote", name: "Remote", order: 0 }],
+    assignments: {},
+  }),
+});
+
+runWholeBlobC2Suite({
+  label: "sections",
+  Manager: ChannelSectionSyncManager,
+  publishEdit: (m, store) => m.publishSections(store),
+  publishReplay: (m, store) => m.publishSections(store, true),
+  subscribe: (m, cb) => m.subscribeToSections(cb),
+  makeNonEmptyStore: () => ({
+    version: 1,
+    sections: [{ id: "s1", name: "Work", order: 0 }],
+    assignments: {},
+  }),
+  makeEditStore: () => ({
+    version: 1,
+    sections: [{ id: "click", name: "Click", order: 0 }],
+    assignments: {},
+  }),
+  makeRemoteStore: () => ({
+    version: 1,
+    sections: [{ id: "remote", name: "Remote", order: 0 }],
+    assignments: {},
+  }),
+});
+
+runWholeBlobC3Suite({
+  label: "sections",
+  Manager: ChannelSectionSyncManager,
+  publishEdit: (m, store) => m.publishSections(store),
   makeEditStore: () => ({
     version: 1,
     sections: [{ id: "click", name: "Click", order: 0 }],

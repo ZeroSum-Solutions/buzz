@@ -192,6 +192,7 @@ export function useChannelSections(
           const durable = managerRef.current?.publishSections(
             outbox.store,
             true,
+            outbox.queuedAt,
           );
           if (durable && outbox.legacyRawToConsume !== null) {
             markChannelSectionsLegacyConsumed(

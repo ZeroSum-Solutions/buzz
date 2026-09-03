@@ -189,6 +189,7 @@ export function useChannelSortPreference(
           const durable = managerRef.current?.publishSortPrefs(
             outbox.store,
             true,
+            outbox.queuedAt,
           );
           if (durable && outbox.legacyRawToConsume !== null) {
             markChannelSortLegacyConsumed(

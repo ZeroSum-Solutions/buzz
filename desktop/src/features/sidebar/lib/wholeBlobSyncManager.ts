@@ -124,8 +124,15 @@ export type WholeBlobLaneConfig<S> = {
   parse: (json: unknown) => S | null;
   /** Serialize a store into the JSON object to be encrypted and published. */
   serializePayload: (store: S) => unknown;
-  /** Persist this window's pending edit to the durable outbox. */
-  writeOutbox: (pubkey: string, store: S, relayUrl: string) => boolean;
+  /** Persist this window's pending edit to the durable outbox.
+   *  `nowSecs` overrides the default wall-clock stamp — pass the original
+   *  `queuedAt` from a restored outbox so a replay never remints the age. */
+  writeOutbox: (
+    pubkey: string,
+    store: S,
+    relayUrl: string,
+    nowSecs?: number,
+  ) => boolean;
   /** Clear this window's own outbox key. */
   clearOutbox: (pubkey: string, relayUrl: string) => void;
   /** True when `store` is semantically identical to `last`. Used to skip no-op publishes. */
@@ -136,31 +143,13 @@ export type WholeBlobLaneConfig<S> = {
 
 /**
  * Shared whole-blob LWW sync engine used by ChannelSectionSyncManager and
- * ChannelSortSyncManager. Both lanes use the same generation-CAS, outbox,
- * watermark, retained-head confirmation, prior-gen fold, and bounded-retry
- * machinery — only lane config (kind, d-tag, store type, parse/serialize,
- * outbox functions) differs.
- *
- * ### Invariants preserved across all passes
- *
- * **pass-2 (genuine-remote adoption):** A remote observed passively during the
- * debounce window still gets adopted because the pending edit's
- * `publishBaseline` is frozen at queue time and only advances via our own
- * successful publishes — not via passive remote observations.
- *
- * **pass-3 (own-confirmed fold):** A prior publish of ours that was confirmed
- * is folded into `publishBaseline` so a later edit's pre-publish check does not
- * mistake our own accepted write for a competing remote and adopt it away.
- *
- * **pass-4 (conditional catch rollback):** The `claimLegacy` logic lives in the
- * storage layer (lane-specific) and is not affected by this shared engine.
- *
- * **r7 prior-gen fold:** When a same-second lower-id peer wins a LWW collision
- * and a newer edit (gen B) was queued after A's ACK but before confirmation
- * resolved, `adoptRemote`'s stale-gen path repairs the poisoned baseline via
- * `foldSupersedingAttemptWinner` so B publishes above the true retained head
- * rather than adopting the winner away. The generation guard requires the
- * baseline attempt to be prior-generation (`attempt < pendingGeneration`).
+ * ChannelSortSyncManager. Both lanes share generation-CAS, outbox, watermark,
+ * retained-head confirmation, prior-gen fold, and bounded-retry machinery —
+ * only lane config (kind, d-tag, store type, parse/serialize, outbox fns)
+ * differs. Invariants: pass-2 (remote observed during debounce adopts via
+ * frozen baseline), pass-3 (own confirmed write folds into baseline, not
+ * adopted away), r7 prior-gen fold (same-second LWW loser repairs poisoned
+ * baseline for a newer edit queued after the ACK).
  */
 export class WholeBlobSyncManager<S> {
   private pubkey: string;
@@ -228,6 +217,19 @@ export class WholeBlobSyncManager<S> {
   // session's durable outbox record. Suppresses the failed-bootstrap exception
   // in fetchOwnBlobBeforePublish (Carl P1, see publish() JSDoc).
   private pendingIsRestoredReplay = false;
+  // The original queuedAt from the restored outbox (seconds). Set only when
+  // pendingIsRestoredReplay=true; cleared with the pending generation.
+  // Used in fetchOwnBlobBeforePublish to guard the failed-bootstrap adopt path:
+  // a restored edit with queuedAt=200 must publish above a head at createdAt=100
+  // (the restored edit is genuinely newer), not adopt it away.
+  private pendingRestoredQueuedAt: number | undefined = undefined;
+  // The head snapshot bootstrap() last fetched successfully (or {0,""} when
+  // bootstrap has not run / ran with a failed fetch). Stored when bootstrap
+  // resolves so a restored replay that arrives in the hook's .then() callback
+  // can establish publishBaseline from this immutable snapshot rather than from
+  // mutable lastRemoteHead (which subscribeLive may have advanced to a
+  // suppressed live peer head — H102 — that must remain a genuine remote advance).
+  private bootstrapResultHead: PublishBaseline = { createdAt: 0, eventId: "" };
   // Event ids we signed and sent to the relay but whose ACK never arrived (the
   // publish promise rejected as a timeout/socket error after the frame left).
   // The relay MAY have accepted such a write, so if a later cycle's pre-publish
@@ -379,17 +381,12 @@ export class WholeBlobSyncManager<S> {
   }
 
   /**
-   * Release any edit that was deferred until bootstrap resolved. Called by
-   * bootstrap() after it sets bootstrapResolved=true, passing the head that
-   * bootstrap itself observed (the canonical head at the moment bootstrap
-   * completed — NOT the mutable lastRemoteHead, which subscribeLive may advance
-   * at any time). Re-freezes publishBaseline to
-   * canonicalMax(queueTimeBaseline, bootstrapResultHead) and schedules the 2s
-   * debounce. Using the bootstrap-result snapshot (not lastRemoteHead) is
-   * critical: a live peer head arriving after the click but before bootstrap
-   * resolves must remain a genuine remote advance, not be folded into the
-   * baseline. For a failed bootstrap, bootstrapResultHead is {0,""} and the
-   * bootstrapFailed flag enables the doPublish-time exception.
+   * Release any edit deferred until bootstrap resolved. Re-freezes
+   * publishBaseline to canonicalMax(queueTime, bootstrapResultHead) and
+   * schedules the 2s debounce. Uses the bootstrap-result snapshot (NOT mutable
+   * lastRemoteHead) so a live peer head arriving during the bootstrap fetch
+   * remains a genuine advance. For a failed bootstrap, bootstrapResultHead is
+   * {0,""} and bootstrapFailed enables the doPublish-time exception.
    */
   private releaseDeferred(bootstrapResultHead: PublishBaseline): void {
     if (
@@ -416,28 +413,13 @@ export class WholeBlobSyncManager<S> {
   }
 
   /**
-   * When the current `publishBaseline` was frozen against one of our own
-   * attempted (but non-retained) event ids and `remote` is the same-second
-   * lower-id peer that won the collision, the baseline is poisoned: the next
-   * pre-publish check would see the winner as having advanced past our phantom
-   * attempt and adopt the edit away (Carl P1 / same-second variants). Folding
-   * the winner in repairs the baseline so the pre-publish check sees the true
-   * retained head and publishes above it.
-   *
-   * Scoped to same-second lower-id only: a strictly-later remote is a genuine
-   * advance that the pending edit must still adopt (pass-2 invariant).
-   *
-   * Requires the baseline attempt to be prior-generation (gen <
-   * pendingGeneration): if no newer edit was queued, the current generation's
-   * own in-flight attempt cannot trigger the fold — the loser must adopt (LWW
-   * correctness). The post-ACK ordering is load-bearing for causal soundness:
-   * because A's ACK returned before B queued, the peer winner pre-existed B, so
-   * preserving B is causally justified. If B queues while A's ACK is pending,
-   * the peer may have been accepted after B and is a genuine remote advance B
-   * must adopt — B's baseline will not equal A's attempt id in that case, so
-   * the fold does not fire (correct behaviour, by the causal argument above).
-   *
-   * Returns true when the fold was applied (caller may use for branching).
+   * When `publishBaseline` was frozen against one of our own attempted (but
+   * non-retained) event ids and `remote` is the same-second lower-id peer that
+   * won the collision, the baseline is poisoned. Fold the winner in so the
+   * next pre-publish check sees the true retained head and publishes above it.
+   * Scoped to same-second lower-id only (strictly-later is a genuine advance).
+   * Requires the baseline attempt to be prior-generation (gen < pendingGeneration).
+   * Returns true when the fold was applied.
    */
   private foldSupersedingAttemptWinner(remote: {
     createdAt: number;
@@ -468,11 +450,7 @@ export class WholeBlobSyncManager<S> {
   private adoptRemote(remote: RemoteBlob<S>, gen: number): void {
     this.recordRemoteHead(remote.createdAt, remote.eventId);
     if (gen !== this.pendingGeneration) {
-      // A newer edit is pending. Its baseline may have been frozen against our
-      // own attempted (non-retained) event id if it was queued after the ACK
-      // but before confirmation resolved. Repair any poisoned baseline so the
-      // newer edit's pre-publish check publishes above the true retained head
-      // rather than adopting the winner away (Carl P1).
+      // Newer edit pending — repair any poisoned baseline (Carl P1).
       this.foldSupersedingAttemptWinner(remote);
       return;
     }
@@ -483,65 +461,72 @@ export class WholeBlobSyncManager<S> {
   }
 
   /**
-   * Clear the in-memory pending edit and this window's own durable outbox key —
-   * but only if the completing publish still owns the current generation. A
-   * publish for an older edit that finishes after a newer edit was queued must
-   * leave the newer edit (and its retry state) untouched.
+   * Clear the pending edit and durable outbox only when `gen` still owns the
+   * current generation — a stale publish must not clear a newer edit's state.
    */
   private discardPending(gen: number): void {
     if (gen !== this.pendingGeneration) return;
     this.pendingStore = null;
     this.pendingIsRestoredReplay = false;
+    this.pendingRestoredQueuedAt = undefined;
     this.config.clearOutbox(this.pubkey, this.relayUrl);
   }
 
   /**
    * Queue a store for debounced publish.
    *
-   * @param isRestoredReplay  When true, this call is a hook-level replay of a
-   *   prior session's durable outbox record. Two behaviours are adjusted:
+   * When `isRestoredReplay=true` (hook-level replay of a prior session's outbox):
+   * - **Baseline (C2):** set to `canonicalMax(current, bootstrapResultHead)` so
+   *   a no-prior-pending replay gets the correct baseline (blocked-bootstrap
+   *   replay is idempotent; H102 in lastRemoteHead stays a genuine advance).
+   * - **Age (C1):** `writeOutbox` is called with `restoredQueuedAt` so the
+   *   on-disk stamp is never reminted; `pendingRestoredQueuedAt` drives the
+   *   adopt-guard in `fetchOwnBlobBeforePublish`.
+   * - **Failed-bootstrap exception:** suppressed for replays (Carl P1).
    *
-   *   1. **Baseline preservation (P2a-1):** `publishBaseline` is NOT
-   *      re-frozen from `lastRemoteHead`. `releaseDeferred` already set it to
-   *      `canonicalMax(queueTime, bootstrapResult)` — re-freezing here would
-   *      fold in a suppressed live peer head (H102) and cause the pre-publish
-   *      check to see equality and publish over H102 instead of adopting it.
-   *
-   *   2. **Failed-bootstrap exception (P1):** the "first unknown base"
-   *      exception in `fetchOwnBlobBeforePublish` is suppressed. A restored
-   *      replay carries its original `queuedAt` from the prior session and its
-   *      baseline was already frozen then — the exception was designed only for
-   *      fresh in-session clicks. Letting it fire for a replay would publish
-   *      the stale edit over a newer peer head retained while offline (Carl P1).
+   * @param restoredQueuedAt Original `queuedAt` from the prior outbox; controls
+   *   the on-disk stamp and adopt-vs-publish in `fetchOwnBlobBeforePublish`.
    */
-  publish(store: S, isRestoredReplay = false): boolean {
+  publish(
+    store: S,
+    isRestoredReplay = false,
+    restoredQueuedAt?: number,
+  ): boolean {
     this.pendingStore = store;
     ++this.pendingGeneration;
-    // Freeze the canonical head this edit is racing against at queue time. The
-    // pre-publish check compares the fetched head against this baseline, not the
-    // mutable watermark — a live event applied during the debounce window
-    // advances the watermark to a new remote head, which would otherwise make
-    // the pre-publish comparison see equality and fall through to a publish that
-    // overwrites a remote that became head *after* this edit was queued. The
-    // baseline only advances via our own successful publishes (see doPublish),
-    // so a prior generation's own accepted write is folded in rather than
-    // mistaken for a competing remote. For a restored replay, the baseline was
-    // already established by releaseDeferred — do not re-freeze (see JSDoc).
-    if (!isRestoredReplay) {
+    // Freeze the canonical head this edit races against at queue time. The
+    // pre-publish check compares against this baseline — not the mutable
+    // watermark — so a live event during the debounce window that advances the
+    // watermark still gets adopted (baseline only advances via our own
+    // confirmed publishes). For a restored replay: use canonicalMax(current,
+    // bootstrapResultHead) from the immutable bootstrap snapshot (C2):
+    //   No prior pending: publishBaseline={0,""}, canonicalMax sets bootstrap head.
+    //   Blocked-bootstrap: releaseDeferred already set it; re-apply is idempotent.
+    //   lastRemoteHead excluded (may carry suppressed H102 from subscribeLive).
+    if (isRestoredReplay) {
+      this.publishBaseline = canonicalMax(
+        this.publishBaseline,
+        this.bootstrapResultHead,
+      );
+    } else {
       this.publishBaseline = { ...this.lastRemoteHead };
     }
-    // Record whether this is a restored replay so fetchOwnBlobBeforePublish
-    // can suppress the failed-bootstrap exception (P1) — a replay must not
-    // re-qualify for the "first unknown base" logic.
+    // Suppress failed-bootstrap exception for replays (P1/C1); preserve original
+    // queuedAt for the failed-bootstrap adopt-guard (publish when relay head
+    // createdAt <= restoredQueuedAt — restored edit is genuinely newer).
     this.pendingIsRestoredReplay = isRestoredReplay;
-    // Persist synchronously so an edit made <2s before quit/community-switch
-    // survives teardown and resumes on next mount (durable outbox).
-    // This window's own key is the only one written — a single unconditional setItem,
-    // never a shared-key read-modify-write; `queuedAt` stamps it so resume
-    // replays only the newest queued blob (whole-blob LWW). The returned flag
-    // reports whether the intent is now durably held, so a legacy replay can
-    // gate its consumption marker on a proven transfer.
-    const durable = this.config.writeOutbox(this.pubkey, store, this.relayUrl);
+    this.pendingRestoredQueuedAt = isRestoredReplay
+      ? restoredQueuedAt
+      : undefined;
+    // Persist synchronously (durable outbox). Pass restoredQueuedAt so the
+    // on-disk stamp is never reminted for a replay (C1). Returns durable flag
+    // so a legacy replay can gate its consumed marker on a proven transfer.
+    const durable = this.config.writeOutbox(
+      this.pubkey,
+      store,
+      this.relayUrl,
+      isRestoredReplay ? restoredQueuedAt : undefined,
+    );
     if (this.debounceTimer !== null) {
       window.clearTimeout(this.debounceTimer);
       this.debounceTimer = null;
@@ -620,17 +605,11 @@ export class WholeBlobSyncManager<S> {
       // against state we cannot inspect, so retain the pending edit and retry
       // rather than blindly overwrite authoritative state (Carl P1).
       if (!remote) return { kind: "retain" };
-      // Whole-blob LWW. Compare the fetched head against the baseline frozen
-      // when this edit was queued — NOT the live watermark, which a passive live
-      // event during debounce may already have advanced to this same head. If
-      // the canonical head advanced since the edit began, the local edit lost
-      // and is adopted-away rather than republished over it.
+      // Whole-blob LWW: compare against the frozen baseline (not the live
+      // watermark — a passive event during debounce must still adopt).
       if (remoteAdvancedSince(remote, this.publishBaseline)) {
-        // Unless the advancing head is a prior publish of OURS whose ACK was
-        // lost: the relay accepted it, but our promise rejected before we could
-        // fold it forward, so it is our own accepted predecessor — not a
-        // competing remote. Fold it into the baseline and publish above it so
-        // the queued edit survives instead of adopting our own stale write away.
+        // Advancing head is a lost-ACK write of ours: fold into baseline and
+        // publish above our own accepted predecessor.
         if (this.ambiguousAttemptIds.has(remote.eventId)) {
           this.publishBaseline = canonicalMax(this.publishBaseline, {
             createdAt: remote.createdAt,
@@ -639,31 +618,15 @@ export class WholeBlobSyncManager<S> {
           return { kind: "publish", store, fetchedRemote: remote };
         }
         // Same-second lower-id peer winner that superseded our own attempted
-        // head: baseline.eventId is our attempted id (still in
-        // ambiguousAttemptIds because the adopt path never clears it) and the
-        // relay retained the peer's lower-id blob instead. This arises when
-        // confirmation returned retain/failed and the retry pre-publish fetch
-        // sees the winner directly with the original poisoned baseline still in
-        // place. Fold the winner in so this edit publishes above the true
-        // retained head rather than adopting it away (Carl P1).
+        // head (baseline.eventId is our attempt, still in ambiguousAttemptIds).
+        // Fold the winner in and publish above the true retained head (Carl P1).
         if (this.foldSupersedingAttemptWinner(remote)) {
           return { kind: "publish", store, fetchedRemote: remote };
         }
-        // Failed-bootstrap exception (P2a): when bootstrap failed, the FIRST
-        // relay head at pre-publish time is the true first established baseline;
-        // publish above it rather than adopting it away.
-        //
-        // Three guards: (1) no external head observed after the failed bootstrap
-        // (subscribeLive or reconnect/periodic fetch set
-        // bootstrapFailedExternalHeadObserved — that head is a genuine post-click
-        // advance that normal remoteAdvancedSince correctly adopts); (2) this
-        // is NOT a restored outbox replay (pendingIsRestoredReplay) — the
-        // exception was designed for fresh in-session clicks only; letting it
-        // fire for a replay publishes the stale edit over a newer peer head
-        // retained while offline (Carl P1); (3) publishBaseline is still {0,""}.
-        //
-        // (For a successful bootstrap, releaseDeferred sets publishBaseline to the
-        // fetched head before the timer fires; this branch is not reached.)
+        // Failed-bootstrap exception (P2a): first relay head seen after a
+        // failed bootstrap is the true first established baseline — publish
+        // above it. Guards: no external head observed post-failure; not a
+        // restored replay; publishBaseline still {0,""}.
         if (
           this.bootstrapFailed &&
           !this.bootstrapFailedExternalHeadObserved &&
@@ -676,6 +639,21 @@ export class WholeBlobSyncManager<S> {
             eventId: remote.eventId,
           });
           return { kind: "publish", store, fetchedRemote: remote };
+        }
+        // Restored-replay adopt-guard (C1): failed bootstrap + restored outbox.
+        // Publish only when the restored edit is genuinely newer than the head
+        // (remote.createdAt <= restoredQueuedAt); adopt when head is strictly newer.
+        if (
+          this.pendingIsRestoredReplay &&
+          this.pendingRestoredQueuedAt !== undefined
+        ) {
+          if (remote.createdAt <= this.pendingRestoredQueuedAt) {
+            this.publishBaseline = canonicalMax(this.publishBaseline, {
+              createdAt: remote.createdAt,
+              eventId: remote.eventId,
+            });
+            return { kind: "publish", store, fetchedRemote: remote };
+          }
         }
         return { kind: "adopt", remote };
       }
@@ -710,16 +688,26 @@ export class WholeBlobSyncManager<S> {
       if (events.length === 0 || events[0].pubkey !== this.pubkey)
         return { kind: "retain" };
       const event = events[0];
-      this.recordRemoteHead(event.created_at, event.id);
-      if (event.id === ourEventId) return { kind: "confirmed" };
+      // Own-ID confirmation: the event we signed is still the relay head.
+      // Record immediately — no decrypt needed (we know the store content).
+      if (event.id === ourEventId) {
+        this.recordRemoteHead(event.created_at, event.id);
+        return { kind: "confirmed" };
+      }
       // A different event is the head. If it is one of OUR OWN accepted prior
       // attempts (a lost-ACK write the relay retained, or a same-second lower-id
       // attempt that won over this one), it is not a competing remote — retain
       // so the retry's pre-publish folds it forward and publishes above it,
       // rather than adopting our own older blob and dropping the current edit.
       if (this.ambiguousAttemptIds.has(event.id)) return { kind: "retain" };
+      // Foreign winner: decrypt before recording the head tuple. A concurrent
+      // click between this fetch and decryptAndParse must not freeze its
+      // publishBaseline against a head whose store has not yet been applied
+      // (Carl P2b / CRITICAL 3 — mirrors the fetchRemoteBlob fix). The scalar
+      // watermark is advanced only after decrypt succeeds (via recordRemoteHead).
       const remote = await this.decryptAndParse(event);
       if (!remote) return { kind: "retain" };
+      this.recordRemoteHead(event.created_at, event.id);
       return { kind: "adopt", remote };
     } catch {
       return { kind: "retain" };
@@ -978,6 +966,7 @@ export class WholeBlobSyncManager<S> {
     // already see bootstrapResolved=true and schedule the debounce normally.
     // releaseDeferred() covers edits queued via other paths during the fetch,
     // using the bootstrap-result snapshot so no post-click live head races in.
+    this.bootstrapResultHead = bootstrapResultHead;
     this.bootstrapResolved = true;
     this.releaseDeferred(bootstrapResultHead);
     return result;

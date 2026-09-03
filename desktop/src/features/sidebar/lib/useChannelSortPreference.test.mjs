@@ -7,6 +7,9 @@ import { runWholeBlobHookSuite } from "./wholeBlobHook.shared.test.mjs";
 import { runWholeBlobP2aSuite } from "./wholeBlobSyncP2a.shared.test.mjs";
 import {
   runWholeBlobCarlSuite,
+  runWholeBlobC2Suite,
+  runWholeBlobC3Suite,
+  runWholeBlobP2a1Suite,
   runWholeBlobP2bSuite,
 } from "./wholeBlobSyncCarl.shared.test.mjs";
 
@@ -148,6 +151,32 @@ runWholeBlobP2aSuite({
 
 runWholeBlobCarlSuite({
   label: "sort",
+  outboxKeyPrefix: "buzz-channel-sort-outbox.v1",
+  storageKey,
+  writeOutboxKey: (pubkey, relayUrl) => {
+    const encoded = encodeURIComponent(
+      relayUrl.trim().replace(/\/$/, "").toLowerCase(),
+    );
+    return `buzz-channel-sort-outbox.v1:${pubkey}:${encoded}`;
+  },
+  useHook: useChannelSortPreference,
+  makeEditStore: () => ({ version: 1, groups: { click: "alpha" } }),
+  makeRemoteStore: () => ({ version: 1, groups: { remote: "recent" } }),
+});
+
+runWholeBlobP2a1Suite({
+  label: "sort",
+  Manager: ChannelSortSyncManager,
+  publishEdit: (m, store) => m.publishSortPrefs(store),
+  publishReplay: (m, store) => m.publishSortPrefs(store, true),
+  subscribe: (m, cb) => m.subscribeToSortPrefs(cb),
+  makeNonEmptyStore: () => ({ version: 1, groups: { s1: "recent" } }),
+  makeEditStore: () => ({ version: 1, groups: { click: "alpha" } }),
+  makeRemoteStore: () => ({ version: 1, groups: { remote: "recent" } }),
+});
+
+runWholeBlobC2Suite({
+  label: "sort",
   Manager: ChannelSortSyncManager,
   publishEdit: (m, store) => m.publishSortPrefs(store),
   publishReplay: (m, store) => m.publishSortPrefs(store, true),
@@ -158,6 +187,14 @@ runWholeBlobCarlSuite({
 });
 
 runWholeBlobP2bSuite({
+  label: "sort",
+  Manager: ChannelSortSyncManager,
+  publishEdit: (m, store) => m.publishSortPrefs(store),
+  makeEditStore: () => ({ version: 1, groups: { click: "alpha" } }),
+  makeRemoteStore: () => ({ version: 1, groups: { remote: "recent" } }),
+});
+
+runWholeBlobC3Suite({
   label: "sort",
   Manager: ChannelSortSyncManager,
   publishEdit: (m, store) => m.publishSortPrefs(store),

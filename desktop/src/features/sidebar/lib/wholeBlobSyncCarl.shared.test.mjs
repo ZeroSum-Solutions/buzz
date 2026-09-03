@@ -1,30 +1,37 @@
-// Carl-round regression suite for WholeBlobSyncManager (P1, P2a-1, P2b).
+// Carl-round regression suite for whole-blob sync (P1/C1, P2a-1/C2, P2b).
 //
-// Three causal regressions confirmed at source in Duncan's analysis pass:
+// P1/C1 — restored-outbox provenance (failed bootstrap):
+//   A restored edit with queuedAt=200 vs a failed-bootstrap relay head at
+//   createdAt=100 must PUBLISH (the edit is genuinely newer). Without the fix
+//   the failed-bootstrap exception fires and publishes over the peer head, OR
+//   the adopt path runs unconditionally and throws away the newer edit.
+//   Mutation (P1): remove !pendingIsRestoredReplay guard from the exception
+//     → exception fires, the edit publishes as if fresh.
+//   Mutation (C1-adopt): remove pendingRestoredQueuedAt adopt-guard
+//     → restored edit always adopts regardless of age.
 //
-// T-P1  (hook layer): failed bootstrap → restored outbox (old queuedAt) →
-//   bootstrap `.then()` replay → pre-publish fetch finds newer peer head B
-//   retained while device was closed → must ADOPT (never publish stale edit
-//   over B).
-//   Mutation: remove `!this.pendingIsRestoredReplay` guard from the
-//   failed-bootstrap exception → exception fires, folds B in, publishes over it.
+// C2 — successful-bootstrap replay needs a baseline:
+//   A restored edit with queuedAt=100 vs a successful bootstrap at H100
+//   (createdAt=50) must PUBLISH (hook replays because queuedAt >= createdAt).
+//   Without the fix publishBaseline stays {0,""} and the pre-publish fetch
+//   sees H100 as an advance, adopting the edit away.
+//   Mutation (C2): do not set publishBaseline from bootstrapResultHead in
+//     publish(_, true) → baseline stays {0,""} → H100 adopted → no publish.
 //
-// T-P2a1 (hook layer): blocked bootstrap H100 → click → live H102 arrives and
-//   is suppressed (hasPendingEdit) → bootstrap resolves H100 → hook `.then()`
-//   calls publishSections/publishSortPrefs(outbox, isRestoredReplay=true) →
-//   replay must NOT re-freeze publishBaseline from mutable lastRemoteHead →
-//   pre-publish fetch returns H102 → ADOPT (H102 is a genuine advance).
-//   Mutation: remove `if (!isRestoredReplay)` guard from publish() →
-//   publishBaseline refreezes to H102 → pre-publish sees equality → publishes
-//   pre-H102 content over H102, H102's changes lost.
+// P2a-1 (manager layer — blocked-bootstrap sequence):
+//   Blocked H100 → click → live H102 arrives suppressed → bootstrap resolves
+//   H100 → hook replay (isRestoredReplay=true) → H102 must remain a genuine
+//   advance (ADOPT). At hook layer the replay is driven by publish(_, true)
+//   which uses canonicalMax(current, bootstrapResultHead). Manager-level test
+//   is sufficient here because the state machine (publishBaseline vs
+//   bootstrapResultHead vs lastRemoteHead) is manager-internal.
+//   Mutation: set publishBaseline = lastRemoteHead in publish(_, true)
+//     → H102 folds into baseline → pre-publish sees equality → publish-over.
 //
-// T-P2b (manager layer): periodic/reconnect fetchRemoteBlob path records
-//   lastRemoteHead BEFORE decryptAndParse returns; a concurrent click freezes
-//   publishBaseline against the pre-decrypt head; the pre-publish fetch then
-//   sees no advance and publishes stale content over the fetched event.
-//   Mutation: move recordRemoteHead back above decryptAndParse (revert P2b fix)
-//   → publishBaseline freezes against undecrypted head → pre-publish fetch
-//   returns same head → no advance → publish-over.
+// P2b (manager layer — fetchRemoteBlob decrypt gap):
+//   Click during periodic-fetch decrypt gap must not publish over the head.
+//   Manager-level test is sufficient; the race is manager-internal.
+//   Mutation: move recordRemoteHead back above decryptAndParse.
 
 import assert from "node:assert/strict";
 import test, { mock } from "node:test";
@@ -32,25 +39,268 @@ import test, { mock } from "node:test";
 import { relayClient } from "@/shared/api/relayClient";
 import {
   makeHookTimerBed,
+  makeHookStubs,
   installEchoTauri,
 } from "./sidebarSyncTestHelpers.mjs";
 
-const RELAY = "wss://r.carl";
+const { stubRelay } = makeHookStubs();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Hook-layer suites: P1/C1 and C2 use the actual React hooks so the real
+// bootstrap .then() callback, outbox read, queuedAt, and shouldReplay guard
+// are exercised. Both sections and sort variants run via runWholeBlobCarlSuite.
+// ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Register the Carl-round P1/P2a-1 hook-layer regressions for a single lane.
+ * Hook-layer P1/C1 and C2 regressions for a single whole-blob lane.
  *
  * @param {object} opts
- * @param {string} opts.label         — "sections"|"sort"
- * @param {Function} opts.Manager     — concrete manager class
- * @param {Function} opts.publishEdit — (manager, store) => void (fresh click, isRestoredReplay=false)
- * @param {Function} opts.publishReplay — (manager, store) => void (restored replay, isRestoredReplay=true)
- * @param {Function} opts.subscribe   — (manager, cb) => Promise<unsubscribe>
- * @param {Function} opts.makeNonEmptyStore  — () => non-empty mount store
- * @param {Function} opts.makeEditStore      — () => user-click store (distinct from mount)
- * @param {Function} opts.makeRemoteStore    — () => peer relay head store
+ * @param {string}   opts.label              "sections"|"sort"
+ * @param {string}   opts.outboxKeyPrefix    e.g. "buzz-channel-sections-outbox.v1"
+ * @param {string}   opts.storageKeyPrefix   localStorage key for the store
+ * @param {Function} opts.storageKey         (pubkey, relayUrl) => string (store key)
+ * @param {Function} opts.writeOutboxKey     (pubkey, relayUrl) => v2 outbox key
+ *                                           (legacy shared key — pre-v2 nonce path)
+ * @param {Function} opts.useHook            the hook under test
+ * @param {Function} opts.makeEditStore      () => store (the restored edit)
+ * @param {Function} opts.makeRemoteStore    () => store (peer head content)
  */
 export function runWholeBlobCarlSuite({
+  label,
+  outboxKeyPrefix,
+  storageKey,
+  writeOutboxKey,
+  useHook,
+  makeEditStore,
+  makeRemoteStore,
+}) {
+  // ── P1/C1-publish: failed bootstrap → restored outbox (queuedAt=200) →
+  //   relay head at createdAt=100 → MUST PUBLISH (restored edit is newer).
+  //
+  // Production sequence through the real hook:
+  //   1. Outbox seeded with queuedAt=200 (prior session edit).
+  //   2. Bootstrap fetch fails → bootstrapFailed=true.
+  //   3. hook .then(): result.action="hold" → shouldReplay=true
+  //      → publishSections(store, true, 200) → publish(_, true, 200)
+  //      → publishBaseline = canonicalMax({0,""}, bootstrapResultHead={0,""}) = {0,""}
+  //      → pendingRestoredQueuedAt = 200.
+  //   4. Debounce fires. fetchOwnBlobBeforePublish returns peerHead (createdAt=100).
+  //      remoteAdvancedSince(100, {0,""}) = true.
+  //      Failed-bootstrap exception: !pendingIsRestoredReplay suppresses it.
+  //      Restored-replay adopt-guard: remote.createdAt(100) <= queuedAt(200)
+  //      → PUBLISH (restored edit is genuinely newer than head).
+  //
+  // Mutations that must make this test red:
+  //   M1 (exception not suppressed): remove !pendingIsRestoredReplay guard
+  //      → exception fires → publishBaseline folds peerHead in → publish.
+  //      Test PASSES with mutation: this mutation does not cause silent data-loss
+  //      here, it publishes correctly but for the WRONG reason. The real defect
+  //      is the stale-queuedAt remint. We catch that separately in C1-adopt.
+  //
+  //   M2 (adopt-guard absent, C1): remove pendingRestoredQueuedAt guard
+  //      → restored replay always adopts when remoteAdvancedSince=true
+  //      → publish=0, adopted=1 → test FAILS.
+  test(`P1/C1 ${label}: failed-bootstrap hook replay — restored edit (queuedAt=200) must publish above older relay head (createdAt=100)`, async () => {
+    const { act, cleanup, renderHook } = await import("@testing-library/react");
+    const pubkey = `pk-c1-fail-${label}`;
+    const relayUrl = `wss://r.c1fail.${label}`;
+    const encodedRelay = encodeURIComponent(relayUrl);
+
+    const tauri = installEchoTauri(pubkey);
+    const restoreRelay = stubRelay(relayClient);
+
+    // Seed legacy outbox: queuedAt=200, store has the edit.
+    const legacyKey = writeOutboxKey(pubkey, relayUrl);
+    window.localStorage.setItem(
+      legacyKey,
+      JSON.stringify({ store: makeEditStore(), queuedAt: 200 }),
+    );
+    // Seed local store = edit store (so hook mounts with non-empty state).
+    window.localStorage.setItem(
+      storageKey(pubkey, relayUrl),
+      JSON.stringify(makeEditStore()),
+    );
+
+    // peerHead: another peer's head, createdAt=100 (older than queuedAt=200).
+    const peerHead = tauri.mintHead(
+      makeRemoteStore(),
+      100,
+      `evt-c1-peer-${label}`,
+    );
+    peerHead.pubkey = pubkey;
+    peerHead.kind = 30078;
+
+    const publishCalls = [];
+    let fetchCalls = 0;
+    relayClient.fetchEvents = async () => {
+      fetchCalls++;
+      // Call 1 = bootstrap fetch: fail.
+      if (fetchCalls === 1) return Promise.reject(new Error("bootstrap fail"));
+      // Subsequent calls (pre-publish fetch): return peerHead.
+      return [peerHead];
+    };
+    relayClient.publishEvent = async (evt) => {
+      publishCalls.push(evt);
+    };
+
+    const { fireDelay, restore: restoreTimers } = makeHookTimerBed();
+    const origDateNow = Date.now;
+    Date.now = () => 300 * 1_000; // wall clock at t=300 — remint would stamp 300
+
+    let hook = null;
+    try {
+      await act(async () => {
+        hook = renderHook(() => useHook(pubkey, relayUrl));
+        for (let i = 0; i < 40; i++) await Promise.resolve();
+      });
+
+      // Bootstrap failed → hook .then() fired → shouldReplay=true (hold)
+      // → publishSections(store, true, 200) called.
+      // Debounce scheduled. Fire it.
+      await fireDelay(2000);
+      for (let i = 0; i < 100; i++) await Promise.resolve();
+
+      // With the fix: restored edit (queuedAt=200) > head (createdAt=100)
+      //   → pendingRestoredQueuedAt guard → PUBLISH.
+      // Mutation (C1-adopt): guard absent → adopt → publishCalls.length === 0.
+      assert.ok(
+        publishCalls.length > 0,
+        `P1/C1 ${label}: restored edit (queuedAt=200) must publish above older head ` +
+          `(createdAt=100) — drop pendingRestoredQueuedAt guard → adopt-away`,
+      );
+      // Verify the published store contains the edit, not the peer head.
+      const plaintext = tauri.capturedPlaintext();
+      assert.ok(plaintext !== null, "encrypt must have been called");
+      const published = JSON.parse(plaintext);
+      assert.deepEqual(
+        published,
+        makeEditStore(),
+        `P1/C1 ${label}: published store must be the restored edit, not the peer head`,
+      );
+      hook.unmount();
+    } finally {
+      cleanup();
+      Date.now = origDateNow;
+      tauri.restore();
+      restoreRelay();
+      restoreTimers();
+      window.localStorage.clear();
+      mock.reset();
+    }
+  });
+
+  // ── C2: successful bootstrap → hook replay (queuedAt >= bootstrapHead.createdAt)
+  //   → MUST PUBLISH above the bootstrap head, not adopt it away.
+  //
+  // Note: the hook layer always passes queuedAt through publishSections, so the
+  // restored-replay adopt-guard (C1) also fires and protects the case where
+  // remote.createdAt <= queuedAt. The independent C2 coverage is in the manager
+  // layer (runWholeBlobC2Suite), where we drive publish(_, true, undefined) so
+  // only the bootstrapResultHead baseline mechanism (C2) can protect the edit.
+  // This hook test verifies the combined C1+C2 end-to-end path: outbox read,
+  // queuedAt threading, shouldReplay guard, and the real .then() callback.
+  //
+  // Probe: queuedAt=100, H50 (createdAt=50), shouldReplay=true. With fix:
+  // publishBaseline={50,id} → no advance → PUBLISH; without fix publishBaseline
+  // stays {0,""} but C1 guard fires (50<=100) → also publishes. This test is
+  // a combined integration path; mutation-causal C2 coverage lives below.
+  test(`C2 ${label}: successful-bootstrap hook replay (queuedAt=100 >= head.createdAt=50) must publish above bootstrap head, not adopt it away`, async () => {
+    const { act, cleanup, renderHook } = await import("@testing-library/react");
+    const pubkey = `pk-c2-${label}`;
+    const relayUrl = `wss://r.c2.${label}`;
+
+    const tauri = installEchoTauri(pubkey);
+    const restoreRelay = stubRelay(relayClient);
+
+    // Seed legacy outbox: queuedAt=100.
+    const legacyKey = writeOutboxKey(pubkey, relayUrl);
+    window.localStorage.setItem(
+      legacyKey,
+      JSON.stringify({ store: makeEditStore(), queuedAt: 100 }),
+    );
+    window.localStorage.setItem(
+      storageKey(pubkey, relayUrl),
+      JSON.stringify(makeEditStore()),
+    );
+
+    // Bootstrap head: H50 at createdAt=50.
+    const H50 = tauri.mintHead(makeRemoteStore(), 50, `evt-c2-h50-${label}`);
+    H50.pubkey = pubkey;
+    H50.kind = 30078;
+    // Tag so the hook's decryptAndParse can identify the d-tag.
+    H50.tags = [
+      ["d", label === "sections" ? "channel-sections" : "channel-sort"],
+    ];
+
+    const publishCalls = [];
+    let fetchCalls = 0;
+    relayClient.fetchEvents = async () => {
+      fetchCalls++;
+      // Call 1 = bootstrap fetch: return H50.
+      if (fetchCalls === 1) return [H50];
+      // Pre-publish fetch: return H50 (relay still has H50).
+      return [H50];
+    };
+    relayClient.publishEvent = async (evt) => {
+      publishCalls.push(evt);
+    };
+
+    const { fireDelay, restore: restoreTimers } = makeHookTimerBed();
+    const origDateNow = Date.now;
+    Date.now = () => 200 * 1_000;
+
+    let hook = null;
+    try {
+      await act(async () => {
+        hook = renderHook(() => useHook(pubkey, relayUrl));
+        for (let i = 0; i < 40; i++) await Promise.resolve();
+      });
+
+      await fireDelay(2000);
+      for (let i = 0; i < 100; i++) await Promise.resolve();
+
+      // Combined C1+C2 path: restored edit (queuedAt=100) vs head (createdAt=50).
+      // C2 fix: publishBaseline={50,id} → no advance → PUBLISH.
+      // C1 guard also fires: 50<=100 → PUBLISH (provides redundant protection).
+      assert.ok(
+        publishCalls.length > 0,
+        `C2 ${label}: hook replay (queuedAt=100 >= bootstrapHead.createdAt=50) ` +
+          `must publish above bootstrap head`,
+      );
+      hook.unmount();
+    } finally {
+      cleanup();
+      Date.now = origDateNow;
+      tauri.restore();
+      restoreRelay();
+      restoreTimers();
+      window.localStorage.clear();
+      mock.reset();
+    }
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Manager-layer suites: P2a-1 and P2b test manager-internal state that cannot
+// be driven from the hook layer without precise timing control. These are
+// correctly labeled as manager-level tests.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Manager-layer C2 regression (successful-bootstrap replay needs a baseline).
+ *
+ * This is the mutation-causal test for C2. The hook layer cannot isolate C2
+ * from C1 because whenever shouldReplay fires (queuedAt >= bootstrapHead),
+ * queuedAt is threaded through and C1's guard also protects the same case.
+ * At the manager layer we drive publish(_, true, undefined) — no queuedAt —
+ * so C1's guard is disabled and only C2's bootstrapResultHead baseline can
+ * prevent the adopt.
+ *
+ * Probe: bootstrap H50 → publish(store, true, undefined) → pre-publish H50
+ *   → With fix: publishBaseline={50,id} → not advance → PUBLISH.
+ *   → Mutation: publishBaseline={0,""} → H50 advance → adopt → publish=0.
+ */
+export function runWholeBlobC2Suite({
   label,
   Manager,
   publishEdit,
@@ -60,46 +310,23 @@ export function runWholeBlobCarlSuite({
   makeEditStore,
   makeRemoteStore,
 }) {
-  // T-P1: failed bootstrap → hook replay of restored outbox → peer head B was
-  //   retained while device was closed → replay must ADOPT, never publish over B.
-  //
-  // Production sequence:
-  //   1. A edits at t=100, queuedAt=100, quits before publish.
-  //   2. Peer retains head B at t=200 while A is offline.
-  //   3. A reopens: bootstrap fetch fails → bootstrapFailed=true.
-  //   4. Hook `.then()` reads outbox (queuedAt=100 < B.createdAt=200 → shouldReplay
-  //      guard in the hook would be false for apply-remote; but bootstrap=hold here
-  //      so shouldReplay is always true). The replay calls publish(store,
-  //      isRestoredReplay=true) → pendingIsRestoredReplay=true.
-  //   5. Debounce fires. fetchOwnBlobBeforePublish returns B.
-  //      remoteAdvancedSince(B, {0,""}) = true → would normally adopt.
-  //      Failed-bootstrap exception: bootstrapFailed=true,
-  //      !bootstrapFailedExternalHeadObserved=true, publishBaseline={0,""}.
-  //      With the fix: pendingIsRestoredReplay=true → exception suppressed
-  //      → normal adopt fires.
-  //      Mutation: exception fires → fold B into baseline → publish over B.
-  //
-  // The test uses a `hold` bootstrap (failed fetch) so the hook always replays.
-  // `shouldReplay` is true for `hold`. The outbox queuedAt (100) is older than
-  // B (200) — without the fix, the exception would override and publish over B.
-  test(`P1 ${label}: failed-bootstrap hook replay must adopt a newer peer head retained while device was closed, never publish over it`, async () => {
+  test(`C2 ${label} (manager): successful-bootstrap replay without queuedAt must publish above bootstrap head; bootstrapResultHead baseline is the only protection`, async () => {
     let publishCalls = 0;
     const { fireDelay, restore } = makeHookTimerBed();
-    const tauri = installEchoTauri(`pk-p1-${label}`);
+    const tauri = installEchoTauri(`pk-c2m-${label}`);
 
-    const peerHead = tauri.mintHead(
-      makeRemoteStore(),
-      200,
-      `evt-p1-peer-${label}`,
-    );
+    const H50 = tauri.mintHead(makeRemoteStore(), 50, `evt-c2m-h50-${label}`);
 
     let fetchCalls = 0;
+    mock.method(relayClient, "subscribeLive", (_f, cb) =>
+      Promise.resolve(async () => {}),
+    );
     mock.method(relayClient, "fetchEvents", () => {
       fetchCalls++;
-      // Call 1 = bootstrap fetch: fail → bootstrapFailed=true.
-      if (fetchCalls === 1) return Promise.reject(new Error("bootstrap fail"));
-      // Subsequent calls (pre-publish fetch, retry): return peerHead.
-      return Promise.resolve([peerHead]);
+      // Bootstrap fetch: return H50.
+      if (fetchCalls === 1) return Promise.resolve([H50]);
+      // Pre-publish fetch: return H50 (relay unchanged).
+      return Promise.resolve([H50]);
     });
     mock.method(relayClient, "publishEvent", () => {
       publishCalls++;
@@ -107,40 +334,30 @@ export function runWholeBlobCarlSuite({
     });
 
     try {
-      const manager = new Manager(`pk-p1-${label}`, RELAY);
+      const manager = new Manager(`pk-c2m-${label}`, "wss://r.c2m");
       const adopted = [];
       manager.setOnRemoteAdopted((r) => adopted.push(r));
 
-      // Bootstrap fails synchronously.
+      await subscribe(manager, () => {});
       await manager.bootstrap(makeNonEmptyStore());
+      for (let i = 0; i < 20; i++) await Promise.resolve();
 
-      // Hook .then() replays the outbox: publishEdit with isRestoredReplay=true.
-      // The manager sees bootstrapResolved=true and schedules the debounce.
+      // Simulate hook replay WITHOUT queuedAt (undefined = no C1 guard).
+      // Only C2's bootstrapResultHead baseline can prevent adopt here.
       publishReplay(manager, makeEditStore());
 
-      // Debounce fires.
       await fireDelay(2000);
       for (let i = 0; i < 100; i++) await Promise.resolve();
 
-      // The pre-publish fetch returns peerHead (createdAt=200) which is newer
-      // than publishBaseline={0,""}. With the fix: pendingIsRestoredReplay=true
-      // → failed-bootstrap exception is suppressed → normal adopt fires.
-      // Mutation: exception fires → fold peerHead into baseline → publish over it.
       assert.equal(
-        publishCalls,
-        0,
-        `P1 ${label}: restored replay must ADOPT newer peer head, never publish over it`,
+        publishCalls >= 1,
+        true,
+        `C2 ${label}: successful-bootstrap replay (no queuedAt) must PUBLISH above H50 — ` +
+          `drop bootstrapResultHead from publish(_, true) → publishBaseline stays {0,""} → H50 adopted before publish`,
       );
-      assert.equal(
-        adopted.length,
-        1,
-        `P1 ${label}: peer head must be adopted after restored replay`,
-      );
-      assert.equal(
-        manager.getPendingStore(),
-        null,
-        `P1 ${label}: pending cleared after adopt`,
-      );
+      // (The post-publish confirmation may still adopt H50 if our event loses
+      // the LWW confirm race — that is correct separate behaviour. The C2
+      // defect is publish=0 + adopt=1 at the pre-publish fetch step.)
       manager.destroy();
     } finally {
       tauri.restore();
@@ -148,22 +365,29 @@ export function runWholeBlobCarlSuite({
       mock.reset();
     }
   });
+}
 
-  // T-P2a1: blocked bootstrap H100 → click → live H102 decrypts (suppressed by
-  //   hasPendingEdit) → bootstrap resolves H100 → hook .then() replay
-  //   (isRestoredReplay=true) → H102 must be adopted as a genuine advance.
+/**
+ * Manager-layer P2a-1 regression (blocked-bootstrap baseline after hook replay).
+ */
+export function runWholeBlobP2a1Suite({
+  label,
+  Manager,
+  publishEdit,
+  publishReplay,
+  subscribe,
+  makeNonEmptyStore,
+  makeEditStore,
+  makeRemoteStore,
+}) {
+  // T-P2a1 (manager layer): blocked H100 → click → live H102 suppressed →
+  //   bootstrap resolves H100 → publish(_, true) uses canonicalMax(H100,
+  //   bootstrapResultHead=H100) = H100 → pre-publish returns H102 → ADOPT.
   //
-  // This tests that the hook-level replay path (which calls publish with
-  // isRestoredReplay=true) does NOT re-freeze publishBaseline from lastRemoteHead
-  // (which now holds H102 after the live delivery). releaseDeferred already set
-  // publishBaseline = canonicalMax(click-time, H100) = H100 (click-time baseline
-  // was {0,""}). The replay's publish(store, true) must keep that baseline.
-  // Pre-publish fetch returns H102 (createdAt=400 > H100.createdAt=200) →
-  // remoteAdvancedSince(H102, H100) = true → ADOPT.
-  //
-  // Mutation: publish() re-freezes publishBaseline = lastRemoteHead = H102 →
-  // pre-publish sees equality → publishes pre-H102 content over H102 (lose H102).
-  test(`P2a-1 ${label}: hook replay after blocked bootstrap must not re-freeze baseline from live peer head H102; H102 must be adopted`, async () => {
+  // Mutation: set publishBaseline = lastRemoteHead in publish(_, true)
+  //   → publishBaseline = H102 → remoteAdvancedSince(H102, H102) = false
+  //   → publishes pre-H102 content over H102 (H102's changes lost).
+  test(`P2a-1 ${label} (manager): hook replay after blocked bootstrap must keep H100 baseline; H102 must be adopted as genuine advance`, async () => {
     let publishCalls = 0;
     let liveCallback = null;
     let releaseBootstrap = null;
@@ -181,12 +405,10 @@ export function runWholeBlobCarlSuite({
     let fetchCalls = 0;
     mock.method(relayClient, "fetchEvents", () => {
       fetchCalls++;
-      // Call 1 = bootstrap fetch (blocked).
       if (fetchCalls === 1)
         return new Promise((res) => {
           releaseBootstrap = () => res([H100]);
         });
-      // Subsequent (pre-publish fetch): return H102.
       return Promise.resolve([H102]);
     });
     mock.method(relayClient, "publishEvent", () => {
@@ -195,49 +417,30 @@ export function runWholeBlobCarlSuite({
     });
 
     try {
-      const manager = new Manager(`pk-p2a1-${label}`, RELAY);
+      const manager = new Manager(`pk-p2a1-${label}`, "wss://r.carl");
       const adopted = [];
       manager.setOnRemoteAdopted((r) => adopted.push(r));
 
-      // Subscribe to capture live callback.
       await subscribe(manager, () => {});
 
-      // Bootstrap blocked; fresh click BEFORE bootstrap resolves.
-      // (No existing outbox — this simulates a click during the bootstrap window,
-      // with the hook seeing an existing pending edit before .then() runs.)
       const bootstrapPromise = manager.bootstrap(makeNonEmptyStore());
-      // Fresh click: publish(store, isRestoredReplay=false) — normal path, freezes
-      // publishBaseline = {0,""} (lastRemoteHead before any live event).
       publishEdit(manager, makeEditStore());
 
-      // Live H102 arrives BEFORE bootstrap resolves (suppressed by hasPendingEdit).
       while (liveCallback === null) await Promise.resolve();
       liveCallback(H102);
       for (let i = 0; i < 20; i++) await Promise.resolve();
-      // lastRemoteHead is now H102.
 
-      // Bootstrap resolves with H100. releaseDeferred sets publishBaseline =
-      // canonicalMax({0,""}, H100) = H100.
       while (releaseBootstrap === null) await Promise.resolve();
       releaseBootstrap();
       await bootstrapPromise;
       for (let i = 0; i < 50; i++) await Promise.resolve();
-      // bootstrapResolved=true. The timer was scheduled by releaseDeferred.
 
-      // Hook .then() would replay the outbox edit. Simulate: call publish with
-      // isRestoredReplay=true as the hook's .then() callback does.
-      // With the fix: baseline is unchanged (still H100).
-      // With the mutation: publishBaseline is reset to lastRemoteHead=H102.
+      // Simulate hook .then() replay with isRestoredReplay=true.
       publishReplay(manager, makeEditStore());
 
-      // Fire the debounce.
       await fireDelay(2000);
       for (let i = 0; i < 100; i++) await Promise.resolve();
 
-      // Pre-publish returns H102 (createdAt=400 > H100.createdAt=200).
-      // Fix: publishBaseline=H100 → remoteAdvancedSince(H102, H100) = true → ADOPT.
-      // Mutation: publishBaseline=H102 → remoteAdvancedSince(H102, H102) = false
-      //   → publish-over fires, H102's changes lost.
       assert.equal(
         publishCalls,
         0,
@@ -258,15 +461,136 @@ export function runWholeBlobCarlSuite({
 }
 
 /**
- * Register the Carl-round P2b manager-level regression (fetchRemoteBlob
- * decrypt gap — periodic/reconnect path).
+ * Manager-layer C3 regression (confirmRetainedHead decrypt gap).
  *
- * @param {object} opts
- * @param {string} opts.label     — "sections"|"sort"
- * @param {Function} opts.Manager — concrete manager class
- * @param {Function} opts.publishEdit — (manager, store) => void
- * @param {Function} opts.makeEditStore  — () => store
- * @param {Function} opts.makeRemoteStore — () => store
+ * Generation A publishes → confirm fetch finds foreign winner B → without the
+ * fix, canonical tuple advances to B before decrypt; a fresh Click C then
+ * freezes baseline=B; decrypt returns B; stale-gen adopt does not advance state
+ * for C; C's pre-publish fetch sees B == its baseline and publishes pre-B
+ * content OVER B (B's changes lost).
+ *
+ * Fix: advance lastRemoteHead for a foreign winner ONLY after decrypt succeeds.
+ * Mutation: move recordRemoteHead back above decryptAndParse for non-own-ID case.
+ */
+export function runWholeBlobC3Suite({
+  label,
+  Manager,
+  publishEdit,
+  makeEditStore,
+  makeRemoteStore,
+}) {
+  test(`C3 ${label} (manager): confirmRetainedHead must not advance lastRemoteHead before decrypt; click during confirm decrypt gap must not publish over foreign winner`, async () => {
+    let publishCalls = 0;
+    const { fireDelay, restore } = makeHookTimerBed();
+    const tauri = installEchoTauri(`pk-c3-${label}`);
+
+    // B: the foreign winner — createdAt=200 (must be > A's publish timestamp).
+    // A's publish timestamp = clampPublishCreatedAt(0) = max(floor(Date.now/1000), 1).
+    // We mock Date.now to return 50s so A's createdAt=50 < B's createdAt=200.
+    const B = tauri.mintHead(makeRemoteStore(), 200, `evt-c3-b-${label}`);
+    const origDateNow = Date.now;
+    Date.now = () => 50 * 1_000; // A publishes at createdAt=50
+
+    let releaseDecrypt = null;
+    const orig = globalThis.window.__TAURI_INTERNALS__;
+    let decryptCallCount = 0;
+    globalThis.window.__TAURI_INTERNALS__ = {
+      invoke: (cmd, args) => {
+        if (cmd === "nip44_decrypt_from_self") {
+          decryptCallCount++;
+          // The first decrypt call is from confirmRetainedHead — both bootstrap
+          // and pre-publish preflight return absent so no decrypt fires there.
+          // Gate the very first decrypt call (confirmRetainedHead's foreign winner).
+          if (decryptCallCount === 1) {
+            return new Promise((res, rej) => {
+              if (releaseDecrypt === null) {
+                // First gated call — park it.
+                releaseDecrypt = () =>
+                  orig.invoke(cmd, args).then(res).catch(rej);
+              } else {
+                // Subsequent calls resolve immediately.
+                orig.invoke(cmd, args).then(res).catch(rej);
+              }
+            });
+          }
+          return orig.invoke(cmd, args);
+        }
+        return orig.invoke(cmd, args);
+      },
+    };
+
+    let fetchCalls = 0;
+    let publishedEventId = null;
+    mock.method(relayClient, "fetchEvents", () => {
+      fetchCalls++;
+      // 1: bootstrap fetch — absent (no remote, so bootstrap result = {0,""}).
+      if (fetchCalls === 1) return Promise.resolve([]);
+      // 2: pre-publish preflight — absent (no head, publish proceeds).
+      if (fetchCalls === 2) return Promise.resolve([]);
+      // 3: confirmRetainedHead — returns foreign winner B (not our event).
+      return Promise.resolve([B]);
+    });
+    mock.method(relayClient, "publishEvent", (evt) => {
+      publishedEventId = evt.id ?? `our-evt-${publishCalls}`;
+      publishCalls++;
+      return Promise.resolve();
+    });
+
+    try {
+      const manager = new Manager(`pk-c3-${label}`, "wss://r.c3");
+      const adopted = [];
+      manager.setOnRemoteAdopted((r) => adopted.push(r));
+
+      // Bootstrap: absent. baseline stays {0,""}.
+      await manager.bootstrap(makeEditStore());
+
+      // Click A: publish starts.
+      publishEdit(manager, makeEditStore());
+      await fireDelay(2000);
+      // Let publish + confirm fetch start, then park on the confirm decrypt.
+      for (let i = 0; i < 30; i++) await Promise.resolve();
+
+      assert.ok(
+        releaseDecrypt !== null,
+        "confirm decrypt gate must have been hit (fetchCalls >= 3 and decrypt started)",
+      );
+
+      // Click C: arrives DURING the confirm decrypt gap. With mutation:
+      // lastRemoteHead was already advanced to B → publishBaseline = B.
+      // Pre-publish fetch returns B → remoteAdvancedSince(B, B) = false
+      //   → publishes pre-B content OVER B.
+      // With fix: lastRemoteHead = {0,""} → publishBaseline = {0,""}.
+      // Pre-publish fetch returns B → remoteAdvancedSince(B, {0,""}) = true
+      //   → ADOPT (B is a genuine advance; do not publish over it).
+      publishEdit(manager, makeEditStore());
+
+      releaseDecrypt();
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+
+      await fireDelay(2000);
+      for (let i = 0; i < 100; i++) await Promise.resolve();
+
+      // With fix: Click C's pre-publish fetch sees B as a genuine advance and
+      // adopts it. publishCalls = 1 (A's publish only; C is adopted).
+      // With mutation: publishCalls = 2 (A publishes, C also publishes over B).
+      assert.equal(
+        publishCalls,
+        1,
+        `C3 ${label}: click during confirmRetainedHead decrypt gap must NOT publish over foreign winner — ` +
+          `move recordRemoteHead before decrypt → C baseline=B → C publishes over B`,
+      );
+      manager.destroy();
+    } finally {
+      globalThis.window.__TAURI_INTERNALS__ = orig;
+      Date.now = origDateNow;
+      restore();
+      mock.reset();
+    }
+  });
+}
+
+/**
+ * Manager-layer P2b regression (fetchRemoteBlob decrypt-gap).
  */
 export function runWholeBlobP2bSuite({
   label,
@@ -275,48 +599,21 @@ export function runWholeBlobP2bSuite({
   makeEditStore,
   makeRemoteStore,
 }) {
-  // T-P2b: periodic/reconnect fetchRemoteBlob records lastRemoteHead BEFORE
-  //   decryptAndParse; a concurrent click (whose publish() fires during the
-  //   async decrypt gap) freezes publishBaseline against the pre-decrypt head;
-  //   the pre-publish fetch returns the same head; no advance → publish-over.
-  //
-  // Sequence:
-  //   1. fetchRemoteBlob is in-flight, has fetched the event but has not yet
-  //      decrypted it. Before the fix, recordRemoteHead(event.id) fires here →
-  //      lastRemoteHead advances to H.
-  //   2. User click: publish() freezes publishBaseline = lastRemoteHead = H.
-  //   3. decryptAndParse resolves → store updated to H's content.
-  //   4. Debounce fires. fetchOwnBlobBeforePublish returns H.
-  //      remoteAdvancedSince(H, H) = false → publishes. BUT: our store is the
-  //      click's intent, NOT H's content + click merged in → H's remote-only
-  //      changes are lost.
-  //   With the fix: recordRemoteHead deferred to after decrypt → at step 2
-  //   lastRemoteHead is still {createdAt: 0} → publishBaseline={0,""} → at
-  //   step 4 remoteAdvancedSince(H, {0,""}) = true → ADOPT (or use exception
-  //   path for a failed-bootstrap scenario). Either way, the clicked edit
-  //   doesn't silently overwrite H's remote-only changes.
-  //
-  // This test exercises the race by controlling the decrypt resolution.
-  test(`P2b ${label}: fetchRemoteBlob must not advance lastRemoteHead before decryptAndParse succeeds; click during decrypt gap must not publish over fetched head`, async () => {
+  test(`P2b ${label} (manager): fetchRemoteBlob must not advance lastRemoteHead before decryptAndParse succeeds; click during decrypt gap must not publish over fetched head`, async () => {
     let publishCalls = 0;
     const { fireDelay, restore } = makeHookTimerBed();
     const tauri = installEchoTauri(`pk-p2b-${label}`);
 
-    // H: the pre-existing relay head with some remote-only content.
     const H = tauri.mintHead(makeRemoteStore(), 200, `evt-p2b-h-${label}`);
 
-    // A controlled decrypt gate: we resolve the decrypt promise AFTER the click.
     let releaseDecrypt = null;
-    const origInvoke = globalThis.window?.__TAURI_INTERNALS__?.invoke;
     const orig = globalThis.window.__TAURI_INTERNALS__;
-    // Wrap decrypt: the first call (for H in fetchRemoteBlob) is gated.
     let decryptCallCount = 0;
     globalThis.window.__TAURI_INTERNALS__ = {
       invoke: (cmd, args) => {
         if (cmd === "nip44_decrypt_from_self") {
           decryptCallCount++;
           if (decryptCallCount === 1) {
-            // First decrypt (fetchRemoteBlob's call for H): hold it.
             return new Promise((res, rej) => {
               releaseDecrypt = () =>
                 orig.invoke(cmd, args).then(res).catch(rej);
@@ -331,11 +628,8 @@ export function runWholeBlobP2bSuite({
     let fetchCalls = 0;
     mock.method(relayClient, "fetchEvents", () => {
       fetchCalls++;
-      // Bootstrap fetch: absent (no remote head at mount).
       if (fetchCalls === 1) return Promise.resolve([]);
-      // fetchRemoteBlob (periodic/reconnect) call: return H.
       if (fetchCalls === 2) return Promise.resolve([H]);
-      // Pre-publish fetch: return H (relay still has H as head).
       return Promise.resolve([H]);
     });
     mock.method(relayClient, "publishEvent", () => {
@@ -344,38 +638,22 @@ export function runWholeBlobP2bSuite({
     });
 
     try {
-      const manager = new Manager(`pk-p2b-${label}`, RELAY);
+      const manager = new Manager(`pk-p2b-${label}`, "wss://r.carl");
       const adopted = [];
       manager.setOnRemoteAdopted((r) => adopted.push(r));
 
-      // Bootstrap: absent → bootstrapFailed=false, publishBaseline={0,""}.
       await manager.bootstrap(makeEditStore());
 
-      // Trigger a fetchRemoteBlob (simulates the periodic/reconnect path).
-      // This call will block at the decrypt await.
       const fetchPromise = manager.fetchRemoteBlob();
-      // Wait for the fetch to have collected the event but not yet decrypted.
-      // The fetch awaits decryptAndParse at this point.
       for (let i = 0; i < 10; i++) await Promise.resolve();
 
-      // Click during the decrypt gap.
-      // With the fix: lastRemoteHead still {createdAt:0} (decrypt not done yet)
-      //   → publishBaseline = {0,""}.
-      // With the mutation: lastRemoteHead = {200, H.id} (pre-decrypt record)
-      //   → publishBaseline = {200, H.id}.
       publishEdit(manager, makeEditStore());
 
-      // Release the decrypt.
       assert.ok(releaseDecrypt !== null, "decrypt gate must have been hit");
       releaseDecrypt();
       await fetchPromise;
       for (let i = 0; i < 20; i++) await Promise.resolve();
 
-      // Debounce fires. Pre-publish fetch returns H (createdAt=200, same id).
-      // With the fix: publishBaseline={0,""} → remoteAdvancedSince(H,{0,""})=true
-      //   → bootstrapFailed=false so no exception → normal ADOPT.
-      // With the mutation: publishBaseline=H → remoteAdvancedSince(H,H)=false
-      //   → publish fires, H's remote-only content silently lost.
       await fireDelay(2000);
       for (let i = 0; i < 100; i++) await Promise.resolve();
 

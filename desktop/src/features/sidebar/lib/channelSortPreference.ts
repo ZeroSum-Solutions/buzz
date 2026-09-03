@@ -160,12 +160,14 @@ export function writeChannelSortOutbox(
   pubkey: string,
   store: ChannelSortStore,
   relayUrl: string,
+  nowSecs?: number,
 ): boolean {
   return writeOwnOutbox(
     OUTBOX_KEY_PREFIX,
     pubkey,
     relayUrl,
     boundChannelSortStore(store),
+    nowSecs,
   );
 }
 
