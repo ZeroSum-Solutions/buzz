@@ -170,12 +170,13 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
         let route_mode = upload_route_mode(parts.uri.path())?;
 
         // 2. Extract and validate Blossom auth event against the bound host.
+        // Derive strictness from NIP-FI mode: strict rules apply in active (non-Off) modes.
+        // Off mode preserves the pre-NIP-FI permissive behavior [FI-INV-15].
         let auth_event = extract_blossom_auth(headers)?;
-        // Use the permissive window (3600s) here because we don't know the
-        // content type yet.  The upload functions re-verify with the correct
-        // per-type window (600s for images, 3600s for video) after the body
-        // has been consumed and the SHA-256 computed.
-        buzz_media::auth::verify_blossom_auth_event(&auth_event, Some(tenant.host()), 3600)?;
+        let strictness = blossom_strictness_from_state(state);
+        // Pre-body strictness check: verify freshness, cardinality, and server tag before
+        // the body is consumed. The x-tag hash binding is checked after body completion.
+        buzz_media::auth::verify_blossom_auth_event(&auth_event, Some(tenant.host()), strictness)?;
 
         // 3. Require X-SHA-256 header (BUD-11: mandatory for PUT /upload)
         let claimed_hash = headers
@@ -533,7 +534,13 @@ async fn authenticate_media_read(
 
     let auth_event = extract_blossom_auth(headers)?;
     let sha256 = sha256_ext.split('.').next().unwrap_or(sha256_ext);
-    buzz_media::auth::verify_blossom_get_auth(&auth_event, sha256, Some(tenant.host()), 3600)?;
+    let strictness = blossom_strictness_from_state(state);
+    buzz_media::auth::verify_blossom_get_auth(
+        &auth_event,
+        sha256,
+        Some(tenant.host()),
+        strictness,
+    )?;
 
     let auth_tag = crate::api::relay_members::extract_auth_tag_header(headers);
     crate::api::relay_members::enforce_relay_membership(
@@ -985,13 +992,29 @@ async fn resolve_s3_key(
 /// Extract and verify a kind:24242 Blossom auth event from the `Authorization` header.
 ///
 /// Accepts both base64url (BUD-11 spec) and standard base64 (nostr-tools compat).
+///
+/// Per NIP-FI §Transport and cardinality:
+///   - Missing `Authorization` → `missing_evidence` (401 via `MediaError::MissingAuth`)
+///   - Repeated, comma-combined, empty, malformed, or wrong-scheme → `evidence_rejected`
+///     (403 via `MediaError::InvalidAuthScheme` / `MediaError::DuplicateTag("Authorization")`)
 fn extract_blossom_auth(headers: &HeaderMap) -> Result<nostr::Event, MediaError> {
     use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 
-    let header = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .ok_or(MediaError::MissingAuth)?;
+    // NIP-FI: repeated or comma-combined Authorization → evidence_rejected (403).
+    // HeaderMap::get_all returns all values for the key; more than one is malformed.
+    let mut auth_values = headers.get_all("authorization").iter();
+    let first = auth_values.next().ok_or(MediaError::MissingAuth)?;
+    if auth_values.next().is_some() {
+        // More than one Authorization header value → evidence_rejected
+        return Err(MediaError::DuplicateTag("Authorization"));
+    }
+
+    let header = first.to_str().map_err(|_| MediaError::InvalidAuthScheme)?;
+
+    // Reject empty or whitespace-only Authorization values
+    if header.trim().is_empty() {
+        return Err(MediaError::InvalidAuthScheme);
+    }
 
     let token = header
         .strip_prefix("Nostr ")
@@ -1006,6 +1029,23 @@ fn extract_blossom_auth(headers: &HeaderMap) -> Result<nostr::Event, MediaError>
         serde_json::from_slice(&json_bytes).map_err(|_| MediaError::InvalidAuthEvent)?;
 
     Ok(event)
+}
+
+/// Derive `BlossomStrictness` from the current NIP-FI mode stored in `AppState`.
+///
+/// This is the bridge between the relay's mode configuration and the
+/// `buzz-media` verifier. When #7264 is merged and `config.nip_fi` is
+/// present, strict rules apply in any non-Off mode (Enforce, DenyProtected).
+/// Off mode preserves the pre-NIP-FI permissive verifier behavior [FI-INV-15].
+///
+/// On `origin/main` (before #7264 merges), `AppState` has no `nip_fi` field —
+/// the relay defaults to Permissive. The TODO below tracks the wiring to remove
+/// after #7264 lands.
+fn blossom_strictness_from_state(_state: &AppState) -> buzz_media::auth::BlossomStrictness {
+    // TODO(#7264): replace with `state.config.nip_fi.is_enforce()` once
+    // NipFiRelayConfig is wired into AppState by #7264. Until then, all
+    // deployments use Permissive (preserving existing behavior).
+    buzz_media::auth::BlossomStrictness::Permissive
 }
 
 #[cfg(test)]

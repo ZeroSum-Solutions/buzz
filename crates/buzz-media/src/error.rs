@@ -26,6 +26,9 @@ pub enum MediaError {
     InvalidAuthVerb,
     #[error("missing required tag: {0}")]
     MissingTag(&'static str),
+    /// A tag that must appear exactly once appeared more than once.
+    #[error("duplicate tag: {0}")]
+    DuplicateTag(&'static str),
     #[error("hash mismatch")]
     HashMismatch,
     #[error("server mismatch")]
@@ -119,16 +122,32 @@ impl IntoResponse for MediaError {
             Self::FileTooLarge { .. } | Self::ImageTooLarge => {
                 (StatusCode::PAYLOAD_TOO_LARGE, self.to_string())
             }
-            // All authentication failures return the same generic 401 to prevent oracle enumeration.
-            // InsufficientScope is intentionally 403 — it's an authorization (not authentication)
-            // failure and is safe to distinguish since it requires a valid identity first.
-            Self::MissingAuth
-            | Self::InvalidAuthScheme
+            // NIP-FI denial-class split (NIP-FI §Transport and cardinality):
+            //   missing_evidence  (401) — Authorization header absent
+            //   evidence_rejected (403) — wrong scheme, malformed, duplicate, or
+            //                            otherwise structurally invalid proof
+            //
+            // All other authentication failures (signature invalid, expired,
+            // timestamp out of window, hash mismatch, etc.) return 401 to
+            // prevent oracle enumeration — they are indistinguishable from an
+            // absent identity to an unauthenticated caller.
+            Self::MissingAuth => {
+                tracing::warn!(error = %self, "authentication failed: missing evidence");
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "authentication failed".to_string(),
+                )
+            }
+            Self::InvalidAuthScheme
             | Self::InvalidBase64
             | Self::InvalidAuthEvent
-            | Self::InvalidSignature
             | Self::InvalidAuthKind
             | Self::InvalidAuthVerb
+            | Self::DuplicateTag(_) => {
+                tracing::warn!(error = %self, "authentication failed: evidence rejected");
+                (StatusCode::FORBIDDEN, "authorization denied".to_string())
+            }
+            Self::InvalidSignature
             | Self::TokenExpired
             | Self::TimestampOutOfWindow
             | Self::Unauthorized

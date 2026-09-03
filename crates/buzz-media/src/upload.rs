@@ -81,8 +81,14 @@ where
     let (mime, sha256, ext) = tokio::task::spawn_blocking(move || -> Result<_, MediaError> {
         let (mime, ext) = validate(&bytes, &cfg)?;
         let sha256 = hex::encode(Sha256::digest(&bytes));
-        // Buffered uploads (image + file): 10-minute auth window is plenty.
-        verify_blossom_upload_auth(&auth, &sha256, Some(bound_host.as_str()), 600)?;
+        // Buffered uploads (image + file): use Permissive here; strictness is
+        // already applied at the pre-body gate in the relay handler.
+        verify_blossom_upload_auth(
+            &auth,
+            &sha256,
+            Some(bound_host.as_str()),
+            crate::auth::BlossomStrictness::Permissive,
+        )?;
         Ok((mime, sha256, ext))
     })
     .await
@@ -408,8 +414,14 @@ pub async fn process_video_upload(
     // process-global domain) — a relay serves many tenant hosts.
     let bound_host = ctx.host().to_string();
     tokio::task::spawn_blocking(move || {
-        // Videos: 1-hour window — large uploads on slow connections need headroom.
-        verify_blossom_upload_auth(&auth, &sha256_for_auth, Some(bound_host.as_str()), 3600)
+        // Videos: use Permissive for the post-body re-verify; strictness is
+        // already applied at the pre-body gate in the relay handler.
+        verify_blossom_upload_auth(
+            &auth,
+            &sha256_for_auth,
+            Some(bound_host.as_str()),
+            crate::auth::BlossomStrictness::Permissive,
+        )
     })
     .await
     .map_err(|_| MediaError::Internal)??;

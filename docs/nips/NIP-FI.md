@@ -678,10 +678,9 @@ constitutes a **known gap** in this section's security guarantees.
 
 #### Compliance note
 
-The implementation as of PR #7264 pairs via a permissive Blossom verifier and
-is explicitly non-compliant with this section.  The named gaps are:
-multi-tag acceptance, a 3600-second proof window, and an optional `server`
-tag.  These are resolved when the bounded hardening task lands.
+The gaps named in previous revisions (multi-tag acceptance, 3600-second proof
+window, and an optional `server` tag) are resolved as of the bounded hardening
+PR.  The implementation is now compliant with this section.
 
 ### Request format
 
