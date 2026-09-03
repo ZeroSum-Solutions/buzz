@@ -220,6 +220,9 @@ pub async fn apply_workspace(
             .lock()
             .map_err(|e| e.to_string())?;
         state
+            .managed_agent_authority_ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        state
             .private_managed_agent_overlay
             .lock()
             .map_err(|e| e.to_string())?

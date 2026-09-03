@@ -20,8 +20,8 @@ use crate::{app_state::AppState, managed_agents::ManagedAgentRecord};
 /// [`agent_event_content`] projection — the retention upsert's content-equality
 /// guard compares this projection, so an operational start/stop that mutates
 /// only runtime fields produces an identical row and never re-enqueues a
-/// publish. Best-effort: a failure here is logged and swallowed so a retention
-/// hiccup never blocks the disk-authoritative write.
+/// publish. Retention failures propagate: disk persistence alone is not a
+/// successful relay-primary configuration write.
 ///
 /// Also writes the just-retained kind:30179 head back through to the in-memory
 /// overlay. This is the ONLY path by which the overlay learns config this
@@ -36,10 +36,11 @@ pub(crate) fn retain_managed_agent_pending(
     app: &AppHandle,
     state: &AppState,
     record: &ManagedAgentRecord,
-) {
+) -> Result<(), String> {
     use crate::managed_agents::{reconcile::retain_agent_record, retention::open_retention_db};
 
-    let result = (|| -> Result<(), String> {
+    (|| -> Result<(), String> {
+        crate::managed_agents::private_config_overlay::require_authority_ready(state)?;
         let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
         let conn = open_retention_db(&scope.db_path)?;
         // Shared engine with the boot-time reconcile: projection content diff
@@ -51,61 +52,22 @@ pub(crate) fn retain_managed_agent_pending(
             .lock()
             .map_err(|error| error.to_string())?
             .absorb_retained_head(&conn, &scope.owner_keys, &record.pubkey)
-    })();
-    if let Err(e) = result {
-        eprintln!("buzz-desktop: agent-retain: {e}");
-    }
+    })()
 }
 
-/// Purge a deleted agent's pending row and enqueue a NIP-09 tombstone, both
-/// inside the `managed_agents_store_lock`-held delete body and NEVER across an
-/// `.await`.
-///
-/// Mirrors `commands::personas::tombstone_persona_pending`: the agent row at
-/// `(30177, owner, agent_pubkey)` is purged first so an unpublished edit can
-/// never resurrect it after the tombstone publishes, then the kind:5 tombstone
-/// is retained at its own `(5, owner, agent_pubkey)` coordinate with
-/// `pending_sync = 1`. The `d_tag` is the agent's pubkey. Best-effort: a
-/// failure is logged and swallowed so a retention hiccup never blocks the
-/// disk-authoritative delete. Removes BOTH the public (30177) and private
-/// (30179) retained heads and enqueues both tombstones plus the NIP-IA archive
-/// request in one transaction ([`tombstone_managed_agent_at`]).
-pub(crate) fn tombstone_managed_agent_pending(
-    app: &AppHandle,
+/// Durably prepare deletion BEFORE removing JSON or key material.
+/// Caller holds the store lock. Tombstones, archive, head purge, and exact
+/// cleanup intent commit together; cleanup completion clears only the intent.
+pub(crate) fn tombstone_managed_agent_pending<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
     agent_pubkey: &str,
-) {
-    let result = (|| -> Result<(), String> {
-        let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
-        tombstone_managed_agent_at(&scope.db_path, &scope.owner_keys, agent_pubkey)
-    })();
-    if let Err(e) = result {
-        eprintln!("buzz-desktop: agent-tombstone: {e}");
-    }
+) -> Result<(), String> {
+    let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
+    tombstone_managed_agent_at(&scope.db_path, &scope.owner_keys, agent_pubkey)
 }
 
-/// Scope-free core of [`tombstone_managed_agent_pending`], so the atomic
-/// purge-and-enqueue and its future-dated-head domination can be asserted
-/// directly against a retention database (mirrors
-/// `personas::tombstone_persona_at`).
-///
-/// Enqueues THREE durable effects for the deleted agent in ONE transaction: the
-/// NIP-09 kind:5 tombstones for the public kind:30177 head AND the owner-encrypted
-/// kind:30179 private-config head (the two are one record locally, so both
-/// coordinates must die together or a surviving 30179 head rematerializes the
-/// deleted secret-bearing config at the next boot hydration), AND the NIP-IA
-/// kind:9035 archive request that stops the identity appearing in member
-/// pickers. The tombstone and archive were previously two
-/// independent best-effort calls — a crash between them could tombstone the
-/// 30177 head while leaving the identity live, with no boot path to reconstruct
-/// the archive. The archive's `persona_id` payload is derived from the retained
-/// 30177 head's content (where it lives as owner-signed historical alias data),
-/// NOT the deleted record. Unlike personas/teams, managed agents are NOT
-/// re-enqueued by the boot deletion sweep ([`crate::event_sync`]) — a retained
-/// 30177 head with no local record is the normal cross-device state, so a crash
-/// after the disk-authoritative record is removed but before this
-/// tombstone+archive transaction commits leaves agent deletion-retry a
-/// pre-existing gap owned by this direct delete path alone.
+/// Atomic scope-bound tombstones/archive and recoverable cleanup intent.
 pub(crate) fn tombstone_managed_agent_at(
     db_path: &std::path::Path,
     keys: &nostr::Keys,
@@ -128,6 +90,13 @@ pub(crate) fn tombstone_managed_agent_at(
 
     let owner_pubkey = keys.public_key().to_hex();
     let conn = open_retention_db(db_path)?;
+    if crate::managed_agents::retention::deletion_intent::pending(
+        &conn,
+        &owner_pubkey,
+        agent_pubkey,
+    )? {
+        return Ok(());
+    }
     // Single transaction: a kill between the head purge and the tombstone
     // enqueue would otherwise leave the 30177 head live with no local retry
     // witness. Reading the head's `created_at` inside the same `BEGIN
@@ -189,6 +158,12 @@ pub(crate) fn tombstone_managed_agent_at(
                 },
             )?;
         }
+        crate::managed_agents::retention::deletion_intent::record(
+            &conn,
+            &owner_pubkey,
+            agent_pubkey,
+            deleted_at.as_secs() as i64,
+        )?;
         retain_event(
             &conn,
             &RetainedEvent {
@@ -308,6 +283,33 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn local_tombstone_prepares_exact_cleanup_and_retry_does_not_reauthor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retention.db");
+        let keys = nostr::Keys::generate();
+        let owner = keys.public_key().to_hex();
+        seed_agent_head(&path, &owner, 10);
+        tombstone_managed_agent_at(&path, &keys, AGENT_PUBKEY).unwrap();
+        let conn = open_retention_db(&path).unwrap();
+        assert_eq!(
+            crate::managed_agents::retention::deletion_intent::agents(&conn, &owner).unwrap(),
+            vec![AGENT_PUBKEY]
+        );
+        let before: Vec<_> = get_pending_sync(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.raw_event)
+            .collect();
+        tombstone_managed_agent_at(&path, &keys, AGENT_PUBKEY).unwrap();
+        let after: Vec<_> = get_pending_sync(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.raw_event)
+            .collect();
+        assert_eq!(before, after, "retry must not mint a newer deletion");
     }
 
     #[test]

@@ -23,7 +23,7 @@ mod inbound_tests;
 mod catalog_reconcile_tests;
 
 #[derive(Debug)]
-enum InboundRuntimeRefresh {
+pub(super) enum InboundRuntimeRefresh {
     Local {
         pubkey: String,
         relay_urls: Vec<String>,
@@ -144,7 +144,7 @@ pub async fn reconcile_inbound_persona_event(
     Ok(())
 }
 
-fn reconcile_inbound_persona_event_blocking<R: tauri::Runtime>(
+pub(super) fn reconcile_inbound_persona_event_blocking<R: tauri::Runtime>(
     event_json: String,
     arrival_relay_url: String,
     app: AppHandle<R>,
@@ -572,7 +572,7 @@ fn parse_verified_inbound_event(event_json: &str) -> Result<nostr::Event, String
 /// Parse a NIP-09 `a`-tag coordinate `<kind>:<owner_pubkey>:<d_tag>` into its
 /// target kind and d-tag. Returns `None` if the tag is absent or malformed, so
 /// the caller no-ops on a tombstone it can't route.
-fn parse_deletion_coordinate(event: &nostr::Event) -> Option<(u32, String)> {
+pub(super) fn parse_deletion_coordinate(event: &nostr::Event) -> Option<(u32, String)> {
     event.tags.iter().find_map(|tag| {
         let values: Vec<&str> = tag.as_slice().iter().map(|s| s.as_str()).collect();
         if values.first() != Some(&"a") {
@@ -711,14 +711,15 @@ fn reconcile_inbound_tombstone<R: tauri::Runtime>(
     app: &AppHandle<R>,
     state: &AppState,
 ) -> Result<(), String> {
-    use crate::managed_agents::{
-        load_managed_agents, load_teams, retention::open_retention_db, save_managed_agents,
-        save_teams,
-    };
+    use crate::managed_agents::{load_teams, retention::open_retention_db, save_teams};
     use buzz_core_pkg::kind::{
         KIND_MANAGED_AGENT, KIND_PERSONA, KIND_PRIVATE_MANAGED_AGENT, KIND_TEAM, KIND_TEAM_CATALOG,
     };
 
+    let _transition_guard = state
+        .managed_agent_runtime_transition
+        .lock()
+        .map_err(|error| error.to_string())?;
     let _store_guard = state
         .managed_agents_store_lock
         .lock()
@@ -761,14 +762,13 @@ fn reconcile_inbound_tombstone<R: tauri::Runtime>(
                 save_teams(app, &teams)
             }
             KIND_MANAGED_AGENT | KIND_PRIVATE_MANAGED_AGENT => {
-                state
-                    .private_managed_agent_overlay
-                    .lock()
-                    .map_err(|error| error.to_string())?
-                    .remove(target_d_tag);
-                let mut agents = load_managed_agents(app)?;
-                agents.retain(|record| record.pubkey != target_d_tag);
-                save_managed_agents(app, &agents)
+                crate::managed_agents::deletion_recovery::finish(
+                    app,
+                    state,
+                    &conn,
+                    &scope.owner_keys.public_key().to_hex(),
+                    target_d_tag,
+                )
             }
             // A 30178 catalog head has no local JSON record — it lives only in
             // the retention store as this device's publication witness. The
@@ -778,6 +778,17 @@ fn reconcile_inbound_tombstone<R: tauri::Runtime>(
             _ => unreachable!("target kind gated above"),
         },
     )?;
+    if event.pubkey == scope.owner_keys.public_key() {
+        if let Some((KIND_MANAGED_AGENT | KIND_PRIVATE_MANAGED_AGENT, agent)) =
+            parse_deletion_coordinate(event)
+        {
+            state
+                .private_managed_agent_overlay
+                .lock()
+                .map_err(|e| e.to_string())?
+                .refresh_config_authority(&conn, &scope.owner_keys, &agent)?;
+        }
+    }
     let Some((target_kind, target_d_tag)) = resolved else {
         return Ok(());
     };

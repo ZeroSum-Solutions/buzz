@@ -136,7 +136,7 @@ pub(crate) async fn deploy_to_provider(
     if result.is_ok() {
         // Author the settlement as the next 30179 head and write it through
         // to the overlay, exactly like every other edit this device makes.
-        super::retain_managed_agent_pending(app, state, &settled);
+        super::retain_managed_agent_pending(app, state, &settled)?;
     }
     result
 }

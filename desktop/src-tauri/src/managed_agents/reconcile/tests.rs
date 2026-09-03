@@ -717,5 +717,88 @@ fn retain_agent_record_is_noop_when_unchanged() {
     );
 }
 
+/// `effort_level` is the single persisted effort authority (main #4625). A
+/// follower device must run the leader's effort, so the private payload has to
+/// carry it and an effort-only edit has to publish a successor head.
+#[test]
+fn effort_level_is_portable_in_private_config() {
+    let dir = TempDir::new().unwrap();
+    let owner_keys = nostr::Keys::generate();
+    let agent_keys = nostr::Keys::generate();
+    let pubkey = agent_keys.public_key().to_hex();
+    let owner_hex = owner_keys.public_key().to_hex();
+    let mut record = sample_record(&pubkey, "effort-agent");
+    record.private_key_nsec = agent_keys.secret_key().to_bech32().unwrap();
+    record.effort_level = Some("high".into());
+    let conn = open_retention_db(&dir.path().join("retention.db")).unwrap();
+
+    let decrypt_head = |conn: &rusqlite::Connection| {
+        let row = get_retained_event(conn, KIND_PRIVATE_MANAGED_AGENT, &owner_hex, &pubkey)
+            .unwrap()
+            .unwrap();
+        let event = nostr::Event::from_json(&row.raw_event).unwrap();
+        private_managed_agent::validate_and_decrypt(&event, &owner_keys)
+            .unwrap()
+            .1
+    };
+
+    assert!(retain_agent_record(&conn, &owner_keys, &record).unwrap());
+    let payload = decrypt_head(&conn);
+    assert_eq!(payload.config.effort_level.as_deref(), Some("high"));
+
+    record.effort_level = Some("low".into());
+    assert!(
+        retain_agent_record(&conn, &owner_keys, &record).unwrap(),
+        "an effort-only edit must publish a successor head"
+    );
+    let payload = decrypt_head(&conn);
+    assert_eq!(payload.generation, 2);
+    assert_eq!(payload.config.effort_level.as_deref(), Some("low"));
+}
+
+mod field_classification_tests;
 mod self_authored_overlay_tests;
 mod stale_republish_tests;
+
+#[test]
+fn public_recreation_does_not_boot_mint_deleted_private_settings() {
+    let dir = TempDir::new().unwrap();
+    let owner_keys = nostr::Keys::generate();
+    let owner = owner_keys.public_key().to_hex();
+    let agent_keys = nostr::Keys::generate();
+    let pubkey = agent_keys.public_key().to_hex();
+    let mut record = sample_record(&pubkey, "public recreation");
+    record.private_key_nsec = agent_keys.secret_key().to_bech32().unwrap();
+    record
+        .env_vars
+        .insert("API_TOKEN".into(), "deleted private credential".into());
+    let conn = open_retention_db(&dir.path().join("retention.db")).unwrap();
+    retain_event(
+        &conn,
+        &RetainedEvent {
+            kind: 5,
+            pubkey: owner.clone(),
+            d_tag: crate::managed_agents::retention::tombstone_retention_d_tag(
+                KIND_PRIVATE_MANAGED_AGENT,
+                &pubkey,
+            ),
+            content: String::new(),
+            created_at: 1,
+            raw_event: "{}".into(),
+            pending_sync: false,
+        },
+    )
+    .unwrap();
+    retain_agent_record_at_boot(&conn, &owner_keys, &record).unwrap();
+    assert!(
+        get_retained_event(&conn, KIND_MANAGED_AGENT, &owner, &pubkey)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        get_retained_event(&conn, KIND_PRIVATE_MANAGED_AGENT, &owner, &pubkey)
+            .unwrap()
+            .is_none(),
+        "public recreation cannot restore deleted private config from disk at boot"
+    );
+}

@@ -40,6 +40,8 @@ pub const MAX_ENV_VALUE_BYTES: usize = 16_384;
 pub const MAX_AGENT_ARGS: usize = 256;
 /// Maximum UTF-8 bytes in one argument.
 pub const MAX_AGENT_ARG_BYTES: usize = 8_192;
+/// Maximum UTF-8 bytes in a portable effort level (a short runtime keyword).
+pub const MAX_EFFORT_LEVEL_BYTES: usize = 256;
 /// Maximum serialized bytes accepted for an extension/recovery/config value.
 pub const MAX_VALUE_BYTES: usize = 32_768;
 
@@ -154,6 +156,12 @@ pub struct PrivateConfig {
     /// Versioned provider/definition relay-mesh marker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_mesh: Option<Value>,
+    /// Canonical harness-agnostic effort level (`ManagedAgentRecord.effort_level`).
+    /// Carried verbatim; each device normalizes it against the destination
+    /// runtime at spawn. `None` = inherit. Absent in payloads authored before
+    /// this field existed, which deserialize as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_level: Option<String>,
     /// Unknown JSON members preserved verbatim for forward compatibility.
     ///
     /// A newer Desktop may author config keys this version does not model; they
@@ -424,6 +432,13 @@ fn validate_identity_and_config(
     }
     if config.name.is_empty() || config.name.len() > 4096 {
         return Err(Error::InvalidPayload("invalid name length".into()));
+    }
+    if config
+        .effort_level
+        .as_deref()
+        .is_some_and(|effort| effort.len() > MAX_EFFORT_LEVEL_BYTES)
+    {
+        return Err(Error::InvalidPayload("invalid effort_level length".into()));
     }
     if config.agent_args.len() > MAX_AGENT_ARGS
         || config
@@ -696,6 +711,7 @@ mod tests {
                 team_id: None,
                 persona_name_in_team: None,
                 relay_mesh: None,
+                effort_level: None,
                 extra: serde_json::Map::new(),
             },
             extensions: BTreeMap::new(),
@@ -774,6 +790,37 @@ mod tests {
         let mut candidate = payload(&owner, &Keys::generate());
         candidate.config.relay_url.clear();
         validate_payload(&candidate).unwrap();
+    }
+
+    // `effort_level` is a typed portable field: it round-trips through the
+    // owner-self codec, is bounded, and a pre-field payload (key absent)
+    // decodes to `None` rather than being rejected.
+    #[test]
+    fn effort_level_is_typed_bounded_and_backward_compatible() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let mut expected = payload(&owner, &agent);
+        expected.config.effort_level = Some("high".into());
+        let event = build_event(&owner, &expected, 1_785_780_000).unwrap();
+        let (_, actual) = validate_and_decrypt(&event, &owner).unwrap();
+        assert_eq!(actual.config.effort_level.as_deref(), Some("high"));
+        assert!(!actual.config.extra.contains_key("effort_level"));
+
+        let mut oversized = payload(&owner, &agent);
+        oversized.config.effort_level = Some("x".repeat(MAX_EFFORT_LEVEL_BYTES + 1));
+        assert!(matches!(
+            validate_payload(&oversized),
+            Err(Error::InvalidPayload(message)) if message.contains("effort_level")
+        ));
+
+        let mut legacy = serde_json::to_value(payload(&owner, &agent)).unwrap();
+        let config = legacy["config"].as_object_mut().unwrap();
+        assert!(
+            config.remove("effort_level").is_none(),
+            "None must serialize as absent"
+        );
+        let decoded: Payload = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.config.effort_level, None);
     }
 
     #[test]

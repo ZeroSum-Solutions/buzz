@@ -190,7 +190,23 @@ fn retain_agent_record_at_boot(
         &keys.public_key().to_hex(),
         &record.pubkey,
     )?;
-    let private_changed = if private_head.is_some() {
+    // A public-only recreation preserves its key/lifecycle, not deleted private
+    // settings. Absence after deletion is not permission to mint stale disk config.
+    let owner = keys.public_key().to_hex();
+    let deleted_before = [KIND_MANAGED_AGENT, KIND_PRIVATE_MANAGED_AGENT]
+        .into_iter()
+        .map(|kind| {
+            get_retained_event(
+                &transaction,
+                buzz_core_pkg::kind::KIND_DELETION,
+                &owner,
+                &super::retention::tombstone_retention_d_tag(kind, &record.pubkey),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(Option::is_some);
+    let private_changed = if private_head.is_some() || deleted_before {
         false
     } else {
         retain_private_agent_record(&transaction, keys, record)?
@@ -403,6 +419,7 @@ fn private_payload_from_record(
             team_id: record.team_id.clone(),
             persona_name_in_team: record.persona_name_in_team.clone(),
             relay_mesh,
+            effort_level: record.effort_level.clone(),
             extra: serde_json::Map::new(),
         },
         extensions: BTreeMap::new(),

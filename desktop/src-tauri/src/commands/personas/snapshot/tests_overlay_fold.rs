@@ -50,6 +50,7 @@ fn relay_payload(pubkey: &str, name: &str, prompt: &str) -> Payload {
             team_id: None,
             persona_name_in_team: None,
             relay_mesh: None,
+            effort_level: None,
             extra: Map::new(),
         },
         extensions: BTreeMap::new(),
@@ -111,4 +112,100 @@ fn follower_exports_effective_relay_values_not_stale_disk() {
         snapshot.definition.respond_to_allowlist,
         vec!["ab".repeat(32)]
     );
+}
+
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn deleted_config_is_not_exported_or_selected_for_persona_cascade() {
+    use crate::app_state::{build_app_state, AppState};
+    use crate::commands::personas::{
+        collect_cascade_pubkeys, snapshot::load_effective_managed_agents,
+    };
+    use crate::managed_agents::{load_managed_agents, save_managed_agents};
+    use std::sync::atomic::Ordering;
+    use tauri::Manager;
+
+    let _env_lock = crate::managed_agents::lock_path_mutex();
+    let temp = tempfile::tempdir().unwrap();
+    struct EnvGuard(&'static str, Option<std::ffi::OsString>);
+    impl EnvGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let prior = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self(key, prior)
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.1.take() {
+                Some(value) => std::env::set_var(self.0, value),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+    let _home = EnvGuard::set("HOME", temp.path());
+    let _xdg = EnvGuard::set("XDG_DATA_HOME", temp.path());
+    let app = tauri::test::mock_builder()
+        .manage(build_app_state())
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .unwrap();
+    let state = app.state::<AppState>();
+    let _store = state.managed_agents_store_lock.lock().unwrap();
+    state
+        .managed_agent_authority_ready
+        .store(true, Ordering::Release);
+    let denied = make_instance(&"aa".repeat(32), "persona");
+    let permitted = make_instance(&"bb".repeat(32), "persona");
+    let disk = vec![denied.clone(), permitted.clone()];
+    save_managed_agents(app.handle(), &disk).unwrap();
+    state
+        .private_managed_agent_overlay
+        .lock()
+        .unwrap()
+        .deny_deleted_config(&denied.pubkey);
+
+    // Exercise the production loader shared by export and cascade, not a
+    // test-side copy of its filter. The denied identity remains on disk for Stop.
+    let selected = load_effective_managed_agents(app.handle(), &state).unwrap();
+    assert!(resolve_from_lists(&denied.pubkey, &selected, &[]).is_err());
+    assert_eq!(
+        resolve_from_lists(&permitted.pubkey, &selected, &[])
+            .unwrap()
+            .0
+            .pubkey,
+        permitted.pubkey
+    );
+    assert_eq!(
+        collect_cascade_pubkeys(&selected, "persona"),
+        vec![permitted.pubkey.clone()]
+    );
+    assert_eq!(load_managed_agents(app.handle()).unwrap(), disk);
+
+    // A newer validated head restores selection without replacing local identity.
+    let mut restored = relay_payload(&denied.pubkey, "Restored", "new prompt");
+    restored.config.persona_id = Some("persona".into());
+    state
+        .private_managed_agent_overlay
+        .lock()
+        .unwrap()
+        .insert(restored)
+        .unwrap();
+    let selected = load_effective_managed_agents(app.handle(), &state).unwrap();
+    assert_eq!(
+        resolve_from_lists(&denied.pubkey, &selected, &[])
+            .unwrap()
+            .0
+            .system_prompt
+            .as_deref(),
+        Some("new prompt")
+    );
+    assert_eq!(collect_cascade_pubkeys(&selected, "persona").len(), 2);
+    assert_eq!(load_managed_agents(app.handle()).unwrap(), disk);
+
+    state
+        .managed_agent_authority_ready
+        .store(false, Ordering::Release);
+    assert!(load_effective_managed_agents(app.handle(), &state)
+        .unwrap_err()
+        .contains("authority is unavailable"));
 }

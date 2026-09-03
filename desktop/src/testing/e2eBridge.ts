@@ -13711,6 +13711,8 @@ export function maybeInstallE2eTauriMocks() {
           ],
         };
       }
+      case "get_managed_agent_sync_error":
+        return null;
       case "list_managed_agents":
         return handleListManagedAgents(activeConfig);
       case "get_agent_memory":

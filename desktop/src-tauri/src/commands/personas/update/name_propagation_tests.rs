@@ -287,3 +287,90 @@ fn sami_probe_resolve_before_rename_can_skip_the_intended_rename() {
     // PAYLOAD without moving the `name != old_display_name` decision onto the
     // resolved name.
 }
+
+#[test]
+fn propagation_checks_relay_membership_and_converges_after_partial_rename() {
+    use crate::managed_agents::private_config_overlay::{test_relay_payload, PrivateConfigOverlay};
+    let state = crate::app_state::build_app_state();
+    state
+        .managed_agent_authority_ready
+        .store(true, std::sync::atomic::Ordering::Release);
+    let pubkey = "ab".repeat(32);
+    let mut payload = test_relay_payload(&pubkey);
+    payload.config.persona_id = Some("definition".into());
+    payload.config.name = "Old name".into();
+    let mut overlay = PrivateConfigOverlay::default();
+    overlay.insert(payload.clone()).unwrap();
+    let disk = overlay.materialize_relay_only_record(&pubkey, &[]).unwrap();
+    let mut persona: AgentDefinition = serde_json::from_value(serde_json::json!({
+        "id":"definition", "display_name":"New name", "system_prompt":"prompt", "created_at":"now", "updated_at":"now"
+    })).unwrap();
+    persona.avatar_url = Some("https://example.com/avatar.png".into());
+    for binding in [None, Some("other-definition")] {
+        payload.config.persona_id = binding.map(str::to_owned);
+        state
+            .private_managed_agent_overlay
+            .lock()
+            .unwrap()
+            .insert(payload.clone())
+            .unwrap();
+        assert!(
+            prepare_authoritative_linked_update(&state, &disk, &persona, "Old name")
+                .unwrap()
+                .is_none()
+        );
+    }
+    payload.config.persona_id = Some(persona.id.clone());
+    for name in ["Old name", "New name", "Pool name"] {
+        payload.config.name = name.into();
+        state
+            .private_managed_agent_overlay
+            .lock()
+            .unwrap()
+            .insert(payload.clone())
+            .unwrap();
+        let (updated, update) =
+            prepare_authoritative_linked_update(&state, &disk, &persona, "Old name")
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            updated.name,
+            if name == "Pool name" {
+                "Pool name"
+            } else {
+                "New name"
+            }
+        );
+        assert!(update.profile_sync_required);
+        assert_eq!(update.profile_avatar, persona.avatar_url);
+    }
+}
+
+#[test]
+fn deleted_private_config_does_not_block_unrelated_persona_edits() {
+    let state = crate::app_state::build_app_state();
+    let disk = agent("deleted-definition", "Old name", Some("Old name"));
+    let persona: AgentDefinition = serde_json::from_value(serde_json::json!({
+        "id":"other-definition", "display_name":"New name", "system_prompt":"prompt",
+        "created_at":"now", "updated_at":"now"
+    }))
+    .unwrap();
+    state
+        .private_managed_agent_overlay
+        .lock()
+        .unwrap()
+        .deny_deleted_config(&disk.pubkey);
+    assert!(
+        prepare_authoritative_linked_update(&state, &disk, &persona, "Old name").is_err(),
+        "global authority failure must still propagate"
+    );
+    state
+        .managed_agent_authority_ready
+        .store(true, std::sync::atomic::Ordering::Release);
+    assert!(
+        prepare_authoritative_linked_update(&state, &disk, &persona, "Old name")
+            .unwrap()
+            .is_none(),
+        "deleted config is not membership in any definition"
+    );
+}

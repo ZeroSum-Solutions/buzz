@@ -60,23 +60,28 @@ pub(crate) fn resolve_from_lists<'a>(
 /// overlay folded on — patching disk records and synthesizing relay-only
 /// entries, the same resolution the agent list uses.
 ///
-/// Every export/card resolver must read instances through this helper, never
-/// raw `load_managed_agents`: raw disk exports stale values on a follower
-/// device and fails with "agent not found" for a relay-only agent that has
-/// never been started on this device.
+/// Every export/card resolver and persona-cascade selection reads instances
+/// through this helper, never raw `load_managed_agents`: disk may carry stale
+/// config or deleted linkage, while relay-only agents have no disk row.
+/// Deleted-private identities are omitted without hiding them from List/Stop.
 ///
 /// Lock order: callers already hold `managed_agents_store_lock` (outer);
 /// this takes only the overlay lock (inner) and releases it before returning.
-pub(crate) fn load_effective_managed_agents(
-    app: &AppHandle,
-    state: &State<'_, AppState>,
+pub(crate) fn load_effective_managed_agents<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
 ) -> Result<Vec<ManagedAgentRecord>, String> {
+    crate::managed_agents::private_config_overlay::require_authority_ready(state)?;
     let instances = load_managed_agents(app)?;
-    Ok(state
+    let overlay = state
         .private_managed_agent_overlay
         .lock()
-        .map_err(|e| e.to_string())?
-        .resolved_records(&instances))
+        .map_err(|e| e.to_string())?;
+    Ok(overlay
+        .resolved_records(&instances)
+        .into_iter()
+        .filter(|record| overlay.require_config_authority(&record.pubkey).is_ok())
+        .collect())
 }
 
 /// Materialize persona-owned display metadata onto a cloned instance for

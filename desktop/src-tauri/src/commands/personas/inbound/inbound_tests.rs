@@ -203,6 +203,7 @@ fn private_agent_payload(
             team_id: None,
             persona_name_in_team: None,
             relay_mesh: None,
+            effort_level: None,
             extra: serde_json::Map::new(),
         },
         extensions: BTreeMap::new(),

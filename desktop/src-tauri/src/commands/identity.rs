@@ -433,6 +433,9 @@ pub(crate) fn commit_imported_identity(
         state.set_identity_storage(storage);
     }
     state
+        .managed_agent_authority_ready
+        .store(false, std::sync::atomic::Ordering::Release);
+    state
         .private_managed_agent_overlay
         .lock()
         .map_err(|e| e.to_string())?

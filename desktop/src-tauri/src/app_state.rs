@@ -45,6 +45,12 @@ pub struct AppState {
     /// Never perform network I/O while holding this lock.
     pub managed_agent_runtime_transition: Mutex<()>,
     pub managed_agents_store_lock: Mutex<()>,
+    /// False until retained private authority hydrates for the active scope.
+    /// Scope changes clear this under managed_agents_store_lock; inbound heads
+    /// alone cannot establish that every retained coordinate was recovered.
+    pub(crate) managed_agent_authority_ready: AtomicBool,
+    /// Last bootstrap error, scoped by retention path; readable until retry succeeds.
+    pub(crate) managed_agent_bootstrap_error: Mutex<Option<(std::path::PathBuf, String)>>,
     pub(crate) private_managed_agent_overlay:
         Mutex<crate::managed_agents::private_config_overlay::PrivateConfigOverlay>,
     pub channel_templates_store_lock: Mutex<()>,
@@ -211,6 +217,8 @@ pub fn build_app_state() -> AppState {
         managed_agent_runtime_transition: Mutex::new(()),
         identity_mutation: Mutex::new(()),
         managed_agents_store_lock: Mutex::new(()),
+        managed_agent_authority_ready: AtomicBool::new(false),
+        managed_agent_bootstrap_error: Mutex::new(None),
         private_managed_agent_overlay: Mutex::new(Default::default()),
         channel_templates_store_lock: Mutex::new(()),
         managed_agent_processes: Mutex::new(HashMap::new()),

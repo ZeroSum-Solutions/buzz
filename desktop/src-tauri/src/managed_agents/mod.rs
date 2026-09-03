@@ -147,3 +147,5 @@ pub fn default_agent_workdir() -> Option<std::path::PathBuf> {
 fn is_real_dir(path: &std::path::Path) -> bool {
     path.symlink_metadata().map(|m| m.is_dir()).unwrap_or(false)
 }
+
+pub(crate) mod deletion_recovery;

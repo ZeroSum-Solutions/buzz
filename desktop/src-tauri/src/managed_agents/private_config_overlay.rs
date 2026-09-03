@@ -33,6 +33,7 @@ pub(crate) struct PrivateConfigPatch {
     team_id: Option<String>,
     persona_name_in_team: Option<String>,
     relay_mesh: Option<RelayMeshConfig>,
+    effort_level: Option<String>,
     updated_at: String,
 }
 
@@ -88,6 +89,7 @@ impl PrivateConfigPatch {
             team_id: config.team_id,
             persona_name_in_team: config.persona_name_in_team,
             relay_mesh,
+            effort_level: config.effort_level,
             updated_at: payload.updated_at,
         })
     }
@@ -122,6 +124,7 @@ impl PrivateConfigPatch {
             .persona_name_in_team
             .clone_from(&self.persona_name_in_team);
         record.relay_mesh.clone_from(&self.relay_mesh);
+        record.effort_level.clone_from(&self.effort_level);
         record.updated_at.clone_from(&self.updated_at);
     }
 
@@ -191,17 +194,22 @@ impl PrivateConfigPatch {
 }
 
 #[derive(Default)]
-pub(crate) struct PrivateConfigOverlay(HashMap<String, PrivateConfigPatch>);
+pub(crate) struct PrivateConfigOverlay(
+    HashMap<String, PrivateConfigPatch>,
+    std::collections::HashSet<String>,
+);
 
 impl PrivateConfigOverlay {
     #[cfg(test)]
     pub(crate) fn insert(&mut self, payload: Payload) -> Result<(), String> {
         let patch = PrivateConfigPatch::from_payload(payload)?;
+        self.1.remove(&patch.pubkey);
         self.0.insert(patch.pubkey.clone(), patch);
         Ok(())
     }
 
     pub(crate) fn insert_patch(&mut self, patch: PrivateConfigPatch) {
+        self.1.remove(&patch.pubkey);
         self.0.insert(patch.pubkey.clone(), patch);
     }
 
@@ -211,6 +219,7 @@ impl PrivateConfigOverlay {
 
     pub(crate) fn clear(&mut self) {
         self.0.clear();
+        self.1.clear();
     }
 
     pub(crate) fn remove(&mut self, pubkey: &str) {
@@ -232,8 +241,8 @@ impl PrivateConfigOverlay {
     /// Absorbing unconditionally (not only when the retain reported a change)
     /// is safe and strictly convergent: the overlay is never ahead of
     /// retention — every insert either comes from a row written in the same
-    /// step or is read back out of retention. A missing/undecodable head
-    /// leaves the current entry alone rather than clearing it.
+    /// step or is read back out of retention. A missing head leaves the
+    /// current entry alone; an undecodable retained head is an error.
     pub(crate) fn absorb_retained_head(
         &mut self,
         conn: &rusqlite::Connection,
@@ -246,11 +255,12 @@ impl PrivateConfigOverlay {
             &owner_keys.public_key().to_hex(),
             agent_pubkey,
         )?;
-        if let Some(patch) = row
-            .as_ref()
-            .and_then(|row| patch_from_retained_row(&row.raw_event, owner_keys))
-        {
-            self.insert_patch(patch);
+        if let Some(row) = row {
+            if super::retention::managed_agent_head_is_deleted(conn, &row)? {
+                self.deny_deleted_config(agent_pubkey);
+            } else {
+                self.insert_patch(patch_from_retained_row(&row, owner_keys)?);
+            }
         }
         Ok(())
     }
@@ -271,11 +281,12 @@ impl PrivateConfigOverlay {
         if local.iter().any(|record| record.pubkey == pubkey) {
             return None;
         }
-        let mut record = self.0.get(pubkey)?.fresh_record();
-        // Persona definitions are device-local. A fresh device can still run the
-        // complete relay snapshot, but must not bind it to an absent local persona.
-        record.persona_id = None;
-        Some(record)
+        // The definition link travels with the config. Clearing it here would
+        // only hold until the next overlay resolve re-applies the head, so
+        // the saved row and its resolve would disagree; whether the linked
+        // definition is present on this device is checked at the save seam
+        // (`materialize_relay_only_agent`), not erased.
+        Some(self.0.get(pubkey)?.fresh_record())
     }
 
     pub(crate) fn resolved_records(&self, local: &[ManagedAgentRecord]) -> Vec<ManagedAgentRecord> {
@@ -297,15 +308,54 @@ impl PrivateConfigOverlay {
     }
 }
 
+/// Caller holds the store lock, pairing readiness with the active scope.
+pub(crate) fn require_authority_ready(state: &crate::app_state::AppState) -> Result<(), String> {
+    if !state
+        .managed_agent_authority_ready
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err(
+            "managed-agent authority is unavailable; retry workspace initialization".into(),
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn resolved_local_record(
     state: &crate::app_state::AppState,
     record: &ManagedAgentRecord,
 ) -> Result<ManagedAgentRecord, String> {
+    require_authority_ready(state)?;
     state
         .private_managed_agent_overlay
         .lock()
         .map_err(|error| error.to_string())
-        .map(|overlay| overlay.resolve_local_record(record))
+        .and_then(|overlay| {
+            overlay.require_config_authority(&record.pubkey)?;
+            Ok(overlay.resolve_local_record(record))
+        })
+}
+
+/// Read one relay-primary record without creating local lifecycle membership.
+/// Caller holds store lock. Read surfaces must not use a disk-only lookup or
+/// materialize just to display configuration.
+pub(crate) fn resolved_record_for_read(
+    state: &crate::app_state::AppState,
+    local: &[ManagedAgentRecord],
+    pubkey: &str,
+) -> Result<ManagedAgentRecord, String> {
+    require_authority_ready(state)?;
+    let overlay = state
+        .private_managed_agent_overlay
+        .lock()
+        .map_err(|e| e.to_string())?;
+    overlay.require_config_authority(pubkey)?;
+    local
+        .iter()
+        .find(|record| record.pubkey == pubkey)
+        .map(|record| overlay.resolve_local_record(record))
+        .or_else(|| overlay.materialize_relay_only_record(pubkey, local))
+        .ok_or_else(|| format!("agent {pubkey} not found"))
 }
 
 pub(crate) fn copy_lifecycle_state(
@@ -324,8 +374,8 @@ pub(crate) fn copy_lifecycle_state(
     destination.last_error_code = source.last_error_code;
 }
 
-pub(crate) fn materialize_relay_only_agent(
-    app: &tauri::AppHandle,
+pub(crate) fn materialize_relay_only_agent<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     state: &crate::app_state::AppState,
     pubkey: &str,
 ) -> Result<(), String> {
@@ -343,6 +393,7 @@ pub(crate) fn materialize_relay_only_agent(
         .managed_agents_store_lock
         .lock()
         .map_err(|error| error.to_string())?;
+    require_authority_ready(state)?;
     let mut records = super::load_managed_agents(app)?;
     let relay_only = state
         .private_managed_agent_overlay
@@ -352,6 +403,16 @@ pub(crate) fn materialize_relay_only_agent(
     if let Some(record) = relay_only {
         if record.backend != BackendKind::Local {
             return Err("relay-only provider agents cannot be started on this device".into());
+        }
+        // A linked instance whose definition has not reached this device is
+        // an orphan; refuse it here, before a lifecycle row exists, with the
+        // same message every other orphan boundary uses. The link itself is
+        // kept: once the definition syncs, the next attempt materializes.
+        if let Some(persona_id) = record.persona_id.as_deref() {
+            let personas = super::load_personas(app)?;
+            if !personas.iter().any(|persona| persona.id == persona_id) {
+                return Err(super::effective_config::ORPHANED_INSTANCE_ERROR.to_string());
+            }
         }
         records.push(record);
         super::save_managed_agents(app, &records)?;
@@ -398,6 +459,7 @@ pub(crate) fn test_relay_payload(pubkey: &str) -> Payload {
             team_id: None,
             persona_name_in_team: None,
             relay_mesh: None,
+            effort_level: None,
             extra: serde_json::Map::new(),
         },
         extensions: BTreeMap::new(),
@@ -447,6 +509,7 @@ mod tests {
                 team_id: None,
                 persona_name_in_team: None,
                 relay_mesh: None,
+                effort_level: None,
                 extra: Map::new(),
             },
             extensions: BTreeMap::new(),
@@ -497,7 +560,6 @@ mod tests {
         assert_eq!(relay_only.name, "relay only");
         assert_eq!(relay_only.private_key_nsec, "nsec-test");
         assert_eq!(relay_only.backend, BackendKind::Local);
-        assert!(relay_only.persona_id.is_none());
     }
 
     #[test]
@@ -510,6 +572,178 @@ mod tests {
         assert_eq!(overlay.resolved_records(&[])[0].name, "valid");
         overlay.clear();
         assert!(overlay.resolved_records(&[]).is_empty());
+    }
+
+    /// A follower runs the leader's effort: the relay head's `effort_level`
+    /// overrides the disk column, and a head that cleared it clears the column
+    /// (the local picker's "inherit" round-trips as `None`).
+    #[test]
+    fn follower_adopts_relay_effort_level() {
+        let mut overlay = PrivateConfigOverlay::default();
+        let mut head = payload("aa", "agent");
+        head.config.effort_level = Some("high".into());
+        overlay.insert(head).unwrap();
+        let mut local = overlay.0["aa"].fresh_record();
+        local.effort_level = Some("low".into());
+
+        assert_eq!(
+            overlay.resolve_local_record(&local).effort_level.as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            overlay
+                .materialize_relay_only_record("aa", &[])
+                .unwrap()
+                .effort_level
+                .as_deref(),
+            Some("high")
+        );
+
+        overlay.insert(payload("aa", "agent")).unwrap();
+        assert_eq!(overlay.resolve_local_record(&local).effort_level, None);
+    }
+
+    /// F2: the definition link is portable state, not a device-local detail.
+    /// Materialization must carry it verbatim so the record a device saves
+    /// and the record the next overlay resolve produces agree — otherwise
+    /// materialize clears it, the next START resolve restores it, and the
+    /// start path refuses the agent as an orphan it just created.
+    #[test]
+    fn materialization_preserves_persona_link_through_next_resolve() {
+        let mut overlay = PrivateConfigOverlay::default();
+        let mut head = payload("aa", "linked");
+        head.config.persona_id = Some("def-1".into());
+        overlay.insert(head).unwrap();
+
+        let materialized = overlay.materialize_relay_only_record("aa", &[]).unwrap();
+        assert_eq!(materialized.persona_id.as_deref(), Some("def-1"));
+        assert_eq!(
+            overlay
+                .resolve_local_record(&materialized)
+                .persona_id
+                .as_deref(),
+            Some("def-1"),
+            "the saved row and its next resolve must agree on the definition link"
+        );
+    }
+
+    /// F2 on the real seam: a persona-linked relay-only head whose definition
+    /// has not reached this device is refused by name BEFORE any lifecycle
+    /// row lands in the store; once the definition arrives the same call
+    /// materializes the record with its link intact, and the production
+    /// second resolve keeps it. A definition-less head is the control: it
+    /// materializes with no definition present.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn materialize_agent_refuses_until_linked_definition_is_present() {
+        use crate::app_state::{build_app_state, AppState};
+        use crate::managed_agents::{load_managed_agents, save_personas, AgentDefinition};
+        use tauri::Manager;
+
+        // Tauri resolves `app_data_dir` from `$HOME` (macOS) / `$XDG_DATA_HOME`
+        // (Linux); hold the crate-wide env lock and point both at a tempdir.
+        let _env_lock = crate::managed_agents::lock_path_mutex();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        struct EnvVarGuard(&'static str, Option<std::ffi::OsString>);
+        impl EnvVarGuard {
+            fn set(key: &'static str, value: &std::path::Path) -> Self {
+                let prior = std::env::var_os(key);
+                std::env::set_var(key, value);
+                Self(key, prior)
+            }
+        }
+        impl Drop for EnvVarGuard {
+            fn drop(&mut self) {
+                match self.1.take() {
+                    Some(prior) => std::env::set_var(self.0, prior),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _xdg = EnvVarGuard::set("XDG_DATA_HOME", &home);
+
+        let app = tauri::test::mock_builder()
+            .manage(build_app_state())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app builds headless");
+        let state = app.state::<AppState>();
+
+        let linked = "ab".repeat(32);
+        let unlinked = "cd".repeat(32);
+        {
+            let mut overlay = state.private_managed_agent_overlay.lock().unwrap();
+            let mut head = test_relay_payload(&linked);
+            head.config.persona_id = Some("def-1".into());
+            overlay.insert(head).unwrap();
+            overlay.insert(test_relay_payload(&unlinked)).unwrap();
+        }
+
+        // Even a cached, definition-less head cannot create lifecycle state
+        // before the active scope's authority has hydrated.
+        let error = materialize_relay_only_agent(app.handle(), &state, &unlinked)
+            .expect_err("unhydrated authority must refuse materialization");
+        assert!(error.contains("authority is unavailable"));
+        assert!(load_managed_agents(app.handle()).unwrap().is_empty());
+        state
+            .managed_agent_authority_ready
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        let error = materialize_relay_only_agent(app.handle(), &state, &linked)
+            .expect_err("a linked head must not materialize without its definition");
+        assert_eq!(
+            error,
+            crate::managed_agents::effective_config::ORPHANED_INSTANCE_ERROR
+        );
+        assert!(
+            load_managed_agents(app.handle()).unwrap().is_empty(),
+            "refusal must happen before any lifecycle row is saved"
+        );
+
+        // Control: no definition link, no definition needed.
+        materialize_relay_only_agent(app.handle(), &state, &unlinked).unwrap();
+        assert_eq!(load_managed_agents(app.handle()).unwrap().len(), 1);
+
+        // The definition arrives (persona sync, import, ...) and the retry
+        // succeeds with the link intact on disk and after the next resolve.
+        let definition = AgentDefinition {
+            id: "def-1".into(),
+            display_name: "Definition".into(),
+            avatar_url: None,
+            description: None,
+            system_prompt: "definition prompt".into(),
+            runtime: Some("goose".into()),
+            model: None,
+            provider: None,
+            name_pool: vec![],
+            is_builtin: false,
+            is_active: true,
+            shared: false,
+            source_team: None,
+            source_team_persona_slug: None,
+            catalog_source: None,
+            team_catalog_source: None,
+            env_vars: BTreeMap::new(),
+            respond_to: None,
+            respond_to_allowlist: vec![],
+            parallelism: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+        save_personas(app.handle(), &[definition]).unwrap();
+        materialize_relay_only_agent(app.handle(), &state, &linked).unwrap();
+
+        let records = load_managed_agents(app.handle()).unwrap();
+        let saved = records
+            .iter()
+            .find(|record| record.pubkey == linked)
+            .expect("linked record materializes once its definition is present");
+        assert_eq!(saved.persona_id.as_deref(), Some("def-1"));
+        let resolved = resolved_local_record(&state, saved).unwrap();
+        assert_eq!(resolved.persona_id.as_deref(), Some("def-1"));
+        assert_eq!(resolved.name, "relay name");
     }
 
     #[test]
@@ -527,19 +761,27 @@ mod tests {
 
 /// Decode one retained kind:30179 row into a patch. Shared by boot hydration
 /// and the self-authored write-through so both learn config through exactly
-/// one decode path. Best-effort: a row that fails to parse, decrypt, or
-/// validate yields `None` rather than an error, matching the inbound path's
-/// per-record reject.
+/// one decode path. Unlike an untrusted inbound candidate, an already-retained
+/// row is known authority: corruption must fail closed, not revive stale disk.
 fn patch_from_retained_row(
-    raw_event: &str,
+    row: &super::retention::RetainedEvent,
     owner_keys: &nostr::Keys,
-) -> Option<PrivateConfigPatch> {
+) -> Result<PrivateConfigPatch, String> {
     use buzz_core_pkg::private_managed_agent;
     use nostr::JsonUtil;
 
-    let event = nostr::Event::from_json(raw_event).ok()?;
-    let (_, payload) = private_managed_agent::validate_and_decrypt(&event, owner_keys).ok()?;
-    PrivateConfigPatch::from_payload(payload).ok()
+    let event = nostr::Event::from_json(&row.raw_event)
+        .map_err(|error| format!("invalid retained private authority: {error}"))?;
+    let (_, payload) = private_managed_agent::validate_and_decrypt(&event, owner_keys)
+        .map_err(|error| format!("unreadable retained private authority: {error}"))?;
+    if row.d_tag != payload.agent_pubkey
+        || row.pubkey != payload.owner_pubkey
+        || row.created_at != event.created_at.as_secs() as i64
+        || row.content != event.content
+    {
+        return Err("retained private authority metadata does not match signed event".into());
+    }
+    PrivateConfigPatch::from_payload(payload)
 }
 
 /// Rebuild the in-memory overlay from the retained kind:30179 rows.
@@ -552,9 +794,8 @@ fn patch_from_retained_row(
 /// Hydrating from the durable rows at boot makes relay-primary config survive
 /// a restart.
 ///
-/// Best-effort per row: a row that fails to parse, decrypt, or validate is
-/// skipped rather than failing the boot, matching the inbound path's
-/// per-record reject.
+/// All-or-nothing: an unreadable retained row fails hydration. Its absence
+/// from an apparently healthy overlay would silently restore stale disk config.
 pub(crate) fn hydrate_from_retention(
     conn: &rusqlite::Connection,
     owner_keys: &nostr::Keys,
@@ -568,9 +809,10 @@ pub(crate) fn hydrate_from_retention(
     )?;
 
     let mut overlay = PrivateConfigOverlay::default();
+    overlay.load_deletion_fences(conn, owner_keys)?;
     for row in rows {
-        if let Some(patch) = patch_from_retained_row(&row.raw_event, owner_keys) {
-            overlay.insert_patch(patch);
+        if !super::retention::managed_agent_head_is_deleted(conn, &row)? {
+            overlay.insert_patch(patch_from_retained_row(&row, owner_keys)?);
         }
     }
     Ok(overlay)
@@ -601,14 +843,17 @@ mod write_site_resolve_guard {
                 include_str!("../commands/agent_models_update.rs"),
                 1,
             ),
-            // 4 = the 3 sites Carl already resolved correctly (start/stop/
-            // delete) plus the pair-start snapshot re-apply. The count is
-            // deliberately exact rather than `>= 1`: a lower bound would not
-            // notice a site losing its resolve while another gained one.
+            // Exact count: Stop now lives in agents_stop.rs and is tested
+            // through its native blocking seam with tracked child processes.
             (
                 "commands/agents.rs",
                 include_str!("../commands/agents.rs"),
-                4,
+                3,
+            ),
+            (
+                "commands/agents_stop.rs",
+                include_str!("../commands/agents_stop.rs"),
+                1,
             ),
             // 2 = the preflight snapshot resolve plus the locked spawn-record
             // resolve in `start_local_agent_with_preflight` (extracted from
@@ -697,3 +942,10 @@ mod write_site_resolve_guard {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "private_config_read_tests.rs"]
+mod read_tests;
+
+#[path = "private_config_deletion.rs"]
+mod deletion;

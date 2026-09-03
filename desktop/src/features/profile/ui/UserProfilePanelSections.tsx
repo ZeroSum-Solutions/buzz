@@ -4,6 +4,7 @@ import { ChevronDown, ChevronUp, Pencil } from "lucide-react";
 import { useAgentWorking } from "@/features/agents/agentWorkingSignal";
 import {
   getManagedAgentPrimaryActionLabel,
+  canStartManagedAgent,
   isManagedAgentActive,
 } from "@/features/agents/lib/managedAgentControlActions";
 import { RestartDiffBadge } from "@/features/agents/ui/RestartDiffBadge";
@@ -426,7 +427,14 @@ export function ProfileSummaryView({
           className={primaryActionsMotionClassName}
           concealed={primaryActionsConcealed}
           followMutation={followMutation}
-          agentActionDisabled={isAgentActionPending}
+          agentActionDisabled={
+            isAgentActionPending ||
+            Boolean(
+              managedAgent &&
+                !isManagedAgentActive(managedAgent) &&
+                !canStartManagedAgent(managedAgent),
+            )
+          }
           agentActionLabel={
             isOwner === true && managedAgent
               ? getManagedAgentPrimaryActionLabel(managedAgent)

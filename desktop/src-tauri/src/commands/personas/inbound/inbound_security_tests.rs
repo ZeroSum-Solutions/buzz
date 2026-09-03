@@ -349,3 +349,115 @@ fn sami_fix_overlay_rehydrates_from_retention_after_restart() {
         "control: hydration is owner-scoped"
     );
 }
+
+#[test]
+fn meli_deleted_private_head_replay_must_not_resurrect() {
+    use crate::managed_agents::{
+        private_config_overlay::{hydrate_from_retention, PrivateConfigOverlay},
+        retention::{open_retention_db, InboundOutcome},
+    };
+    let conn = open_retention_db(std::path::Path::new(":memory:")).unwrap();
+    let owner = nostr::Keys::generate();
+    let agent = nostr::Keys::generate();
+    let pubkey = agent.public_key().to_hex();
+    let payload = private_agent_payload(&owner, &agent, "deleted agent", 4);
+    let head = buzz_core_pkg::private_managed_agent::build_event(&owner, &payload, 20).unwrap();
+    let mut overlay = PrivateConfigOverlay::default();
+    assert_eq!(
+        apply_inbound_private_managed_agent_event(&head, &owner, &conn, &mut overlay).unwrap(),
+        InboundOutcome::Applied
+    );
+    let tombstone = owned_deletion_event_at(&owner, 30177, &pubkey, 30);
+    assert_eq!(
+        resolve_inbound_tombstone_with_store(&tombstone, &owner.public_key(), &conn, |_, key| {
+            overlay.remove(key);
+            Ok(())
+        })
+        .unwrap(),
+        Some((30177, pubkey.clone()))
+    );
+    assert!(hydrate_from_retention(&conn, &owner)
+        .unwrap()
+        .resolved_records(&[])
+        .is_empty());
+    let outcome =
+        apply_inbound_private_managed_agent_event(&head, &owner, &conn, &mut overlay).unwrap();
+    let recovered = hydrate_from_retention(&conn, &owner)
+        .unwrap()
+        .resolved_records(&[]);
+    assert_eq!(
+        (outcome, recovered.len()),
+        (InboundOutcome::Skipped, 0),
+        "head t20 replay after tombstone t30 must not rehydrate secret-bearing config"
+    );
+}
+
+#[test]
+fn retained_authority_corruption_cannot_hydrate_as_absent() {
+    use crate::managed_agents::{
+        private_config_overlay::{hydrate_from_retention, PrivateConfigOverlay},
+        retention::{open_retention_db, retain_event, RetainedEvent},
+    };
+    let conn = open_retention_db(std::path::Path::new(":memory:")).unwrap();
+    let owner = nostr::Keys::generate();
+    let agent = nostr::Keys::generate();
+    retain_event(
+        &conn,
+        &RetainedEvent {
+            kind: 30179,
+            pubkey: owner.public_key().to_hex(),
+            d_tag: agent.public_key().to_hex(),
+            content: "corrupt ciphertext".into(),
+            created_at: 20,
+            raw_event: "not a signed event".into(),
+            pending_sync: false,
+        },
+    )
+    .unwrap();
+    assert!(
+        hydrate_from_retention(&conn, &owner).is_err(),
+        "known but unreadable authority is not absent authority"
+    );
+    assert!(
+        PrivateConfigOverlay::default()
+            .absorb_retained_head(&conn, &owner, &agent.public_key().to_hex())
+            .is_err(),
+        "self-authored write-through cannot swallow unreadable authority"
+    );
+}
+
+#[test]
+fn retained_authority_metadata_must_match_signed_event() {
+    use crate::managed_agents::{
+        private_config_overlay::hydrate_from_retention,
+        retention::{open_retention_db, retain_event, RetainedEvent},
+    };
+    use nostr::JsonUtil;
+    let owner = nostr::Keys::generate();
+    let agent = nostr::Keys::generate();
+    let payload = private_agent_payload(&owner, &agent, "authority", 1);
+    let event = buzz_core_pkg::private_managed_agent::build_event(&owner, &payload, 20).unwrap();
+    for field in ["d_tag", "content", "created_at"] {
+        let conn = open_retention_db(std::path::Path::new(":memory:")).unwrap();
+        let mut row = RetainedEvent {
+            kind: 30179,
+            pubkey: owner.public_key().to_hex(),
+            d_tag: agent.public_key().to_hex(),
+            content: event.content.clone(),
+            created_at: 20,
+            raw_event: event.as_json(),
+            pending_sync: false,
+        };
+        match field {
+            "d_tag" => row.d_tag = nostr::Keys::generate().public_key().to_hex(),
+            "content" => row.content = "different ciphertext".into(),
+            "created_at" => row.created_at = 30,
+            _ => unreachable!(),
+        }
+        retain_event(&conn, &row).unwrap();
+        assert!(
+            hydrate_from_retention(&conn, &owner).is_err(),
+            "mismatched {field} must not become authority"
+        );
+    }
+}

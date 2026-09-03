@@ -57,10 +57,9 @@ pub async fn get_agent_models(
             state.clear_agent_session_caches(pubkey);
         }
 
-        let record = records
-            .iter()
-            .find(|r| r.pubkey == pubkey)
-            .ok_or_else(|| format!("agent {pubkey} not found"))?;
+        let record = crate::managed_agents::private_config_overlay::resolved_record_for_read(
+            &state, &records, &pubkey,
+        )?;
 
         let resolved = resolve_command(&record.acp_command)
             .ok_or_else(|| missing_command_message(&record.acp_command, "ACP harness command"))?;
@@ -75,7 +74,7 @@ pub async fn get_agent_models(
         // resolver, packaged so the linked-agent regression test binds the
         // exact values this command consumes. Returns Err on dangling harness
         // id, propagating it to the caller.
-        let discovery = agent_model_discovery_config(record, &personas, &global)
+        let discovery = agent_model_discovery_config(&record, &personas, &global)
             .map_err(|e| model_discovery_error(&pubkey, &e))?;
 
         let resolved_agent = resolve_command(&discovery.command)
