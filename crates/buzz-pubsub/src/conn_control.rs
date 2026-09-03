@@ -63,6 +63,26 @@ pub struct NipFiDisconnect {
     pub until_unix_nanos: u32,
 }
 
+/// Encode a [`NipFiDisconnect`] message to a JSON string for publication on
+/// the Redis pub/sub channel.
+///
+/// This is the single publication path — the HTTP handler and any future
+/// publisher must call this function rather than serialising directly, so the
+/// wire format is defined in one place and the round-trip oracle can cover it.
+pub fn encode_nip_fi_disconnect(message: &NipFiDisconnect) -> Result<String, serde_json::Error> {
+    serde_json::to_string(message)
+}
+
+/// Decode a [`NipFiDisconnect`] message from a JSON string received from the
+/// Redis pub/sub channel.
+///
+/// This is the single consumption path — the subscriber and any future consumer
+/// must call this function rather than deserialising directly, so the wire format
+/// is defined in one place and the round-trip oracle can cover it.
+pub fn decode_nip_fi_disconnect(payload: &str) -> Result<NipFiDisconnect, serde_json::Error> {
+    serde_json::from_str(payload)
+}
+
 /// Parse a connection-control Redis channel into its scoped community id.
 pub fn parse_conn_control_channel(channel: &str) -> Option<CommunityId> {
     let mut parts = channel.split(':');
@@ -244,7 +264,7 @@ async fn connect_and_subscribe_nip_fi(
             }
         };
 
-        let command: NipFiDisconnect = match serde_json::from_str(&payload) {
+        let command: NipFiDisconnect = match decode_nip_fi_disconnect(&payload) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("Failed to deserialize NIP-FI disconnect message: {e}");

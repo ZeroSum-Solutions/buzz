@@ -56,6 +56,7 @@ use crate::cache_invalidation::{
 };
 pub use crate::conn_control::NipFiDisconnect;
 use crate::conn_control::{conn_control_channel, ConnControl, ScopedConnControl};
+pub use crate::conn_control::{decode_nip_fi_disconnect, encode_nip_fi_disconnect};
 pub use crate::topic::{channel_key, global_key, EventTopic, EventTopicKey};
 
 /// A Nostr event received on a scoped Redis event topic, broadcast to local subscribers.
@@ -335,9 +336,9 @@ impl PubSubManager {
         &self,
         command: &NipFiDisconnect,
     ) -> Result<i64, PubSubError> {
-        use crate::conn_control::NIP_FI_DISCONNECT_CHANNEL;
+        use crate::conn_control::{encode_nip_fi_disconnect, NIP_FI_DISCONNECT_CHANNEL};
         let mut conn = self.pool.get().await?;
-        let payload = serde_json::to_string(command)?;
+        let payload = encode_nip_fi_disconnect(command)?;
         let subscriber_count: i64 = redis::cmd("PUBLISH")
             .arg(NIP_FI_DISCONNECT_CHANNEL)
             .arg(&payload)

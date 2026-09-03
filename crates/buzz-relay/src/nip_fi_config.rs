@@ -237,9 +237,14 @@ impl NipFiRelayConfig {
                     },
                 ));
             } else {
-                // No maximum_command_age_seconds: S4 command API is not enabled for
-                // this issuer.  Reject orphan S4 fields that would be silently ignored,
-                // since their presence almost certainly indicates a misconfiguration.
+                // No maximum_command_age_seconds: in enforce mode every issuer MUST be
+                // command-capable (NIP-FI.md:405-409 requires maximum_command_age per
+                // authorized issuer).  An enforce issuer without command fields would
+                // silently produce an empty command_configs and a permanently-503
+                // endpoint — reject it at startup.
+                //
+                // Orphan S4 fields are detected first to give the operator precise
+                // error feedback before the all-or-nothing rejection fires.
                 if entry.authorized_principals.is_some() {
                     return Err(ConfigError::InvalidValue(format!(
                         "BUZZ_NIP_FI_ISSUERS: issuer [index {idx}]: \
@@ -254,6 +259,15 @@ impl NipFiRelayConfig {
                          S4 command API requires maximum_command_age_seconds"
                     )));
                 }
+                // No orphan fields: reject because enforce mode requires every issuer
+                // to be command-capable (NIP-FI.md:405-409).
+                return Err(ConfigError::InvalidValue(format!(
+                    "BUZZ_NIP_FI_ISSUERS: issuer [index {idx}]: \
+                     maximum_command_age_seconds is required in enforce mode — \
+                     every configured issuer must be command-capable. \
+                     Add maximum_command_age_seconds and authorized_principals, \
+                     or remove this issuer from BUZZ_NIP_FI_ISSUERS"
+                )));
             }
         }
 
@@ -562,6 +576,41 @@ mod tests {
         assert!(
             msg.contains("maximum_command_age_seconds"),
             "error names the missing dependency: {msg}"
+        );
+    }
+
+    #[test]
+    fn enforce_issuer_without_command_fields_is_rejected() {
+        // An enforce-mode issuer entry with ALL THREE S4 fields absent must
+        // fail startup.  This is the blocker-4a case: the issuer is a valid
+        // JWKS/assertion issuer but carries no command config.  Without this
+        // rejection from_env() would succeed with an empty command_configs,
+        // the endpoint would permanently return 503, and startup would log nothing.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::new(NIP_FI_VARS);
+
+        std::env::set_var("BUZZ_NIP_FI_MODE", "enforce");
+        std::env::set_var("BUZZ_NIP_FI_MAX_CONNECTION_LIFETIME_SECS", "3600");
+        // All three S4 command fields absent — pure assertion/JWKS issuer.
+        std::env::set_var(
+            "BUZZ_NIP_FI_ISSUERS",
+            r#"[{
+                "issuer": "https://idp.example.com",
+                "audiences": ["https://relay.example.com"],
+                "token_class": "nip-fi+jwt",
+                "algorithms": ["ES256"],
+                "maximum_assertion_age_seconds": 3600,
+                "jwks_uri": "https://idp.example.com/.well-known/jwks.json",
+                "jwks_refresh_interval_seconds": 300,
+                "jwks_hard_deadline_seconds": 86400
+            }]"#,
+        );
+        let err = NipFiRelayConfig::from_env()
+            .expect_err("enforce issuer without command fields must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("maximum_command_age_seconds"),
+            "error must name the missing field: {msg}"
         );
     }
 }

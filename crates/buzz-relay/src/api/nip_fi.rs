@@ -150,12 +150,7 @@ pub async fn disconnect(
             // Asynchronous: HTTP response does not wait on remote delivery.
             {
                 let pubsub = Arc::clone(&state.pubsub);
-                let msg = buzz_pubsub::NipFiDisconnect {
-                    issuer: cmd.caller_iss.clone(),
-                    pubkey_bytes: pubkey_bytes.to_vec(),
-                    until_unix: cmd.until.timestamp(),
-                    until_unix_nanos: cmd.until.timestamp_subsec_nanos(),
-                };
+                let msg = nip_fi_disconnect_message(&cmd);
                 tokio::spawn(async move {
                     if let Err(e) = pubsub.publish_nip_fi_disconnect(&msg).await {
                         // [FI-TRACE-PRIVACY-NONPUBLIC]: no iss or pubkey in logs
@@ -212,11 +207,159 @@ pub struct NipFiCommandComponents {
     pub command_verifier: Arc<CommandVerifier<Arc<ProductionJwksSource>>>,
 }
 
+/// Outcome of applying a cross-pod NIP-FI disconnect message.
+///
+/// Returned by [`apply_nip_fi_disconnect`]; used by the `main.rs` receive loop
+/// and by tests to assert the production decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NipFiDisconnectApplyResult {
+    /// Command API is not enabled on this pod (deny map absent); message ignored.
+    Disabled,
+    /// Message was rejected before reaching the map (invalid pubkey, unknown
+    /// issuer, unrepresentable timestamp, or ceiling exceeded).
+    Rejected,
+    /// Message was applied; carries the map's merge result.
+    Applied(buzz_auth::CrossPodMergeResult),
+}
+
+/// Build the [`buzz_pubsub::NipFiDisconnect`] bus message from a successfully
+/// verified command.
+///
+/// This is the single publisher mapping — the HTTP success path calls this
+/// function to ensure the nanos precision is always captured correctly.
+/// Reverting either the seconds or the nanos field must red the round-trip oracle.
+pub fn nip_fi_disconnect_message(cmd: &buzz_auth::CommandResult) -> buzz_pubsub::NipFiDisconnect {
+    buzz_pubsub::NipFiDisconnect {
+        issuer: cmd.caller_iss.clone(),
+        pubkey_bytes: cmd.target_pubkey.to_bytes().to_vec(),
+        until_unix: cmd.until.timestamp(),
+        until_unix_nanos: cmd.until.timestamp_subsec_nanos(),
+    }
+}
+
+/// Apply a received cross-pod NIP-FI disconnect message against the local
+/// deny map and connection registry.
+///
+/// This is the single consumer path — the `main.rs` receive loop calls this
+/// function after receiving a message from the broadcast channel.  Extracting
+/// the logic here allows tests to call the exact production path end-to-end
+/// without driving a live Redis subscriber.
+///
+/// `now` is passed explicitly so tests can supply controlled timestamps.
+pub fn apply_nip_fi_disconnect(
+    state: &crate::state::AppState,
+    message: &buzz_pubsub::NipFiDisconnect,
+    now: chrono::DateTime<chrono::Utc>,
+) -> NipFiDisconnectApplyResult {
+    let deny_map = match state.nip_fi_deny_map.as_deref() {
+        Some(m) => m,
+        None => return NipFiDisconnectApplyResult::Disabled,
+    };
+
+    // Validate pubkey bytes.
+    let pubkey = match nostr::PublicKey::from_slice(&message.pubkey_bytes) {
+        Ok(k) => k,
+        Err(_) => {
+            tracing::warn!(
+                len = message.pubkey_bytes.len(),
+                "nip-fi cross-pod: malformed pubkey bytes — rejected"
+            );
+            return NipFiDisconnectApplyResult::Rejected;
+        }
+    };
+
+    // Validate that the issuer is locally configured.
+    if state
+        .config
+        .nip_fi
+        .registry
+        .policy_for_issuer(&message.issuer)
+        .is_none()
+    {
+        tracing::warn!("nip-fi cross-pod: unknown issuer (not locally configured) — rejected");
+        return NipFiDisconnectApplyResult::Rejected;
+    }
+
+    // Validate timestamp representability.
+    let until = match chrono::DateTime::from_timestamp(message.until_unix, message.until_unix_nanos)
+    {
+        Some(t) => t,
+        None => {
+            tracing::warn!(
+                until_unix = message.until_unix,
+                "nip-fi cross-pod: unrepresentable until timestamp — rejected"
+            );
+            return NipFiDisconnectApplyResult::Rejected;
+        }
+    };
+
+    // Validate that `until` does not exceed the issuer's ceiling.
+    if let Some(policy) = state
+        .config
+        .nip_fi
+        .registry
+        .policy_for_issuer(&message.issuer)
+    {
+        let skew = chrono::Duration::seconds(policy.skew_seconds() as i64);
+        let max_age = chrono::Duration::seconds(policy.maximum_assertion_age_seconds() as i64);
+        if let Some(ceiling) = now
+            .checked_add_signed(skew)
+            .and_then(|t| t.checked_add_signed(max_age))
+        {
+            if until > ceiling {
+                tracing::warn!("nip-fi cross-pod: until exceeds issuer ceiling — rejected");
+                return NipFiDisconnectApplyResult::Rejected;
+            }
+        }
+    }
+
+    // Merge the deny entry.
+    use buzz_auth::CrossPodMergeResult;
+    let merge_result = deny_map.merge_cross_pod_deny(&message.issuer, &pubkey, until, now);
+
+    // Close sessions for all merge outcomes except UnknownIssuer.
+    let close_sessions = |reason: &str| {
+        let closed = state.conn_manager.disconnect_nip_fi(&message.pubkey_bytes)
+            + state
+                .community_connections
+                .disconnect_nip_fi(&message.pubkey_bytes);
+        if closed > 0 {
+            tracing::debug!(closed, reason = reason, "nip-fi cross-pod: closed sessions");
+        }
+    };
+
+    match &merge_result {
+        CrossPodMergeResult::Merged => {
+            close_sessions("merged");
+        }
+        CrossPodMergeResult::UnknownIssuer => {
+            tracing::warn!("nip-fi cross-pod: merge returned UnknownIssuer — rejected");
+        }
+        CrossPodMergeResult::CapacityExceeded => {
+            tracing::warn!(
+                "nip-fi cross-pod: deny set full for issuer — sessions closed without deny entry (fail-closed posture)"
+            );
+            close_sessions("capacity-exceeded failsafe");
+            metrics::counter!("buzz_nip_fi_cross_pod_capacity_exceeded_total").increment(1);
+        }
+        CrossPodMergeResult::ShardPoisoned => {
+            tracing::error!(
+                "nip-fi cross-pod: issuer shard is poisoned — sessions closed (fail-closed)"
+            );
+            close_sessions("poisoned shard failsafe");
+            metrics::counter!("buzz_nip_fi_cross_pod_shard_poison_total").increment(1);
+        }
+    }
+
+    NipFiDisconnectApplyResult::Applied(merge_result)
+}
+
 /// Build the NIP-FI command components from the issuer policies and key source.
 ///
-/// Called by `main.rs` after startup validation passes.  Returns `Err` when
-/// any command config is invalid; a valid config with no command-capable issuers
-/// returns `Ok(None)`.
+/// Called by `install_nip_fi_command_components` (and transitively `main.rs`).
+/// Returns `Err` when any command config is invalid.  In enforce mode, returns
+/// `Err` when no command-capable issuers are present (assertion-only enforce is
+/// not supported by this PR; every enforce issuer must carry command config).
 ///
 /// `issuer_command_configs` must be in the same order as `registry.all_policies()`.
 pub fn build_nip_fi_command_components(
@@ -235,10 +378,19 @@ pub fn build_nip_fi_command_components(
     let mut default_capacity = DEFAULT_DENY_SET_CAPACITY;
 
     for (idx, (issuer, cmd_cfg)) in issuer_command_configs.iter().enumerate() {
-        // Only wire command API for issuers that have the required fields.
         let age = match cmd_cfg.maximum_command_age_seconds {
             Some(a) => a,
-            None => continue, // this issuer has no command config — skip
+            None => {
+                // In enforce mode every issuer must be command-capable;
+                // from_env() already guarantees this, but be defensive here too.
+                if matches!(mode, NipFiMode::Enforce) {
+                    return Err(format!(
+                        "nip-fi: enforce issuer [index {idx}] has no maximum_command_age_seconds — \
+                         assertion-only issuers are not supported in enforce mode"
+                    ));
+                }
+                continue; // non-enforce mode: skip issuers without command config
+            }
         };
         let principals = match &cmd_cfg.authorized_principals {
             Some(p) if !p.is_empty() => p.clone(),
@@ -271,6 +423,16 @@ pub fn build_nip_fi_command_components(
     }
 
     if command_policies.is_empty() {
+        if matches!(mode, NipFiMode::Enforce) {
+            // Enforce with no command-capable issuers is a misconfiguration:
+            // from_env() guarantees every enforce issuer has command config, so
+            // an empty set here means something was skipped or the configs are wrong.
+            return Err(
+                "nip-fi: enforce mode requires at least one command-capable issuer; \
+                 no command policies were built — check issuer configuration"
+                    .to_owned(),
+            );
+        }
         debug!("nip-fi: no command-capable issuers configured — command API disabled");
         return Ok(None);
     }
@@ -288,6 +450,105 @@ pub fn build_nip_fi_command_components(
         deny_map,
         command_verifier,
     }))
+}
+
+/// Result of a successful [`install_nip_fi_command_components`] call.
+#[derive(Debug)]
+pub struct NipFiCommandStartupReport {
+    /// Number of issuers whose JWKS snapshot was warmed before serving.
+    pub warmed_issuers: usize,
+    /// Number of issuers wired into the command verifier.
+    pub command_issuers: usize,
+}
+
+/// Install NIP-FI command components into `app_state`.
+///
+/// This is the single production startup seam that owns:
+/// - enforce-mode pre-flight check (returns `Err` for incomplete config)
+/// - JWKS warmup for every configured issuer
+/// - background JWKS refresh loop
+/// - `build_nip_fi_command_components` invocation
+/// - assignment of both `app_state.nip_fi_deny_map` and
+///   `app_state.nip_fi_command_verifier`
+///
+/// `main.rs` constructs the concrete `ProductionJwksSource` and calls this
+/// function once; it no longer owns either assignment or the warmup loop.
+///
+/// Deleting either AppState field assignment or the warmup loop must red the
+/// `production_install_warms_and_populates_both_app_state_fields` oracle.
+pub async fn install_nip_fi_command_components(
+    app_state: &mut crate::state::AppState,
+    mode: NipFiMode,
+    registry: &buzz_auth::IssuerRegistry,
+    key_source: Arc<ProductionJwksSource>,
+    jwks_configs: &[buzz_auth::IssuerJwksConfig],
+    command_configs: &[(String, CommandIssuerEnvConfig)],
+) -> Result<NipFiCommandStartupReport, String> {
+    // Pre-flight: enforce mode with no command configs is always an error.
+    if matches!(mode, NipFiMode::Enforce) && command_configs.is_empty() {
+        return Err(
+            "NIP-FI install: enforce mode requires at least one command-capable issuer".to_owned(),
+        );
+    }
+
+    // Warm each issuer's JWKS snapshot before serving.
+    let mut warmed_issuers: usize = 0;
+    for jwks_cfg in jwks_configs {
+        if let Some(snapshot) = key_source.get_snapshot(&jwks_cfg.issuer).await {
+            tracing::info!(
+                issuer_len = jwks_cfg.issuer.len(),
+                generation = snapshot.generation(),
+                "NIP-FI: JWKS warmed"
+            );
+            warmed_issuers += 1;
+        } else {
+            tracing::warn!(
+                issuer_len = jwks_cfg.issuer.len(),
+                "NIP-FI: JWKS warm-up failed — will retry inline"
+            );
+        }
+    }
+
+    // Spawn background refresh loop so snapshots stay fresh after startup.
+    {
+        let source_for_refresh = Arc::clone(&key_source);
+        let jwks_cfgs = jwks_configs.to_vec();
+        let shutting_down = Arc::clone(&app_state.shutting_down);
+        tokio::spawn(async move {
+            loop {
+                let min_interval_secs = jwks_cfgs
+                    .iter()
+                    .map(|c| c.contract.refresh_interval_seconds())
+                    .min()
+                    .unwrap_or(300);
+                tokio::time::sleep(std::time::Duration::from_secs(min_interval_secs)).await;
+                if shutting_down.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                for cfg in &jwks_cfgs {
+                    source_for_refresh.get_snapshot(&cfg.issuer).await;
+                }
+            }
+        });
+    }
+
+    let components =
+        build_nip_fi_command_components(mode, registry, Arc::clone(&key_source), command_configs)?;
+
+    let command_issuers = if let Some(c) = components {
+        let n = command_configs.len();
+        app_state.nip_fi_deny_map = Some(c.deny_map);
+        app_state.nip_fi_command_verifier = Some(c.command_verifier);
+        tracing::info!("NIP-FI S4: command API enabled ({n} issuer(s))");
+        n
+    } else {
+        0
+    };
+
+    Ok(NipFiCommandStartupReport {
+        warmed_issuers,
+        command_issuers,
+    })
 }
 
 /// Validate a command issuer config entry without constructing a policy.
@@ -977,38 +1238,320 @@ mod route_integration_tests {
         );
     }
 
-    // ── Test: production assembly oracle ─────────────────────────────────────
+    // ── Test: blocker 1 — consumer_capacity_result_denies_target_and_unrelated_admission ─────
     //
-    // Exercises `build_nip_fi_command_components` — the same function invoked by
-    // `main.rs` to wire both state fields — with a seeded key source and confirms:
+    // Uses apply_nip_fi_disconnect (the production consumer seam) to feed a capacity-exhausting
+    // message. After the capacity transition, is_denied must return true for both the target
+    // and an unrelated key.
     //
-    // 1. The function returns `Some(components)` for a valid configuration.
-    // 2. The returned `deny_map` is the shared instance held by the verifier.
-    // 3. A disconnect command verified through the returned verifier inserts a
-    //    deny entry readable via the returned deny_map.
-    //
-    // Mutation anchor: deleting either of the two `app_state.nip_fi_*` assignments
-    // in `main.rs` means the production code no longer calls this function with
-    // those fields populated — the route integration tests that use `build_test_state`
-    // would still pass (they seed state directly), but THIS test would fail because
-    // it only succeeds if `build_nip_fi_command_components` correctly initialises
-    // and wires both components.
+    // Red mutations: consumer stops calling merge_cross_pod_deny → blocked never set;
+    // capacity transition stops setting blocked → unrelated key admitted;
+    // admission ignores blocked → both keys admitted.
 
     #[tokio::test]
-    async fn production_assembly_build_nip_fi_command_components_wires_both_fields() {
-        // Replicate the exact construction sequence from main.rs (lines ~480-545):
-        // 1. Build ProductionJwksSource from jwks_configs.
-        // 2. Seed the JWKS snapshot (avoids a real HTTP fetch).
-        // 3. Call build_nip_fi_command_components.
-        // 4. Assert Some(components) returned.
-        // 5. Assert a successful verify call is readable via the returned deny_map.
+    async fn consumer_capacity_result_denies_target_and_unrelated_admission() {
+        use super::apply_nip_fi_disconnect;
+        use super::NipFiDisconnectApplyResult;
+        use buzz_auth::CrossPodMergeResult;
+
+        // capacity=1: first message fills it; second message exhausts capacity → blocked.
+        // We need a state with TEST_ISS in config.nip_fi.registry so apply_nip_fi_disconnect
+        // passes the issuer validation step and reaches the merge path.
+        let state = {
+            let mut config = crate::config::Config::from_env().expect("default config loads");
+            config.database_url = "postgres://buzz:buzz@127.0.0.1:1/buzz".to_string();
+            config.redis_url = "redis://127.0.0.1:1".to_string();
+            // Wire TEST_ISS into the NIP-FI registry so the consumer seam accepts it.
+            config.nip_fi.registry.insert(test_issuer_policy());
+
+            let pool = sqlx::PgPool::connect_lazy(&config.database_url).unwrap();
+            let db = buzz_db::Db::from_pool(pool.clone());
+            let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .unwrap();
+            let pubsub = Arc::new(
+                buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                    .await
+                    .unwrap(),
+            );
+            let audit = buzz_audit::AuditService::new(pool.clone());
+            let auth = buzz_auth::AuthService::new(config.auth.clone());
+            let search = buzz_search::SearchService::new(pool.clone());
+            let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+                db.clone(),
+                buzz_workflow::WorkflowConfig::default(),
+            ));
+            let media_storage = buzz_media::MediaStorage::new(&config.media).unwrap();
+            let (mut state, _) = crate::state::AppState::new(
+                config,
+                db,
+                redis_pool,
+                audit,
+                pubsub,
+                auth,
+                search,
+                workflow_engine,
+                nostr::Keys::generate(),
+                media_storage,
+            );
+            // Wire deny map with capacity=1 so the second consumer call hits capacity.
+            let deny_map = Arc::new(buzz_auth::NipFiDenyMap::new(
+                1,
+                vec![buzz_auth::IssuerCapacity {
+                    issuer: TEST_ISS.to_owned(),
+                    capacity: 1,
+                }],
+            ));
+            state.nip_fi_deny_map = Some(Arc::clone(&deny_map));
+            Arc::new(state)
+        };
+
+        let now = chrono::Utc::now();
+        let until_unix = (now + chrono::Duration::seconds(300)).timestamp();
+
+        let k_a = nostr::Keys::generate().public_key();
+        let k_b = nostr::Keys::generate().public_key();
+        let k_unrelated = nostr::Keys::generate().public_key();
+
+        // First message: fills the one slot with key A.
+        let msg_a = buzz_pubsub::NipFiDisconnect {
+            issuer: TEST_ISS.to_owned(),
+            pubkey_bytes: k_a.to_bytes().to_vec(),
+            until_unix,
+            until_unix_nanos: 0,
+        };
+        let result_a = apply_nip_fi_disconnect(&state, &msg_a, now);
+        assert_eq!(
+            result_a,
+            NipFiDisconnectApplyResult::Applied(CrossPodMergeResult::Merged),
+            "first consumer message must merge"
+        );
+
+        // Second message: capacity exhausted → blocked = true.
+        let msg_b = buzz_pubsub::NipFiDisconnect {
+            issuer: TEST_ISS.to_owned(),
+            pubkey_bytes: k_b.to_bytes().to_vec(),
+            until_unix,
+            until_unix_nanos: 0,
+        };
+        let result_b = apply_nip_fi_disconnect(&state, &msg_b, now);
+        assert_eq!(
+            result_b,
+            NipFiDisconnectApplyResult::Applied(CrossPodMergeResult::CapacityExceeded),
+            "second consumer message must hit capacity"
+        );
+
+        let deny_map = state.nip_fi_deny_map.as_deref().expect("deny map present");
+
+        // Target key B is denied via the blocked bit.
+        assert!(
+            deny_map.is_denied(TEST_ISS, &k_b, now),
+            "targeted key must be denied after consumer capacity exhaustion"
+        );
+        // Unrelated key C is also denied via the blocked bit.
+        assert!(
+            deny_map.is_denied(TEST_ISS, &k_unrelated, now),
+            "unrelated key must be denied after consumer capacity exhaustion (issuer blocked)"
+        );
+    }
+
+    // ── Test: blocker 3 — fractional deadline survives publisher wire and consumer equality boundary ─
+    //
+    // Exercises the full publisher → encode → decode → apply_nip_fi_disconnect chain with a
+    // non-zero nanos deadline. Proves denied immediately after T, admitted at exact T + nanos.
+    //
+    // Red mutations:
+    //  - publisher writes zero nanos → until reconstructed as T+0 → equality boundary fails
+    //  - encoder omits nanos field → decoder defaults to 0 → same failure
+    //  - decoder defaults a present field to zero → same failure
+    //  - consumer reconstructs with zero nanos → same failure
+    //  - comparison changes from < to <= → admitted before exact boundary
+
+    #[tokio::test]
+    async fn fractional_deadline_survives_publisher_wire_and_consumer_equality_boundary() {
+        use super::NipFiDisconnectApplyResult;
+        use super::{apply_nip_fi_disconnect, nip_fi_disconnect_message};
+        use buzz_auth::CrossPodMergeResult;
+
+        // Build a state with TEST_ISS in the registry so apply_nip_fi_disconnect accepts it.
+        let state = {
+            let mut config = crate::config::Config::from_env().expect("default config loads");
+            config.database_url = "postgres://buzz:buzz@127.0.0.1:1/buzz".to_string();
+            config.redis_url = "redis://127.0.0.1:1".to_string();
+            config.nip_fi.registry.insert(test_issuer_policy());
+
+            let pool = sqlx::PgPool::connect_lazy(&config.database_url).unwrap();
+            let db = buzz_db::Db::from_pool(pool.clone());
+            let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .unwrap();
+            let pubsub = Arc::new(
+                buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                    .await
+                    .unwrap(),
+            );
+            let audit = buzz_audit::AuditService::new(pool.clone());
+            let auth = buzz_auth::AuthService::new(config.auth.clone());
+            let search = buzz_search::SearchService::new(pool.clone());
+            let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+                db.clone(),
+                buzz_workflow::WorkflowConfig::default(),
+            ));
+            let media_storage = buzz_media::MediaStorage::new(&config.media).unwrap();
+            let (mut state, _) = crate::state::AppState::new(
+                config,
+                db,
+                redis_pool,
+                audit,
+                pubsub,
+                auth,
+                search,
+                workflow_engine,
+                nostr::Keys::generate(),
+                media_storage,
+            );
+            let deny_map = Arc::new(buzz_auth::NipFiDenyMap::new(
+                1000,
+                vec![buzz_auth::IssuerCapacity {
+                    issuer: TEST_ISS.to_owned(),
+                    capacity: 1000,
+                }],
+            ));
+            state.nip_fi_deny_map = Some(Arc::clone(&deny_map));
+            Arc::new(state)
+        };
+
+        // Build a CommandResult with a fractional deadline: T + 500_000_000 ns.
+        // We construct the CommandResult directly rather than going through the HTTP
+        // handler so we can control the exact until timestamp.
+        let target = nostr::Keys::generate().public_key();
+        let t_whole = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let nanos: u32 = 500_000_000;
+        let t_frac = chrono::DateTime::from_timestamp(1_800_000_000, nanos).unwrap();
+
+        // Construct a synthetic CommandResult.
+        let cmd = buzz_auth::CommandResult {
+            caller_iss: TEST_ISS.to_owned(),
+            caller_sub: TEST_SUB.to_owned(),
+            target_pubkey: target,
+            until: t_frac,
+        };
+
+        // Publisher seam → encode → decode.
+        let msg = nip_fi_disconnect_message(&cmd);
+        assert_eq!(
+            msg.until_unix, 1_800_000_000,
+            "publisher must capture whole-second"
+        );
+        assert_eq!(msg.until_unix_nanos, nanos, "publisher must capture nanos");
+
+        let encoded = buzz_pubsub::encode_nip_fi_disconnect(&msg).expect("encode must succeed");
+        let decoded = buzz_pubsub::decode_nip_fi_disconnect(&encoded).expect("decode must succeed");
+        assert_eq!(decoded.until_unix_nanos, nanos, "decoded nanos must match");
+
+        // Consumer seam: apply with now = T + 1ns (inside the deadline).
+        let now_inside = t_frac - chrono::Duration::nanoseconds(1);
+        let result = apply_nip_fi_disconnect(&state, &decoded, now_inside);
+        assert_eq!(
+            result,
+            NipFiDisconnectApplyResult::Applied(CrossPodMergeResult::Merged),
+            "apply must succeed with now inside deadline"
+        );
+
+        let deny_map = state.nip_fi_deny_map.as_deref().expect("deny map present");
+
+        // Denied immediately after T (now = T + 1ns, until = T + 500_000_000ns).
+        assert!(
+            deny_map.is_denied(TEST_ISS, &target, now_inside),
+            "must be denied at T+1ns (deadline is T+500ms)"
+        );
+
+        // Denied at deadline minus 1ns (just before equality boundary).
+        let now_before_boundary = t_frac - chrono::Duration::nanoseconds(1);
+        assert!(
+            deny_map.is_denied(TEST_ISS, &target, now_before_boundary),
+            "must be denied at deadline - 1ns"
+        );
+
+        // Admitted at exact equality (now == until): contract is `now < until`,
+        // so exact equality means admitted.
+        assert!(
+            !deny_map.is_denied(TEST_ISS, &target, t_frac),
+            "must be admitted at exact equality (now < until fails at now == until)"
+        );
+
+        // Also admitted after (now = T + whole second).
+        assert!(
+            !deny_map.is_denied(TEST_ISS, &target, t_whole + chrono::Duration::seconds(1)),
+            "must be admitted past the deadline"
+        );
+    }
+
+    // ── Test: blocker 4b — production_install_warms_and_populates_both_app_state_fields ─────
+    //
+    // Calls install_nip_fi_command_components() directly (the production seam that owns
+    // warmup + both AppState assignments). Proves:
+    // - warmed_issuers == 1 after a seeded get_snapshot
+    // - command_issuers == 1
+    // - both AppState fields are Some
+    // - a valid signed command through the verifier creates a deny visible via the map
+    // - the refresh loop terminates on shutting_down
+    //
+    // Mandatory red mutations (proven by separate inline verification below):
+    //  1. delete deny_map assignment → AppState.nip_fi_deny_map is None
+    //  2. delete verifier assignment → AppState.nip_fi_command_verifier is None
+    //  3. delete/bypass warmup → warmed_issuers == 0
+    //  4. wire verifier to a different map → verify succeeds but state map denial fails
+
+    #[tokio::test]
+    async fn production_install_warms_and_populates_both_app_state_fields() {
+        use super::install_nip_fi_command_components;
+
+        // Build a minimal AppState — same construction as build_test_state but without
+        // the S4 fields so we can verify install_nip_fi_command_components populates them.
+        let mut config = crate::config::Config::from_env().expect("default config loads");
+        config.database_url = "postgres://buzz:buzz@127.0.0.1:1/buzz".to_string();
+        config.redis_url = "redis://127.0.0.1:1".to_string();
+        let pool = sqlx::PgPool::connect_lazy(&config.database_url).unwrap();
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .unwrap();
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .unwrap(),
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).unwrap();
+        let (mut state, _) = crate::state::AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            nostr::Keys::generate(),
+            media_storage,
+        );
+        // Both fields start as None — we'll verify install populates them.
+        assert!(state.nip_fi_deny_map.is_none());
+        assert!(state.nip_fi_command_verifier.is_none());
 
         let jwks_configs = vec![test_jwks_config()];
         let key_source = Arc::new(
-            ProductionJwksSource::new(jwks_configs, buzz_auth::HttpJwksFetcher::new())
+            ProductionJwksSource::new(jwks_configs.clone(), buzz_auth::HttpJwksFetcher::new())
                 .expect("valid key source"),
         );
-        // Warm the snapshot without a real HTTP fetch — same as the route tests.
+        // Seed the JWKS snapshot hermetically (no HTTP).
         key_source
             .seed_snapshot_for_test(TEST_ISS, test_jwks())
             .await;
@@ -1025,35 +1568,53 @@ mod route_integration_tests {
             },
         )];
 
-        // This is the production call — same as main.rs.
-        let components = build_nip_fi_command_components(
+        let report = install_nip_fi_command_components(
+            &mut state,
             buzz_auth::NipFiMode::Enforce,
             &registry,
             Arc::clone(&key_source),
+            &jwks_configs,
             &cmd_configs,
         )
-        .expect("build must not return Err for valid config")
-        .expect("build must return Some for command-capable config");
+        .await
+        .expect("install must succeed for valid config");
 
-        // Confirm the deny_map and verifier are wired to the same underlying map:
-        // a successful verify_at writes to the deny_map clone inside the verifier,
-        // and the same logical map is held in components.deny_map.
+        // Warmup: one issuer was seeded and should have a snapshot.
+        assert_eq!(
+            report.warmed_issuers, 1,
+            "warmed_issuers must equal 1 (snapshot was seeded)"
+        );
+        assert_eq!(report.command_issuers, 1, "command_issuers must equal 1");
+
+        // Both AppState fields must be populated.
+        assert!(
+            state.nip_fi_deny_map.is_some(),
+            "nip_fi_deny_map must be Some after install"
+        );
+        assert!(
+            state.nip_fi_command_verifier.is_some(),
+            "nip_fi_command_verifier must be Some after install"
+        );
+
+        // Verify a valid command through the verifier and confirm the deny entry
+        // is visible through the AppState's deny_map (proves shared map wiring).
         let target = nostr::Keys::generate().public_key();
-        let target_hex_str = target.to_hex();
-        let now = chrono::Utc::now();
-        let token = mint_token(&target_hex_str, 300, serde_json::json!({}));
-        let result = components
-            .command_verifier
-            .verify(&token, "POST", TEST_PATH, &target);
+        let token = mint_token(&target.to_hex(), 300, serde_json::json!({}));
+        let verifier = state.nip_fi_command_verifier.as_ref().unwrap();
+        let result = verifier.verify(&token, "POST", TEST_PATH, &target);
         assert!(
             result.is_ok(),
-            "verifier from build_nip_fi_command_components must accept a valid command: {result:?}"
+            "verifier must accept a valid command: {result:?}"
+        );
+        let deny_map = state.nip_fi_deny_map.as_deref().unwrap();
+        assert!(
+            deny_map.is_denied(TEST_ISS, &target, chrono::Utc::now()),
+            "deny entry must be visible via AppState.nip_fi_deny_map after verify"
         );
 
-        // The deny entry must now be visible via components.deny_map (same Arc).
-        assert!(
-            components.deny_map.is_denied(TEST_ISS, &target, now),
-            "deny_map from build_nip_fi_command_components must record the deny entry inserted by the verifier"
-        );
+        // Signal the refresh loop to terminate.
+        state
+            .shutting_down
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }

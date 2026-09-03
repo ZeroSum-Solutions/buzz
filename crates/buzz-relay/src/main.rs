@@ -472,95 +472,30 @@ async fn main() -> anyhow::Result<()> {
     );
     // NIP-FI S4: construct deny map + command verifier from startup config,
     // before Arc::new so we can mutate app_state directly.
-    // Fail-closed: `from_env()` already validated all command fields; the
-    // builder returns Err on invalid config (no warn-and-skip), and a None
-    // key-source is treated as a startup failure in enforce mode.
+    // Delegates to install_nip_fi_command_components which owns JWKS warmup,
+    // the refresh loop, build_nip_fi_command_components, and both state assignments.
     {
         let nip_fi = &config.nip_fi;
-        if nip_fi.is_enforce() && !nip_fi.command_configs.is_empty() {
-            let key_source = buzz_auth::ProductionJwksSource::new(
-                nip_fi.jwks_configs.clone(),
-                buzz_auth::HttpJwksFetcher::new(),
-            )
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "NIP-FI: failed to construct JWKS key source \
-                     (empty or duplicate issuer config)"
-                )
-            })?;
-            // Warm each issuer's JWKS snapshot before serving: ensure key_set()
-            // returns Some on the first request.  A fetch failure here is non-fatal
-            // (the source will retry inline on the first verify call) but is logged.
-            let key_source = Arc::new(key_source);
-            for jwks_cfg in &nip_fi.jwks_configs {
-                if let Some(snapshot) = key_source.get_snapshot(&jwks_cfg.issuer).await {
-                    tracing::info!(
-                        issuer_len = jwks_cfg.issuer.len(),
-                        generation = snapshot.generation(),
-                        "NIP-FI: JWKS warmed"
-                    );
-                } else {
-                    tracing::warn!(
-                        issuer_len = jwks_cfg.issuer.len(),
-                        "NIP-FI: JWKS warm-up failed — will retry inline"
-                    );
-                }
-            }
-            // Spawn background refresh loop so snapshots stay fresh after startup.
-            {
-                let source_for_refresh = Arc::clone(&key_source);
-                let jwks_cfgs = nip_fi.jwks_configs.clone();
-                let shutting_down = Arc::clone(&app_state.shutting_down);
-                tokio::spawn(async move {
-                    loop {
-                        // Find the shortest refresh interval across issuers.
-                        let min_interval_secs = jwks_cfgs
-                            .iter()
-                            .map(|c| c.contract.refresh_interval_seconds())
-                            .min()
-                            .unwrap_or(300);
-                        tokio::time::sleep(std::time::Duration::from_secs(min_interval_secs)).await;
-                        if shutting_down.load(std::sync::atomic::Ordering::Acquire) {
-                            break;
-                        }
-                        for cfg in &jwks_cfgs {
-                            source_for_refresh.get_snapshot(&cfg.issuer).await;
-                        }
-                    }
-                });
-            }
-            let components = buzz_relay::api::nip_fi::build_nip_fi_command_components(
-                nip_fi.mode,
-                &nip_fi.registry,
-                Arc::clone(&key_source),
-                &nip_fi.command_configs,
-            )
-            .map_err(|e| anyhow::anyhow!("NIP-FI command component construction failed: {e}"))?;
-            if let Some(c) = components {
-                app_state.nip_fi_deny_map = Some(c.deny_map);
-                app_state.nip_fi_command_verifier = Some(c.command_verifier);
-                tracing::info!(
-                    "NIP-FI S4: command API enabled ({} issuer(s))",
-                    nip_fi.command_configs.len()
-                );
-            }
-        } else if let Some(key_source) = buzz_auth::ProductionJwksSource::new(
+        if let Some(key_source) = buzz_auth::ProductionJwksSource::new(
             nip_fi.jwks_configs.clone(),
             buzz_auth::HttpJwksFetcher::new(),
         ) {
-            // Off/DenyProtected with JWKS: warm snapshots for S3 assertion path.
             let key_source = Arc::new(key_source);
-            if let Some(components) = buzz_relay::api::nip_fi::build_nip_fi_command_components(
+            buzz_relay::api::nip_fi::install_nip_fi_command_components(
+                &mut app_state,
                 nip_fi.mode,
                 &nip_fi.registry,
                 Arc::clone(&key_source),
+                &nip_fi.jwks_configs,
                 &nip_fi.command_configs,
             )
-            .map_err(|e| anyhow::anyhow!("NIP-FI command component construction failed: {e}"))?
-            {
-                app_state.nip_fi_deny_map = Some(components.deny_map);
-                app_state.nip_fi_command_verifier = Some(components.command_verifier);
-            }
+            .await
+            .map_err(|e| anyhow::anyhow!("NIP-FI startup failed: {e}"))?;
+        } else if nip_fi.is_enforce() {
+            return Err(anyhow::anyhow!(
+                "NIP-FI: failed to construct JWKS key source \
+                 (empty or duplicate issuer config)"
+            ));
         }
     }
     let state = Arc::new(app_state);
@@ -1126,11 +1061,9 @@ async fn main() -> anyhow::Result<()> {
     // also receives its own message and applies it — this is idempotent because
     // the deny entry was already inserted locally before the publish.
     //
-    // The consumer treats the Redis bus as a hostile boundary:
-    // - Unknown issuers are rejected without allocating state.
-    // - Invalid pubkey bytes are rejected.
-    // - Unrepresentable or policy-invalid `until` timestamps are rejected.
-    // - Capacity/poison failures transition the issuer to fail-closed (deny all).
+    // The consumer delegates to `apply_nip_fi_disconnect` which owns all
+    // validation, merge, and session-close logic.  This keeps the loop body
+    // minimal and makes the exact production path testable end-to-end.
     {
         let state_for_nip_fi = Arc::clone(&state);
         let mut rx = state_for_nip_fi.pubsub.subscribe_nip_fi_disconnect();
@@ -1138,147 +1071,12 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 match rx.recv().await {
                     Ok(msg) => {
-                        // Only apply if the deny map is present (command API enabled).
-                        let deny_map = match state_for_nip_fi.nip_fi_deny_map.as_deref() {
-                            Some(m) => m,
-                            None => continue,
-                        };
-
-                        // Validate pubkey bytes.
-                        let pubkey = match nostr::PublicKey::from_slice(&msg.pubkey_bytes) {
-                            Ok(k) => k,
-                            Err(_) => {
-                                tracing::warn!(
-                                    len = msg.pubkey_bytes.len(),
-                                    "nip-fi cross-pod: malformed pubkey bytes — rejected"
-                                );
-                                continue;
-                            }
-                        };
-
-                        // Validate that the issuer is locally configured.  Unknown
-                        // issuers are rejected without allocating any shard state.
-                        if state_for_nip_fi
-                            .config
-                            .nip_fi
-                            .registry
-                            .policy_for_issuer(&msg.issuer)
-                            .is_none()
-                        {
-                            tracing::warn!(
-                                "nip-fi cross-pod: unknown issuer (not locally configured) — rejected"
-                            );
-                            continue;
-                        }
-
-                        // Validate timestamp representability.
-                        let until = match chrono::DateTime::from_timestamp(
-                            msg.until_unix,
-                            msg.until_unix_nanos,
-                        ) {
-                            Some(t) => t,
-                            None => {
-                                tracing::warn!(
-                                    until_unix = msg.until_unix,
-                                    "nip-fi cross-pod: unrepresentable until timestamp — rejected"
-                                );
-                                continue;
-                            }
-                        };
-
-                        // Validate that `until` does not exceed the issuer's ceiling.
-                        // Ceiling = now + skew + maximum_assertion_age (same formula as command verifier).
                         let now = chrono::Utc::now();
-                        if let Some(policy) = state_for_nip_fi
-                            .config
-                            .nip_fi
-                            .registry
-                            .policy_for_issuer(&msg.issuer)
-                        {
-                            let skew = chrono::Duration::seconds(policy.skew_seconds() as i64);
-                            let max_age = chrono::Duration::seconds(
-                                policy.maximum_assertion_age_seconds() as i64,
-                            );
-                            if let Some(ceiling) = now
-                                .checked_add_signed(skew)
-                                .and_then(|t| t.checked_add_signed(max_age))
-                            {
-                                if until > ceiling {
-                                    tracing::warn!(
-                                        "nip-fi cross-pod: until exceeds issuer ceiling — rejected"
-                                    );
-                                    continue;
-                                }
-                            }
-                        }
-
-                        // Merge the deny entry.
-                        use buzz_auth::CrossPodMergeResult;
-                        match deny_map.merge_cross_pod_deny(&msg.issuer, &pubkey, until, now) {
-                            CrossPodMergeResult::Merged => {
-                                // Close matching sessions.
-                                let closed = state_for_nip_fi
-                                    .conn_manager
-                                    .disconnect_nip_fi(&msg.pubkey_bytes)
-                                    + state_for_nip_fi
-                                        .community_connections
-                                        .disconnect_nip_fi(&msg.pubkey_bytes);
-                                if closed > 0 {
-                                    // [FI-TRACE-PRIVACY-NONPUBLIC]: no iss or pubkey in logs
-                                    tracing::debug!(closed, "nip-fi cross-pod: closed sessions");
-                                }
-                            }
-                            CrossPodMergeResult::UnknownIssuer => {
-                                // Already validated above; belt-and-suspenders.
-                                tracing::warn!(
-                                    "nip-fi cross-pod: merge returned UnknownIssuer — rejected"
-                                );
-                            }
-                            CrossPodMergeResult::CapacityExceeded => {
-                                // Fail-closed: the issuer shard is at capacity.
-                                // Sessions are still closed so the key cannot re-authenticate;
-                                // the missing deny entry will be corrected on reconnect via
-                                // the origin pod's deny map.
-                                tracing::warn!(
-                                    "nip-fi cross-pod: deny set full for issuer — sessions closed without deny entry (fail-closed posture)"
-                                );
-                                let closed = state_for_nip_fi
-                                    .conn_manager
-                                    .disconnect_nip_fi(&msg.pubkey_bytes)
-                                    + state_for_nip_fi
-                                        .community_connections
-                                        .disconnect_nip_fi(&msg.pubkey_bytes);
-                                if closed > 0 {
-                                    tracing::debug!(
-                                        closed,
-                                        "nip-fi cross-pod: closed sessions (capacity-exceeded failsafe)"
-                                    );
-                                }
-                                metrics::counter!("buzz_nip_fi_cross_pod_capacity_exceeded_total")
-                                    .increment(1);
-                            }
-                            CrossPodMergeResult::ShardPoisoned => {
-                                // Fail-closed: poisoned shard.  Close sessions and
-                                // alert; the shard is permanently inaccessible until restart.
-                                tracing::error!(
-                                    "nip-fi cross-pod: issuer shard is poisoned — sessions closed (fail-closed)"
-                                );
-                                let closed = state_for_nip_fi
-                                    .conn_manager
-                                    .disconnect_nip_fi(&msg.pubkey_bytes)
-                                    + state_for_nip_fi
-                                        .community_connections
-                                        .disconnect_nip_fi(&msg.pubkey_bytes);
-                                if closed > 0 {
-                                    tracing::debug!(
-                                        closed,
-                                        "nip-fi cross-pod: closed sessions (poisoned shard failsafe)"
-                                    );
-                                }
-                                metrics::counter!("buzz_nip_fi_cross_pod_shard_poison_total")
-                                    .increment(1);
-                            }
-                        }
+                        buzz_relay::api::nip_fi::apply_nip_fi_disconnect(
+                            &state_for_nip_fi,
+                            &msg,
+                            now,
+                        );
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         metrics::counter!("buzz_nip_fi_disconnect_lag_total").increment(n);
