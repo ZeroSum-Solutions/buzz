@@ -667,9 +667,18 @@ import os.log
       store: endpointGrantStore,
       appAttestKeychainAccessGroup: pushKeychainAccessGroup
     )
+    let cleanupDeviceToken = apnsDeviceToken
     let task = Task { [weak self] in
-      try await driver.cleanRetiredGateways(deviceToken: self?.apnsDeviceToken)
-      try self?.endpointGrantStore.clearReplacementRelayOrigins()
+      try await driver.cleanRetiredGateways(deviceToken: cleanupDeviceToken)
+      try await MainActor.run { [weak self] in
+        guard let self else { return }
+        try BuzzPushCleanupTokenFence.checkpointIfCurrent(
+          capturedDeviceToken: cleanupDeviceToken,
+          liveDeviceToken: self.apnsDeviceToken
+        ) {
+          try self.endpointGrantStore.clearReplacementRelayOrigins()
+        }
+      }
     }
     gatewayCleanupTask = task
     Task { [weak self] in
