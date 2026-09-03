@@ -1560,12 +1560,18 @@ test("other-owned agents without a shared channel remain unavailable", async ({
   const input = page.getByTestId("message-input");
   await input.fill("@mira");
 
-  const dropdown = autocomplete(page);
+  await expect(
+    autocomplete(page).getByRole("button", {
+      name: "Checking mira",
+      exact: true,
+    }),
+  ).toBeDisabled();
   const action = autocomplete(page).getByRole("button", {
     name: "Unavailable mira",
     exact: true,
   });
-  await expect(action).toBeDisabled();
+  // The product intentionally gives unknown evidence a five-second window.
+  await expect(action).toBeDisabled({ timeout: 7000 });
   await input.press("Tab");
   await expect(input).toHaveText("@mira");
   await expect(input.locator(".mention-chip")).toHaveCount(0);
@@ -1582,11 +1588,18 @@ test("stale channel-member agents absent from managed and relay directories rema
   const input = page.getByTestId("message-input");
   await input.fill("@mira");
 
+  await expect(
+    autocomplete(page).getByRole("button", {
+      name: "Checking mira",
+      exact: true,
+    }),
+  ).toBeDisabled();
   const action = autocomplete(page).getByRole("button", {
     name: "Unavailable mira",
     exact: true,
   });
-  await expect(action).toBeDisabled();
+  // The product intentionally gives unknown evidence a five-second window.
+  await expect(action).toBeDisabled({ timeout: 7000 });
   await input.press("Tab");
   await expect(input).toHaveText("@mira");
 });
@@ -1872,6 +1885,13 @@ test("relay-agent directory errors fail closed and recover after a fresh fetch",
   page,
 }) => {
   await installMockBridge(page, {
+    searchProfiles: [
+      {
+        pubkey: ALLOWLIST_RELAY_AGENT_PUBKEY,
+        displayName: "quinn",
+        isAgent: true,
+      },
+    ],
     relayAgentListErrors: Array(20).fill("mock directory unavailable"),
     relayAgents: [
       {
@@ -1885,6 +1905,21 @@ test("relay-agent directory errors fail closed and recover after a fresh fetch",
   });
   await page.goto("/");
   await page.getByTestId("channel-general").click();
+  // Failed discovery cannot disclose an unknown directory-only identity.
+  // Seed a known channel member independently, so Retry has an existing row.
+  await page.evaluate(
+    async ({ channelId, pubkey }) => {
+      await window.__BUZZ_E2E_INVOKE_MOCK_COMMAND__?.("add_channel_members", {
+        channelId,
+        pubkeys: [pubkey],
+        role: "bot",
+      });
+      await window.__BUZZ_E2E_QUERY_CLIENT__?.invalidateQueries({
+        queryKey: ["channels", channelId, "members"],
+      });
+    },
+    { channelId: GENERAL_CHANNEL_ID, pubkey: ALLOWLIST_RELAY_AGENT_PUBKEY },
+  );
   const input = page.getByTestId("message-input");
   await input.fill("@quinn");
   await expect(
@@ -1893,12 +1928,15 @@ test("relay-agent directory errors fail closed and recover after a fresh fetch",
       exact: true,
     }),
   ).toBeDisabled();
+  await input.press("Tab");
+  await expect(input).toHaveText("@quinn");
+  await expect(input.locator(".mention-chip")).toHaveCount(0);
 
   await page.evaluate(async () => {
     window.__BUZZ_E2E__.mock!.relayAgentListErrors = [];
   });
   await autocomplete(page)
-    .getByRole("button", { name: "Retry", exact: true })
+    .getByRole("button", { name: "Retry access check for quinn", exact: true })
     .click();
   await expect(
     autocomplete(page).getByRole("button", {
