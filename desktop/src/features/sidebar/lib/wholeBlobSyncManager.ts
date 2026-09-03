@@ -188,10 +188,8 @@ export class WholeBlobSyncManager<S> {
   // publish after a newer edit exists.
   private publishInFlight = false;
   // Whether bootstrap() has been called (started) and whether it has completed.
-  // publish() defers the debounce timer only when bootstrap was started but has
-  // not yet resolved. When bootstrap() is never called (e.g. standalone tests
-  // or managers used without the standard hook lifecycle), both flags stay false
-  // and publish() behaves as before — schedules the timer immediately.
+  // publish() defers the debounce timer until bootstrap resolves; when bootstrap
+  // is never called, both flags stay false and the timer schedules immediately.
   //
   // The P2a queue-until-bootstrap contract: no publish debounce fires between
   // bootstrap starting and bootstrap resolving, so a click during an unresolved
@@ -203,8 +201,7 @@ export class WholeBlobSyncManager<S> {
   // fetchOwnBlobBeforePublish so an edit whose baseline is {0,""} because
   // bootstrap failed still publishes ABOVE the first head it discovers rather
   // than adopting it away. (For a successful bootstrap, releaseDeferred re-freezes
-  // publishBaseline to the bootstrap-result head, so the baseline is not {0,""}
-  // at doPublish and this flag is never consulted.)
+  // publishBaseline to the bootstrap-result head, so this flag is never consulted.)
   private bootstrapFailed = false;
   // Disarmed once any head is independently observed after a failed bootstrap
   // (live relay subscription or a reconnect/periodic fetch). When disarmed, the
@@ -500,14 +497,20 @@ export class WholeBlobSyncManager<S> {
     isRestoredReplay = false,
     restoredQueuedAt?: number,
   ): boolean {
+    const wasIdle = this.pendingStore === null;
+    // Reseed only when (a) starting a new sequence (wasIdle) or (b)
+    // lastRemoteHead is our OWN attempt (lastIsOwnAttempt: eventId ∈
+    // ambiguousAttemptIds). Case (b) lets foldSupersedingAttemptWinner
+    // repair the baseline on a same-second collision. All other superseding
+    // edits preserve the existing baseline: lastRemoteHead may carry a
+    // suppressed live H102 that must not be silently overwritten (Carl P2).
+    const lastIsOwnAttempt =
+      this.lastRemoteHead.eventId !== "" &&
+      this.ambiguousAttemptIds.has(this.lastRemoteHead.eventId);
     this.pendingStore = store;
     ++this.pendingGeneration;
-    // Freeze the canonical head this edit races against at queue time. The
-    // pre-publish check compares against this baseline — not the mutable
-    // watermark — so a live event during the debounce window that advances the
-    // watermark still gets adopted (baseline only advances via our own
-    // confirmed publishes). For a restored replay: use canonicalMax(current,
-    // bootstrapResultHead) from the immutable bootstrap snapshot (C2):
+    // Freeze the canonical head this edit races against at queue time.
+    // For a restored replay: use canonicalMax(current, bootstrapResultHead):
     //   No prior pending: publishBaseline={0,""}, canonicalMax sets bootstrap head.
     //   Blocked-bootstrap: releaseDeferred already set it; re-apply is idempotent.
     //   lastRemoteHead excluded (may carry suppressed H102 from subscribeLive).
@@ -516,9 +519,10 @@ export class WholeBlobSyncManager<S> {
         this.publishBaseline,
         this.bootstrapResultHead,
       );
-    } else {
+    } else if (wasIdle || lastIsOwnAttempt) {
       this.publishBaseline = { ...this.lastRemoteHead };
     }
+    // else: superseding edit — preserve baseline (Carl P2).
     // Suppress failed-bootstrap exception for replays (P1/C1); preserve original
     // queuedAt for the failed-bootstrap adopt-guard (publish when relay head
     // createdAt <= restoredQueuedAt — restored edit is genuinely newer).

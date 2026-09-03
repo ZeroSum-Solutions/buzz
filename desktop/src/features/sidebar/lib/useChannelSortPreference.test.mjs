@@ -13,6 +13,7 @@ import {
   runWholeBlobP2a1HookSuite,
   runWholeBlobP2bSuite,
 } from "./wholeBlobSyncCarl.shared.test.mjs";
+import { runWholeBlobCarlP2SecondClickSuite } from "./wholeBlobSyncCarlP2SecondClick.shared.test.mjs";
 
 const { act, cleanup, renderHook } = await import("@testing-library/react");
 const { relayClient } = await import("@/shared/api/relayClient");
@@ -232,4 +233,12 @@ runWholeBlobP2a1HookSuite({
       `P2a-1/hook ${label}: hook.sortModeFor("remote") must reflect adopted H102 store — applyRemote returning prev leaves UI stale`,
     );
   },
+});
+
+runWholeBlobCarlP2SecondClickSuite({
+  label: "sort",
+  useHook: useChannelSortPreference,
+  makeEdit1: (r) => r.setSortModeFor("channels", "alpha"),
+  makeEdit2: (r) => r.setSortModeFor("groups", "recent"),
+  makeRemoteStore: () => ({ version: 1, groups: { remote: "recent" } }),
 });

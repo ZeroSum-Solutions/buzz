@@ -13,6 +13,7 @@ import {
   runWholeBlobP2a1HookSuite,
   runWholeBlobP2bSuite,
 } from "./wholeBlobSyncCarl.shared.test.mjs";
+import { runWholeBlobCarlP2SecondClickSuite } from "./wholeBlobSyncCarlP2SecondClick.shared.test.mjs";
 
 const { act, cleanup, renderHook } = await import("@testing-library/react");
 const { relayClient } = await import("@/shared/api/relayClient");
@@ -383,4 +384,16 @@ runWholeBlobP2a1HookSuite({
       `P2a-1/hook ${label}: hook.assignments must reflect adopted H102 store`,
     );
   },
+});
+
+runWholeBlobCarlP2SecondClickSuite({
+  label: "sections",
+  useHook: useChannelSections,
+  makeEdit1: (r) => r.createSection("A1-Section"),
+  makeEdit2: (r) => r.createSection("A2-Section"),
+  makeRemoteStore: () => ({
+    version: 1,
+    sections: [{ id: "remote", name: "Remote", order: 0 }],
+    assignments: {},
+  }),
 });
