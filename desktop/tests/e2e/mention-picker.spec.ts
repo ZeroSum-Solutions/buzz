@@ -130,6 +130,10 @@ test("collision distinction, deliberate key choice, and exact publication", asyn
   const rowIds = await page
     .locator("[data-mention-suggestion-index]")
     .evaluateAll((rows) => rows.map((row) => row.getAttribute("data-testid")));
+  expect(rowIds).toEqual([
+    `mention-suggestion-${A}`,
+    `mention-suggestion-${B}`,
+  ]);
   const first = rowIds[0]?.endsWith(A) ? A : B;
   const second = first === A ? B : A;
   await capture(page, "duplicates-tab");
@@ -184,6 +188,17 @@ test("collision distinction, deliberate key choice, and exact publication", asyn
       ),
     )
     .toEqual([[first, second]]);
+  await input.fill("@Scout");
+  await expect
+    .poll(() =>
+      page
+        .locator("[data-mention-suggestion-index]")
+        .evaluateAll((rows) =>
+          rows.map((row) => row.getAttribute("data-testid")),
+        ),
+    )
+    .toEqual([`mention-suggestion-${second}`, `mention-suggestion-${first}`]);
+  await capture(page, "next-open-ranking");
 });
 
 test("closing and navigating away discard delayed picker results", async ({
