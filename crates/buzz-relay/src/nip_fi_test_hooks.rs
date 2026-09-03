@@ -58,8 +58,8 @@
 //! | **CW10** (commit-won/quiescence: expiry blocked at barrier) | same | Remove `acquire_effect()` from `commit_participant_join` | permit never held — expiry completes before hook fires — `expire_done` is true before check — "expiry must be blocked" assertion panics |
 //! | **CW10-full** (full-handler lifecycle: committed join → exactly one 48102) | `audio/handler.rs` — full `handle_active_audio_connection` via WS; hook at `after_participant_fanout`, then disconnect triggers normal teardown | Remove `emit_participant_event(48102, ...)` from handler epilogue | 48102 count stays 0 — assertion panics |
 //! | **CW10-full** (full-handler lifecycle) | same | Remove `room.remove_peer_and_check_ended` from teardown | room entry persists — `audio_rooms.get()` returns Some — room assertion panics |
-//! | **CW6** (guard-level: unattached lease released on pre-commit exit) | `audio/handler.rs` — `HuddleAdmissionGuard::release_before_commit` with injected `CountingDir` double (no Redis/mesh required) | Remove `if let Some((lease, directory)) = self.lease.take()` block from `release_before_commit` | renewer never spawned — `release_calls` stays 0 — assertion panics |
-//! | **CW6** (guard-level: unattached lease released on pre-commit exit) | same | Remove `cancel.cancel()` call inside `release_before_commit` (so renewer is spawned with live token instead of pre-cancelled) | renewer tries to renew instead of releasing — `release_calls` stays 0 — assertion panics |
+//! | **CW6** (guard-level: unattached lease released on pre-commit exit) | `audio/handler.rs` — `HuddleAdmissionGuard::release_before_commit` with injected `CountingDir` double (no Redis/mesh required) | Remove `if let Some((lease, directory)) = self.lease.take()` block from `release_before_commit` | `directory.release()` never called — `release_calls` stays 0 — assertion panics |
+//! | **CW6** (guard-level: unattached lease released on pre-commit exit) | same | Short-circuit `release_before_commit` to return immediately before the lease block | same as above — `release_calls` stays 0 — assertion panics |
 //! | **CW7** (guard-level: clean close sent on remote stream pre-commit exit) | `audio/handler.rs` — `HuddleAdmissionGuard::release_before_commit` with injected `RecordingSend` stub MeshStream + `RemoteHuddleSession::for_test` | Remove `if let (Some(session), Some(ref mut stream)) = ...` block from `release_before_commit` | `send_frame` never called — `goodbye_sent` is false — assertion panics |
 //! | **CW7** (guard-level: clean close sent on remote stream pre-commit exit) | same | Swap `UnregisterPeer` and `Goodbye` frame order in `send_clean_close` | frames recorded in wrong order — assertion on Goodbye position panics |
 //!
@@ -176,3 +176,44 @@ make_hook!(audio_membership_lock_hook, before_membership_lock);
 make_hook!(audio_participant_commit_hook, before_participant_commit);
 make_hook!(audio_participant_fanout_hook, after_participant_fanout);
 make_hook!(audio_add_peer_hook, after_add_peer);
+
+// ── Publication-attempt counter ────────────────────────────────────────────
+// `before_event_publish`: fires immediately before `state.pubsub.publish_event`
+// in `dispatch_persistent_event_inner`. Used by W2: after handle_event returns
+// under session-expired, assert this counter is 0 — proves `publish_event` was
+// never called (real publication boundary, not a proxy).
+//
+// Mutation evidence (W2):
+//   Remove `acquire_effect()` from event.rs → ingest_event is called →
+//   dispatch_persistent_event_inner runs → before_event_publish fires →
+//   counter = 1 → `assert_eq!(publish_count, 0)` panics.
+pub(crate) mod event_publish_counter {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTERS: LazyLock<Mutex<HashMap<CommunityId, Arc<AtomicU32>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Register a counter for `community` and return it. The counter starts at 0
+    /// and is incremented each time `before_event_publish` fires for this community.
+    pub(crate) fn register(community: CommunityId) -> Arc<AtomicU32> {
+        let counter = Arc::new(AtomicU32::new(0));
+        COUNTERS.lock().unwrap().insert(community, counter.clone());
+        counter
+    }
+
+    /// Deregister the counter for `community` (call after the test assertion).
+    pub(crate) fn deregister(community: CommunityId) {
+        COUNTERS.lock().unwrap().remove(&community);
+    }
+
+    pub(crate) fn increment(community: CommunityId) {
+        if let Some(counter) = COUNTERS.lock().unwrap().get(&community) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub(crate) fn before_event_publish(community: CommunityId) {
+    event_publish_counter::increment(community);
+}

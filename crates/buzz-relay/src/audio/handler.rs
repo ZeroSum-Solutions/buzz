@@ -895,11 +895,19 @@ pub(crate) async fn handle_active_audio_connection(
     // Owner path: install (or reuse) this room's single lease renewer now that
     // a peer is admitted, and capture its owner-loss signal. The connection
     // that won the CAS holds the lease in the guard; it installs the renewer
-    // now that the peer is committed to the room (IMPORTANT 1: lease transfers
-    // into HuddleOwnerRegistry only here, after add_peer succeeded). A steady-
-    // state owner (an earlier joiner installed it) reuses the room's existing
-    // signal. `owner_lost` drives this connection's own teardown below;
-    // `owner_generation` fences the release on room-empty so a stale teardown
+    // here, after add_peer succeeded, and transfers the lease into the registry.
+    //
+    // I1 invariant: the lease must be released on every pre-commit exit after
+    // this point. `attach_signals` consumes the lease into the registry renewer,
+    // so `guard.release_before_commit()` can no longer release it — instead,
+    // every post-attach pre-commit failure must call
+    // `mesh.owners.release(channel_id, generation)` (generation-fenced) to
+    // cancel the renewer and release the Redis lease. `owner_generation` carries
+    // the generation for this purpose.
+    //
+    // A steady-state owner (an earlier joiner installed it) reuses the room's
+    // existing signal. `owner_lost` drives this connection's own teardown;
+    // `owner_generation` also fences room-empty release so a stale teardown
     // cannot release a newer epoch a re-acquire installed.
     //
     // The reuse arm's live entry is guaranteed by `resolve_join_owner_ready`:
@@ -1069,6 +1077,12 @@ pub(crate) async fn handle_active_audio_connection(
             if let Some(t) = _nip_fi_admission_expiry.take() {
                 let _ = t.await;
             }
+            // I1 invariant: attach_signals transferred the lease to the registry.
+            // Release the registry-owned lease (generation-fenced) so the renewer
+            // cancels and the Redis lease is freed before peer/room teardown.
+            if let (Some(mesh), Some(gen)) = (state.mesh(), owner_generation) {
+                mesh.owners.release(channel_id, gen);
+            }
             guard.release_before_commit().await;
             // Drain the terminal denial frame (already queued by expiry task).
             use futures_util::SinkExt as _;
@@ -1085,6 +1099,10 @@ pub(crate) async fn handle_active_audio_connection(
             cancel.cancel();
             if let Some(t) = _nip_fi_admission_expiry.take() {
                 let _ = t.await;
+            }
+            // I1 invariant: release the registry-owned lease (generation-fenced).
+            if let (Some(mesh), Some(gen)) = (state.mesh(), owner_generation) {
+                mesh.owners.release(channel_id, gen);
             }
             guard.release_before_commit().await;
             let _ = ws_send
@@ -1104,6 +1122,10 @@ pub(crate) async fn handle_active_audio_connection(
             cancel.cancel();
             if let Some(t) = _nip_fi_admission_expiry.take() {
                 let _ = t.await;
+            }
+            // I1 invariant: release the registry-owned lease (generation-fenced).
+            if let (Some(mesh), Some(gen)) = (state.mesh(), owner_generation) {
+                mesh.owners.release(channel_id, gen);
             }
             guard.release_before_commit().await;
             let _ = ws_send
@@ -1125,6 +1147,10 @@ pub(crate) async fn handle_active_audio_connection(
             if let Some(t) = _nip_fi_admission_expiry.take() {
                 let _ = t.await;
             }
+            // I1 invariant: release the registry-owned lease (generation-fenced).
+            if let (Some(mesh), Some(gen)) = (state.mesh(), owner_generation) {
+                mesh.owners.release(channel_id, gen);
+            }
             guard.release_before_commit().await;
             let _ = ws_send
                 .send(WsMessage::Text(
@@ -1143,6 +1169,10 @@ pub(crate) async fn handle_active_audio_connection(
             cancel.cancel();
             if let Some(t) = _nip_fi_admission_expiry.take() {
                 let _ = t.await;
+            }
+            // I1 invariant: release the registry-owned lease (generation-fenced).
+            if let (Some(mesh), Some(gen)) = (state.mesh(), owner_generation) {
+                mesh.owners.release(channel_id, gen);
             }
             guard.release_before_commit().await;
             let _ = ws_send
