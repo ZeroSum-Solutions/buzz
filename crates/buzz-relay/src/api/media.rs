@@ -1174,13 +1174,14 @@ mod tests {
             MediaError::DuplicateTag("Authorization"),
             MediaError::InvalidAuthScheme,
         ] {
+            let label = format!("{error:?}");
             let denial = MediaDenial(error, BlossomStrictness::Strict);
             let resp = denial.into_response();
 
             assert_eq!(
                 resp.status(),
                 StatusCode::FORBIDDEN,
-                "expected 403 for Strict {error:?}"
+                "expected 403 for Strict {label}"
             );
 
             let ct = resp
@@ -1190,19 +1191,19 @@ mod tests {
                 .unwrap_or("");
             assert!(
                 ct.contains("text/plain"),
-                "expected text/plain CT for {error:?}, got: {ct}"
+                "expected text/plain CT for {label}, got: {ct}"
             );
 
             assert!(
                 resp.headers().get("www-authenticate").is_none(),
-                "403 must not have WWW-Authenticate for {error:?}"
+                "403 must not have WWW-Authenticate for {label}"
             );
 
             let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
             assert_eq!(
                 body.as_ref(),
                 b"evidence rejected\n",
-                "wrong body for {error:?}"
+                "wrong body for {label}"
             );
         }
     }
@@ -1238,13 +1239,14 @@ mod tests {
             MediaError::HashMismatch,
             MediaError::MissingTag("t"),
         ] {
+            let label = format!("{error:?}");
             let denial = MediaDenial(error, BlossomStrictness::Permissive);
             let resp = denial.into_response();
 
             assert_eq!(
                 resp.status(),
                 StatusCode::UNAUTHORIZED,
-                "Permissive: expected 401 for {error:?}"
+                "Permissive: expected 401 for {label}"
             );
 
             let ct = resp
@@ -1254,7 +1256,7 @@ mod tests {
                 .unwrap_or("");
             assert!(
                 ct.contains("application/json"),
-                "Permissive must keep JSON CT for {error:?}, got: {ct}"
+                "Permissive must keep JSON CT for {label}, got: {ct}"
             );
         }
     }
