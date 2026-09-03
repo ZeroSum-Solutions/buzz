@@ -90,11 +90,15 @@ fn decode_challenge(value: &str) -> Option<[u8; 32]> {
 fn authority_error(e: AuthorityError) -> Response {
     match e {
         AuthorityError::Rejected => error(StatusCode::NOT_FOUND, "not_authorized"),
+        AuthorityError::Conflict => installation_conflict(),
         AuthorityError::RateLimited => error(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
         AuthorityError::Unavailable => {
             error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable")
         }
     }
+}
+fn installation_conflict() -> Response {
+    error(StatusCode::CONFLICT, "installation_conflict")
 }
 fn endpoint_bytes(endpoint: &str) -> Option<Vec<u8>> {
     valid_endpoint(endpoint)
@@ -234,7 +238,7 @@ async fn enroll(State(s): State<AppState>, body: Bytes) -> Response {
             )
                 .into_response();
         }
-        Ok(Some(_)) => return error(StatusCode::NOT_FOUND, "not_authorized"),
+        Ok(Some(_)) => return installation_conflict(),
         Ok(None) => {}
         Err(e) => return authority_error(e),
     }
@@ -672,6 +676,11 @@ async fn deliver(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> 
             crate::metrics::record_delivery_error("invalid_grant");
             return error(StatusCode::NOT_FOUND, "invalid_grant");
         }
+        Err(AuthorityError::Conflict) => {
+            crate::metrics::record_admission(crate::metrics::Admission::Rejected);
+            crate::metrics::record_delivery_error("invalid_grant");
+            return error(StatusCode::NOT_FOUND, "invalid_grant");
+        }
         Err(AuthorityError::RateLimited) => {
             crate::metrics::record_admission(crate::metrics::Admission::Rejected);
             crate::metrics::record_delivery_error("rate_limited");
@@ -944,6 +953,15 @@ mod request_limit_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn live_installation_conflict_has_an_unambiguous_status() {
+        assert_eq!(
+            authority_error(AuthorityError::Conflict).status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(installation_conflict().status(), StatusCode::CONFLICT);
     }
 
     #[test]

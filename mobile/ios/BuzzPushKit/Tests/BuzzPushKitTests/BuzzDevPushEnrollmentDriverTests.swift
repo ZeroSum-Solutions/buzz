@@ -1793,7 +1793,7 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
       case ("POST", "http://new-gateway.example/v1/installations"):
         installationAttempts += 1
         if installationAttempts == 1 {
-          return Self.response(request, status: 404, json: ["error": "not_authorized"])
+          return Self.response(request, status: 409, json: ["error": "installation_conflict"])
         }
         return Self.response(
           request,

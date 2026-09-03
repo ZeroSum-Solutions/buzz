@@ -827,7 +827,7 @@ public final class BuzzDevPushEnrollmentDriver {
       } catch let error as BuzzDevPushEnrollmentError {
         guard
           case .unexpectedStatus(
-            route: "v1/installations", _, actual: 404, _
+            route: "v1/installations", _, actual: 409, _
           ) = error
         else { throw error }
         let cleanupStates = try store.gatewayCleanupStates()

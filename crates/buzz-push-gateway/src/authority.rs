@@ -103,6 +103,8 @@ pub enum DeliveryDisposition {
 pub enum AuthorityError {
     #[error("authority state rejected the request")]
     Rejected,
+    #[error("installation authority is already live")]
+    Conflict,
     #[error("authority request rate exceeded")]
     RateLimited,
     #[error("authority store unavailable")]
@@ -291,7 +293,7 @@ impl AuthorityStore for MemoryAuthorityStore {
                 .is_some_and(|installation| !installation.revoked && installation.expires_at >= now)
         }) {
             // App identity and token possession never supersede a live installation.
-            return Err(AuthorityError::Rejected);
+            return Err(AuthorityError::Conflict);
         }
         for id in replaced {
             if let Some(old) = s.installations.remove(&id) {
@@ -786,7 +788,7 @@ mod tests {
             store
                 .create_installation(replacement(Uuid::from_u128(5)), 1_999)
                 .await,
-            Err(AuthorityError::Rejected)
+            Err(AuthorityError::Conflict)
         );
         store
             .create_installation(replacement(Uuid::from_u128(5)), 2_001)

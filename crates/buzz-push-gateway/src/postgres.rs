@@ -187,7 +187,7 @@ impl AuthorityStore for PostgresAuthorityStore {
                 _ => true,
             }
         }) {
-            return Err(AuthorityError::Rejected);
+            return Err(AuthorityError::Conflict);
         }
         let replaced = existing
             .iter()
@@ -208,7 +208,7 @@ impl AuthorityStore for PostgresAuthorityStore {
         let result = sqlx::query("INSERT INTO push_gateway_installations(id,app_attest_key_id,app_attest_public_key,assertion_counter,app_profile,token_ciphertext,token_fingerprint,endpoint_epoch,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING")
             .bind(n.id).bind(n.app_attest_key_id).bind(n.app_attest_public_key).bind(i64::from(n.assertion_counter)).bind(n.profile.as_str()).bind(n.token_ciphertext).bind(n.token_fingerprint.to_vec()).bind(n.endpoint_epoch).bind(at(n.expires_at)?).execute(&mut *tx).await.map_err(db)?;
         if result.rows_affected() != 1 {
-            return Err(AuthorityError::Rejected);
+            return Err(AuthorityError::Conflict);
         }
         tx.commit().await.map_err(db)?;
         Ok(())
@@ -946,7 +946,7 @@ mod postgres_tests {
             store
                 .create_installation(installation(Uuid::from_u128(3), now + 2_000), now + 999,)
                 .await,
-            Err(AuthorityError::Rejected)
+            Err(AuthorityError::Conflict)
         );
         store
             .create_installation(installation(Uuid::from_u128(3), now + 2_000), now + 1_001)
