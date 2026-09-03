@@ -824,6 +824,9 @@ class ThreadDetailPage extends HookConsumerWidget {
     return FrostedScaffold(
       resizeToAvoidBottomInset: !usesFixedAndroidImeViewport,
       appBar: FrostedAppBar(
+        horizontalInset: Theme.of(context).platform == TargetPlatform.iOS
+            ? iosGlassChannelHeaderHorizontalInset
+            : Grid.xxs,
         leading: usesNativeIosGlassBackButton
             ? IosGlassNavigationButton(
                 key: const ValueKey('thread-ios-glass-back'),

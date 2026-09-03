@@ -255,6 +255,9 @@ class ChannelDetailsPage extends HookConsumerWidget {
     return FrostedScaffold(
       useUtilitySurfaceTheme: true,
       appBar: FrostedAppBar(
+        horizontalInset: Theme.of(context).platform == TargetPlatform.iOS
+            ? iosGlassChannelHeaderHorizontalInset
+            : Grid.xxs,
         centerTitle: true,
         leading: usesNativeIosGlassBackButton
             ? IosGlassNavigationButton(

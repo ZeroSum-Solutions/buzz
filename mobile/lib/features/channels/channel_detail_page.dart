@@ -572,6 +572,9 @@ class ChannelDetailPage extends HookConsumerWidget {
       resizeToAvoidBottomInset:
           !usesFixedAndroidImeViewport || resolvedChannel.isForum,
       appBar: FrostedAppBar(
+        horizontalInset: Theme.of(context).platform == TargetPlatform.iOS
+            ? iosGlassChannelHeaderHorizontalInset
+            : Grid.xxs,
         leading: usesNativeIosGlassBackButton
             ? IosGlassNavigationButton(
                 key: const ValueKey('channel-ios-glass-back'),

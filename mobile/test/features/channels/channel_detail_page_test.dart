@@ -9741,6 +9741,7 @@ void main() {
             huddleButtonRect.left +
             (huddleParams['buttonCenterX']! as double) +
             controlRadius;
+        expect(backVisualLeft, moreOrLessEquals(Grid.gutter));
         expect(
           backVisualLeft,
           moreOrLessEquals(

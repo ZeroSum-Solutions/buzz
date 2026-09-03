@@ -79,6 +79,11 @@ const iosGlassChannelHeaderLeadingWidth = 48.0;
 const iosGlassChannelHeaderButtonCenterX =
     iosGlassChannelHeaderLeadingWidth / 2;
 
+/// Insets channel-style controls so their glass edges match chat content.
+const iosGlassChannelHeaderHorizontalInset =
+    Grid.gutter -
+    (iosGlassChannelHeaderLeadingWidth - buzzNavigationActionSize) / 2;
+
 /// Space between the leading region and a channel-style title.
 const iosGlassChannelHeaderTitleSpacing = Grid.xs;
 
