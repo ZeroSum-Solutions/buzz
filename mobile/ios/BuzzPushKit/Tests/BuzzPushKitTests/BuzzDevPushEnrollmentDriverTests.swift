@@ -1739,6 +1739,95 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     XCTAssertEqual(URLProtocolStub.requests.count, 1)
   }
 
+  func testEnrollmentRetiresConflictingInstallationFromRenamedGateway() async throws {
+    let oldGatewayOrigin = "http://old-gateway.example"
+    let newGatewayURL = try XCTUnwrap(URL(string: "http://new-gateway.example"))
+    let stale = BuzzPushEndpointGrantRecord(
+      gatewayOrigin: oldGatewayOrigin,
+      relayOrigin: "wss://relay.example",
+      relayPubkey: Self.relayPubkey,
+      gatewayInstallationHandle: Self.installationHandle,
+      appAttestKeyId: Self.keyId,
+      installationId: Self.installationId,
+      endpointGrant: "stale-grant",
+      endpointHash: Self.hex(SHA256.hash(data: Data((1...32).map(UInt8.init)))),
+      appProfile: "buzz-ios-dogfood",
+      endpointEpoch: 1,
+      generation: 1,
+      expiresAt: Self.expiresAt
+    )
+    let store = MemoryGrantStore()
+    store.cleanup = [
+      BuzzPushGatewayCleanupState(
+        gatewayOrigin: oldGatewayOrigin,
+        grants: [stale],
+        pendingEnrollments: []
+      )
+    ]
+    let driver = try makeDriver(
+      gatewayBaseURL: newGatewayURL,
+      store: store,
+      appAttest: RecordingAppAttest()
+    )
+    var installationAttempts = 0
+    var revokedOldInstallation = false
+    URLProtocolStub.handler = { request in
+      switch (request.httpMethod, request.url?.absoluteString) {
+      case ("GET", "https://relay.example/"):
+        return Self.response(
+          request,
+          status: 200,
+          json: ["push": ["keys": [["pubkey": Self.relayPubkey, "current": true]]]]
+        )
+      case ("POST", "http://new-gateway.example/v1/installations/challenges"),
+        ("POST", "http://old-gateway.example/v1/installations/challenges"):
+        return Self.response(
+          request,
+          status: 200,
+          json: [
+            "challenge_id": Self.firstChallengeId,
+            "challenge": Self.challenge,
+            "expires_at": Self.now + 300,
+          ]
+        )
+      case ("POST", "http://new-gateway.example/v1/installations"):
+        installationAttempts += 1
+        if installationAttempts == 1 {
+          return Self.response(request, status: 404, json: ["error": "not_authorized"])
+        }
+        return Self.response(
+          request,
+          status: 201,
+          json: [
+            "installation_handle": Self.installationHandle,
+            "endpoint_epoch": 1,
+            "expires_at": Self.expiresAt,
+          ]
+        )
+      case ("POST", "http://old-gateway.example/v1/installations/revoke"):
+        revokedOldInstallation = true
+        return Self.response(request, status: 200, json: ["status": "revoked"])
+      case ("POST", "http://new-gateway.example/v1/delegations"):
+        return Self.response(request, status: 201, json: ["endpoint_grant": "new-grant"])
+      default:
+        XCTFail("Unexpected request \(request.url?.absoluteString ?? "nil")")
+        return Self.response(request, status: 500, json: [:])
+      }
+    }
+
+    let record = try await driver.enroll(
+      deviceToken: Data((1...32).map(UInt8.init)),
+      relayURL: Self.relayURL
+    )
+
+    XCTAssertEqual(installationAttempts, 2)
+    XCTAssertTrue(revokedOldInstallation)
+    XCTAssertTrue(store.cleanup.isEmpty)
+    XCTAssertEqual(store.replacementOrigins, ["wss://relay.example"])
+    XCTAssertEqual(record.gatewayOrigin, "http://new-gateway.example")
+    XCTAssertEqual(record.endpointGrant, "new-grant")
+  }
+
   func testSecondOriginOnSameRelayKeyReusesGrantWithFreshLeaseAddress() async throws {
     let existing = BuzzPushEndpointGrantRecord(
       gatewayOrigin: Self.gatewayOrigin,

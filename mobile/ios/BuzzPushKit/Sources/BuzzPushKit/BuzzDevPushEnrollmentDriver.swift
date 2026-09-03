@@ -824,6 +824,29 @@ public final class BuzzDevPushEnrollmentDriver {
           appProfile: Self.appProfile
         )
         return try await enrollCurrent(deviceToken: deviceToken, relayURL: relayURL)
+      } catch let error as BuzzDevPushEnrollmentError {
+        guard
+          case .unexpectedStatus(
+            route: "v1/installations", _, actual: 404, _
+          ) = error
+        else { throw error }
+        let cleanupStates = try store.gatewayCleanupStates()
+        guard !cleanupStates.isEmpty else { throw error }
+        let affectedRelayOrigins = cleanupStates.flatMap {
+          $0.grants.map(\.relayOrigin) + $0.pendingEnrollments.map(\.relayOrigin)
+        }
+        // A gateway origin can change while retaining the same backing
+        // authority store. Its live installation then conflicts with the new
+        // origin's enrollment. Preserve replacement work before retiring that
+        // authority, then retry against the released APNs token.
+        try store.queueReplacementRelayOrigins(affectedRelayOrigins)
+        try await cleanStaleGateways(deviceToken: deviceToken)
+        try store.removePendingEnrollment(
+          gatewayOrigin: gatewayOrigin,
+          relayOrigin: relayOrigin.text,
+          appProfile: Self.appProfile
+        )
+        return try await enrollCurrent(deviceToken: deviceToken, relayURL: relayURL)
       }
       pending = BuzzPushPendingEnrollmentRecord(
         gatewayOrigin: gatewayOrigin,

@@ -371,22 +371,42 @@ import os.log
         }
       }
     case "completeGatewayMigration":
-      Task {
-        do {
-          if let cleanupTask = try retiredGatewayCleanupTask() {
-            try await cleanupTask.value
-          }
-          try endpointGrantStore.clearReplacementRelayOrigins()
-          result(nil)
-        } catch {
-          result(
-            FlutterError(
-              code: "push_gateway_cleanup_failed",
-              message: "Retired push gateway cleanup failed.",
-              details: error.localizedDescription
-            )
+      guard enrollmentTask == nil else {
+        result(
+          FlutterError(
+            code: "push_enrollment_in_progress",
+            message: "Push enrollment must finish before gateway cleanup.",
+            details: nil
           )
+        )
+        return
+      }
+      do {
+        let cleanupTask = try retiredGatewayCleanupTask()
+        Task {
+          do {
+            if let cleanupTask {
+              try await cleanupTask.value
+            }
+            result(nil)
+          } catch {
+            result(
+              FlutterError(
+                code: "push_gateway_cleanup_failed",
+                message: "Retired push gateway cleanup failed.",
+                details: error.localizedDescription
+              )
+            )
+          }
         }
+      } catch {
+        result(
+          FlutterError(
+            code: "push_gateway_cleanup_failed",
+            message: "Retired push gateway cleanup failed.",
+            details: error.localizedDescription
+          )
+        )
       }
     case "startRegistration":
       guard let gatewayURL = gatewayURL(from: call) else {
@@ -506,6 +526,16 @@ import os.log
       )
       return
     }
+    guard gatewayCleanupTask == nil else {
+      result(
+        FlutterError(
+          code: "gateway_cleanup_in_progress",
+          message: "Gateway cleanup must finish before push enrollment.",
+          details: nil
+        )
+      )
+      return
+    }
     guard let deviceToken = apnsDeviceToken else {
       result(
         FlutterError(
@@ -594,10 +624,14 @@ import os.log
       appAttestKeychainAccessGroup: pushKeychainAccessGroup
     )
     let task = Task { [weak self] in
-      defer { self?.gatewayCleanupTask = nil }
       try await driver.cleanRetiredGateways(deviceToken: self?.apnsDeviceToken)
+      try self?.endpointGrantStore.clearReplacementRelayOrigins()
     }
     gatewayCleanupTask = task
+    Task { [weak self] in
+      _ = await task.result
+      self?.gatewayCleanupTask = nil
+    }
     return task
   }
 
