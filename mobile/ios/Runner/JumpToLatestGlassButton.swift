@@ -385,6 +385,9 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
       // with the Buzz theme instead of falling back to the system blue tint.
       button.tintColor = foregroundColor
       button.configuration?.baseForegroundColor = foregroundColor
+      button.configuration?.imageColorTransformer = contentIcon == "avatar"
+        ? nil
+        : UIConfigurationColorTransformer { _ in foregroundColor }
       activityIndicator.color = foregroundColor
     }
     if let swatchColorValue {
