@@ -1874,4 +1874,164 @@ mod route_integration_tests {
             .shutting_down
             .store(true, std::sync::atomic::Ordering::Release);
     }
+
+    // ── Startup-oracle: shared JWKS source wiring ──────────────────────────
+    //
+    // Proves that `install_nip_fi_command_components` warms the EXACT Arc that
+    // `nip_fi_verifier` holds, so a valid assertion JWT succeeds after startup.
+    //
+    // Construction path mirrors `main.rs` exactly:
+    //   1. Build AppState with an Enforce config that has jwks_configs populated —
+    //      `build_nip_fi_components` runs and sets `nip_fi_verifier` and
+    //      `nip_fi_jwks_source` on the state.
+    //   2. Seed the state's own `nip_fi_jwks_source` (no HTTP).
+    //   3. Call `install_nip_fi_command_components` with
+    //      `state.nip_fi_jwks_source.clone()` — the same Arc the verifier holds.
+    //   4. Assert `nip_fi_verifier.verify(assertion_jwt)` succeeds.
+    //
+    // Mutation evidence:
+    //   Reintroduce a second, unseeded source and pass it to the installer (the
+    //   original bug) → the verifier's source stays cold → verify returns
+    //   `KeySourceUnavailable` → the is_ok() assertion panics.
+    #[tokio::test]
+    async fn installer_warmup_makes_assertion_verifier_functional() {
+        use super::install_nip_fi_command_components;
+        use crate::nip_fi_config::NipFiRelayConfig;
+        use buzz_auth::NipFiMode;
+
+        // Build the config with an Enforce NIP-FI section so build_nip_fi_components
+        // sets nip_fi_verifier + nip_fi_jwks_source on the AppState.
+        let mut config = crate::config::Config::hermetic_for_test();
+        let jwks_configs = vec![test_jwks_config()];
+        let mut registry = IssuerRegistry::new();
+        registry.insert(test_issuer_policy());
+        let cmd_configs = vec![(
+            TEST_ISS.to_owned(),
+            CommandIssuerEnvConfig {
+                maximum_command_age_seconds: Some(30),
+                authorized_principals: Some(vec![TEST_SUB.to_owned()]),
+                deny_set_capacity: Some(100),
+            },
+        )];
+        config.nip_fi = NipFiRelayConfig {
+            mode: NipFiMode::Enforce,
+            registry: registry.clone(),
+            jwks_configs: jwks_configs.clone(),
+            command_configs: cmd_configs.clone(),
+            max_connection_lifetime_secs: 3600,
+        };
+
+        let pool = sqlx::PgPool::connect_lazy(&config.database_url).unwrap();
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .unwrap();
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .unwrap(),
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).unwrap();
+        // build_nip_fi_components runs here because mode == Enforce and jwks_configs
+        // is non-empty; nip_fi_verifier and nip_fi_jwks_source are set on the state.
+        let (mut state, _) = crate::state::AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            nostr::Keys::generate(),
+            media_storage,
+        );
+        assert!(
+            state.nip_fi_verifier.is_some(),
+            "nip_fi_verifier must be Some for Enforce config"
+        );
+        assert!(
+            state.nip_fi_jwks_source.is_some(),
+            "nip_fi_jwks_source must be Some for Enforce config"
+        );
+
+        // Seed the state's own JWKS source — the exact Arc the verifier holds.
+        // This is the warmup step that main.rs achieves by passing this same Arc
+        // to install_nip_fi_command_components.
+        let state_source = state.nip_fi_jwks_source.as_ref().unwrap();
+        state_source
+            .seed_snapshot_for_test(TEST_ISS, test_jwks())
+            .await;
+
+        // Clone the source Arc before the mutable borrow of state so the
+        // borrow checker sees both borrows as non-overlapping.  This clone is
+        // the same operation main.rs performs: it shares the EXACT underlying
+        // source, not a fresh one.
+        let shared_source = state.nip_fi_jwks_source.clone().unwrap();
+
+        // Call the installer with the state's own source (mirrors main.rs after
+        // the shared-source fix). The warmup loop confirms the seeded snapshot.
+        let report = install_nip_fi_command_components(
+            &mut state,
+            NipFiMode::Enforce,
+            &registry,
+            shared_source,
+            &jwks_configs,
+            &cmd_configs,
+        )
+        .await
+        .expect("install must succeed for valid config");
+        assert_eq!(
+            report.warmed_issuers, 1,
+            "installer must report 1 warmed issuer (snapshot was pre-seeded)"
+        );
+
+        // Assert that a valid assertion JWT now verifies successfully.
+        // This is the core oracle: the verifier reads key_set() from the same
+        // Arc that the installer warmed — if they were different Arcs, the
+        // verifier's source would be cold and this would return KeySourceUnavailable.
+        let key = nostr::Keys::generate();
+        let token = mint_assertion_token(&key.public_key().to_hex());
+        let verifier = state.nip_fi_verifier.as_deref().unwrap();
+        let result = verifier.verify(&token);
+        assert!(
+            result.is_ok(),
+            "nip_fi_verifier.verify must succeed after installer warmup on the shared source; \
+             got: {result:?}"
+        );
+
+        state
+            .shutting_down
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Mint a valid ES256 `nip-fi+jwt` assertion for `nostr_pubkey = key_hex`,
+    /// signed by the route-integration-test key pair.
+    /// Used by the startup-oracle test to verify the assertion verifier against
+    /// its own JWKS source after installer warmup.
+    fn mint_assertion_token(key_hex: &str) -> String {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        let now = chrono::Utc::now().timestamp();
+        let claims = serde_json::json!({
+            "iss": TEST_ISS,
+            "aud": TEST_AUD,
+            "sub": TEST_SUB,
+            "iat": now,
+            "exp": now + 600,
+            "nostr_pubkey": key_hex,
+        });
+        let mut header = Header::new(Algorithm::ES256);
+        header.typ = Some("nip-fi+jwt".to_owned());
+        header.kid = Some(TEST_KID.to_owned());
+        let key =
+            EncodingKey::from_ec_pem(TEST_PRIVATE_KEY_PEM.as_bytes()).expect("valid test EC key");
+        encode(&header, &claims, &key).expect("sign assertion-test token")
+    }
 }

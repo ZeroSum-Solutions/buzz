@@ -184,12 +184,12 @@ make_hook!(audio_add_peer_hook, after_add_peer);
 // immediately BEFORE the `is_denied(iss, k, now)` call.
 //
 // The straddle witness arms this gate, then inserts a deny entry in the window
-// between registration and check. The invariant: either
+// between registration and check. The invariant covers BOTH sides of the race:
 //   (a) a concurrent disconnect sees the registered session and closes it (close
-//       scan side), OR
-//   (b) the deny check fires here and finds the entry (check side).
-// This test exercises path (b): the entry is inserted AFTER registration but
-// BEFORE the check — the check sees it and closes the connection.
+//       scan side) — exercised by the real `disconnect_nip_fi` call in the test,
+//       which asserts exactly 1 session found at the hook window; OR
+//   (b) the deny check fires here and finds the entry (check side) — exercised by
+//       the is_cancelled + AuthorizationDenied NOTICE oracles.
 //
 // Mutation evidence (W_deny_straddle, W_audio_deny):
 //   A) Delete `before_deny_set_check(...)` from auth.rs / audio/handler.rs →
@@ -198,9 +198,9 @@ make_hook!(audio_add_peer_hook, after_add_peer);
 //      panics.
 //   B) Remove the `is_denied` check entirely → same outcome as (A).
 //   C) Move `before_deny_set_check` to BEFORE `set_authenticated_pubkey` →
-//      hook fires before registration → straddle semantics violated (close scan
-//      cannot see the session) → test still passes because (b) side still works,
-//      but the barrier witness is no longer at the correct seam.
+//      hook fires before registration → close-scan side fails (disconnect finds
+//      0 sessions) → `assert_eq!(scan_count, 1)` panics regardless of whether
+//      (b) still catches the deny.
 make_hook!(deny_set_check_hook, before_deny_set_check);
 
 // `after_deny_set_check_passed`: fires in the audio handler immediately after the

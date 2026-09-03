@@ -536,16 +536,15 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
     // the refresh loop, build_nip_fi_command_components, and both state assignments.
     {
         let nip_fi = &config.nip_fi;
-        if let Some(key_source) = buzz_auth::ProductionJwksSource::new(
-            nip_fi.jwks_configs.clone(),
-            buzz_auth::HttpJwksFetcher::new(),
-        ) {
-            let key_source = Arc::new(key_source);
+        if let Some(key_source) = app_state.nip_fi_jwks_source.clone() {
+            // Share the exact Arc that nip_fi_verifier already holds so warmup
+            // and the background refresh loop populate the same snapshot cache
+            // that assertion verification reads synchronously via key_set().
             buzz_relay::api::nip_fi::install_nip_fi_command_components(
                 &mut app_state,
                 nip_fi.mode,
                 &nip_fi.registry,
-                Arc::clone(&key_source),
+                key_source,
                 &nip_fi.jwks_configs,
                 &nip_fi.command_configs,
             )

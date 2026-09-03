@@ -1058,10 +1058,9 @@ mod tests {
                 let expected = crate::protocol::RelayMessage::notice(
                     buzz_auth::DenialClass::AuthorizationDenied.nostr_text(),
                 );
-                let expected_str: String = expected.into();
                 assert_eq!(
                     t.as_str(),
-                    expected_str.as_str(),
+                    expected.as_str(),
                     "W_deny_straddle: ctrl frame must be exact authorization_denied NOTICE; got: {t}"
                 );
                 found_denial = true;

@@ -876,16 +876,21 @@ pub struct AppState {
     ///
     /// `None` when `config.nip_fi.mode` is `Off`. When present, the verifier
     /// is shared across all connections and is the single authority for
-    /// assertion validation at WebSocket upgrade. The backing `ProductionJwksSource`
-    /// is also shared and performs bounded periodic JWKS refresh internally.
+    /// assertion validation at WebSocket upgrade. Shares the same
+    /// `ProductionJwksSource` Arc as `nip_fi_jwks_source`; the installer warms
+    /// and refreshes that shared source so `key_set()` reads a populated cache
+    /// on every WS upgrade check.
     pub nip_fi_verifier:
         Option<Arc<buzz_auth::FederatedAssertionVerifier<Arc<buzz_auth::ProductionJwksSource>>>>,
 
-    /// The shared JWKS source backing `nip_fi_verifier`, exposed so callers
-    /// can warm it at startup as a latency optimization.
-    /// `ProductionJwksSource::get_snapshot` refreshes on-demand when the cached
-    /// snapshot is stale or expired — no external refresh loop is required for
-    /// correctness. `None` iff `nip_fi_verifier` is `None`.
+    /// The shared JWKS key source backing `nip_fi_verifier`.
+    ///
+    /// `main.rs` passes this same Arc to `install_nip_fi_command_components`,
+    /// which warms each issuer snapshot at startup and spawns the background
+    /// refresh loop. `FederatedAssertionVerifier::verify` reads the cache
+    /// synchronously via `key_set()` — it never fetches — so warmup must
+    /// complete on this Arc before the relay begins serving WS upgrades.
+    /// `None` iff `nip_fi_verifier` is `None`.
     pub nip_fi_jwks_source: Option<Arc<buzz_auth::ProductionJwksSource>>,
 
     // ── NIP-FI command API (S4) ────────────────────────────────────────────
@@ -1082,7 +1087,9 @@ impl AppState {
             tracer: Arc::new(crate::conformance::NoopTracer),
             mesh: Arc::new(std::sync::OnceLock::new()),
             // NIP-FI assertion verifier and JWKS source — built from config above.
-            // `main.rs` warms the JWKS source and starts the background refresh loop.
+            // main.rs passes nip_fi_jwks_source to install_nip_fi_command_components,
+            // which warms it and spawns the background refresh loop so key_set()
+            // returns a populated cache on every WS upgrade check.
             nip_fi_verifier,
             nip_fi_jwks_source,
             // NIP-FI deny map and command verifier are initialized lazily by
@@ -1507,11 +1514,14 @@ impl AuditShutdownHandle {
 
 /// Construct the NIP-FI assertion verifier + JWKS source from `config.nip_fi`.
 ///
-/// Returns `(None, None)` when the mode is `Off`. In `Enforce` or
-/// `DenyProtected` mode, constructs a `ProductionJwksSource` (shared via `Arc`)
-/// and a `FederatedAssertionVerifier` over a clone of that `Arc`. Both are
-/// returned so `main.rs` can warm and periodically refresh the source while the
-/// relay uses the verifier for every WebSocket upgrade check.
+/// Returns `(None, None)` when the mode is `Off` or `DenyProtected`. In
+/// `Enforce` mode, constructs one `ProductionJwksSource` (shared via `Arc`)
+/// and a `FederatedAssertionVerifier` backed by a clone of that same `Arc`.
+/// Both are stored on `AppState`; `main.rs` then passes `nip_fi_jwks_source`
+/// to `install_nip_fi_command_components`, which warms every issuer snapshot
+/// and spawns the background refresh loop. Because `verify` calls `key_set()`
+/// — a synchronous cache read — the verifier is only functional after warmup
+/// completes on that shared Arc.
 ///
 /// Named return type for [`build_nip_fi_components`].
 ///
@@ -1523,7 +1533,7 @@ type NipFiComponents = (
 );
 
 /// The source starts empty; admission returns `authorization_unavailable`
-/// (503) until the startup warm in `main.rs` succeeds for at least one issuer.
+/// (503) until `install_nip_fi_command_components` warms it at startup.
 /// This is intentional: config validity must not be hostage to IdP availability
 /// at boot. [FI-TRACE-DEPENDENCY-FAIL-CLOSED]
 fn build_nip_fi_components(config: &crate::config::Config) -> NipFiComponents {
