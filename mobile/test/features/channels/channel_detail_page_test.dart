@@ -9358,6 +9358,38 @@ void main() {
         (huddleNativeView.creationParams as Map<String, Object>)['icon'],
         'headphones',
       );
+
+      Navigator.of(tester.element(back)).pop();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 80));
+      for (final control in [back, identity, huddle]) {
+        expect(
+          tester
+              .widget<Opacity>(
+                find.descendant(
+                  of: control,
+                  matching: find.byKey(
+                    const ValueKey('ios-glass-navigation-native-layer'),
+                  ),
+                ),
+              )
+              .opacity,
+          1,
+        );
+        expect(
+          tester
+              .widget<AnimatedOpacity>(
+                find.descendant(
+                  of: control,
+                  matching: find.byKey(
+                    const ValueKey('ios-glass-navigation-fallback-layer'),
+                  ),
+                ),
+              )
+              .opacity,
+          0,
+        );
+      }
       expect(tester.takeException(), isNull);
       debugDefaultTargetPlatformOverride = null;
     });

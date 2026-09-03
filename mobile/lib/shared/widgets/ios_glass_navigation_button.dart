@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:ui' show ImageFilter;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -184,11 +185,13 @@ class IosGlassNavigationButton extends HookWidget {
         ModalRoute.of(context)?.animation ??
         const AlwaysStoppedAnimation<double>(1);
     final routeIsTransitioning = useState(
-      routeAnimation.status != AnimationStatus.completed,
+      routeAnimation.status == AnimationStatus.forward,
     );
     useEffect(() {
       void updateRouteTransition(AnimationStatus status) {
-        final next = status != AnimationStatus.completed;
+        // Keep the real UIKit control during an interactive pop. Replacing it
+        // while the user drags backward exposes the Flutter approximation.
+        final next = status == AnimationStatus.forward;
         if (routeIsTransitioning.value != next) {
           routeIsTransitioning.value = next;
         }
@@ -335,130 +338,153 @@ class IosGlassNavigationButton extends HookWidget {
                   top: (height - controlSize) / 2,
                   width: fillWidth ? null : controlSize,
                   height: controlSize,
-                  child: DecoratedBox(
-                    decoration: BoxDecoration(
-                      color: context.colors.surface.withValues(alpha: 0.72),
-                      borderRadius: BorderRadius.circular(controlSize / 2),
-                      border: Border.all(
-                        color: context.colors.inverseSurface.withValues(
-                          alpha: 0.07,
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(controlSize / 2),
+                    child: BackdropFilter(
+                      filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          color: context.colors.surface.withValues(alpha: 0.68),
+                          borderRadius: BorderRadius.circular(controlSize / 2),
+                          border: Border.all(
+                            color: context.colors.inverseSurface.withValues(
+                              alpha: 0.08,
+                            ),
+                          ),
                         ),
-                      ),
-                    ),
-                    child: isBusy
-                        ? Center(
-                            child: SizedBox.square(
-                              dimension: 22,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                                color: effectiveForeground,
-                              ),
-                            ),
-                          )
-                        : icon == IosGlassNavigationIcon.colorSwatch
-                        ? Padding(
-                            padding: const EdgeInsets.all(4),
-                            child: DecoratedBox(
-                              decoration: BoxDecoration(
-                                color: swatchColor,
-                                shape: BoxShape.circle,
-                              ),
-                            ),
-                          )
-                        : isLeadingContent && label != null
-                        ? Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 6),
-                            child: Row(
-                              children: [
-                                if (icon == IosGlassNavigationIcon.avatar)
-                                  AvatarImage(
-                                    imageUrl: avatarImageUrl,
-                                    radius: (controlSize - 12) / 2,
-                                    backgroundColor:
-                                        context.colors.primaryContainer,
-                                    fallback: Text(
-                                      avatarFallback ?? '?',
-                                      style: context.textTheme.labelMedium
-                                          ?.copyWith(
-                                            color: context
-                                                .colors
-                                                .onPrimaryContainer,
-                                            fontWeight: FontWeight.w600,
-                                          ),
-                                    ),
-                                  )
-                                else
-                                  SizedBox.square(
-                                    dimension: controlSize - 12,
-                                    child: Icon(
-                                      fallbackIcon,
-                                      size: 12,
-                                      color: effectiveForeground,
-                                    ),
-                                  ),
-                                const SizedBox(width: Grid.xs),
-                                Expanded(
-                                  child: Column(
-                                    mainAxisAlignment: MainAxisAlignment.center,
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
-                                        label!,
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        textScaler: TextScaler.noScaling,
-                                        style:
-                                            (icon ==
-                                                        IosGlassNavigationIcon
-                                                            .channel
-                                                    ? context
-                                                          .textTheme
-                                                          .titleSmall
-                                                    : context
-                                                          .textTheme
-                                                          .titleMedium)
-                                                ?.copyWith(
-                                                  color: effectiveForeground,
-                                                  fontWeight: FontWeight.w600,
-                                                ),
-                                      ),
-                                      if (subtitle != null)
-                                        Text(
-                                          subtitle!,
-                                          maxLines: 1,
-                                          overflow: TextOverflow.ellipsis,
-                                          textScaler: TextScaler.noScaling,
-                                          style: context.textTheme.bodySmall
-                                              ?.copyWith(
-                                                color: context.colors.onSurface
-                                                    .withValues(alpha: 0.65),
-                                              ),
-                                        ),
-                                    ],
+                        child: isBusy
+                            ? Center(
+                                child: SizedBox.square(
+                                  dimension: 22,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    color: effectiveForeground,
                                   ),
                                 ),
-                              ],
-                            ),
-                          )
-                        : label != null
-                        ? Text(
-                            label!,
-                            maxLines: 1,
-                            style: context.textTheme.labelMedium?.copyWith(
-                              color: effectiveForeground,
-                              fontWeight: FontWeight.w600,
-                            ),
-                          )
-                        : Icon(
-                            fallbackIcon,
-                            size: icon == IosGlassNavigationIcon.shutter
-                                ? controlSize * 0.72
-                                : 17,
-                            color: icon == IosGlassNavigationIcon.colorSwatch
-                                ? swatchColor
-                                : effectiveForeground,
-                          ),
+                              )
+                            : icon == IosGlassNavigationIcon.colorSwatch
+                            ? Padding(
+                                padding: const EdgeInsets.all(4),
+                                child: DecoratedBox(
+                                  decoration: BoxDecoration(
+                                    color: swatchColor,
+                                    shape: BoxShape.circle,
+                                  ),
+                                ),
+                              )
+                            : isLeadingContent &&
+                                  (label != null ||
+                                      icon == IosGlassNavigationIcon.avatar)
+                            ? Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 6,
+                                ),
+                                child: Row(
+                                  children: [
+                                    if (icon == IosGlassNavigationIcon.avatar)
+                                      AvatarImage(
+                                        imageUrl: avatarImageUrl,
+                                        radius: (controlSize - 12) / 2,
+                                        backgroundColor:
+                                            context.colors.primaryContainer,
+                                        fallback: Text(
+                                          avatarFallback ?? '?',
+                                          style: context.textTheme.labelMedium
+                                              ?.copyWith(
+                                                color: context
+                                                    .colors
+                                                    .onPrimaryContainer,
+                                                fontWeight: FontWeight.w600,
+                                              ),
+                                        ),
+                                      )
+                                    else
+                                      SizedBox.square(
+                                        dimension: controlSize - 12,
+                                        child: Icon(
+                                          fallbackIcon,
+                                          size: 12,
+                                          color: effectiveForeground,
+                                        ),
+                                      ),
+                                    if (label != null) ...[
+                                      const SizedBox(width: Grid.xs),
+                                      Expanded(
+                                        child: Column(
+                                          mainAxisAlignment:
+                                              MainAxisAlignment.center,
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.start,
+                                          children: [
+                                            Text(
+                                              label!,
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                              textScaler: TextScaler.noScaling,
+                                              style:
+                                                  (icon ==
+                                                              IosGlassNavigationIcon
+                                                                  .channel
+                                                          ? context
+                                                                .textTheme
+                                                                .titleSmall
+                                                          : context
+                                                                .textTheme
+                                                                .titleMedium)
+                                                      ?.copyWith(
+                                                        color:
+                                                            effectiveForeground,
+                                                        fontWeight:
+                                                            FontWeight.w600,
+                                                      ),
+                                            ),
+                                            if (subtitle != null)
+                                              Text(
+                                                subtitle!,
+                                                maxLines: 1,
+                                                overflow: TextOverflow.ellipsis,
+                                                textScaler:
+                                                    TextScaler.noScaling,
+                                                style: context
+                                                    .textTheme
+                                                    .bodySmall
+                                                    ?.copyWith(
+                                                      color: context
+                                                          .colors
+                                                          .onSurface
+                                                          .withValues(
+                                                            alpha: 0.65,
+                                                          ),
+                                                    ),
+                                              ),
+                                          ],
+                                        ),
+                                      ),
+                                    ],
+                                  ],
+                                ),
+                              )
+                            : label != null
+                            ? Text(
+                                label!,
+                                maxLines: 1,
+                                style: context.textTheme.labelMedium?.copyWith(
+                                  color: effectiveForeground,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              )
+                            : Icon(
+                                fallbackIcon,
+                                size: icon == IosGlassNavigationIcon.shutter
+                                    ? controlSize * 0.72
+                                    : 17,
+                                color:
+                                    icon == IosGlassNavigationIcon.colorSwatch
+                                    ? swatchColor
+                                    : effectiveForeground,
+                              ),
+                      ),
+                    ),
                   ),
                 ),
               ],

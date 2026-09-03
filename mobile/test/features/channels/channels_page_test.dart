@@ -832,6 +832,14 @@ void main() {
       find.descendant(of: controlFinder, matching: find.byType(UiKitView)),
       findsNothing,
     );
+    expect(
+      find.descendant(of: controlFinder, matching: find.byType(AvatarImage)),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: controlFinder, matching: find.byType(BackdropFilter)),
+      findsOneWidget,
+    );
     expect(find.byKey(const Key('community-switcher-sheet')), findsOneWidget);
 
     Navigator.of(tester.element(find.text('Switch Community'))).pop();
@@ -866,6 +874,14 @@ void main() {
     expect(
       find.descendant(of: controlFinder, matching: find.byType(UiKitView)),
       findsNothing,
+    );
+    expect(
+      find.descendant(of: controlFinder, matching: find.byType(AvatarImage)),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: controlFinder, matching: find.byType(BackdropFilter)),
+      findsOneWidget,
     );
     await tester.pumpAndSettle();
     Navigator.of(tester.element(find.text('Injected settings'))).pop();
