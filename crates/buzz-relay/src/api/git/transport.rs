@@ -79,6 +79,7 @@ pub struct GitAuth {
 impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
     type Rejection = Response;
 
+    #[allow(clippy::result_large_err)] // Response is the natural error type for axum handlers
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
         state: &Arc<AppState>,
@@ -233,15 +234,12 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
         .await?;
 
         // NIP-FI admission: pubkey proven by NIP-98 above; closure supplies it.
-        // Assertion verify → pair → deny-map run in fixed order.
+        // Assertion verify → pair → deny-map run in fixed order. The admission
+        // value is intentionally discarded — pubkey came from NIP-98 above.
         // [FI-TRACE-AUTHORITY-UNIFORM]
-        if let Err(resp) =
-            crate::nip_fi_http::admit_nip_fi_http_on_state(state, &parts.headers, || {
-                Ok((pubkey, ()))
-            })
-        {
-            return Err(resp);
-        }
+        let _ = crate::nip_fi_http::admit_nip_fi_http_on_state(state, &parts.headers, || {
+            Ok((pubkey, ()))
+        })?;
 
         Ok(GitAuth { pubkey, tenant })
     }

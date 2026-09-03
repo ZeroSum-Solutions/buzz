@@ -720,6 +720,7 @@ fn truncate_reason(s: &str, max_bytes: usize) -> &str {
 }
 
 /// Submit a signed Nostr event via HTTP bridge (NIP-98 auth).
+#[allow(clippy::result_large_err)] // Response is the natural error type for axum handlers
 pub async fn submit_event(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -768,8 +769,7 @@ pub async fn submit_event(
         )
         .map(|auth| (auth.pubkey, (auth.event_id_bytes, auth.signed_created_at)))
         .map_err(|e| e.into_response())
-    })
-    .map_err(|resp| resp)?;
+    })?;
     let pubkey = *admission.proven_pubkey();
     let (event_id_bytes, signed_created_at) = admission.into_extra();
     let pubkey_hex = pubkey.to_hex();
@@ -1026,6 +1026,7 @@ async fn submit_event_authed(
 /// Query events via HTTP bridge (NIP-98 auth). Returns JSON array of events.
 ///
 /// Enforces channel access: results are filtered to channels the user can access.
+#[allow(clippy::result_large_err)] // Response is the natural error type for axum handlers
 pub async fn query_events(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1072,8 +1073,7 @@ pub async fn query_events(
         )
         .map(|auth| (auth.pubkey, (auth.event_id_bytes, auth.signed_created_at)))
         .map_err(|e| e.into_response())
-    })
-    .map_err(|resp| resp)?;
+    })?;
     let pubkey = *admission.proven_pubkey();
     let (event_id_bytes, signed_created_at) = admission.into_extra();
     let pubkey_hex = pubkey.to_hex();
@@ -1585,6 +1585,7 @@ async fn repair_requested_channel_access(
 ///
 /// Enforces channel access: only counts events in channels the user can access.
 /// For filters without a `#h` tag, falls back to per-event counting with access checks.
+#[allow(clippy::result_large_err)] // Response is the natural error type for axum handlers
 pub async fn count_events(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1630,8 +1631,7 @@ pub async fn count_events(
         )
         .map(|auth| (auth.pubkey, (auth.event_id_bytes, auth.signed_created_at)))
         .map_err(|e| e.into_response())
-    })
-    .map_err(|resp| resp)?;
+    })?;
     let pubkey = *admission.proven_pubkey();
     let (event_id_bytes, signed_created_at) = admission.into_extra();
     let pubkey_hex = pubkey.to_hex();
@@ -2399,6 +2399,7 @@ async fn synthesize_presence(
 /// (`restricted`) pass `None` and keep the bare-path expectation. The verbatim
 /// request query is used (not a re-serialized parse) so the match stays byte-exact
 /// with what the client signed regardless of param order or encoding.
+#[allow(clippy::result_large_err)] // Response is the natural error type for axum handlers
 async fn authorize_moderation_read(
     state: &Arc<AppState>,
     headers: &HeaderMap,
@@ -2440,8 +2441,7 @@ async fn authorize_moderation_read(
         )
         .map(|auth| (auth.pubkey, auth.event_id_bytes))
         .map_err(|e| e.into_response())
-    })
-    .map_err(|resp| resp)?;
+    })?;
     let pubkey = *admission.proven_pubkey();
     let event_id_bytes = admission.into_extra();
 

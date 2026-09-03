@@ -118,6 +118,7 @@ fn klipy_share_request(
         .json(&serde_json::json!({ "customer_id": request.customer_id })))
 }
 
+#[allow(clippy::result_large_err)] // Response is the natural error type for axum handlers
 async fn authenticate(
     state: &Arc<AppState>,
     headers: &HeaderMap,
@@ -152,8 +153,7 @@ async fn authenticate(
         )
         .map(|auth| (auth.pubkey, (auth.event_id_bytes, auth.signed_created_at)))
         .map_err(|e| e.into_response())
-    })
-    .map_err(|resp| resp)?;
+    })?;
     let pubkey = *admission.proven_pubkey();
     let (event_id_bytes, signed_created_at) = admission.into_extra();
 

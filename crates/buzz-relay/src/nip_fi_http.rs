@@ -207,6 +207,10 @@ impl<X> NipFiAdmission<X> {
 /// layers (assertion/pairing/deny) are skipped entirely.
 ///
 /// [FI-TRACE-AUTHORITY-UNIFORM]
+// Response<Body> is intentionally large (axum's design); boxing it here
+// would add allocation without architectural benefit. The large Err variant
+// is load-bearing: it IS the HTTP response, returned directly by handlers.
+#[allow(clippy::result_large_err)]
 pub(crate) fn admit_nip_fi_http<D, X, F>(
     headers: &HeaderMap,
     extract_nip98: F,
@@ -240,7 +244,7 @@ where
     // Steps 4–8 — Enforce mode.
 
     // Step 4: extract the assertion token.
-    let token = extract_bearer_token(headers).map_err(|class| http_denial(class))?;
+    let token = extract_bearer_token(headers).map_err(http_denial)?;
 
     // Step 5: cryptographic verification (signature, issuer, expiry, claims).
     let verifier = verifier.ok_or_else(|| {
@@ -370,6 +374,8 @@ pub(crate) fn http_denial(class: DenialClass) -> Response<Body> {
 /// There is no other way to produce a [`NipFiAdmission`].
 ///
 /// [FI-TRACE-AUTHORITY-UNIFORM]
+// Response<Body> is intentionally large (axum's design); see admit_nip_fi_http.
+#[allow(clippy::result_large_err)]
 pub(crate) fn admit_nip_fi_http_on_state<X, F>(
     state: &crate::state::AppState,
     headers: &HeaderMap,
@@ -393,6 +399,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    // Response<Body> is 128 bytes by axum's design; the large Err is intentional
+    // throughout this module — it IS the HTTP response returned from tests.
+    #![allow(clippy::result_large_err)]
     use super::*;
     use axum::http::HeaderValue;
     use buzz_auth::{NipFiMode, VerifyAssertion};
@@ -732,9 +741,9 @@ mod tests {
         // Mock verifier: always succeeds, always claims pubkey_a as asserted_key.
         struct PairingMockVerifier(nostr::PublicKey);
         impl VerifyAssertion for PairingMockVerifier {
-            fn verify_assertion<'t>(
+            fn verify_assertion(
                 &self,
-                _token: &'t str,
+                _token: &str,
             ) -> Result<VerifiedAssertion, buzz_auth::VerifierError> {
                 Ok(VerifiedAssertion::new_for_test(self.0))
             }

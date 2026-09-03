@@ -292,6 +292,7 @@ pub async fn mint_invite(
     mint_invite_checked(state, headers, body).await
 }
 
+#[allow(clippy::result_large_err)] // Response is the natural error type for axum handlers
 async fn mint_invite_checked(
     state: Arc<AppState>,
     headers: HeaderMap,
