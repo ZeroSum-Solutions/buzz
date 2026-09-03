@@ -340,6 +340,14 @@ class BuzzPushBootstrap extends HookConsumerWidget {
 
     final token = apnsDeviceToken.value;
     final retiredRelayOrigins = retiredBuzzPushRelayOrigins.value;
+    final targetGatewayOrigin = buzzPushGatewayOrigin(Env.pushGatewayUrl);
+    final activeCommunityAwaitingGatewayMigration =
+        community != null &&
+        buzzPushCommunitiesRequiringGatewayMigration(
+          communities: [community],
+          retiredRelayOrigins: retiredRelayOrigins,
+          targetGatewayOrigin: targetGatewayOrigin,
+        ).isNotEmpty;
     useEffect(
       () {
         if (token == null ||
@@ -354,9 +362,6 @@ class BuzzPushBootstrap extends HookConsumerWidget {
         if (!gatewayMigrationAttempt.tryBegin(attempt)) return null;
         unawaited(() async {
           try {
-            final targetGatewayOrigin = buzzPushGatewayOrigin(
-              Env.pushGatewayUrl,
-            );
             for (final candidate
                 in buzzPushCommunitiesRequiringGatewayMigration(
                   communities: communities,
@@ -417,7 +422,7 @@ class BuzzPushBootstrap extends HookConsumerWidget {
               descriptor: descriptor,
             ) ||
             token == null ||
-            retiredRelayOrigins.isNotEmpty) {
+            activeCommunityAwaitingGatewayMigration) {
           return null;
         }
         final activeCommunity = community!;
@@ -481,7 +486,7 @@ class BuzzPushBootstrap extends HookConsumerWidget {
         memberPubkey,
         descriptor,
         token,
-        retiredRelayOrigins,
+        activeCommunityAwaitingGatewayMigration,
         publicationRetry.value,
       ],
     );
