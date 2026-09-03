@@ -1163,7 +1163,7 @@ mod tests {
     /// A `t` tag with no content (`["t"]`) in Strict mode: counted as one occurrence,
     /// content check fires → `InvalidAuthVerb` (malformed instance, NIP-FI §cardinality).
     #[test]
-    fn test_valueless_t_tag_is_not_counted_strict() {
+    fn test_strict_rejects_valueless_t_tag() {
         let keys = Keys::generate();
         let sha256 = "a".repeat(64);
         let now = Timestamp::now().as_secs();
@@ -1225,7 +1225,7 @@ mod tests {
     /// A `t` tag with an empty-string value (`["t", ""]`) in Strict mode: counted
     /// as one occurrence, content check fires → `InvalidAuthVerb`.
     #[test]
-    fn test_empty_string_t_tag_is_not_counted_strict() {
+    fn test_strict_rejects_empty_string_t_tag() {
         let keys = Keys::generate();
         let sha256 = "a".repeat(64);
         let now = Timestamp::now().as_secs();
