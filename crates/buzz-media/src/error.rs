@@ -290,8 +290,8 @@ mod tests {
     // These pins cover the legacy/Permissive path (MediaError::into_response).
     // Strict mode overrides this via MediaDenial in buzz-relay [FI-INV-15].
 
-    #[test]
-    fn all_auth_failures_return_json_401_in_permissive_path() {
+    #[tokio::test]
+    async fn all_auth_failures_return_json_401_in_permissive_path() {
         // In the legacy/Permissive path all auth failures collapse to a single
         // JSON 401 to prevent oracle enumeration [FI-INV-15].  Strict mode
         // (MediaDenial in buzz-relay) applies the NIP-FI 401/403 split instead.
@@ -333,6 +333,15 @@ mod tests {
             assert!(
                 resp.headers().get("www-authenticate").is_none(),
                 "Permissive path must not include WWW-Authenticate for {label}"
+            );
+            // Exact body: legacy path emits {"error":"authentication failed"} [FI-INV-15].
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("body collect");
+            assert_eq!(
+                body.as_ref(),
+                br#"{"error":"authentication failed"}"#,
+                "Permissive path: wrong body for {label}"
             );
         }
     }
