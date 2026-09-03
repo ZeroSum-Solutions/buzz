@@ -60,6 +60,9 @@ pub fn router(state: Arc<crate::state::AppState>) -> Router {
         .route("/operators", get(list_operators))
         .route("/operators/{pubkey}", put(upsert_operator))
         .route("/operators/{pubkey}", delete(delete_operator))
+        .route("/members/restrictions", get(list_member_restrictions))
+        .route("/members/{pubkey}/ban", delete(unban_member))
+        .route("/members/{pubkey}/timeout", delete(untimeout_member))
         .layer(middleware::from_fn(security_headers))
         // Mutation routes carry a JSON body (max ~4 KB); read-only routes have no body.
         .layer(RequestBodyLimitLayer::new(4096))
@@ -1108,7 +1111,198 @@ async fn delete_operator(
     Ok(Json(serde_json::json!({"deleted": canonical_hex})))
 }
 
-// ── Staffing helpers ──────────────────────────────────────────────────────────
+// ── Member restriction routes ─────────────────────────────────────────────────
+
+/// JSON response shape for one restriction record.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemberRestrictionRecord {
+    /// Target member pubkey as lowercase hex.
+    pubkey: String,
+    /// Whether the member is currently banned.
+    banned: bool,
+    /// Ban expiry timestamp; `null` while `banned` ⇒ permanent.
+    ban_expires_at: Option<DateTime<Utc>>,
+    /// Moderator-supplied ban reason (private to the admin plane).
+    ban_reason: Option<String>,
+    /// Write-block until this timestamp; `null` or past ⇒ not timed out.
+    muted_until: Option<DateTime<Utc>>,
+    /// Moderator-supplied timeout reason (private to the admin plane).
+    mute_reason: Option<String>,
+    /// Last-acting moderator pubkey as lowercase hex.
+    actor_pubkey: String,
+    /// Last modification time.
+    updated_at: DateTime<Utc>,
+}
+
+impl From<buzz_db::moderation::BanRecord> for MemberRestrictionRecord {
+    fn from(r: buzz_db::moderation::BanRecord) -> Self {
+        Self {
+            pubkey: hex::encode(&r.pubkey),
+            banned: r.banned,
+            ban_expires_at: r.ban_expires_at,
+            ban_reason: r.ban_reason,
+            muted_until: r.muted_until,
+            mute_reason: r.mute_reason,
+            actor_pubkey: hex::encode(&r.actor_pubkey),
+            updated_at: r.updated_at,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommunityQuery {
+    community_id: Uuid,
+}
+
+/// GET /members/restrictions?communityId={uuid}
+///
+/// List all currently active bans and timeouts for the given community.
+/// Returns 400 if `communityId` is absent or not a valid UUID.
+/// Requires admin auth (nip98 or disabled mode).
+async fn list_member_restrictions(
+    State(state): State<Arc<crate::state::AppState>>,
+    uri: Uri,
+    headers: HeaderMap,
+    Query(query): Query<CommunityQuery>,
+) -> Result<Json<Vec<MemberRestrictionRecord>>, ApiError> {
+    authorize(
+        &state,
+        &headers,
+        uri.path_and_query()
+            .map_or_else(|| uri.path(), |pq| pq.as_str()),
+        "GET",
+        None,
+    )
+    .await?;
+
+    let community = buzz_core::CommunityId::from_uuid(query.community_id);
+    let records = state.db.list_community_restrictions(community).await?;
+    Ok(Json(records.into_iter().map(Into::into).collect()))
+}
+
+/// DELETE /members/{pubkey}/ban?communityId={uuid}
+///
+/// Lift an active ban for the given member in the given community.
+/// Returns 204 on success, 409 if no active ban exists.
+/// Requires nip98 auth.
+async fn unban_member(
+    State(state): State<Arc<crate::state::AppState>>,
+    uri: Uri,
+    headers: HeaderMap,
+    Path(pubkey_hex): Path<String>,
+    Query(query): Query<CommunityQuery>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    let principal_opt = authorize(
+        &state,
+        &headers,
+        uri.path_and_query()
+            .map_or_else(|| uri.path(), |pq| pq.as_str()),
+        "DELETE",
+        None,
+    )
+    .await?;
+
+    let principal = require_mutation_principal(principal_opt)?;
+
+    let target_bytes = decode_hex_pubkey(&pubkey_hex)?;
+    let community = buzz_core::CommunityId::from_uuid(query.community_id);
+
+    let lifted = state
+        .db
+        .unban_community_member(community, &target_bytes, &principal.pubkey)
+        .await?;
+    if !lifted {
+        return Err(ApiError::conflict("no active ban for this member"));
+    }
+
+    let actor_authority = match principal.role {
+        AdminRole::Operator => "relay_operator",
+        AdminRole::Moderator => "relay_moderator",
+    };
+    state
+        .db
+        .insert_moderation_action(
+            community,
+            buzz_db::moderation::NewAction {
+                actor_pubkey: &principal.pubkey,
+                action: "unban",
+                target_pubkey: Some(&target_bytes),
+                target_event_id: None,
+                channel_id: None,
+                reason_code: None,
+                public_reason: None,
+                private_reason: None,
+                matched_principal: None,
+                actor_authority: Some(actor_authority),
+            },
+        )
+        .await?;
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// DELETE /members/{pubkey}/timeout?communityId={uuid}
+///
+/// Clear an active timeout/write-block for the given member in the given
+/// community. Returns 204 on success, 409 if no active timeout exists.
+/// Requires nip98 auth.
+async fn untimeout_member(
+    State(state): State<Arc<crate::state::AppState>>,
+    uri: Uri,
+    headers: HeaderMap,
+    Path(pubkey_hex): Path<String>,
+    Query(query): Query<CommunityQuery>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    let principal_opt = authorize(
+        &state,
+        &headers,
+        uri.path_and_query()
+            .map_or_else(|| uri.path(), |pq| pq.as_str()),
+        "DELETE",
+        None,
+    )
+    .await?;
+
+    let principal = require_mutation_principal(principal_opt)?;
+
+    let target_bytes = decode_hex_pubkey(&pubkey_hex)?;
+    let community = buzz_core::CommunityId::from_uuid(query.community_id);
+
+    let lifted = state
+        .db
+        .untimeout_community_member(community, &target_bytes, &principal.pubkey)
+        .await?;
+    if !lifted {
+        return Err(ApiError::conflict("no active timeout for this member"));
+    }
+
+    let actor_authority = match principal.role {
+        AdminRole::Operator => "relay_operator",
+        AdminRole::Moderator => "relay_moderator",
+    };
+    state
+        .db
+        .insert_moderation_action(
+            community,
+            buzz_db::moderation::NewAction {
+                actor_pubkey: &principal.pubkey,
+                action: "untimeout",
+                target_pubkey: Some(&target_bytes),
+                target_event_id: None,
+                channel_id: None,
+                reason_code: None,
+                public_reason: None,
+                private_reason: None,
+                matched_principal: None,
+                actor_authority: Some(actor_authority),
+            },
+        )
+        .await?;
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
 
 /// Returns true if any config-backed operator is effective — a non-empty
 /// `RELAY_OPERATOR_PUBKEYS` (every entry is an operator) or, when that list is
@@ -1721,6 +1915,178 @@ mod postgres_tests {
             response.status(),
             StatusCode::FORBIDDEN,
             "mismatched origin must still be rejected in disabled mode"
+        );
+    }
+
+    // ── Member restriction tests ──────────────────────────────────────────
+
+    #[test]
+    fn restriction_record_converts_ban_record_pubkeys_to_hex() {
+        // Pure unit test: BanRecord → MemberRestrictionRecord hex encodes the
+        // Vec<u8> pubkeys. No database or state needed.
+        let record = buzz_db::moderation::BanRecord {
+            pubkey: vec![0xAB; 32],
+            banned: true,
+            ban_expires_at: None,
+            ban_reason: Some("spam".to_string()),
+            muted_until: None,
+            mute_reason: None,
+            actor_pubkey: vec![0xCD; 32],
+            updated_at: chrono::Utc::now(),
+        };
+        let response: MemberRestrictionRecord = record.into();
+        assert_eq!(response.pubkey, "ab".repeat(32));
+        assert_eq!(response.actor_pubkey, "cd".repeat(32));
+        assert!(response.banned);
+        assert_eq!(response.ban_reason.as_deref(), Some("spam"));
+    }
+
+    #[tokio::test]
+    async fn list_restrictions_rejects_missing_credential() {
+        let state = test_state().await;
+        let community_id = Uuid::nil();
+        let response = status_for(
+            state,
+            Request::builder()
+                .uri(format!("/members/restrictions?communityId={community_id}"))
+                .header(header::HOST, "admin.example")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "GET /members/restrictions without credential must return 401"
+        );
+    }
+
+    #[tokio::test]
+    async fn unban_member_rejects_missing_credential() {
+        let state = test_state().await;
+        let pubkey_hex = "ab".repeat(32);
+        let community_id = Uuid::nil();
+        let response = status_for(
+            state,
+            Request::builder()
+                .method("DELETE")
+                .uri(format!(
+                    "/members/{pubkey_hex}/ban?communityId={community_id}"
+                ))
+                .header(header::HOST, "admin.example")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "DELETE /members/{{pubkey}}/ban without credential must return 401"
+        );
+    }
+
+    #[tokio::test]
+    async fn untimeout_member_rejects_missing_credential() {
+        let state = test_state().await;
+        let pubkey_hex = "ab".repeat(32);
+        let community_id = Uuid::nil();
+        let response = status_for(
+            state,
+            Request::builder()
+                .method("DELETE")
+                .uri(format!(
+                    "/members/{pubkey_hex}/timeout?communityId={community_id}"
+                ))
+                .header(header::HOST, "admin.example")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "DELETE /members/{{pubkey}}/timeout without credential must return 401"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn unban_member_returns_409_when_no_active_ban() {
+        let pool = sqlx::PgPool::connect(&database_url())
+            .await
+            .expect("connect test database");
+        let db = buzz_db::Db::from_pool(pool.clone());
+        db.migrate().await.expect("migrate test database");
+
+        // Create an isolated community so the test doesn't clash with other rows.
+        let community_uuid = Uuid::new_v4();
+        let host = format!("unban-test-{}.example", community_uuid.simple());
+        db.ensure_configured_community(&host)
+            .await
+            .expect("create test community");
+
+        let state = test_state().await;
+        let operator_keys = test_operator_keys();
+        let pubkey_hex = "ab".repeat(32);
+        let community_id = community_uuid;
+
+        let path = format!("/members/{pubkey_hex}/ban?communityId={community_id}");
+        let auth = make_nostr_auth_delete(&operator_keys, &path);
+        let response = status_for(
+            state,
+            Request::builder()
+                .method("DELETE")
+                .uri(&path)
+                .header(header::HOST, "admin.example")
+                .header(header::AUTHORIZATION, auth)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "unban with no active ban must return 409"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn untimeout_member_returns_409_when_no_active_timeout() {
+        let pool = sqlx::PgPool::connect(&database_url())
+            .await
+            .expect("connect test database");
+        let db = buzz_db::Db::from_pool(pool.clone());
+        db.migrate().await.expect("migrate test database");
+
+        let community_uuid = Uuid::new_v4();
+        let host = format!("untimeout-test-{}.example", community_uuid.simple());
+        db.ensure_configured_community(&host)
+            .await
+            .expect("create test community");
+
+        let state = test_state().await;
+        let operator_keys = test_operator_keys();
+        let pubkey_hex = "ab".repeat(32);
+        let community_id = community_uuid;
+
+        let path = format!("/members/{pubkey_hex}/timeout?communityId={community_id}");
+        let auth = make_nostr_auth_delete(&operator_keys, &path);
+        let response = status_for(
+            state,
+            Request::builder()
+                .method("DELETE")
+                .uri(&path)
+                .header(header::HOST, "admin.example")
+                .header(header::AUTHORIZATION, auth)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "untimeout with no active timeout must return 409"
         );
     }
 
