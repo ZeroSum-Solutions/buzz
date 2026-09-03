@@ -278,8 +278,8 @@ async fn test_auth_wrong_kind() {
         ],
     );
     let resp = upload_with_auth(&client, &auth, &sha256, &jpeg).await;
-    assert_eq!(resp.status(), 403, "wrong kind must be 403");
-    println!("✅ Wrong kind → 403");
+    assert_eq!(resp.status(), 401, "wrong kind must be 401");
+    println!("✅ Wrong kind → 401");
 }
 
 #[tokio::test]
@@ -367,8 +367,8 @@ async fn test_auth_empty_content() {
         ],
     );
     let resp = upload_with_auth(&client, &auth, &sha256, &jpeg).await;
-    assert_eq!(resp.status(), 403, "empty content must be 403");
-    println!("✅ Empty content → 403");
+    assert_eq!(resp.status(), 401, "empty content must be 401");
+    println!("✅ Empty content → 401");
 }
 
 #[tokio::test]
