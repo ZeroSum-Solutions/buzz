@@ -76,7 +76,8 @@ export type DraftState = {
    * The `"sent"` value is not written by any production path; legacy `sent:`
    * keyed records from older builds are dropped on read by `readStore`.
    * Entries persisted before this field was added have no status field —
-   * the read path treats absent status as `"active"` (see `isValidDraftState`).
+   * the read path treats absent status as `"active"` (see
+   * `normalizeStoredDraft`).
    */
   status: "active" | "sent";
 };
@@ -197,7 +198,7 @@ function readStore(): Map<string, DraftState> {
           continue;
         }
         if (isValidDraftState(value)) {
-          map.set(key, value);
+          map.set(key, normalizeStoredDraft(value));
         }
       }
     }
@@ -214,6 +215,12 @@ function readStore(): Map<string, DraftState> {
   return map;
 }
 
+/**
+ * Pure structural predicate over a parsed store entry — it never writes to
+ * its argument. Migration-era absences (`mentionRefs`, `status`, `entryKind`)
+ * are accepted here and defaulted by `normalizeStoredDraft` at the read
+ * boundary in `readStore`.
+ */
 function isValidDraftState(v: unknown): v is DraftState {
   if (typeof v !== "object" || v === null) return false;
   const d = v as Partial<DraftState>;
@@ -229,37 +236,48 @@ function isValidDraftState(v: unknown): v is DraftState {
   ) {
     return false;
   }
-  // Migration: drafts written before mention routing was persisted have no
-  // mentionRefs. Preserve them as ordinary drafts with no selected identities.
-  if (d.mentionRefs === undefined) {
-    (d as DraftState).mentionRefs = [];
-  } else if (
-    !Array.isArray(d.mentionRefs) ||
-    d.mentionRefs.some(
-      (ref) =>
-        typeof ref !== "object" ||
-        ref === null ||
-        typeof ref.displayName !== "string" ||
-        ref.displayName.trim().length === 0 ||
-        typeof ref.pubkey !== "string" ||
-        ref.pubkey.trim().length === 0 ||
-        typeof ref.isAgent !== "boolean",
-    )
+  // Drafts written before mention routing was persisted have no mentionRefs —
+  // accepted, and preserved as ordinary drafts with no selected identities.
+  if (
+    d.mentionRefs !== undefined &&
+    (!Array.isArray(d.mentionRefs) ||
+      d.mentionRefs.some(
+        (ref) =>
+          typeof ref !== "object" ||
+          ref === null ||
+          typeof ref.displayName !== "string" ||
+          ref.displayName.trim().length === 0 ||
+          typeof ref.pubkey !== "string" ||
+          ref.pubkey.trim().length === 0 ||
+          typeof ref.isAgent !== "boolean",
+      ))
   ) {
     return false;
   }
-  // Migration: entries written before the status field was introduced have no
-  // status field. Treat absent status as "active" to avoid data loss on the
-  // first run after the upgrade.
+  // Entries written before the status field was introduced have no status
+  // field — accepted, to avoid data loss on the first run after the upgrade.
   // Legacy sent: keys are skipped by readStore before reaching this function;
   // reject any remaining entry whose status is not "active".
-  if (d.status === undefined || d.status === null) {
-    (d as DraftState).status = "active";
-  } else if (d.status !== "active") {
+  if (d.status !== undefined && d.status !== null && d.status !== "active") {
     return false;
   }
-  (d as DraftState).entryKind = normalizeDraftEntryKind(d);
   return true;
+}
+
+/**
+ * Canonicalize a validated store entry at the read boundary: default the
+ * migration-era optional fields (`mentionRefs`, `status`) and demote any
+ * stored `entryKind` that no longer satisfies the agent-prefill invariants.
+ * This lives in the read funnel rather than inside `isValidDraftState` so
+ * validation stays a pure predicate.
+ */
+function normalizeStoredDraft(draft: DraftState): DraftState {
+  return {
+    ...draft,
+    mentionRefs: draft.mentionRefs ?? [],
+    status: draft.status ?? "active",
+    entryKind: normalizeDraftEntryKind(draft),
+  };
 }
 
 function normalizeDraftEntryKind(draft: Partial<DraftState>): DraftEntryKind {

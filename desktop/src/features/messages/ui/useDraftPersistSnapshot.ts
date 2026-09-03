@@ -221,9 +221,25 @@ export function useDraftPersistLifecycle({
         if (queuedAttachments.length > 0) {
           saveQueuedAttachmentsForDraft?.(effectiveDraftKey, queuedAttachments);
         }
-        const content = emptyContentIsAuthoritativeRef.current
+        const entryKind =
+          pendingImetaForPersistRef.current.length > 0 ||
+          queuedAttachments.length > 0
+            ? "draft"
+            : entryKindRef.current;
+        const editorContent = emptyContentIsAuthoritativeRef.current
           ? ""
-          : persistedContent(syncComposerContentFromEditor());
+          : syncComposerContentFromEditor();
+        // A pure automatic prefill IS the implicit prefix: stripping it here
+        // would persist "" (which clears the record), so the agent-prefill
+        // classification would survive full reloads but not in-app
+        // navigation. Any authored edit or retained attachment has already
+        // demoted entryKind to "draft", and the storage boundary re-demotes
+        // anything that is not mention-only, so skipping the strip cannot
+        // leak an implicit prefix into an Inbox-visible draft.
+        const content =
+          entryKind === "agent-prefill"
+            ? editorContent
+            : persistedContent(editorContent);
         persistDraft(
           effectiveDraftKey,
           content,
@@ -231,10 +247,7 @@ export function useDraftPersistLifecycle({
           [...pendingImetaForPersistRef.current],
           [...spoileredAttachmentUrlsRef.current],
           getMentionRefs(content),
-          pendingImetaForPersistRef.current.length > 0 ||
-            queuedAttachments.length > 0
-            ? "draft"
-            : entryKindRef.current,
+          entryKind,
         );
       }
     };

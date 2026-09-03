@@ -8,6 +8,8 @@ const CHANNEL_ID = "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50";
 const RANDOM_CHANNEL_ID = "9dae0116-799b-5071-a0a8-fdd30a91a35d";
 const AGENT_A = "a".repeat(64);
 const AGENT_B = "b".repeat(64);
+// Active mock identity (DEFAULT_MOCK_IDENTITY.pubkey in e2eBridge.ts).
+const OWN_PUBKEY = "deadbeef".repeat(8);
 const THREAD_ROOT_ID = "mock-general-welcome";
 const KEEP_MENTIONED_AGENTS_PINNED_STORAGE_KEY =
   "buzz.messages.keepMentionedAgentsPinned";
@@ -407,16 +409,22 @@ test("automatic agent prefill survives navigation and reload without becoming an
   page,
 }) => {
   await installAudienceFixtures(page);
-  await openGeneral(page);
+  await openThread(page);
 
-  const composer = channelComposer(page);
+  const composer = threadComposer(page);
   await automaticallyMention(composer, "Morgarita");
   await expect(composer.getByTestId("message-input")).toHaveText("@Morgarita ");
   await expect
     .poll(() => readStoredDraftEntryKind(page, CHANNEL_ID))
     .toBe("agent-prefill");
 
-  await page.goto("/", { waitUntil: "domcontentloaded" });
+  // In-app navigation (no full page load) unmounts the composer and runs the
+  // persist-lifecycle cleanup — the stored classification must survive that
+  // path too, not just full reloads.
+  await page
+    .getByTestId("sidebar-primary-menu")
+    .getByRole("button", { name: "Inbox", exact: true })
+    .click();
   await expect(page.getByTestId("home-inbox")).toBeVisible();
   expect(await readStoredDraftEntryKind(page, CHANNEL_ID)).toBe(
     "agent-prefill",
@@ -429,13 +437,24 @@ test("automatic agent prefill survives navigation and reload without becoming an
   );
   await expect(page.getByTestId("inbox-draft-badge-option")).toHaveCount(0);
 
-  await openGeneral(page);
-  await expect(channelComposer(page).getByTestId("message-input")).toHaveText(
+  await openThread(page);
+  await expect(threadComposer(page).getByTestId("message-input")).toHaveText(
+    "@Morgarita ",
+  );
+
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+  await expect(page.getByTestId("home-inbox")).toBeVisible();
+  expect(await readStoredDraftEntryKind(page, CHANNEL_ID)).toBe(
+    "agent-prefill",
+  );
+
+  await openThread(page);
+  await expect(threadComposer(page).getByTestId("message-input")).toHaveText(
     "@Morgarita ",
   );
   await page.reload({ waitUntil: "domcontentloaded" });
-  await expect(page.getByTestId("chat-title")).toHaveText("general");
-  await expect(channelComposer(page).getByTestId("message-input")).toHaveText(
+  await expect(page.getByTestId("message-thread-panel")).toBeVisible();
+  await expect(threadComposer(page).getByTestId("message-input")).toHaveText(
     "@Morgarita ",
   );
 });
@@ -444,19 +463,43 @@ test("cancelling a message edit restores the automatic prefill classification", 
   page,
 }) => {
   await installAudienceFixtures(page);
-  await openGeneral(page);
+  await openThread(page);
+  await waitForMockLiveSubscription(page, "general");
 
-  const composer = channelComposer(page);
+  // Automatic mentions are thread-only, so the edit that displaces the
+  // prefill must target an own thread reply — routed to the thread composer.
+  const replyId = "e".repeat(64);
+  await page.evaluate(
+    ({ content, eventId, ownPubkey, rootId }) => {
+      window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
+        channelName: "general",
+        content,
+        id: eventId,
+        parentEventId: rootId,
+        pubkey: ownPubkey,
+      });
+    },
+    {
+      content: "own reply before editing",
+      eventId: replyId,
+      ownPubkey: OWN_PUBKEY,
+      rootId: THREAD_ROOT_ID,
+    },
+  );
+  const threadPanel = page.getByTestId("message-thread-panel");
+  const replyRow = threadPanel.locator(`[data-message-id="${replyId}"]`);
+  await expect(replyRow).toBeVisible();
+
+  const composer = threadComposer(page);
   const input = composer.getByTestId("message-input");
   await automaticallyMention(composer, "Morgarita");
   await expect
     .poll(() => readStoredDraftEntryKind(page, CHANNEL_ID))
     .toBe("agent-prefill");
 
-  const editableRow = page.locator(`[data-message-id="${THREAD_ROOT_ID}"]`);
-  await editableRow.hover();
-  await editableRow.getByRole("button", { name: "More actions" }).click();
-  await page.getByTestId(`edit-message-${THREAD_ROOT_ID}`).click();
+  await replyRow.hover();
+  await replyRow.getByRole("button", { name: "More actions" }).click();
+  await page.getByTestId(`edit-message-${replyId}`).click();
   await expect(composer.getByTestId("edit-target")).toBeVisible();
 
   await composer.getByRole("button", { name: "Cancel edit" }).click();

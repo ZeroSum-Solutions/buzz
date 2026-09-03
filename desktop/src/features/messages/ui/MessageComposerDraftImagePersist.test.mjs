@@ -240,6 +240,7 @@ import { useAgentPrefillDraftBridge } from "./useAgentPrefillDraftBridge.ts";
 import {
   clearAllDrafts,
   deleteDraftEntry,
+  getInboxDraftEntries,
   initDraftStore,
   loadDraftEntry,
   persistDraftEntry,
@@ -1122,6 +1123,121 @@ test("failed_send_restores_the_captured_entry_kind", async () => {
   await handle.unmount();
   assert.equal(loadDraftEntry(draftKey)?.entryKind, "draft");
   assert.equal(loadDraftEntry(draftKey)?.content, "authored message");
+});
+
+test("unmount_cleanup_keeps_a_pure_prefill_durable_with_a_real_prefix_getter", async () => {
+  const draftKey = "chan-prefill-unmount-strip";
+  setupStore("pubkey-prefill-unmount-strip");
+  persistDraftEntry(
+    draftKey,
+    "@Jitter ",
+    draftKey,
+    [],
+    [],
+    AGENT_PREFILL_REFS,
+    "agent-prefill",
+  );
+
+  let editorContent = "";
+  const spoileredRef = { current: new Set() };
+  function HarnessComposer() {
+    useDraftPersistLifecycle({
+      effectiveDraftKey: draftKey,
+      channelId: draftKey,
+      loadDraft: loadDraftEntry,
+      persistDraft: persistDraftEntry,
+      getMentionRefs: (content) =>
+        content.includes("@Jitter") ? AGENT_PREFILL_REFS : [],
+      restoreMentionRefs: () => {},
+      livePendingImeta: [],
+      setPendingImeta: () => {},
+      setContent: (content) => {
+        editorContent = content;
+      },
+      clearContent: () => {
+        editorContent = "";
+      },
+      setSpoileredAttachmentUrls: () => {},
+      spoileredAttachmentUrlsRef: spoileredRef,
+      syncComposerContentFromEditor: () => editorContent,
+      // The production wiring supplies the implicit-prefix getter, so the
+      // cleanup's persistedContent() would strip a pure prefill to "" — and an
+      // empty persist clears the stored record. In-app navigation unmounts the
+      // composer through exactly this path.
+      getImplicitAgentMentionPrefix: () => "@Jitter ",
+    });
+    return null;
+  }
+
+  const handle = await mountStrictMode(HarnessComposer);
+  assert.equal(editorContent, "@Jitter ");
+  await handle.unmount();
+
+  assert.equal(
+    loadDraftEntry(draftKey)?.entryKind,
+    "agent-prefill",
+    "the stored agent-prefill classification must survive composer unmount",
+  );
+  assert.equal(loadDraftEntry(draftKey)?.content, "@Jitter ");
+  assert.equal(
+    getInboxDraftEntries().some(({ key }) => key === draftKey),
+    false,
+    "the surviving prefill record must stay excluded from Inbox drafts",
+  );
+});
+
+test("unmount_cleanup_still_strips_the_implicit_prefix_from_authored_drafts", async () => {
+  const draftKey = "chan-authored-unmount-strip";
+  setupStore("pubkey-authored-unmount-strip");
+  persistDraftEntry(
+    draftKey,
+    "@Jitter ",
+    draftKey,
+    [],
+    [],
+    AGENT_PREFILL_REFS,
+    "agent-prefill",
+  );
+
+  let editorContent = "";
+  let trackAuthoredContent;
+  const spoileredRef = { current: new Set() };
+  function HarnessComposer() {
+    ({ trackAuthoredContent } = useDraftPersistLifecycle({
+      effectiveDraftKey: draftKey,
+      channelId: draftKey,
+      loadDraft: loadDraftEntry,
+      persistDraft: persistDraftEntry,
+      getMentionRefs: (content) =>
+        content.includes("@Jitter") ? AGENT_PREFILL_REFS : [],
+      restoreMentionRefs: () => {},
+      livePendingImeta: [],
+      setPendingImeta: () => {},
+      setContent: (content) => {
+        editorContent = content;
+      },
+      clearContent: () => {
+        editorContent = "";
+      },
+      setSpoileredAttachmentUrls: () => {},
+      spoileredAttachmentUrlsRef: spoileredRef,
+      syncComposerContentFromEditor: () => editorContent,
+      getImplicitAgentMentionPrefix: () => "@Jitter ",
+    }));
+    return null;
+  }
+
+  const handle = await mountStrictMode(HarnessComposer);
+  editorContent = "@Jitter hello";
+  trackAuthoredContent(editorContent);
+  await handle.unmount();
+
+  assert.equal(
+    loadDraftEntry(draftKey)?.content,
+    "hello",
+    "authored drafts keep stripping the implicit prefix on unmount",
+  );
+  assert.equal(loadDraftEntry(draftKey)?.entryKind, "draft");
 });
 
 function mountAgentPrefillBridge(overrides = {}) {

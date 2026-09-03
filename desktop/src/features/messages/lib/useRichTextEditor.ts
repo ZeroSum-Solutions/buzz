@@ -709,6 +709,22 @@ export function useRichTextEditor({
     (markdown: string) => {
       if (!editor) return;
       editor.commands.setContent(markdown);
+      // The markdown re-parse drops trailing spaces, but a restored draft's
+      // trailing run can be meaningful: an automatic agent prefill is exactly
+      // "@Name " and its separator must survive restoration so the caret
+      // lands past it and the next keystroke does not fuse into the mention.
+      // Re-insert whatever the parse lost, without emitting an update.
+      const trailingSpaces = / +$/.exec(markdown)?.[0] ?? "";
+      if (!trailingSpaces) return;
+      const doc = editor.state.doc;
+      const docText = doc.textBetween(0, doc.content.size, "\n", "\n");
+      const preserved = / +$/.exec(docText)?.[0] ?? "";
+      const missing = trailingSpaces.slice(preserved.length);
+      if (!missing) return;
+      const end = TextSelection.atEnd(doc).from;
+      editor.view.dispatch(
+        editor.state.tr.insertText(missing, end).setMeta("preventUpdate", true),
+      );
     },
     [editor],
   );
