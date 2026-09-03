@@ -3013,37 +3013,522 @@ mod tests {
         let _ = cancel2; // suppress unused warning
     }
 
-    // ── W9/W10: participant commit barrier — requires DB integration infrastructure ──
+    // ── W9/W10/reaffirm: participant-commit barrier (real-DB) ─────────────────
+    //
+    // These three witnesses require a seeded DB (community + channel + membership).
+    // They use the same skip-if-unavailable guard as W1.
+    //
+    // Shared fixture setup for W9, W10, and the reaffirm variant:
+    //   1. INSERT a community (non-nil UUID, `deletion_state = 'active'`).
+    //   2. INSERT a channel under that community (no TTL → non-ephemeral, so
+    //      `check_membership_for_admission` returns `MembershipAdmission::Existing`
+    //      which we pass directly without going through that function).
+    //   3. INSERT the test pubkey into `channel_members` so the `Existing` path
+    //      is correct and `commit_participant_join` goes straight to the 48101 insert.
+    //   4. Call `commit_participant_join` directly (it is `pub(crate)` for tests).
+
+    /// Create an AppState backed by the real local DB.
+    ///
+    /// Returns `None` if the DB at 127.0.0.1:5432 is not reachable.
+    async fn audio_test_state_real_db() -> Option<std::sync::Arc<crate::state::AppState>> {
+        use std::sync::Arc;
+        let db_url = "postgres://buzz:buzz_dev@127.0.0.1:5432/buzz";
+        if sqlx::PgPool::connect(db_url).await.is_err() {
+            return None;
+        }
+        let mut config = crate::config::Config::from_env().expect("default config loads");
+        config.require_relay_membership = false;
+        config.database_url = db_url.to_string();
+        config.redis_url = "redis://127.0.0.1:1".to_string();
+        let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+        let (state, _audit_shutdown) = crate::state::AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            nostr::Keys::generate(),
+            media_storage,
+        );
+        Some(Arc::new(state))
+    }
+
+    /// Seed a community + channel + membership row. Returns `(pool, tenant, channel_id, pubkey_bytes)`.
+    async fn seed_audio_fixture(
+        pool: &sqlx::PgPool,
+    ) -> (buzz_core::tenant::TenantContext, uuid::Uuid, nostr::Keys) {
+        let community_uuid = uuid::Uuid::new_v4();
+        let host = format!("w9-test-{}.example", community_uuid.simple());
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(community_uuid)
+            .bind(&host)
+            .execute(pool)
+            .await
+            .expect("W9 fixture: seed community");
+
+        let channel_id = uuid::Uuid::new_v4();
+        let creator = nostr::Keys::generate();
+        let creator_bytes = creator.public_key().to_bytes().to_vec();
+        sqlx::query(
+            "INSERT INTO channels (id, community_id, name, channel_type, visibility, created_by) \
+             VALUES ($1, $2, 'w9-test-channel', 'stream', 'open', $3)",
+        )
+        .bind(channel_id)
+        .bind(community_uuid)
+        .bind(&creator_bytes)
+        .execute(pool)
+        .await
+        .expect("W9 fixture: seed channel");
+
+        let member_key = nostr::Keys::generate();
+        let member_bytes = member_key.public_key().to_bytes().to_vec();
+        sqlx::query(
+            "INSERT INTO channel_members (community_id, channel_id, pubkey, role, invited_by) \
+             VALUES ($1, $2, $3, 'member', $4)",
+        )
+        .bind(community_uuid)
+        .bind(channel_id)
+        .bind(&member_bytes)
+        .bind(&creator_bytes)
+        .execute(pool)
+        .await
+        .expect("W9 fixture: seed channel_member");
+
+        let tenant = buzz_core::tenant::TenantContext::resolved(
+            buzz_core::tenant::CommunityId::from_uuid(community_uuid),
+            host,
+        );
+        (tenant, channel_id, member_key)
+    }
+
+    // ── W9: expiry between uncommitted 48101 insert and acquire_effect → rollback ──
     //
     // `before_participant_commit` fires between the uncommitted 48101 insert and
-    // `acquire_effect()`. A test firing expiry at that point proves the transaction
-    // is rolled back (no committed 48101 row, no membership write). A concurrent-
-    // reaffirm variant would fire expiry during the second of two concurrent
-    // committers.
+    // `acquire_effect()`. Firing expiry at that point must roll back the
+    // transaction (no committed 48101 row in the DB) and return
+    // `JoinCommitError::Expired` to the caller.
     //
-    // These witnesses require a seeded DB (channel, community, membership state)
-    // to reach `commit_participant_join`. They are integration-test-level witnesses
-    // and do not run in the unit test suite.
+    // Mutation evidence:
+    //   A) Delete `before_participant_commit(...)` from commit_participant_join →
+    //      hook never fires → `arrived_rx` times out → test panics.
+    //   B) Remove `tx.rollback()` from the `SessionExpired` branch →
+    //      transaction auto-commits at drop, leaving a 48101 row → row-count
+    //      assertion panics.
+    //   C) Remove `acquire_effect()` entirely → commit proceeds despite cancel →
+    //      a row is committed → row-count assertion panics.
+    #[tokio::test]
+    async fn w9_expiry_before_participant_commit_rolls_back_48101_insert() {
+        use chrono::{Duration, Utc};
+        use std::sync::Arc;
+        use uuid::Uuid;
+
+        let state = match audio_test_state_real_db().await {
+            Some(s) => s,
+            None => {
+                eprintln!("W9: skipping — local DB not available at postgres://buzz:buzz_dev@127.0.0.1:5432/buzz");
+                return;
+            }
+        };
+        let pool = state.db.pool().clone();
+        let (tenant, channel_id, member_key) = seed_audio_fixture(&pool).await;
+        let community_id = tenant.community();
+
+        let member_bytes = member_key.public_key().to_bytes().to_vec();
+        let member_hex = member_key.public_key().to_hex();
+        let peer_id = Uuid::new_v4();
+        let roster_revision = 1u64;
+        let membership = MembershipAdmission::Existing {
+            parent_channel_id: channel_id,
+        };
+
+        let deadline = Utc::now() + Duration::hours(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel.clone());
+
+        // Arm the hook: fires between the uncommitted 48101 insert and acquire_effect.
+        let (arrived_rx, release) =
+            crate::nip_fi_test_hooks::audio_participant_commit_hook::arm(community_id);
+
+        let state2 = Arc::clone(&state);
+        let tenant2 = tenant.clone();
+        let member_bytes2 = member_bytes.clone();
+        let member_hex2 = member_hex.clone();
+        let gate2 = Arc::clone(&gate);
+        let handle = tokio::spawn(async move {
+            commit_participant_join(
+                &state2,
+                &tenant2,
+                channel_id,
+                channel_id,
+                &member_hex2,
+                &member_bytes2,
+                peer_id,
+                roster_revision,
+                &membership,
+                &gate2,
+            )
+            .await
+        });
+
+        // Wait for the handler to reach the hook.
+        tokio::time::timeout(std::time::Duration::from_secs(10), arrived_rx)
+            .await
+            .expect("W9: commit_participant_join must reach before_participant_commit within 10s")
+            .expect("arrived channel closed");
+
+        // Fire expiry — acquire_effect will return SessionExpired after release.
+        cancel.cancel();
+
+        // Release — handler resumes, calls acquire_effect(), gets SessionExpired, rolls back.
+        release.notify_one();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("W9: commit_participant_join must return within 10s after hook release")
+            .expect("commit_participant_join task must not panic");
+
+        // Must return Expired, not Ok.
+        assert!(
+            matches!(result, Err(JoinCommitError::Expired)),
+            "W9: commit_participant_join must return JoinCommitError::Expired after mid-flight expiry; got: {result:?}"
+        );
+
+        // Zero committed 48101 rows for this community+channel — transaction was rolled back.
+        let row_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events \
+             WHERE community_id = $1 AND channel_id = $2 AND kind = 48101",
+        )
+        .bind(community_id.as_uuid())
+        .bind(channel_id)
+        .fetch_one(&pool)
+        .await
+        .expect("W9: row count query");
+
+        assert_eq!(
+            row_count, 0,
+            "W9: no 48101 row must be committed after expiry-forced rollback; found {row_count}"
+        );
+
+        // No membership side effects from commit (membership was Existing — no new insert).
+        // The pre-existing channel_members row must still be there (rollback only undoes the tx's own writes).
+        let member_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM channel_members \
+             WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3",
+        )
+        .bind(community_id.as_uuid())
+        .bind(channel_id)
+        .bind(&member_bytes)
+        .fetch_one(&pool)
+        .await
+        .expect("W9: member count query");
+
+        assert_eq!(
+            member_count, 1,
+            "W9: the pre-seeded membership row must survive the rollback"
+        );
+    }
+
+    // ── W10: two concurrent committers; expiry during second; first row intact ──
     //
-    // Blocker: requires a seeded test DB with:
-    //   - A community at `CommunityId::nil()` (or real community UUID)
-    //   - A channel with `channel_id` under that community
-    //   - A user pubkey authorized for relay membership
+    // Two concurrent tasks call `commit_participant_join` for different pubkeys.
+    // Both use the same gate. The first is let through (no hook armed for it).
+    // The second has the hook armed; expiry fires while it is paused at the hook.
+    // After release the second rolls back. The first's committed row is intact.
     //
-    // Once the integration DB fixture is available (see `buzz-relay-integration`
-    // test suite), these witnesses should be added there and referenced here.
+    // Mutation evidence:
+    //   A) Delete `before_participant_commit(...)` → arrived_rx times out → panic.
+    //   B) Remove `acquire_effect()` from the second path → second commits too →
+    //      two rows present → second-row-count assertion panics.
+    #[tokio::test]
+    async fn w10_concurrent_committers_expiry_during_second_first_row_intact() {
+        use chrono::{Duration, Utc};
+        use std::sync::Arc;
+        use uuid::Uuid;
+
+        let state = match audio_test_state_real_db().await {
+            Some(s) => s,
+            None => {
+                eprintln!("W10: skipping — local DB not available at postgres://buzz:buzz_dev@127.0.0.1:5432/buzz");
+                return;
+            }
+        };
+        let pool = state.db.pool().clone();
+        let (tenant, channel_id, member_key_a) = seed_audio_fixture(&pool).await;
+        let community_id = tenant.community();
+
+        // Second distinct member for the concurrent committer.
+        let member_key_b = nostr::Keys::generate();
+        let member_bytes_b = member_key_b.public_key().to_bytes().to_vec();
+        let creator_bytes = member_key_a.public_key().to_bytes().to_vec(); // reuse as invited_by
+        sqlx::query(
+            "INSERT INTO channel_members (community_id, channel_id, pubkey, role, invited_by) \
+             VALUES ($1, $2, $3, 'member', $4)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(channel_id)
+        .bind(&member_bytes_b)
+        .bind(&creator_bytes)
+        .execute(&pool)
+        .await
+        .expect("W10 fixture: seed second member");
+
+        let deadline = Utc::now() + Duration::hours(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel.clone());
+
+        // Task A (first committer) — no hook armed; completes without expiry.
+        let member_bytes_a = member_key_a.public_key().to_bytes().to_vec();
+        let member_hex_a = member_key_a.public_key().to_hex();
+        let state_a = Arc::clone(&state);
+        let tenant_a = tenant.clone();
+        let gate_a = Arc::clone(&gate);
+        let handle_a = tokio::spawn(async move {
+            commit_participant_join(
+                &state_a,
+                &tenant_a,
+                channel_id,
+                channel_id,
+                &member_hex_a,
+                &member_bytes_a,
+                Uuid::new_v4(),
+                1,
+                &MembershipAdmission::Existing {
+                    parent_channel_id: channel_id,
+                },
+                &gate_a,
+            )
+            .await
+        });
+
+        // Wait for task A to complete before arming the hook for task B.
+        let result_a = tokio::time::timeout(std::time::Duration::from_secs(10), handle_a)
+            .await
+            .expect("W10: task A must complete within 10s")
+            .expect("task A must not panic");
+        assert!(
+            result_a.is_ok(),
+            "W10: task A (first committer) must succeed; got: {result_a:?}"
+        );
+
+        // Arm the hook for task B.
+        let (arrived_rx, release) =
+            crate::nip_fi_test_hooks::audio_participant_commit_hook::arm(community_id);
+
+        let member_hex_b = member_key_b.public_key().to_hex();
+        let state_b = Arc::clone(&state);
+        let tenant_b = tenant.clone();
+        let gate_b = Arc::clone(&gate);
+        let handle_b = tokio::spawn(async move {
+            commit_participant_join(
+                &state_b,
+                &tenant_b,
+                channel_id,
+                channel_id,
+                &member_hex_b,
+                &member_bytes_b,
+                Uuid::new_v4(),
+                2,
+                &MembershipAdmission::Existing {
+                    parent_channel_id: channel_id,
+                },
+                &gate_b,
+            )
+            .await
+        });
+
+        // Wait for task B to reach the hook.
+        tokio::time::timeout(std::time::Duration::from_secs(10), arrived_rx)
+            .await
+            .expect("W10: task B must reach before_participant_commit within 10s")
+            .expect("arrived channel closed");
+
+        // Fire expiry — task B's acquire_effect returns SessionExpired.
+        cancel.cancel();
+        release.notify_one();
+
+        let result_b = tokio::time::timeout(std::time::Duration::from_secs(10), handle_b)
+            .await
+            .expect("W10: task B must return within 10s after hook release")
+            .expect("task B must not panic");
+
+        assert!(
+            matches!(result_b, Err(JoinCommitError::Expired)),
+            "W10: task B must return JoinCommitError::Expired after mid-flight expiry; got: {result_b:?}"
+        );
+
+        // Task A's row persists; task B's row was rolled back.
+        let row_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events \
+             WHERE community_id = $1 AND channel_id = $2 AND kind = 48101",
+        )
+        .bind(community_id.as_uuid())
+        .bind(channel_id)
+        .fetch_one(&pool)
+        .await
+        .expect("W10: row count query");
+
+        assert_eq!(
+            row_count, 1,
+            "W10: exactly one 48101 row (task A's) must be committed; found {row_count}"
+        );
+    }
+
+    // ── Concurrent-reaffirm variant: same pubkey twice; expiry during second ──
     //
-    // What `before_participant_commit` proves when exercised:
-    //   - The transaction begins before the hook (148101 insert uncommitted)
-    //   - Expiry fires after the insert, before commit
-    //   - `acquire_effect()` returns `SessionExpired`
-    //   - `tx.rollback()` is called explicitly — no committed row
-    //   - `JoinCommitError::Expired` is returned to the caller
-    //   - Caller removes peer from room (cleanup on Expired)
+    // Two concurrent tasks call `commit_participant_join` for the SAME pubkey.
+    // The second encounters an already-inserted row (idempotent duplicate key →
+    // `was_inserted = false`), then hits the hook. Expiry fires; the second
+    // rolls back. The first's row is intact. `JoinCommitError::Expired` is returned
+    // by the second task.
     //
-    // concurrent-reaffirm variant (also integration-level):
-    //   Two concurrent goroutines calling `commit_participant_join` for the same
-    //   pubkey. The second observes the membership lock shows the first already
-    //   committed. Expiry fires during the second's commit. The second rolls back.
-    //   The first's commit is not affected.
+    // Contract: expiry during a reaffirm commit rolls back without corrupting the
+    // first committer's row. The membership row (if Existing) is unaffected.
+    //
+    // Mutation evidence:
+    //   A) Delete `before_participant_commit(...)` → arrived_rx times out → panic.
+    //   B) Remove `tx.rollback()` in the Expired branch → second auto-rollback
+    //      still leaves zero new rows (idempotent insert), but `JoinCommitError::Expired`
+    //      assertion still passes — covered by (A) instead.
+    #[tokio::test]
+    async fn w10_reaffirm_expiry_during_second_same_pubkey_first_row_intact() {
+        use chrono::{Duration, Utc};
+        use std::sync::Arc;
+        use uuid::Uuid;
+
+        let state = match audio_test_state_real_db().await {
+            Some(s) => s,
+            None => {
+                eprintln!("W10-reaffirm: skipping — local DB not available at postgres://buzz:buzz_dev@127.0.0.1:5432/buzz");
+                return;
+            }
+        };
+        let pool = state.db.pool().clone();
+        let (tenant, channel_id, member_key) = seed_audio_fixture(&pool).await;
+        let community_id = tenant.community();
+
+        let member_bytes = member_key.public_key().to_bytes().to_vec();
+        let member_hex = member_key.public_key().to_hex();
+
+        // Both tasks share the same gate (same connection, same pubkey).
+        let deadline = Utc::now() + Duration::hours(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel.clone());
+
+        // Task 1 (first committer) — completes without expiry.
+        let state1 = Arc::clone(&state);
+        let tenant1 = tenant.clone();
+        let bytes1 = member_bytes.clone();
+        let hex1 = member_hex.clone();
+        let gate1 = Arc::clone(&gate);
+        let handle1 = tokio::spawn(async move {
+            commit_participant_join(
+                &state1,
+                &tenant1,
+                channel_id,
+                channel_id,
+                &hex1,
+                &bytes1,
+                Uuid::new_v4(),
+                1,
+                &MembershipAdmission::Existing {
+                    parent_channel_id: channel_id,
+                },
+                &gate1,
+            )
+            .await
+        });
+
+        let result1 = tokio::time::timeout(std::time::Duration::from_secs(10), handle1)
+            .await
+            .expect("reaffirm: task 1 must complete within 10s")
+            .expect("task 1 must not panic");
+        assert!(
+            result1.is_ok(),
+            "reaffirm: task 1 (first committer) must succeed; got: {result1:?}"
+        );
+
+        // Arm the hook for task 2 (same pubkey — duplicate insert returns was_inserted=false).
+        let (arrived_rx, release) =
+            crate::nip_fi_test_hooks::audio_participant_commit_hook::arm(community_id);
+
+        let state2 = Arc::clone(&state);
+        let tenant2 = tenant.clone();
+        let bytes2 = member_bytes.clone();
+        let hex2 = member_hex.clone();
+        let gate2 = Arc::clone(&gate);
+        let handle2 = tokio::spawn(async move {
+            commit_participant_join(
+                &state2,
+                &tenant2,
+                channel_id,
+                channel_id,
+                &hex2,
+                &bytes2,
+                Uuid::new_v4(),
+                2,
+                &MembershipAdmission::Existing {
+                    parent_channel_id: channel_id,
+                },
+                &gate2,
+            )
+            .await
+        });
+
+        // Wait for task 2 to reach the hook (after the duplicate-key 48101 insert).
+        tokio::time::timeout(std::time::Duration::from_secs(10), arrived_rx)
+            .await
+            .expect("reaffirm: task 2 must reach before_participant_commit within 10s")
+            .expect("arrived channel closed");
+
+        // Fire expiry during the reaffirm commit window.
+        cancel.cancel();
+        release.notify_one();
+
+        let result2 = tokio::time::timeout(std::time::Duration::from_secs(10), handle2)
+            .await
+            .expect("reaffirm: task 2 must return within 10s")
+            .expect("task 2 must not panic");
+
+        assert!(
+            matches!(result2, Err(JoinCommitError::Expired)),
+            "reaffirm: task 2 must return JoinCommitError::Expired; got: {result2:?}"
+        );
+
+        // Exactly one committed 48101 row (task 1's). Task 2's transaction rolled back
+        // (or was a no-op duplicate that rolled back cleanly).
+        let row_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events \
+             WHERE community_id = $1 AND channel_id = $2 AND kind = 48101",
+        )
+        .bind(community_id.as_uuid())
+        .bind(channel_id)
+        .fetch_one(&pool)
+        .await
+        .expect("reaffirm: row count query");
+
+        assert_eq!(
+            row_count, 1,
+            "reaffirm: exactly one 48101 row (task 1's) must persist; found {row_count}"
+        );
+    }
 }

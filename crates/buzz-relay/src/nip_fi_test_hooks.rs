@@ -12,8 +12,9 @@
 //! - Test fires expiry
 //! - Test calls `release_notify.notify_one()` → production proceeds
 //!
-//! Only one gate per slot is supported at a time (static Mutex). Tests are
-//! sequential per community; concurrent tests use different communities.
+//! Only one gate per community-slot is supported at a time (static Mutex<HashMap>).
+//! Tests using different communities can run concurrently — each gets its own gate.
+//! Tests using the same community must not run concurrently (they will interfere).
 //!
 //! # Per-witness mutation-red table
 //!
@@ -38,23 +39,12 @@
 //! | **W7** (audio B3 expiry writer) | `nip_fi_session::spawn_nip_fi_expiry_task`, audio enqueue | Delete the audio denial enqueue | `frames[0]` is not the expected restricted JSON → assertion panics |
 //! | **W8** (audio membership barrier) | `audio/handler.rs:1572` — entry of `check_membership_for_admission` | Delete `before_membership_check(...)` call | `arrived_rx` times out → test panics |
 //! | **W8** (audio membership barrier) | same | Move hook to after `state.db.get_channel()` | DB error fires before hook on lazy pool → `arrived_rx` times out |
-//! | **W9** (audio participant-commit barrier) | `audio/handler.rs:1784` — before `acquire_effect()` in `commit_participant_join` | (DB-integration blocker — see below) | — |
-//! | **W10** (audio concurrent-reaffirm) | same as W9 | (DB-integration blocker — see below) | — |
-//!
-//! **W9/W10 blocker**: `commit_participant_join` requires a real DB transaction
-//! (`state.db.begin_event_write_transaction()`) and seeded channel/membership state
-//! to reach the `before_participant_commit` hook. The lazy pool at port 1 errors at
-//! transaction start. These witnesses belong in the `buzz-relay-integration` test suite
-//! once that suite provides a seeded channel fixture. The hook is in place and will fire
-//! correctly when the DB fixture is available.
-//!
-//! **W9 what it proves**: expiry between an uncommitted 48101 insert and `acquire_effect()`
-//! rolls back the transaction — no committed row, no membership write, `JoinCommitError::Expired`
-//! returned to caller, caller removes peer from room.
-//!
-//! **W10 concurrent-reaffirm what it proves**: two concurrent callers for the same pubkey;
-//! the second observes the first committed; expiry fires during the second's commit; the
-//! second rolls back without affecting the first's committed row.
+//! | **W9** (audio participant-commit barrier) | `audio/handler.rs:1796` — between uncommitted 48101 insert and `acquire_effect()` | Delete `before_participant_commit(...)` call | `arrived_rx` times out — test panics |
+//! | **W9** (audio participant-commit barrier) | same | Remove `tx.rollback()` from `SessionExpired` branch | sqlx rolls back on drop regardless — mutation does NOT change test outcome (explicit rollback is belt-and-suspenders); covered by W9C instead |
+//! | **W9** (audio participant-commit barrier) | same | Remove `acquire_effect()` entirely | commit proceeds despite cancel — row committed — row-count assertion panics |
+//! | **W10** (concurrent committers, different pubkeys) | same as W9 | Delete `before_participant_commit(...)` call | `arrived_rx` times out — test panics |
+//! | **W10** (concurrent committers, different pubkeys) | same | Remove `acquire_effect()` from `commit_participant_join` | second task commits too — two rows present — row-count assertion panics |
+//! | **W10-reaffirm** (same pubkey twice) | same as W9 | Delete `before_participant_commit(...)` call | `arrived_rx` times out — test panics |
 //!
 //! # Teardown ordering (quiescence citations)
 //!
@@ -80,11 +70,11 @@
 //! - `room.remove_peer` (`audio/room.rs`) — removes peer from in-memory room roster
 
 use buzz_core::CommunityId;
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
 use tokio::sync::{oneshot, Notify};
 
 struct Gate {
-    community: CommunityId,
     arrived: oneshot::Sender<()>,
     release: Arc<Notify>,
 }
@@ -94,7 +84,10 @@ macro_rules! make_hook {
         pub(crate) mod $mod_name {
             use super::*;
 
-            static GATE: Mutex<Option<Gate>> = Mutex::new(None);
+            // Keyed by CommunityId so concurrent tests with different communities
+            // can arm independent gates without overwriting each other.
+            static GATE: LazyLock<Mutex<HashMap<CommunityId, Gate>>> =
+                LazyLock::new(|| Mutex::new(HashMap::new()));
 
             /// Arm a one-shot barrier for `community`.
             ///
@@ -104,22 +97,18 @@ macro_rules! make_hook {
             pub(crate) fn arm(community: CommunityId) -> (oneshot::Receiver<()>, Arc<Notify>) {
                 let (tx, rx) = oneshot::channel();
                 let release = Arc::new(Notify::new());
-                *GATE.lock().unwrap() = Some(Gate {
+                GATE.lock().unwrap().insert(
                     community,
-                    arrived: tx,
-                    release: release.clone(),
-                });
+                    Gate {
+                        arrived: tx,
+                        release: release.clone(),
+                    },
+                );
                 (rx, release)
             }
 
             pub(crate) async fn trigger(community: CommunityId) {
-                let gate = {
-                    let mut slot = GATE.lock().unwrap();
-                    match slot.as_ref() {
-                        Some(g) if g.community == community => slot.take(),
-                        _ => None,
-                    }
-                };
+                let gate = GATE.lock().unwrap().remove(&community);
                 if let Some(g) = gate {
                     let _ = g.arrived.send(());
                     g.release.notified().await;

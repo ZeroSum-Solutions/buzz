@@ -2607,6 +2607,8 @@ mod tests {
         let event = nostr::EventBuilder::new(nostr::Kind::TextNote, "w2 barrier test")
             .sign_with_keys(&key)
             .unwrap();
+        // Save the event ID before moving the event into the spawn closure.
+        let event_id_bytes = event.id.to_bytes();
 
         let state = crate::state::tests::test_state().await;
 
@@ -2655,6 +2657,27 @@ mod tests {
         assert!(
             send_rx.try_recv().is_err(),
             "W2: no additional frames must be sent after session-expired denial"
+        );
+
+        // ── Persistence assertions ─────────────────────────────────────────────
+        //
+        // `mark_local_event` is called inside `ingest_event` (for persistent
+        // kinds) and inside the fan-out path (for ephemeral kinds). Since
+        // `acquire_effect()` returned `SessionExpired` before either call was
+        // reached, `local_event_ids` must NOT contain the event's ID. This
+        // proves neither the DB write nor the pubsub fan-out was attempted.
+        //
+        // Mutation evidence for the persistence boundary:
+        //   Remove `acquire_effect()` from event.rs → `ingest_event` is called →
+        //   `mark_local_event` fires → `local_event_ids.contains_key` returns
+        //   true → this assertion panics.
+        assert!(
+            !state
+                .local_event_ids
+                .contains_key(&(community, event_id_bytes)),
+            "W2: local_event_ids must NOT contain the event — \
+             mark_local_event is only called after ingest_event/fan-out, \
+             which must not have been reached when acquire_effect returns SessionExpired"
         );
     }
 }
