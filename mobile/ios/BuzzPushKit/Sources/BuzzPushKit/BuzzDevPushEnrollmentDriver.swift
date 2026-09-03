@@ -969,6 +969,7 @@ public final class BuzzDevPushEnrollmentDriver {
         } else if let currentEndpoint, pending.endpointHash == currentEndpointHash {
           replayEndpoint = currentEndpoint
         } else {
+          guard currentEndpoint != nil else { return false }
           // Pre-endpoint journals cannot be replayed after token rotation. They
           // have no known handle to revoke, so this cleanup item is terminal.
           continue

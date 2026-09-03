@@ -1005,6 +1005,81 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     XCTAssertTrue(store.cleanup.isEmpty)
   }
 
+  func testLegacyCleanupWaitsForAPNsTokenBeforeReplayingHashedEndpoint() async throws {
+    let token = Data(repeating: 0x07, count: 32)
+    let oldOrigin = "http://old-gateway.example"
+    let pending = BuzzPushPendingEnrollmentRecord(
+      gatewayOrigin: oldOrigin,
+      relayOrigin: "wss://relay.example",
+      relayPubkey: Self.relayPubkey,
+      endpointHash: Self.hex(SHA256.hash(data: token)),
+      appProfile: "buzz-ios-dogfood",
+      expiresAt: Self.expiresAt,
+      installationId: Self.installationId,
+      challengeId: Self.firstChallengeId,
+      challenge: Self.challenge,
+      keyId: Self.keyId,
+      attestation: Self.attestation
+    )
+    let state = BuzzPushGatewayCleanupState(
+      gatewayOrigin: oldOrigin,
+      grants: [],
+      pendingEnrollments: [pending]
+    )
+    let store = MemoryGrantStore()
+    store.cleanup = [state]
+    let driver = try makeDriver(store: store, appAttest: RecordingAppAttest())
+    URLProtocolStub.handler = { request in
+      XCTFail("Cleanup must wait for APNs before requesting \(request.url?.absoluteString ?? "nil")")
+      return Self.response(request, status: 500, json: [:])
+    }
+
+    do {
+      try await driver.cleanRetiredGateways()
+      XCTFail("Expected endpoint-less legacy cleanup to remain queued")
+    } catch {
+      XCTAssertEqual(
+        error as? BuzzDevPushEnrollmentError,
+        .retiredGatewayCleanupIncomplete
+      )
+    }
+    XCTAssertEqual(store.cleanup, [state])
+
+    URLProtocolStub.handler = { request in
+      switch (request.httpMethod, request.url?.absoluteString) {
+      case ("POST", "http://old-gateway.example/v1/installations"):
+        XCTAssertEqual(try Self.body(request)["endpoint"] as? String, Self.hex(token))
+        return Self.response(
+          request,
+          status: 201,
+          json: [
+            "installation_handle": Self.installationHandle,
+            "endpoint_epoch": 1,
+            "expires_at": Self.expiresAt,
+          ]
+        )
+      case ("POST", "http://old-gateway.example/v1/installations/challenges"):
+        return Self.response(
+          request,
+          status: 200,
+          json: [
+            "challenge_id": Self.secondChallengeId,
+            "challenge": Self.challenge,
+            "expires_at": Self.now + 300,
+          ]
+        )
+      case ("POST", "http://old-gateway.example/v1/installations/revoke"):
+        return Self.response(request, status: 200, json: ["status": "revoked"])
+      default:
+        XCTFail("Unexpected request \(request.url?.absoluteString ?? "nil")")
+        return Self.response(request, status: 500, json: [:])
+      }
+    }
+
+    try await driver.cleanRetiredGateways(deviceToken: token)
+    XCTAssertTrue(store.cleanup.isEmpty)
+  }
+
   func testFailedStaleGatewayRevocationKeepsCleanupJournal() async throws {
     let endpointHash = Self.hex(SHA256.hash(data: Data((1...32).map(UInt8.init))))
     let stale = BuzzPushEndpointGrantRecord(
