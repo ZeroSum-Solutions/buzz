@@ -175,7 +175,9 @@ private final class NativeNavigationShellPlatformView: NSObject,
 
     var configuration: UIButton.Configuration
     if #available(iOS 26.0, *) {
-      configuration = .glass()
+      // UINavigationBar supplies Liquid Glass for leading custom bar items.
+      // Keeping glass on the nested button draws a second capsule.
+      configuration = .plain()
     } else {
       configuration = .gray()
       configuration.baseBackgroundColor = .secondarySystemBackground
