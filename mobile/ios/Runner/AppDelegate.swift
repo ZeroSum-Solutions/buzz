@@ -282,7 +282,6 @@ import os.log
   ) {
     super.application(application, didRegisterForRemoteNotificationsWithDeviceToken: deviceToken)
     apnsDeviceToken = deviceToken
-    scheduleRetiredGatewayCleanup()
     apnsRegistrationBuffer.recordToken(deviceToken)
   }
 
@@ -360,13 +359,29 @@ import os.log
       }
       Task {
         do {
-          try await initializePushGateway(gatewayURL)
-          result(nil)
+          result(try initializePushGateway(gatewayURL))
         } catch {
           result(
             FlutterError(
               code: "push_gateway_initialization_failed",
               message: "Push gateway initialization failed.",
+              details: error.localizedDescription
+            )
+          )
+        }
+      }
+    case "completeGatewayMigration":
+      Task {
+        do {
+          if let cleanupTask = try retiredGatewayCleanupTask() {
+            try await cleanupTask.value
+          }
+          result(nil)
+        } catch {
+          result(
+            FlutterError(
+              code: "push_gateway_cleanup_failed",
+              message: "Retired push gateway cleanup failed.",
               details: error.localizedDescription
             )
           )
@@ -385,7 +400,6 @@ import os.log
       }
       do {
         try configurePushGateway(gatewayURL)
-        scheduleRetiredGatewayCleanup()
         startPushRegistration(result: result)
       } catch {
         result(
@@ -582,29 +596,6 @@ import os.log
     return task
   }
 
-  private func scheduleRetiredGatewayCleanup() {
-    do {
-      guard let task = try retiredGatewayCleanupTask() else { return }
-      Task {
-        do {
-          try await task.value
-        } catch {
-          os_log(
-            "Retired push gateway cleanup remains queued: %{public}@",
-            type: .error,
-            error.localizedDescription
-          )
-        }
-      }
-    } catch {
-      os_log(
-        "Retired push gateway cleanup could not start: %{public}@",
-        type: .error,
-        error.localizedDescription
-      )
-    }
-  }
-
   private func gatewayURL(from call: FlutterMethodCall) -> URL? {
     guard let arguments = call.arguments as? [String: Any],
       let gatewayText = arguments["gatewayUrl"] as? String
@@ -619,11 +610,14 @@ import os.log
     pushGatewayURL = gatewayOrigin.url
   }
 
-  private func initializePushGateway(_ gatewayURL: URL) async throws {
+  private func initializePushGateway(_ gatewayURL: URL) throws -> [String] {
     try configurePushGateway(gatewayURL)
-    if let cleanupTask = try retiredGatewayCleanupTask() {
-      try await cleanupTask.value
-    }
+    return Array(
+      Set(
+        try endpointGrantStore.gatewayCleanupStates()
+          .flatMap { $0.grants.map(\.relayOrigin) + $0.pendingEnrollments.map(\.relayOrigin) }
+      )
+    ).sorted()
   }
 
   private func handleMediaUploadMethodCall(

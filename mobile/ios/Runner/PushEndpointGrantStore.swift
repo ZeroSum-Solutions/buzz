@@ -19,8 +19,6 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
   }
 
   func reset(forGatewayOrigin gatewayOrigin: String) throws {
-    try migrateLegacyState(gatewayOrigin: gatewayOrigin)
-
     let allRecords = try records()
     let allPending = try pendingEnrollments()
     try BuzzPushGatewayStateReset.run(
@@ -35,49 +33,13 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
     )
   }
 
-  private func migrateLegacyState(gatewayOrigin: String) throws {
-    let legacyGrantData = try data(account: Self.legacyRecordsAccount)
-    let legacyPendingData = try data(account: Self.legacyPendingAccount)
-    if let legacyGrantData {
-      let keyId = try appAttestKeyId()
-      let legacyGrants = try BuzzPushLegacyStateMigration.grants(
-        from: legacyGrantData,
-        gatewayOrigin: gatewayOrigin,
-        appAttestKeyId: keyId ?? ""
-      )
-      guard legacyGrants.isEmpty || keyId != nil else {
-        throw NSError(
-          domain: "BuzzPushEndpointGrantStore",
-          code: 3,
-          userInfo: [NSLocalizedDescriptionKey: "Legacy grants require their App Attest key"]
-        )
-      }
-      var migrated = try records()
-      for record in legacyGrants {
-        migrated.removeAll {
-          $0.gatewayOrigin == record.gatewayOrigin && $0.relayOrigin == record.relayOrigin
-            && $0.appProfile == record.appProfile
-        }
-        migrated.append(record)
-      }
-      try replace(migrated, account: Self.recordsAccount)
-    }
-    if let legacyPendingData {
-      var migrated = try pendingEnrollments()
-      for pending in try BuzzPushLegacyStateMigration.pendingEnrollments(
-        from: legacyPendingData,
-        gatewayOrigin: gatewayOrigin
-      ) {
-        migrated.removeAll {
-          $0.gatewayOrigin == pending.gatewayOrigin && $0.relayOrigin == pending.relayOrigin
-            && $0.appProfile == pending.appProfile
-        }
-        migrated.append(pending)
-      }
-      try replace(migrated, account: Self.pendingAccount)
-    }
-    try delete(account: Self.legacyRecordsAccount)
-    try delete(account: Self.legacyPendingAccount)
+  /// Legacy records do not identify their gateway origin, and grants do not
+  /// identify the App Attest key that created their installation. Keep those
+  /// Keychain accounts as a durable quarantine rather than inventing authority
+  /// that could revoke an unrelated installation after a gateway change.
+  func hasQuarantinedLegacyState() throws -> Bool {
+    try data(account: Self.legacyRecordsAccount) != nil
+      || data(account: Self.legacyPendingAccount) != nil
   }
 
   func records() throws -> [BuzzPushEndpointGrantRecord] {
@@ -228,28 +190,6 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
     return data
   }
 
-  private func appAttestKeyId() throws -> String? {
-    var query: [String: Any] = [
-      kSecClass as String: kSecClassGenericPassword,
-      kSecAttrService as String: "buzz.push.app-attest",
-      kSecAttrAccount as String: "key-id-v1",
-      kSecReturnData as String: true,
-      kSecMatchLimit as String: kSecMatchLimitOne,
-    ]
-    if let accessGroup, !accessGroup.isEmpty {
-      query[kSecAttrAccessGroup as String] = accessGroup
-    }
-    var result: CFTypeRef?
-    let status = SecItemCopyMatching(query as CFDictionary, &result)
-    if status == errSecItemNotFound { return nil }
-    guard status == errSecSuccess, let data = result as? Data,
-      let keyId = String(data: data, encoding: .utf8), !keyId.isEmpty
-    else {
-      throw keychainError(status, operation: "read legacy App Attest key")
-    }
-    return keyId
-  }
-
   private func replace<T: Encodable>(_ values: [T], account: String) throws {
     let data = try JSONEncoder().encode(values)
     let updateStatus = SecItemUpdate(
@@ -267,13 +207,6 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
     let addStatus = SecItemAdd(add as CFDictionary, nil)
     guard addStatus == errSecSuccess else {
       throw keychainError(addStatus, operation: "add")
-    }
-  }
-
-  private func delete(account: String) throws {
-    let status = SecItemDelete(baseQuery(account: account) as CFDictionary)
-    guard status == errSecSuccess || status == errSecItemNotFound else {
-      throw keychainError(status, operation: "delete legacy state")
     }
   }
 

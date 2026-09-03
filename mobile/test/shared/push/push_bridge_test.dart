@@ -21,6 +21,7 @@ void main() {
     apnsRegistrationError.value = null;
     pushEndpointGrants.value = const [];
     pushEndpointGrantError.value = null;
+    retiredBuzzPushRelayOrigins.value = const {};
     pushCommunitySnapshotError.value = null;
     pendingPushNotificationLink.value = null;
     installBuzzPushMethodHandler();
@@ -54,10 +55,29 @@ void main() {
           .setMockMethodCallHandler(_channel, (call) async {
             expect(call.method, 'initializeGateway');
             expect(call.arguments, {'gatewayUrl': Env.pushGatewayUrl});
+            return ['wss://old-relay.example'];
+          });
+
+      expect(await initializeBuzzPushGateway(), {'wss://old-relay.example'});
+      expect(retiredBuzzPushRelayOrigins.value, {'wss://old-relay.example'});
+    },
+  );
+
+  test(
+    'completes retired gateway cleanup only through the explicit seam',
+    () async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+      retiredBuzzPushRelayOrigins.value = {'wss://old-relay.example'};
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(_channel, (call) async {
+            expect(call.method, 'completeGatewayMigration');
+            expect(call.arguments, {'gatewayUrl': Env.pushGatewayUrl});
             return null;
           });
 
-      await initializeBuzzPushGateway();
+      await completeBuzzPushGatewayMigration();
+
+      expect(retiredBuzzPushRelayOrigins.value, isEmpty);
     },
   );
 

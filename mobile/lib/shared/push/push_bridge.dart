@@ -94,6 +94,7 @@ final apnsRegistrationError = ValueNotifier<String?>(null);
 
 final pushEndpointGrants = ValueNotifier<List<BuzzPushEndpointGrant>>([]);
 final pushEndpointGrantError = ValueNotifier<String?>(null);
+final retiredBuzzPushRelayOrigins = ValueNotifier<Set<String>>(const {});
 
 /// The most recent notification response waiting for app navigation.
 ///
@@ -136,14 +137,35 @@ Future<void> syncPendingBuzzPushNotificationResponse() async {
   }
 }
 
-/// Initializes native gateway migration and cleanup without requiring a relay,
-/// notification authorization, or an APNs device token.
-Future<void> initializeBuzzPushGateway() async {
+/// Inventories durable retired-gateway state without revoking it.
+///
+/// Replacement publication and the explicit cleanup completion seam remain
+/// separate so every enabled community can migrate first.
+Future<Set<String>> initializeBuzzPushGateway() async {
+  if (defaultTargetPlatform != TargetPlatform.iOS) return const {};
+  try {
+    final origins = await _channel.invokeListMethod<String>(
+      'initializeGateway',
+      {'gatewayUrl': Env.pushGatewayUrl},
+    );
+    final pending = origins?.toSet() ?? const <String>{};
+    retiredBuzzPushRelayOrigins.value = pending;
+    return pending;
+  } on MissingPluginException {
+    // Flutter tests and non-Runner embeddings do not install the native bridge.
+    return const {};
+  }
+}
+
+/// Revokes retired gateway authority after every affected enabled community
+/// has durably published its replacement lease.
+Future<void> completeBuzzPushGatewayMigration() async {
   if (defaultTargetPlatform != TargetPlatform.iOS) return;
   try {
-    await _channel.invokeMethod<void>('initializeGateway', {
+    await _channel.invokeMethod<void>('completeGatewayMigration', {
       'gatewayUrl': Env.pushGatewayUrl,
     });
+    retiredBuzzPushRelayOrigins.value = const {};
   } on MissingPluginException {
     // Flutter tests and non-Runner embeddings do not install the native bridge.
   }

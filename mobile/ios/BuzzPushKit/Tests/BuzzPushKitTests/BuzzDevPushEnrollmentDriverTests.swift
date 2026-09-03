@@ -389,40 +389,6 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     XCTAssertThrowsError(try JSONDecoder().decode(BuzzPushEndpointGrantRecord.self, from: data))
   }
 
-  func testLegacyKeychainStateMigratesToConfiguredGatewayRecords() throws {
-    let grantData = Data(
-      """
-      [{"relayOrigin":"wss://relay.example","relayPubkey":"\(Self.relayPubkey)","gatewayInstallationHandle":"\(Self.installationHandle)","installationId":"\(Self.installationId)","endpointGrant":"legacy-grant","endpointHash":"\(String(repeating: "b", count: 64))","appProfile":"buzz-ios-dogfood","endpointEpoch":1,"generation":1,"expiresAt":\(Self.expiresAt)}]
-      """.utf8
-    )
-    let pendingData = Data(
-      """
-      [{"relayOrigin":"wss://relay.example","relayPubkey":"\(Self.relayPubkey)","endpointHash":"\(String(repeating: "b", count: 64))","appProfile":"buzz-ios-dogfood","expiresAt":\(Self.expiresAt),"installationId":"\(Self.installationId)","gatewayInstallationHandle":"\(Self.installationHandle)","keyId":"\(Self.keyId)","delegationGeneration":2}]
-      """.utf8
-    )
-
-    let grant = try XCTUnwrap(
-      BuzzPushLegacyStateMigration.grants(
-        from: grantData,
-        gatewayOrigin: "http://localhost:8080",
-        appAttestKeyId: Self.keyId
-      ).first
-    )
-    let pending = try XCTUnwrap(
-      BuzzPushLegacyStateMigration.pendingEnrollments(
-        from: pendingData,
-        gatewayOrigin: "http://localhost:8080"
-      ).first
-    )
-
-    XCTAssertEqual(grant.gatewayOrigin, "http://localhost:8080")
-    XCTAssertEqual(grant.appAttestKeyId, Self.keyId)
-    XCTAssertEqual(grant.gatewayInstallationHandle, Self.installationHandle)
-    XCTAssertEqual(pending.gatewayOrigin, "http://localhost:8080")
-    XCTAssertEqual(pending.gatewayInstallationHandle, Self.installationHandle)
-    XCTAssertEqual(pending.delegationGeneration, 2)
-  }
-
   func testGrantWithoutAppAttestKeyIsRejected() throws {
     let data = Data(
       #"{"gatewayOrigin":"https://push.example","relayOrigin":"wss://relay.example","relayPubkey":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","installationId":"000102030405060708090a0b0c0d0e0f","endpointGrant":"opaque","endpointHash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","appProfile":"buzz-ios-dogfood","endpointEpoch":1,"generation":1,"expiresAt":1752624000}"#
@@ -461,7 +427,8 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
 
     XCTAssertEqual(store.saved, [])
     XCTAssertTrue(store.pending.isEmpty)
-    XCTAssertEqual(store.resetOperations, ["cleanup:https://old-gateway.example", "records", "pending"])
+    XCTAssertEqual(
+      store.resetOperations, ["cleanup:https://old-gateway.example", "records", "pending"])
     XCTAssertEqual(
       store.cleanup,
       [
@@ -933,7 +900,8 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
 
     XCTAssertEqual(store.saved, [current])
     XCTAssertTrue(store.cleanup.isEmpty)
-    XCTAssertEqual(Set(appAttest.assertionKeyIds.compactMap { $0 }), [staleKeyId, secondStaleKeyId])
+    XCTAssertEqual(
+      Set(appAttest.assertionKeyIds.compactMap { $0 }), [staleKeyId, secondStaleKeyId])
   }
 
   func testCleanupReplaysProtectedEndpointAfterCurrentTokenChanges() async throws {
@@ -1030,7 +998,8 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     store.cleanup = [state]
     let driver = try makeDriver(store: store, appAttest: RecordingAppAttest())
     URLProtocolStub.handler = { request in
-      XCTFail("Cleanup must wait for APNs before requesting \(request.url?.absoluteString ?? "nil")")
+      XCTFail(
+        "Cleanup must wait for APNs before requesting \(request.url?.absoluteString ?? "nil")")
       return Self.response(request, status: 500, json: [:])
     }
 

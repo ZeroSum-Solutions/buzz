@@ -138,6 +138,33 @@ void main() {
     );
   });
 
+  test('gateway migration includes inactive enabled communities', () {
+    final active = Community.create(
+      name: 'Active',
+      relayUrl: 'https://active.example/path',
+    ).copyWith(pushNotificationsEnabled: true);
+    final inactive = Community.create(
+      name: 'Inactive',
+      relayUrl: 'wss://inactive.example',
+    ).copyWith(pushNotificationsEnabled: true);
+    final disabled = Community.create(
+      name: 'Disabled',
+      relayUrl: 'wss://disabled.example',
+    );
+
+    expect(
+      buzzPushCommunitiesRequiringGatewayMigration(
+        communities: [active, inactive, disabled],
+        retiredRelayOrigins: const {
+          'wss://active.example',
+          'wss://inactive.example',
+          'wss://disabled.example',
+        },
+      ).map((community) => community.name),
+      ['Active', 'Inactive'],
+    );
+  });
+
   test('pending opt-out tombstone keeps active push lifecycle disabled', () {
     final subscription = BuzzPushSubscription(
       filter: BuzzPushFilter(kinds: const [9], pTags: [_hex('a')]),
