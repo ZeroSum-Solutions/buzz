@@ -9396,6 +9396,114 @@ void main() {
     });
   });
 
+  group('iOS status-bar scroll to top', () {
+    testWidgets('scrolls a channel or DM timeline to its oldest message', (
+      tester,
+    ) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+      final messages = [
+        for (var i = 0; i < 80; i++)
+          _textMsg(
+            id: 'status-bar-message-$i',
+            pubkey: 'alice',
+            content: 'Status bar message $i',
+            createdAt: 1000 + i,
+          ),
+      ];
+
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: messages,
+          users: const {
+            'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
+          },
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(findRichText('Status bar message 0'), findsNothing);
+
+      await tester.binding.defaultBinaryMessenger.handlePlatformMessage(
+        SystemChannels.statusBar.name,
+        SystemChannels.statusBar.codec.encodeMethodCall(
+          const MethodCall('handleScrollToTop'),
+        ),
+        (_) {},
+      );
+      await tester.pumpAndSettle();
+
+      expect(findRichText('Status bar message 0'), findsOneWidget);
+      expect(findRichText('Status bar message 79'), findsNothing);
+      debugDefaultTargetPlatformOverride = null;
+    });
+
+    testWidgets('scrolls the active thread to its head', (tester) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+      final rootEvent = _textMsg(
+        id: 'status-bar-thread-root',
+        pubkey: 'alice',
+        content: 'Status bar thread head',
+        createdAt: 1000,
+      );
+      final replies = [
+        for (var i = 0; i < 80; i++)
+          _textMsg(
+            id: 'status-bar-reply-$i',
+            pubkey: 'bob',
+            content: 'Status bar reply $i',
+            createdAt: 1100 + i,
+            extraTags: const [
+              ['e', 'status-bar-thread-root', '', 'reply'],
+            ],
+          ),
+      ];
+
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: [rootEvent],
+          threadReplies: {'status-bar-thread-root': replies},
+          users: const {
+            'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
+            'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
+          },
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final threadHead = formatTimeline([rootEvent]).single;
+      Navigator.of(tester.element(find.byType(ChannelDetailPage))).push(
+        MaterialPageRoute<void>(
+          builder: (_) => ThreadDetailPage(
+            threadHead: threadHead,
+            allMessages: [threadHead],
+            channelId: _channelId,
+            currentPubkey: 'self',
+            isMember: true,
+            isArchived: false,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(findRichText('Status bar thread head'), findsNothing);
+
+      await tester.binding.defaultBinaryMessenger.handlePlatformMessage(
+        SystemChannels.statusBar.name,
+        SystemChannels.statusBar.codec.encodeMethodCall(
+          const MethodCall('handleScrollToTop'),
+        ),
+        (_) {},
+      );
+      await tester.pumpAndSettle();
+
+      expect(findRichText('Status bar thread head'), findsOneWidget);
+      expect(findRichText('Status bar reply 79'), findsNothing);
+      debugDefaultTargetPlatformOverride = null;
+    });
+  });
+
   group('App bar', () {
     testWidgets('prepares native glass behind matching route controls', (
       tester,

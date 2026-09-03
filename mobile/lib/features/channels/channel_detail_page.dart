@@ -27,6 +27,7 @@ import '../../shared/widgets/frosted_scaffold.dart';
 import '../../shared/widgets/flapping_bee.dart';
 import '../../shared/widgets/keyboard_dismiss_on_drag.dart';
 import '../../shared/widgets/ios_glass_navigation_button.dart';
+import '../../shared/widgets/ios_status_bar_tap_listener.dart';
 import '../../shared/widgets/masked_avatar_badge.dart';
 import '../../shared/widgets/message_author_meta.dart';
 import '../../shared/widgets/modal_presentation.dart';
