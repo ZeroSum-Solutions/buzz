@@ -425,7 +425,7 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
 
     _ = try makeDriver(store: store, appAttest: RecordingAppAttest())
 
-    XCTAssertTrue(store.saved.isEmpty)
+    XCTAssertEqual(store.saved, [])
     XCTAssertTrue(store.pending.isEmpty)
     XCTAssertEqual(store.resetOperations, ["cleanup:https://old-gateway.example", "records", "pending"])
     XCTAssertEqual(
@@ -567,6 +567,97 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
 
     XCTAssertTrue(replayedOldEndpoint)
     XCTAssertEqual(revokedHandles, [quarantinedHandle, Self.installationHandle])
+    XCTAssertEqual(store.saved, [])
+    XCTAssertTrue(store.pending.isEmpty)
+    XCTAssertTrue(store.cleanup.isEmpty)
+  }
+
+  func testEndpointChangeJournalsEveryGrantSharingRevokedInstallation() async throws {
+    let oldToken = Data(repeating: 0x07, count: 32)
+    let newToken = Data(repeating: 0x08, count: 32)
+    let endpointHash = Self.hex(SHA256.hash(data: oldToken))
+    func grant(relayOrigin: String, relayPubkey: String) -> BuzzPushEndpointGrantRecord {
+      BuzzPushEndpointGrantRecord(
+        gatewayOrigin: Self.gatewayOrigin,
+        relayOrigin: relayOrigin,
+        relayPubkey: relayPubkey,
+        gatewayInstallationHandle: Self.installationHandle,
+        appAttestKeyId: Self.keyId,
+        installationId: Self.installationId,
+        endpointGrant: "grant-\(relayOrigin)",
+        endpointHash: endpointHash,
+        appProfile: "buzz-ios-dogfood",
+        endpointEpoch: 1,
+        generation: 1,
+        expiresAt: Self.expiresAt
+      )
+    }
+    let primary = grant(relayOrigin: "wss://relay.example", relayPubkey: Self.relayPubkey)
+    let shared = grant(
+      relayOrigin: "wss://shared-relay.example",
+      relayPubkey: String(repeating: "c", count: 64)
+    )
+    let pending = BuzzPushPendingEnrollmentRecord(
+      gatewayOrigin: Self.gatewayOrigin,
+      relayOrigin: primary.relayOrigin,
+      relayPubkey: primary.relayPubkey,
+      endpoint: Self.hex(oldToken),
+      endpointHash: endpointHash,
+      appProfile: primary.appProfile,
+      expiresAt: Self.expiresAt,
+      installationId: primary.installationId,
+      gatewayInstallationHandle: Self.installationHandle,
+      keyId: Self.keyId,
+      delegationGeneration: 2
+    )
+    let store = MemoryGrantStore(records: [primary, shared], pending: [pending])
+    let driver = try makeDriver(store: store, appAttest: RecordingAppAttest())
+    var challengeRequests = 0
+    var revoked = false
+    URLProtocolStub.handler = { request in
+      switch (request.httpMethod, request.url?.absoluteString) {
+      case ("GET", "https://relay.example/"):
+        return Self.response(
+          request,
+          status: 200,
+          json: ["push": ["keys": [["pubkey": Self.relayPubkey, "current": true]]]]
+        )
+      case ("POST", "http://push.example/v1/installations/challenges"):
+        challengeRequests += 1
+        guard challengeRequests == 1 else {
+          return Self.response(request, status: 503, json: ["error": "injected"])
+        }
+        return Self.response(
+          request,
+          status: 200,
+          json: [
+            "challenge_id": Self.firstChallengeId,
+            "challenge": Self.challenge,
+            "expires_at": Self.now + 300,
+          ]
+        )
+      case ("POST", "http://push.example/v1/installations/revoke"):
+        let body = try Self.body(request)
+        XCTAssertEqual(body["installation_handle"] as? String, Self.installationHandle)
+        revoked = true
+        return Self.response(request, status: 200, json: ["status": "revoked"])
+      default:
+        XCTFail("Unexpected request \(request.url?.absoluteString ?? "nil")")
+        return Self.response(request, status: 500, json: [:])
+      }
+    }
+
+    do {
+      _ = try await driver.enroll(deviceToken: newToken, relayURL: Self.relayURL)
+      XCTFail("Expected the injected replacement challenge failure")
+    } catch BuzzDevPushEnrollmentError.unexpectedStatus(
+      route: "v1/installations/challenges", expected: 200, actual: 503, _
+    ) {
+      // Every grant sharing the revoked installation was removed first.
+    }
+
+    XCTAssertTrue(revoked)
+    XCTAssertTrue(store.saved.isEmpty)
     XCTAssertTrue(store.pending.isEmpty)
     XCTAssertTrue(store.cleanup.isEmpty)
   }
@@ -2009,6 +2100,12 @@ private final class MemoryGrantStore: BuzzPushEndpointGrantStore {
         && $0.appProfile == record.appProfile
     }
     saved.append(record)
+  }
+  func removeRecords(gatewayOrigin: String, installationHandle: String) throws {
+    saved.removeAll {
+      $0.gatewayOrigin == gatewayOrigin
+        && $0.gatewayInstallationHandle == installationHandle
+    }
   }
   func pendingEnrollment(
     gatewayOrigin: String,

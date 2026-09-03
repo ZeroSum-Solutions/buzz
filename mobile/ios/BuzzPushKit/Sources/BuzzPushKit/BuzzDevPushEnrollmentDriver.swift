@@ -97,6 +97,8 @@ public protocol BuzzPushEndpointGrantStore {
   func reset(forGatewayOrigin gatewayOrigin: String) throws
   func records() throws -> [BuzzPushEndpointGrantRecord]
   func save(_ record: BuzzPushEndpointGrantRecord) throws
+  /// Atomically removes every active grant backed by one installation.
+  func removeRecords(gatewayOrigin: String, installationHandle: String) throws
   func pendingEnrollment(
     gatewayOrigin: String,
     relayOrigin: String,
@@ -468,6 +470,7 @@ public final class BuzzDevPushEnrollmentDriver {
       pending.relayPubkey != relayPubkey || pending.endpointHash != endpointHash
         || pending.expiresAt <= nowSeconds
     {
+      var revokedInstallation = false
       let referencedInstallation = pending.gatewayInstallationHandle.flatMap { handle in
         storedRecords
           .filter {
@@ -525,6 +528,22 @@ public final class BuzzDevPushEnrollmentDriver {
           $0.relayOrigin == pending.relayOrigin && $0.appProfile == pending.appProfile
         }
         cleanupState.pendingEnrollments.append(pending)
+        if let installationHandle = pending.gatewayInstallationHandle {
+          for record in storedRecords
+          where record.gatewayOrigin == gatewayOrigin
+            && record.gatewayInstallationHandle == installationHandle
+          {
+            cleanupState.grants.removeAll {
+              $0.relayOrigin == record.relayOrigin && $0.appProfile == record.appProfile
+            }
+            cleanupState.grants.append(record)
+          }
+          try store.saveGatewayCleanupState(cleanupState)
+          try store.removeRecords(
+            gatewayOrigin: gatewayOrigin,
+            installationHandle: installationHandle
+          )
+        }
         guard await cleanStaleGateway(&cleanupState, deviceToken: deviceToken) else {
           if let reconciled = cleanupState.pendingEnrollments.first(where: {
             $0.relayOrigin == pending.relayOrigin && $0.appProfile == pending.appProfile
@@ -534,6 +553,7 @@ public final class BuzzDevPushEnrollmentDriver {
           throw BuzzDevPushEnrollmentError.retiredGatewayCleanupIncomplete
         }
         try store.removeGatewayCleanupState(gatewayOrigin: gatewayOrigin)
+        revokedInstallation = true
       }
       try store.removePendingEnrollment(
         gatewayOrigin: gatewayOrigin,
@@ -541,6 +561,9 @@ public final class BuzzDevPushEnrollmentDriver {
         appProfile: Self.appProfile
       )
       pendingEnrollment = nil
+      if revokedInstallation {
+        return try await enrollCurrent(deviceToken: deviceToken, relayURL: relayURL)
+      }
     }
     if let current = storedForOrigin,
       current.relayPubkey == relayPubkey,
