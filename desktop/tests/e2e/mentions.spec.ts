@@ -3861,7 +3861,12 @@ for (const channel of ["general", "watercooler"]) {
       page.locator("[data-mention-suggestion-index]").first(),
     ).toBeVisible();
     await waitForAnimations(page);
-    await input.press("Meta+ArrowLeft");
+    await expect(input).toBeFocused();
+    // Native line-start movement differs by browser host OS; Meta+ArrowLeft
+    // leaves the caret unchanged in Linux Chromium (including CI).
+    await input.press(
+      process.platform === "darwin" ? "Meta+ArrowLeft" : "Home",
+    );
     await expect
       .poll(() => input.evaluate(() => window.getSelection()?.anchorOffset))
       .toBe(0);
