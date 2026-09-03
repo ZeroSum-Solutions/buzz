@@ -207,6 +207,7 @@ export function CanvasHistoryPanel({
               <button
                 aria-expanded={isSelected}
                 className="flex w-full items-baseline justify-between gap-2 px-3 py-2 text-left"
+                disabled={restoreMutation.isPending}
                 ref={revision.eventId === restoredId ? restoredRowRef : null}
                 onClick={() => {
                   // Clear any prior restore error so it can't render under a
