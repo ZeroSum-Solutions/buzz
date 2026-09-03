@@ -177,6 +177,7 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
   private let activityIndicator = UIActivityIndicatorView(style: .medium)
   private let swatchView = UIView()
   private var buttonLabel: String?
+  private var buttonSubtitle: String?
   private var buttonIconName = "chevron.backward"
   private var contentIcon = "back"
   private var buttonImage: UIImage?
@@ -402,6 +403,7 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
     let icon = arguments?["icon"] as? String
     contentIcon = icon ?? "back"
     buttonLabel = arguments?["label"] as? String
+    buttonSubtitle = arguments?["subtitle"] as? String
     avatarFallback = arguments?["avatarFallback"] as? String ?? "?"
     if let accessibilityLabel = arguments?["accessibilityLabel"] as? String {
       button.accessibilityLabel = accessibilityLabel
@@ -421,29 +423,50 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
     case "moon": buttonIconName = "moon"
     case "systemAppearance": buttonIconName = "circle.lefthalf.filled"
     case "colorSwatch": buttonIconName = "circle.fill"
+    case "channel": buttonIconName = arguments?["systemIconName"] as? String ?? "number"
+    case "headphones": buttonIconName = "headphones"
     default: buttonIconName = "chevron.backward"
     }
-    if contentIcon == "avatar" {
+    if contentIcon == "avatar" || contentIcon == "channel" {
       button.contentHorizontalAlignment = .leading
       button.configuration?.contentInsets = NSDirectionalEdgeInsets(
-        top: 6,
-        leading: 6,
-        bottom: 6,
+        top: contentIcon == "avatar" ? 6 : 4,
+        leading: contentIcon == "avatar" ? 6 : 8,
+        bottom: contentIcon == "avatar" ? 6 : 4,
         trailing: buttonLabel == nil ? 6 : 8
       )
       button.configuration?.imagePadding = buttonLabel == nil ? 0 : 8
       button.configuration?.titleLineBreakMode = .byTruncatingTail
+      let usesChannelTypography = contentIcon == "channel"
       button.configuration?.titleTextAttributesTransformer =
         UIConfigurationTextAttributesTransformer { incoming in
           var outgoing = incoming
-          let preferred = UIFont.preferredFont(forTextStyle: .headline)
+          let preferred = UIFont.preferredFont(
+            forTextStyle: usesChannelTypography ? .subheadline : .headline
+          )
           outgoing.font = UIFont.systemFont(
             ofSize: preferred.pointSize,
             weight: .semibold
           )
           return outgoing
         }
-      updateAvatar(from: arguments?["avatarImageUrl"] as? String)
+      if contentIcon == "avatar" {
+        updateAvatar(from: arguments?["avatarImageUrl"] as? String)
+      } else {
+        avatarLoadTask?.cancel()
+        avatarImageURL = nil
+        buttonImage = UIImage(
+          systemName: buttonIconName,
+          withConfiguration: UIImage.SymbolConfiguration(pointSize: 18, weight: .semibold)
+        )
+        button.configuration?.subtitleTextAttributesTransformer =
+          UIConfigurationTextAttributesTransformer { incoming in
+            var outgoing = incoming
+            outgoing.font = UIFont.preferredFont(forTextStyle: .caption1)
+            outgoing.foregroundColor = UIColor.secondaryLabel
+            return outgoing
+          }
+      }
     } else if buttonLabel != nil {
       button.contentHorizontalAlignment = .center
       avatarLoadTask?.cancel()
@@ -466,11 +489,13 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
           )
           return outgoing
         }
+      button.configuration?.subtitleTextAttributesTransformer = nil
     } else {
       button.contentHorizontalAlignment = .center
       avatarLoadTask?.cancel()
       avatarImageURL = nil
       button.configuration?.titleTextAttributesTransformer = nil
+      button.configuration?.subtitleTextAttributesTransformer = nil
       let iconInset: CGFloat = icon == "shutter"
         ? controlSize * Self.shutterInsetRatio
         : 8
@@ -515,8 +540,10 @@ final class NavigationGlassButtonPlatformView: NSObject, FlutterPlatformView {
     } else {
       let displaysSwatch = contentIcon == "colorSwatch"
       let displaysAvatar = contentIcon == "avatar"
+      let displaysLeadingImage = displaysAvatar || contentIcon == "channel"
       button.configuration?.title = displaysSwatch ? nil : buttonLabel
-      button.configuration?.image = displaysSwatch || (buttonLabel != nil && !displaysAvatar)
+      button.configuration?.subtitle = displaysSwatch ? nil : buttonSubtitle
+      button.configuration?.image = displaysSwatch || (buttonLabel != nil && !displaysLeadingImage)
         ? nil
         : buttonImage
       swatchView.isHidden = !displaysSwatch

@@ -9257,6 +9257,86 @@ void main() {
   });
 
   group('App bar', () {
+    testWidgets('does not composite native glass during the channel route', (
+      tester,
+    ) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: const [],
+          home: Builder(
+            builder: (context) => Scaffold(
+              body: TextButton(
+                onPressed: () => Navigator.of(context).push(
+                  MaterialPageRoute<void>(
+                    builder: (_) => ChannelDetailPage(channel: _testChannel),
+                  ),
+                ),
+                child: const Text('Open channel'),
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Open channel'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 80));
+
+      final back = find.byKey(const ValueKey('channel-ios-glass-back'));
+      final identity = find.byKey(
+        const ValueKey('channel-header-settings-trigger'),
+      );
+      final huddle = find.byKey(const ValueKey('channel-huddle-button'));
+      expect(back, findsOneWidget);
+      expect(identity, findsOneWidget);
+      expect(huddle, findsOneWidget);
+      expect(
+        find.descendant(of: back, matching: find.byType(UiKitView)),
+        findsNothing,
+      );
+      expect(
+        find.descendant(of: identity, matching: find.byType(UiKitView)),
+        findsNothing,
+      );
+      expect(
+        find.descendant(of: huddle, matching: find.byType(UiKitView)),
+        findsNothing,
+      );
+      expect(
+        find.descendant(
+          of: back,
+          matching: find.byKey(
+            const ValueKey('ios-glass-navigation-flutter-fallback'),
+          ),
+        ),
+        findsOneWidget,
+      );
+
+      await tester.pumpAndSettle();
+
+      expect(
+        find.descendant(of: back, matching: find.byType(UiKitView)),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(of: identity, matching: find.byType(UiKitView)),
+        findsOneWidget,
+      );
+      final huddleNativeView = tester.widget<UiKitView>(
+        find.descendant(of: huddle, matching: find.byType(UiKitView)),
+      );
+      expect(
+        (huddleNativeView.creationParams as Map<String, Object>)['icon'],
+        'headphones',
+      );
+      expect(tester.takeException(), isNull);
+      debugDefaultTargetPlatformOverride = null;
+    });
+
     testWidgets('aligns the Channel Details iOS back control with channels', (
       tester,
     ) async {
@@ -9295,14 +9375,18 @@ void main() {
           tester.getTopLeft(channelBack).dx +
           (channelParams['buttonCenterX']! as double);
 
-      await tester.tap(
-        find.byKey(const ValueKey('channel-header-settings-trigger')),
-      );
+      tester
+          .widget<IosGlassNavigationButton>(
+            find.byKey(const ValueKey('channel-header-settings-trigger')),
+          )
+          .onPressed
+          ?.call();
       await tester.pumpAndSettle();
 
       final detailsBack = find.byKey(
         const ValueKey('channel-details-ios-glass-back'),
       );
+      expect(detailsBack, findsOneWidget);
       final detailsNativeView = tester.widget<UiKitView>(
         find.descendant(of: detailsBack, matching: find.byType(UiKitView)),
       );
@@ -9486,17 +9570,30 @@ void main() {
           find.byKey(const ValueKey('channel-ios-glass-back')),
         );
         expect(backButtonRect.width, 58);
-        final channelIconRect = tester.getRect(
-          find.byKey(const ValueKey('channel-header-avatar')),
+        final channelIdentity = find.byKey(
+          const ValueKey('channel-header-settings-trigger'),
         );
+        final channelIdentityRect = tester.getRect(channelIdentity);
+        final channelNativeView = tester.widget<UiKitView>(
+          find.descendant(
+            of: channelIdentity,
+            matching: find.byType(UiKitView),
+          ),
+        );
+        final channelParams =
+            channelNativeView.creationParams as Map<String, Object>;
         expect(
-          channelIconRect.left - backButtonRect.right,
+          channelIdentityRect.left - backButtonRect.right,
           moreOrLessEquals(Grid.xs),
         );
         expect(
           backButtonRect.center.dy,
-          moreOrLessEquals(channelIconRect.center.dy),
+          moreOrLessEquals(channelIdentityRect.center.dy),
         );
+        expect(channelParams['icon'], 'channel');
+        expect(channelParams['label'], 'general');
+        expect(channelParams['subtitle'], '0 members');
+        expect(channelParams['systemIconName'], 'number');
         expect(tester.takeException(), isNull);
         debugDefaultTargetPlatformOverride = null;
       },
@@ -9546,14 +9643,29 @@ void main() {
                   find.byKey(const ValueKey('channel-ios-glass-back')),
                 )
               : tester.getRect(find.byTooltip('Back'));
-          final avatarRect = tester.getRect(
-            find.byKey(const ValueKey('channel-header-avatar')),
+          final titleControl = find.byKey(
+            const ValueKey('channel-header-settings-trigger'),
           );
-          final titleSpacing = avatarRect.left - backRect.right;
-          final title = tester.renderObject<RenderParagraph>(
-            find.byKey(const ValueKey('channel-header-name')),
-          );
-          final titleDidExceedMaxLines = title.didExceedMaxLines;
+          final titleSpacing =
+              tester.getRect(titleControl).left - backRect.right;
+          final titleDidExceedMaxLines = platform == TargetPlatform.iOS
+              ? null
+              : tester
+                    .renderObject<RenderParagraph>(
+                      find.byKey(const ValueKey('channel-header-name')),
+                    )
+                    .didExceedMaxLines;
+          final nativeTitleParams = platform == TargetPlatform.iOS
+              ? tester
+                        .widget<UiKitView>(
+                          find.descendant(
+                            of: titleControl,
+                            matching: find.byType(UiKitView),
+                          ),
+                        )
+                        .creationParams
+                    as Map<String, Object>
+              : null;
           debugDefaultTargetPlatformOverride = previousPlatform;
 
           expect(
@@ -9564,7 +9676,14 @@ void main() {
                   : 0,
             ),
           );
-          expect(titleDidExceedMaxLines, isTrue);
+          if (platform == TargetPlatform.iOS) {
+            expect(
+              nativeTitleParams?['label'],
+              'a-very-long-channel-name-that-must-truncate',
+            );
+          } else {
+            expect(titleDidExceedMaxLines, isTrue);
+          }
           expect(tester.takeException(), isNull);
         },
       );

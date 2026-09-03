@@ -27,6 +27,8 @@ enum IosGlassNavigationIcon {
   moon,
   systemAppearance,
   avatar,
+  channel,
+  headphones,
 }
 
 /// A native contextual-menu item attached to an iOS glass navigation button.
@@ -83,6 +85,7 @@ class IosGlassNavigationButton extends HookWidget {
     required this.semanticLabel,
     required this.onPressed,
     this.label,
+    this.subtitle,
     this.width = 48,
     this.height = 48,
     this.controlSize = 40,
@@ -95,6 +98,7 @@ class IosGlassNavigationButton extends HookWidget {
     this.nativeViewSuppressed,
     this.avatarImageUrl,
     this.avatarFallback,
+    this.systemIconName,
     this.menuItems = const [],
     this.onMenuSelected,
   });
@@ -106,6 +110,9 @@ class IosGlassNavigationButton extends HookWidget {
 
   /// Optional text rendered by the native control instead of [icon].
   final String? label;
+
+  /// Optional secondary text rendered beneath [label].
+  final String? subtitle;
 
   /// Accessibility label exposed by the native view or Flutter fallback.
   final String semanticLabel;
@@ -149,6 +156,9 @@ class IosGlassNavigationButton extends HookWidget {
   /// Initial shown while an avatar image is unavailable.
   final String? avatarFallback;
 
+  /// Optional SF Symbol used by native content such as channel identities.
+  final String? systemIconName;
+
   /// Native menu presented directly beneath the glass control.
   final List<IosGlassNavigationMenuItem> menuItems;
 
@@ -166,6 +176,23 @@ class IosGlassNavigationButton extends HookWidget {
     final foregroundValue = effectiveForeground.toARGB32();
     final swatchColorValue = swatchColor?.toARGB32();
     final enabled = onPressed != null;
+    final routeAnimation =
+        ModalRoute.of(context)?.animation ??
+        const AlwaysStoppedAnimation<double>(1);
+    final routeIsTransitioning = useState(
+      routeAnimation.status != AnimationStatus.completed,
+    );
+    useEffect(() {
+      void updateRouteTransition(AnimationStatus status) {
+        final next = status != AnimationStatus.completed;
+        if (routeIsTransitioning.value != next) {
+          routeIsTransitioning.value = next;
+        }
+      }
+
+      routeAnimation.addStatusListener(updateRouteTransition);
+      return () => routeAnimation.removeStatusListener(updateRouteTransition);
+    }, [routeAnimation]);
     final menuSignature = menuItems
         .map(
           (item) =>
@@ -225,11 +252,15 @@ class IosGlassNavigationButton extends HookWidget {
             'accessibilityLabel': semanticLabel,
           };
           if (label != null) content['label'] = label!;
+          if (subtitle != null) content['subtitle'] = subtitle!;
           if (avatarImageUrl != null) {
             content['avatarImageUrl'] = avatarImageUrl!;
           }
           if (avatarFallback != null) {
             content['avatarFallback'] = avatarFallback!;
+          }
+          if (systemIconName != null) {
+            content['systemIconName'] = systemIconName!;
           }
           content['menuItems'] = menuItems
               .map((item) => item.toJson())
@@ -242,9 +273,11 @@ class IosGlassNavigationButton extends HookWidget {
         nativeChannel.value,
         icon,
         label,
+        subtitle,
         semanticLabel,
         avatarImageUrl,
         avatarFallback,
+        systemIconName,
         menuSignature,
       ],
     );
@@ -252,6 +285,35 @@ class IosGlassNavigationButton extends HookWidget {
     Widget buildControl({required bool suppressNativeView}) {
       if (suppressNativeView) {
         final resolvedButtonCenterX = buttonCenterX ?? width / 2;
+        final isLeadingContent =
+            icon == IosGlassNavigationIcon.avatar ||
+            icon == IosGlassNavigationIcon.channel;
+        final fallbackIcon = switch (icon) {
+          IosGlassNavigationIcon.back => Icons.arrow_back_ios_new_rounded,
+          IosGlassNavigationIcon.close => Icons.close_rounded,
+          IosGlassNavigationIcon.camera => Icons.camera_alt_rounded,
+          IosGlassNavigationIcon.photoLibrary => Icons.photo_library_rounded,
+          IosGlassNavigationIcon.palette => Icons.palette_rounded,
+          IosGlassNavigationIcon.droplet => Icons.water_drop_rounded,
+          IosGlassNavigationIcon.emoji => Icons.emoji_emotions_rounded,
+          IosGlassNavigationIcon.person => Icons.person_rounded,
+          IosGlassNavigationIcon.frame =>
+            Icons.photo_size_select_actual_rounded,
+          IosGlassNavigationIcon.rotateCamera => Icons.cameraswitch_rounded,
+          IosGlassNavigationIcon.shutter => Icons.circle,
+          IosGlassNavigationIcon.colorSwatch => Icons.circle,
+          IosGlassNavigationIcon.sun => Icons.light_mode_rounded,
+          IosGlassNavigationIcon.moon => Icons.dark_mode_rounded,
+          IosGlassNavigationIcon.systemAppearance =>
+            Icons.brightness_auto_rounded,
+          IosGlassNavigationIcon.avatar => Icons.person,
+          IosGlassNavigationIcon.channel => switch (systemIconName) {
+            'lock.fill' => Icons.lock_rounded,
+            'bubble.left.and.bubble.right.fill' => Icons.forum_rounded,
+            _ => Icons.tag_rounded,
+          },
+          IosGlassNavigationIcon.headphones => Icons.headphones_rounded,
+        };
         return Semantics(
           container: true,
           button: true,
@@ -264,14 +326,15 @@ class IosGlassNavigationButton extends HookWidget {
               key: const ValueKey('ios-glass-navigation-flutter-fallback'),
               children: [
                 Positioned(
-                  left: resolvedButtonCenterX - controlSize / 2,
+                  left: fillWidth ? 0 : resolvedButtonCenterX - controlSize / 2,
+                  right: fillWidth ? 0 : null,
                   top: (height - controlSize) / 2,
-                  width: controlSize,
+                  width: fillWidth ? null : controlSize,
                   height: controlSize,
                   child: DecoratedBox(
                     decoration: BoxDecoration(
                       color: context.colors.surface.withValues(alpha: 0.72),
-                      shape: BoxShape.circle,
+                      borderRadius: BorderRadius.circular(controlSize / 2),
                       border: Border.all(
                         color: context.colors.inverseSurface.withValues(
                           alpha: 0.07,
@@ -298,20 +361,69 @@ class IosGlassNavigationButton extends HookWidget {
                               ),
                             ),
                           )
-                        : icon == IosGlassNavigationIcon.avatar
+                        : isLeadingContent && label != null
                         ? Padding(
-                            padding: const EdgeInsets.all(6),
-                            child: AvatarImage(
-                              imageUrl: avatarImageUrl,
-                              radius: (controlSize - 12) / 2,
-                              backgroundColor: context.colors.primaryContainer,
-                              fallback: Text(
-                                avatarFallback ?? '?',
-                                style: context.textTheme.labelMedium?.copyWith(
-                                  color: context.colors.onPrimaryContainer,
-                                  fontWeight: FontWeight.w600,
+                            padding: const EdgeInsets.symmetric(horizontal: 6),
+                            child: Row(
+                              children: [
+                                if (icon == IosGlassNavigationIcon.avatar)
+                                  AvatarImage(
+                                    imageUrl: avatarImageUrl,
+                                    radius: (controlSize - 12) / 2,
+                                    backgroundColor:
+                                        context.colors.primaryContainer,
+                                    fallback: Text(
+                                      avatarFallback ?? '?',
+                                      style: context.textTheme.labelMedium
+                                          ?.copyWith(
+                                            color: context
+                                                .colors
+                                                .onPrimaryContainer,
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                    ),
+                                  )
+                                else
+                                  SizedBox.square(
+                                    dimension: controlSize - 12,
+                                    child: Icon(
+                                      fallbackIcon,
+                                      size: 20,
+                                      color: effectiveForeground,
+                                    ),
+                                  ),
+                                const SizedBox(width: Grid.xs),
+                                Expanded(
+                                  child: Column(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        label!,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: context.textTheme.labelMedium
+                                            ?.copyWith(
+                                              color: effectiveForeground,
+                                              fontWeight: FontWeight.w600,
+                                            ),
+                                      ),
+                                      if (subtitle != null)
+                                        Text(
+                                          subtitle!,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: context.textTheme.labelSmall
+                                              ?.copyWith(
+                                                color: context.colors.onSurface
+                                                    .withValues(alpha: 0.65),
+                                              ),
+                                        ),
+                                    ],
+                                  ),
                                 ),
-                              ),
+                              ],
                             ),
                           )
                         : label != null
@@ -324,38 +436,7 @@ class IosGlassNavigationButton extends HookWidget {
                             ),
                           )
                         : Icon(
-                            switch (icon) {
-                              IosGlassNavigationIcon.back =>
-                                Icons.arrow_back_ios_new_rounded,
-                              IosGlassNavigationIcon.close =>
-                                Icons.close_rounded,
-                              IosGlassNavigationIcon.camera =>
-                                Icons.camera_alt_rounded,
-                              IosGlassNavigationIcon.photoLibrary =>
-                                Icons.photo_library_rounded,
-                              IosGlassNavigationIcon.palette =>
-                                Icons.palette_rounded,
-                              IosGlassNavigationIcon.droplet =>
-                                Icons.water_drop_rounded,
-                              IosGlassNavigationIcon.emoji =>
-                                Icons.emoji_emotions_rounded,
-                              IosGlassNavigationIcon.person =>
-                                Icons.person_rounded,
-                              IosGlassNavigationIcon.frame =>
-                                Icons.photo_size_select_actual_rounded,
-                              IosGlassNavigationIcon.rotateCamera =>
-                                Icons.cameraswitch_rounded,
-                              IosGlassNavigationIcon.shutter => Icons.circle,
-                              IosGlassNavigationIcon.colorSwatch =>
-                                Icons.circle,
-                              IosGlassNavigationIcon.sun =>
-                                Icons.light_mode_rounded,
-                              IosGlassNavigationIcon.moon =>
-                                Icons.dark_mode_rounded,
-                              IosGlassNavigationIcon.systemAppearance =>
-                                Icons.brightness_auto_rounded,
-                              IosGlassNavigationIcon.avatar => Icons.person,
-                            },
+                            fallbackIcon,
                             size: icon == IosGlassNavigationIcon.shutter
                                 ? controlSize * 0.72
                                 : 22,
@@ -387,6 +468,8 @@ class IosGlassNavigationButton extends HookWidget {
         'swatchColor': ?swatchColorValue,
         'avatarImageUrl': ?avatarImageUrl,
         'avatarFallback': ?avatarFallback,
+        'subtitle': ?subtitle,
+        'systemIconName': ?systemIconName,
         'menuItems': menuItems.map((item) => item.toJson()).toList(),
       };
       if (label != null) creationParams['label'] = label!;
@@ -408,11 +491,13 @@ class IosGlassNavigationButton extends HookWidget {
         width: width,
         height: height,
         child: nativeViewSuppressed == null
-            ? buildControl(suppressNativeView: false)
+            ? buildControl(suppressNativeView: routeIsTransitioning.value)
             : ValueListenableBuilder<bool>(
                 valueListenable: nativeViewSuppressed!,
-                builder: (context, suppressNativeView, _) =>
-                    buildControl(suppressNativeView: suppressNativeView),
+                builder: (context, suppressNativeView, _) => buildControl(
+                  suppressNativeView:
+                      suppressNativeView || routeIsTransitioning.value,
+                ),
               ),
       ),
     );

@@ -38,10 +38,15 @@ double _twoLineAppBarTitleContentHeight(
 }
 
 class _ChannelAppBarTitle extends ConsumerWidget {
-  const _ChannelAppBarTitle({required this.channel, required this.onTap});
+  const _ChannelAppBarTitle({
+    required this.channel,
+    required this.onTap,
+    this.nativeViewSuppressed,
+  });
 
   final Channel channel;
   final VoidCallback onTap;
+  final ValueListenable<bool>? nativeViewSuppressed;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -49,6 +54,41 @@ class _ChannelAppBarTitle extends ConsumerWidget {
     final memberCount = membersAsync.value?.length ?? channel.memberCount;
     final memberLabel =
         '$memberCount ${memberCount == 1 ? 'member' : 'members'}';
+
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
+      final systemIconName = channel.isPrivate
+          ? 'lock.fill'
+          : channel.isForum
+          ? 'bubble.left.and.bubble.right.fill'
+          : 'number';
+      return LayoutBuilder(
+        builder: (context, constraints) {
+          final contentHeight = _twoLineAppBarTitleContentHeight(
+            context,
+            isDm: false,
+          );
+          final controlHeight = min(
+            max(contentHeight, 48.0),
+            constraints.maxHeight,
+          );
+          return IosGlassNavigationButton(
+            key: const ValueKey('channel-header-settings-trigger'),
+            icon: IosGlassNavigationIcon.channel,
+            label: channel.name,
+            subtitle: memberLabel,
+            systemIconName: systemIconName,
+            semanticLabel: 'Open settings for ${channel.name}, $memberLabel',
+            onPressed: onTap,
+            width: constraints.maxWidth,
+            height: constraints.maxHeight,
+            controlSize: controlHeight,
+            fillWidth: true,
+            foregroundColor: context.colors.primary,
+            nativeViewSuppressed: nativeViewSuppressed,
+          );
+        },
+      );
+    }
 
     return Semantics(
       button: true,

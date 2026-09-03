@@ -599,6 +599,7 @@ class ChannelDetailPage extends HookConsumerWidget {
                 )
               : _ChannelAppBarTitle(
                   channel: resolvedChannel,
+                  nativeViewSuppressed: messageActionBackdropActive,
                   onTap: () async {
                     final shouldClose = await showChannelDetailsPage(
                       context: context,
@@ -621,6 +622,7 @@ class ChannelDetailPage extends HookConsumerWidget {
                 if (showsHuddleAction)
                   _HuddleButton(
                     channel: resolvedChannel,
+                    nativeViewSuppressed: messageActionBackdropActive,
                     events: [
                       ...messagesState.value ?? const [],
                       ...huddleLifecycle,
@@ -656,6 +658,7 @@ class ChannelDetailPage extends HookConsumerWidget {
                 if (showsComposer)
                   _HuddleButton(
                     channel: resolvedChannel,
+                    nativeViewSuppressed: messageActionBackdropActive,
                     events: [
                       ...messagesState.value ?? const [],
                       ...huddleLifecycle,
