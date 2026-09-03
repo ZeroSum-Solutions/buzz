@@ -78,7 +78,11 @@ type UseDraftPersistLifecycleResult = {
   trackAuthoredContent: (content: string) => void;
   /** Begin a fresh automatic address-only composer snapshot. */
   resetToAgentPrefill: () => void;
-  /** Persist an automatic prefill, or clear it after its last mention is removed. */
+  /**
+   * Persist an automatic prefill, or clear it after its last mention is
+   * removed. Re-persisting a snapshot identical to the stored record is a
+   * no-op (no write, no subscriber broadcast, no updatedAt churn).
+   */
   persistAgentPrefill: (content: string) => void;
   /** Restore the exact classification captured before an attempted send. */
   restoreEntryKind: (entryKind: DraftEntryKind) => void;
@@ -89,6 +93,21 @@ const authoritativelyClearedDraftKeys = new Set<string>();
 
 function scopedDraftKey(draftKey: string): string {
   return `${getDraftStoreScope()}:${draftKey}`;
+}
+
+function mentionRefsEqual(
+  stored: readonly DraftMentionRef[],
+  next: readonly DraftMentionRef[],
+): boolean {
+  return (
+    stored.length === next.length &&
+    stored.every(
+      (ref, i) =>
+        ref.displayName === next[i].displayName &&
+        ref.pubkey === next[i].pubkey &&
+        ref.isAgent === next[i].isAgent,
+    )
+  );
 }
 
 /**
@@ -303,13 +322,30 @@ export function useDraftPersistLifecycle({
         return;
       }
       resetToAgentPrefill();
+      // Effect-driven callers re-run whenever a collaborator identity changes
+      // (profile refresh, audience update) without the prefill itself moving.
+      // saveDraftEntry has no same-content short-circuit — every write flushes
+      // localStorage and broadcasts a fresh updatedAt to Inbox subscribers —
+      // so skip the re-persist when the stored snapshot is already identical.
+      const mentionRefs = getMentionRefs(content);
+      const stored = loadDraft(effectiveDraftKey);
+      if (
+        stored?.entryKind === "agent-prefill" &&
+        stored.content === content &&
+        stored.channelId === (channelId ?? effectiveDraftKey) &&
+        pendingImetaForPersistRef.current.length === 0 &&
+        spoileredAttachmentUrlsRef.current.size === 0 &&
+        mentionRefsEqual(stored.mentionRefs ?? [], mentionRefs)
+      ) {
+        return;
+      }
       persistDraft(
         effectiveDraftKey,
         content,
         channelId ?? effectiveDraftKey,
         [...pendingImetaForPersistRef.current],
         [...spoileredAttachmentUrlsRef.current],
-        getMentionRefs(content),
+        mentionRefs,
         "agent-prefill",
       );
     },
@@ -317,6 +353,7 @@ export function useDraftPersistLifecycle({
       channelId,
       effectiveDraftKey,
       getMentionRefs,
+      loadDraft,
       persistDraft,
       resetToAgentPrefill,
       spoileredAttachmentUrlsRef,

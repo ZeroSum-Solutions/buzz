@@ -244,6 +244,7 @@ import {
   initDraftStore,
   loadDraftEntry,
   persistDraftEntry,
+  subscribeToStore,
 } from "../lib/useDrafts.ts";
 import {
   saveQueuedAttachmentsForDraft,
@@ -967,6 +968,72 @@ test("automatic_prefill_persists_immediately_without_waiting_for_cleanup", async
   persistAgentPrefill("@Jitter ");
   assert.equal(loadDraftEntry(draftKey)?.entryKind, "agent-prefill");
   assert.equal(loadDraftEntry(draftKey)?.content, "@Jitter ");
+  await handle.unmount();
+});
+
+test("repersisting_an_identical_prefill_snapshot_is_a_storage_noop", async () => {
+  const draftKey = "chan-prefill-noop";
+  setupStore("pubkey-prefill-noop");
+  const GROWN_PREFILL_REFS = [
+    ...AGENT_PREFILL_REFS,
+    { displayName: "Scout", pubkey: "agent-scout", isAgent: true },
+  ];
+
+  let persistAgentPrefill;
+  const spoileredRef = { current: new Set() };
+  function HarnessComposer() {
+    ({ persistAgentPrefill } = useDraftPersistLifecycle({
+      effectiveDraftKey: draftKey,
+      channelId: draftKey,
+      loadDraft: loadDraftEntry,
+      persistDraft: persistDraftEntry,
+      getMentionRefs: (content) =>
+        content.includes("@Scout") ? GROWN_PREFILL_REFS : AGENT_PREFILL_REFS,
+      restoreMentionRefs: () => {},
+      livePendingImeta: [],
+      setPendingImeta: () => {},
+      setContent: () => {},
+      clearContent: () => {},
+      setSpoileredAttachmentUrls: () => {},
+      spoileredAttachmentUrlsRef: spoileredRef,
+      syncComposerContentFromEditor: () => "@Jitter ",
+    }));
+    return null;
+  }
+
+  const handle = await mountStrictMode(HarnessComposer);
+  persistAgentPrefill("@Jitter ");
+  const first = loadDraftEntry(draftKey);
+  assert.equal(first?.entryKind, "agent-prefill");
+
+  // ISO timestamps have millisecond precision — space the writes out so an
+  // updatedAt bump from a non-skipped duplicate persist is observable.
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  let notifications = 0;
+  const unsubscribe = subscribeToStore(() => {
+    notifications += 1;
+  });
+  persistAgentPrefill("@Jitter ");
+  persistAgentPrefill("@Jitter ");
+  assert.equal(
+    notifications,
+    0,
+    "re-persisting an identical prefill snapshot must not notify subscribers",
+  );
+  assert.equal(
+    loadDraftEntry(draftKey)?.updatedAt,
+    first.updatedAt,
+    "re-persisting an identical prefill snapshot must not bump updatedAt",
+  );
+
+  // A genuinely changed snapshot (audience grew) must still write and notify.
+  persistAgentPrefill("@Jitter @Scout ");
+  unsubscribe();
+  assert.equal(notifications, 1, "a changed prefill snapshot must persist");
+  const grown = loadDraftEntry(draftKey);
+  assert.equal(grown?.content, "@Jitter @Scout ");
+  assert.equal(grown?.entryKind, "agent-prefill");
+  assert.notEqual(grown?.updatedAt, first.updatedAt);
   await handle.unmount();
 });
 
