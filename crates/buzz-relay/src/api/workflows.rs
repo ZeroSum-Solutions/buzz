@@ -20,7 +20,7 @@ use buzz_core::TenantContext;
 use buzz_auth::NipFiMode;
 
 use crate::{
-    api::{api_error, bridge, internal_error},
+    api::{api_error, bridge, internal_error, parse_query_or_400},
     nip_fi_http::{check_nip_fi_http_on_state, NipFiHttpOutcome},
     state::AppState,
 };
@@ -160,11 +160,11 @@ async fn workflow_runs_inner(
         authorize_workflow_read(&state, &headers, &path, raw_query.as_deref(), workflow_id).await?;
 
     // Parse query string after admission so malformed params (e.g. ?limit=abc)
-    // cannot 400 before the NIP-FI gate fires.
-    let query: RunsQuery = raw_query
-        .as_deref()
-        .and_then(|q| serde_urlencoded::from_str(q).ok())
-        .unwrap_or_default();
+    // cannot 400 before the NIP-FI gate fires.  A parse failure after
+    // admission is a caller error (400); defaulting silently would change
+    // query semantics.  [FI-TRACE-HTTP-INGRESS]
+    let query: RunsQuery =
+        parse_query_or_400(raw_query.as_deref()).map_err(|e| e.into_response())?;
 
     if query.before.is_some() != query.before_id.is_some() {
         return Err(api_error(

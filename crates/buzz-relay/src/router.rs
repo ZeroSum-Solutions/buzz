@@ -24,8 +24,170 @@ use crate::audio;
 use crate::connection::handle_connection;
 use crate::metrics::track_metrics;
 use crate::nip11::{nip11_document, relay_info_handler};
+use crate::nip_fi_http::http_denial;
 use crate::readiness::{self, ReadinessEvaluation, ReadinessReason};
 use crate::state::AppState;
+
+// ── NIP-FI fail-closed assertion guard ───────────────────────────────────────
+//
+// ## Purpose
+//
+// This middleware is the single authority that makes NIP-FI route
+// classification fail-closed.  It runs *over the entire merged router*: in
+// Enforce or DenyProtected mode, any request whose path does not start with a
+// prefix in `NIP_FI_EXEMPT_PREFIXES` must carry the
+// `Nostr-Federated-Identity: Bearer …` assertion header — or it is denied
+// before reaching the handler.
+//
+// A handler that omits its own `check_nip_fi_http_on_state` call therefore
+// cannot admit a client in active NIP-FI mode, because the guard fires first.
+// The per-handler checks (which additionally verify the assertion signature,
+// key pairing, and deny-map) remain in place; this guard is their backstop.
+//
+// ## Adding a new route
+//
+// * **Protected (NIP-98-authenticated):** no action needed here.  The guard
+//   denies the request if the assertion header is absent; add or keep the
+//   per-handler `check_nip_fi_http_on_state` call for full pairing.
+//
+// * **Public / exempt (no NIP-FI requirement):** add the path or prefix to
+//   `NIP_FI_EXEMPT_PREFIXES` below.  Failure to do so will deny the route in
+//   Enforce mode, which is intentional: the default is DENY; public status is
+//   explicit.
+//
+// ## Relationship to Off mode
+//
+// When `NipFiMode::Off` the guard is fully transparent — no request is
+// touched.  [FI-INV-15]
+//
+// ## What this guard checks (and does NOT check)
+//
+// The guard only verifies *assertion-header presence* — not signature, not
+// key pairing, not deny-map.  Full verification is the per-handler job.  This
+// split is intentional: the guard cannot derive the `proven_pubkey` (that
+// comes from per-handler NIP-98 verification), so it cannot do pairing.  The
+// guard's job is exclusively to prevent admission on paths where the handler
+// forgot its own gate.
+//
+// [FI-TRACE-AUTHORITY-UNIFORM] Both the guard and the per-handler checks
+// delegate to `nip_fi_http.rs`; the guard fires first.
+
+/// Path prefixes that are exempt from NIP-FI assertion enforcement.
+///
+/// Every route in this relay is NIP-FI-protected by default.  Routes that
+/// should NOT require the `Nostr-Federated-Identity` header in Enforce mode
+/// MUST appear in this list; omission means the guard denies the route.
+///
+/// **Matching rules:**
+/// - Entries ending with `/` match any path with that prefix (subtree match).
+/// - All other entries match exactly (the request path must equal the entry
+///   or start with the entry followed by `/`, `?`, or `#`).
+///
+/// When adding a new public or pre-auth route, add its path or prefix here
+/// and include the NIP-FI classification comment in `build_router`.
+const NIP_FI_EXEMPT_PREFIXES: &[&str] = &[
+    // WebSocket upgrade + NIP-11 relay info (public; WS-NIP-FI governs WS)
+    "/",
+    // NIP-11 relay info — exact path
+    "/info",
+    // NIP-05 — exact path
+    "/.well-known/nostr.json",
+    // K8s / health probes (no auth) — exact paths
+    "/health",
+    "/_liveness",
+    "/_readiness",
+    // Pre-membership enrollment door — identity not yet issued
+    "/api/invites/claim",
+    // Pre-membership policy gate — no NIP-98 principal yet
+    "/api/invites/accept-policy",
+    // Public policy documents — exact path + subtree
+    "/api/join-policy",
+    // Webhook trigger — secret-header auth; subtree for /hooks/{id}
+    "/hooks/",
+    // Huddle audio WebSocket — WS-NIP-FI governs WebSocket; subtree
+    "/huddle/",
+    // Testbed-only mesh probe — no auth; subtree
+    "/_mesh/",
+    // Operator admin plane — keypair-in-config auth; subtree
+    "/operator/",
+    // Admin SPA backend — operator-credential gated; subtree
+    "/api/admin/",
+    // Static assets served by the SPA fallback; subtree
+    "/assets/",
+    "/favicon.svg",
+    // Invite landing page (SPA) — subtree
+    "/invite/",
+    // Git web GUI (SPA) — exact + subtree
+    "/repos",
+];
+
+/// Middleware: assertion-presence guard for NIP-FI protected paths.
+///
+/// Fires before any handler.  In Enforce mode, if the request path is not
+/// covered by [`NIP_FI_EXEMPT_PREFIXES`] and the
+/// `Nostr-Federated-Identity: Bearer …` header is absent, the request is
+/// denied with the canonical NIP-FI 401 `authentication required\n` response
+/// before the handler is dispatched.
+///
+/// In Off mode the middleware is fully transparent.
+async fn nip_fi_assertion_guard(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+    next: middleware::Next,
+) -> axum::response::Response {
+    use buzz_auth::{NipFiMode, CLIENT_ATTACHED_HEADER};
+
+    // Off mode: fully transparent. [FI-INV-15]
+    if matches!(state.config.nip_fi.mode, NipFiMode::Off) {
+        return next.run(request).await;
+    }
+
+    let path = request.uri().path();
+
+    // Exempt paths bypass the assertion-presence check.
+    let exempt = NIP_FI_EXEMPT_PREFIXES.iter().any(|pattern| {
+        if *pattern == "/" {
+            // Exact root match only.
+            return path == "/";
+        }
+        if pattern.ends_with('/') {
+            // Subtree match: path must start with this prefix.
+            return path.starts_with(pattern);
+        }
+        // Exact-or-subtree match: path equals the pattern, or path starts
+        // with the pattern followed by a path separator or query character.
+        // This prevents "/info" from matching "/info-extra".
+        if path == *pattern {
+            return true;
+        }
+        if let Some(rest) = path.strip_prefix(pattern) {
+            return rest.starts_with('/') || rest.starts_with('?') || rest.starts_with('#');
+        }
+        false
+    });
+
+    if exempt {
+        return next.run(request).await;
+    }
+
+    // Non-exempt path in Enforce or DenyProtected mode.
+    //
+    // DenyProtected: unconditional 503 regardless of assertion presence.
+    // (The per-handler checks also do this; the guard is the backstop.)
+    if matches!(state.config.nip_fi.mode, NipFiMode::DenyProtected) {
+        return http_denial(buzz_auth::DenialClass::AuthorizationUnavailable);
+    }
+
+    // Enforce mode: require assertion-header presence.  Full verification
+    // (signature, pairing, deny-map) is the per-handler job.
+    let headers = request.headers();
+    let has_assertion = headers.contains_key(CLIENT_ATTACHED_HEADER);
+    if !has_assertion {
+        return http_denial(buzz_auth::DenialClass::MissingEvidence);
+    }
+
+    next.run(request).await
+}
 
 /// Build the axum [`Router`] with all relay routes, middleware, and CORS configuration.
 ///
@@ -202,6 +364,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     }
 
     merged
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            nip_fi_assertion_guard,
+        ))
         .layer(middleware::from_fn(track_metrics))
         .layer(http_trace_layer())
         .layer(build_cors_layer(&state.config.cors_origins))
@@ -1374,6 +1540,159 @@ mod tests {
         assert!(
             !handler_receives_message_with_limit(limit, limit + 1).await,
             "oversized messages must be rejected by the WebSocket parser before the handler sees them"
+        );
+    }
+
+    // ── nip_fi_assertion_guard: fail-closed classification tests ─────────────
+    //
+    // ## What these tests prove
+    //
+    // `nip_fi_assertion_guard` is the runtime default-deny layer that makes
+    // NIP-FI route classification fail-closed.  These unit tests directly
+    // verify the exempt-prefix matching logic that determines whether a
+    // request is guarded or not.
+    //
+    // The key property: a non-exempt path with no assertion header must be
+    // denied in Enforce mode, even if the handler does NOT call
+    // `check_nip_fi_http_on_state`.  This is the fail-closed guarantee — a
+    // handler cannot silently bypass NIP-FI by omitting its gate.
+    //
+    // ## Dummy-route failure-mode demonstration (for code review)
+    //
+    // To confirm the failure mode is dead:
+    //   1. In `build_router` add a handler with no NIP-FI gate:
+    //      `.route("/dummy-unclassified", get(|| async { "hello" }))`
+    //      (Do NOT add "/dummy-unclassified" to NIP_FI_EXEMPT_PREFIXES.)
+    //   2. Deploy with NIP-FI in Enforce mode.
+    //   3. Send `GET /dummy-unclassified` with valid NIP-98 but no assertion.
+    //   4. Response: 401 `authentication required\n` from the guard.
+    //   5. Revert the dummy route.
+    //
+    // This is the mechanism the tests below exercise at the unit level.
+
+    /// Returns true when `path` is exempt per `NIP_FI_EXEMPT_PREFIXES`.
+    /// Mirrors the matching logic in `nip_fi_assertion_guard`.
+    fn is_exempt(path: &str) -> bool {
+        NIP_FI_EXEMPT_PREFIXES.iter().any(|pattern| {
+            if *pattern == "/" {
+                return path == "/";
+            }
+            if pattern.ends_with('/') {
+                return path.starts_with(pattern);
+            }
+            if path == *pattern {
+                return true;
+            }
+            if let Some(rest) = path.strip_prefix(pattern) {
+                return rest.starts_with('/') || rest.starts_with('?') || rest.starts_with('#');
+            }
+            false
+        })
+    }
+
+    // Exempt paths — guard must pass these through in Enforce mode.
+    #[test]
+    fn exempt_paths_are_recognized() {
+        // Root exact match
+        assert!(is_exempt("/"), "/ must be exempt (WS + NIP-11)");
+        assert!(!is_exempt("/events"), "POST /events must NOT be exempt");
+        // Exact-match entries must not bleed into adjacent paths
+        assert!(
+            !is_exempt("/info-extra"),
+            "/info-extra must NOT match /info"
+        );
+        assert!(!is_exempt("/healthz"), "/healthz must NOT match /health");
+
+        // Probes
+        assert!(is_exempt("/health"));
+        assert!(is_exempt("/_liveness"));
+        assert!(is_exempt("/_readiness"));
+
+        // Pre-membership
+        assert!(is_exempt("/api/invites/claim"));
+        assert!(is_exempt("/api/invites/accept-policy"));
+
+        // Public docs
+        assert!(is_exempt("/api/join-policy"));
+        assert!(is_exempt("/api/join-policy/terms"));
+        assert!(is_exempt("/api/join-policy/privacy"));
+
+        // Webhook (prefix)
+        assert!(is_exempt("/hooks/abc123"));
+        assert!(!is_exempt("/hooksnot"), "/hooksnot must not match /hooks/");
+
+        // Operator / admin subtrees
+        assert!(is_exempt("/operator/communities"));
+        assert!(is_exempt("/api/admin/v1/something"));
+
+        // SPA / assets
+        assert!(is_exempt("/assets/main.js"));
+        assert!(is_exempt("/invite/abc"));
+        assert!(is_exempt("/repos"));
+        assert!(is_exempt("/repos/owner/name"));
+    }
+
+    // Protected paths — guard must deny these in Enforce mode.
+    #[test]
+    fn protected_paths_are_not_exempt() {
+        assert!(!is_exempt("/events"), "POST /events must be protected");
+        assert!(!is_exempt("/query"), "POST /query must be protected");
+        assert!(!is_exempt("/count"), "POST /count must be protected");
+        assert!(
+            !is_exempt("/gifs/search"),
+            "POST /gifs/search must be protected"
+        );
+        assert!(
+            !is_exempt("/gifs/share"),
+            "POST /gifs/share must be protected"
+        );
+        assert!(
+            !is_exempt("/workflows/abc/runs"),
+            "GET /workflows must be protected"
+        );
+        assert!(
+            !is_exempt("/moderation/reports"),
+            "GET /moderation/reports must be protected"
+        );
+        assert!(
+            !is_exempt("/moderation/audit"),
+            "GET /moderation/audit must be protected"
+        );
+        assert!(
+            !is_exempt("/moderation/restricted"),
+            "GET /moderation/restricted must be protected"
+        );
+        assert!(
+            !is_exempt("/api/invites"),
+            "POST /api/invites (mint) must be protected"
+        );
+        assert!(!is_exempt("/upload"), "PUT /upload must be protected");
+        assert!(
+            !is_exempt("/media/upload"),
+            "PUT /media/upload must be protected"
+        );
+        assert!(
+            !is_exempt("/media/deadbeef.bin"),
+            "GET /media/{{sha}} must be protected"
+        );
+    }
+
+    // Regression: a newly added unclassified path must NOT be exempt by default.
+    // If a developer adds a route and forgets to add it to NIP_FI_EXEMPT_PREFIXES,
+    // `is_exempt` returns false → the guard denies in Enforce mode.
+    // This test proves that the default is DENY, not ADMIT.
+    #[test]
+    fn unclassified_path_is_not_exempt_by_default() {
+        // A path that looks plausibly authenticated but was just added:
+        assert!(
+            !is_exempt("/api/new-feature/data"),
+            "newly added unclassified path must default to NOT exempt; \
+             if this fails, NIP_FI_EXEMPT_PREFIXES has an overly broad entry"
+        );
+        assert!(
+            !is_exempt("/api/invites/new-endpoint"),
+            "a new invite sub-path must not be exempt just because /api/invites/ exists; \
+             only /api/invites/claim and /api/invites/accept-policy are explicitly exempt"
         );
     }
 }
