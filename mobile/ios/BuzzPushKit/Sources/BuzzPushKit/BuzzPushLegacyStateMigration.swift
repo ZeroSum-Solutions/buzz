@@ -1,6 +1,6 @@
 import Foundation
 
-/// Decodes the pre-gateway-origin Keychain schema into the canonical gateway profile.
+/// Decodes the pre-gateway-origin Keychain schema using the artifact's configured gateway.
 public enum BuzzPushLegacyStateMigration {
   private struct LegacyGrant: Decodable {
     let relayOrigin: String
@@ -31,7 +31,7 @@ public enum BuzzPushLegacyStateMigration {
     let delegationGeneration: Int64
   }
 
-  /// Migrates legacy opaque grants without changing their canonical gateway authority.
+  /// Migrates legacy opaque grants under the gateway configured by the upgrading artifact.
   public static func grants(
     from data: Data,
     gatewayOrigin: String,

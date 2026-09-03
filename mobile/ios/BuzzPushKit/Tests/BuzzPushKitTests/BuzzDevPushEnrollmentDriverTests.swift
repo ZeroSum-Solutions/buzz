@@ -389,7 +389,7 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     XCTAssertThrowsError(try JSONDecoder().decode(BuzzPushEndpointGrantRecord.self, from: data))
   }
 
-  func testLegacyKeychainStateMigratesToCanonicalGatewayRecords() throws {
+  func testLegacyKeychainStateMigratesToConfiguredGatewayRecords() throws {
     let grantData = Data(
       """
       [{"relayOrigin":"wss://relay.example","relayPubkey":"\(Self.relayPubkey)","gatewayInstallationHandle":"\(Self.installationHandle)","installationId":"\(Self.installationId)","endpointGrant":"legacy-grant","endpointHash":"\(String(repeating: "b", count: 64))","appProfile":"buzz-ios-dogfood","endpointEpoch":1,"generation":1,"expiresAt":\(Self.expiresAt)}]
@@ -404,21 +404,21 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     let grant = try XCTUnwrap(
       BuzzPushLegacyStateMigration.grants(
         from: grantData,
-        gatewayOrigin: "https://push.buzz.xyz",
+        gatewayOrigin: "http://localhost:8080",
         appAttestKeyId: Self.keyId
       ).first
     )
     let pending = try XCTUnwrap(
       BuzzPushLegacyStateMigration.pendingEnrollments(
         from: pendingData,
-        gatewayOrigin: "https://push.buzz.xyz"
+        gatewayOrigin: "http://localhost:8080"
       ).first
     )
 
-    XCTAssertEqual(grant.gatewayOrigin, "https://push.buzz.xyz")
+    XCTAssertEqual(grant.gatewayOrigin, "http://localhost:8080")
     XCTAssertEqual(grant.appAttestKeyId, Self.keyId)
     XCTAssertEqual(grant.gatewayInstallationHandle, Self.installationHandle)
-    XCTAssertEqual(pending.gatewayOrigin, "https://push.buzz.xyz")
+    XCTAssertEqual(pending.gatewayOrigin, "http://localhost:8080")
     XCTAssertEqual(pending.gatewayInstallationHandle, Self.installationHandle)
     XCTAssertEqual(pending.delegationGeneration, 2)
   }

@@ -11,7 +11,6 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
   private static let recordsAccount = "v2"
   private static let pendingAccount = "pending-v2"
   private static let cleanupAccount = "gateway-cleanup-v1"
-  private static let canonicalLegacyGatewayOrigin = "https://push.buzz.xyz"
 
   private let accessGroup: String?
 
@@ -20,7 +19,7 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
   }
 
   func reset(forGatewayOrigin gatewayOrigin: String) throws {
-    try migrateLegacyState()
+    try migrateLegacyState(gatewayOrigin: gatewayOrigin)
 
     let allRecords = try records()
     let allPending = try pendingEnrollments()
@@ -36,14 +35,14 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
     )
   }
 
-  private func migrateLegacyState() throws {
+  private func migrateLegacyState(gatewayOrigin: String) throws {
     let legacyGrantData = try data(account: Self.legacyRecordsAccount)
     let legacyPendingData = try data(account: Self.legacyPendingAccount)
     if let legacyGrantData {
       let keyId = try appAttestKeyId()
       let legacyGrants = try BuzzPushLegacyStateMigration.grants(
         from: legacyGrantData,
-        gatewayOrigin: Self.canonicalLegacyGatewayOrigin,
+        gatewayOrigin: gatewayOrigin,
         appAttestKeyId: keyId ?? ""
       )
       guard legacyGrants.isEmpty || keyId != nil else {
@@ -67,7 +66,7 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
       var migrated = try pendingEnrollments()
       for pending in try BuzzPushLegacyStateMigration.pendingEnrollments(
         from: legacyPendingData,
-        gatewayOrigin: Self.canonicalLegacyGatewayOrigin
+        gatewayOrigin: gatewayOrigin
       ) {
         migrated.removeAll {
           $0.gatewayOrigin == pending.gatewayOrigin && $0.relayOrigin == pending.relayOrigin
