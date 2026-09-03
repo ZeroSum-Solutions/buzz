@@ -346,6 +346,7 @@ runWholeBlobP2a1HookSuite({
     return `buzz-channel-sections-outbox.v1:${pubkey}:${encoded}`;
   },
   storageKey,
+  readOutbox: readChannelSectionsOutbox,
   useHook: useChannelSections,
   makeEdit: (r) => r.createSection("P2a1-Section"),
   makeEditStore: () => ({

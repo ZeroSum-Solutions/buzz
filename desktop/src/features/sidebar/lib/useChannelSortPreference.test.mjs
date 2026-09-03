@@ -213,6 +213,7 @@ runWholeBlobP2a1HookSuite({
     return `buzz-channel-sort-outbox.v1:${pubkey}:${encoded}`;
   },
   storageKey,
+  readOutbox: readChannelSortOutbox,
   useHook: useChannelSortPreference,
   makeEdit: (r) => r.setSortModeFor("channels", "alpha"),
   makeEditStore: () => ({ version: 1, groups: { click: "alpha" } }),

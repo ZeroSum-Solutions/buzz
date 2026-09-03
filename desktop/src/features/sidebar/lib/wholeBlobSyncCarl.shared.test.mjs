@@ -288,6 +288,42 @@ export function runWholeBlobCarlSuite({
           `fires → publishes stale edit`,
       );
 
+      // Flush React state updates triggered by onRemoteAdopted → setStore(applyRemote(remote)).
+      // applyRemote's state updater writes to localStorage; act() flushes the commit phase.
+      await act(async () => {
+        for (let i = 0; i < 50; i++) await Promise.resolve();
+      });
+
+      // (a) Persisted lane storage must reflect the adopted remote store.
+      // Mutation (onRemoteAdopted callback removed): adopted store never written → still editStore → fails.
+      const persistedRaw = window.localStorage.getItem(
+        storageKey(pubkey, relayUrl),
+      );
+      assert.ok(
+        persistedRaw !== null,
+        `P1/C1-stale ${label}: lane storage must exist after adopt`,
+      );
+      assert.deepEqual(
+        JSON.parse(persistedRaw),
+        makeRemoteStore(),
+        `P1/C1-stale ${label}: lane storage must equal the adopted remote store — ` +
+          `remove onRemoteAdopted callback → old edit store remains persisted`,
+      );
+
+      // (b) Hook state reflects the adopted remote store (driven by localStorage).
+      // After act+microtasks above the hook has already re-rendered from the adopted value.
+      // We use the persisted value as the oracle because it is the source of hook state.
+      // (assertion collapsed into (a) above — same invariant, same mutation tripwire)
+
+      // (c) Losing own outbox must be cleared — head supersedes the stale edit.
+      // Mutation (clearOutbox removed from clearPendingState): old outbox persists → not null → fails.
+      assert.equal(
+        readOutbox(pubkey, relayUrl),
+        null,
+        `P1/C1-stale ${label}: own outbox must be cleared after adopt — ` +
+          `remove clearOutbox from clearPendingState → stale outbox remains, replays again after restart`,
+      );
+
       hook.unmount();
     } finally {
       cleanup();
@@ -597,6 +633,8 @@ export function runWholeBlobP2a1Suite({
  */
 export function runWholeBlobP2a1HookSuite({
   label,
+  storageKey,
+  readOutbox,
   useHook,
   makeEdit,
   makeRemoteStore,
@@ -708,6 +746,37 @@ export function runWholeBlobP2a1HookSuite({
         `P2a-1 ${label} (hook): real .then() replay with bootstrapResultHead baseline — ` +
           `H102 must be ADOPTED as a genuine advance, not published over — ` +
           `set publishBaseline=lastRemoteHead in publish(_, true) → H102 folds into baseline → publishes over H102`,
+      );
+
+      // Flush React state updates triggered by onRemoteAdopted → setStore(applyRemote(remote)).
+      // applyRemote's state updater writes to localStorage; act() flushes the commit phase.
+      await act(async () => {
+        for (let i = 0; i < 50; i++) await Promise.resolve();
+      });
+
+      // Hook state and lane storage must reflect the adopted H102 store.
+      // Mutation (onRemoteAdopted callback removed): H102 never written to storage → old edit persists → fails.
+      const persistedRaw = window.localStorage.getItem(
+        storageKey(pubkey, relayUrl),
+      );
+      assert.ok(
+        persistedRaw !== null,
+        `P2a-1 ${label} (hook): lane storage must exist after H102 adopt`,
+      );
+      assert.deepEqual(
+        JSON.parse(persistedRaw),
+        makeRemoteStore(),
+        `P2a-1 ${label} (hook): lane storage must equal the adopted H102 store — ` +
+          `remove onRemoteAdopted callback → own edit store remains persisted`,
+      );
+
+      // Own outbox written by the click must be cleared after H102 supersedes it.
+      // Mutation (onRemoteAdopted callback removed): adopt never fires, outbox not cleared → not null → fails.
+      assert.equal(
+        readOutbox(pubkey, relayUrl),
+        null,
+        `P2a-1 ${label} (hook): own outbox must be cleared after H102 adopt — ` +
+          `remove onRemoteAdopted callback → click outbox remains, replays stale edit on next restart`,
       );
 
       hook.unmount();
