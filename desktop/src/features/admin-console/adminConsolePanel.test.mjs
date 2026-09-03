@@ -1388,7 +1388,7 @@ test("reports-tab-scope-all: admin_list_reports IPC call includes scope=all", as
     return Promise.resolve([]);
   });
 
-  const { container, doRender, unmount } = mountPanel({ origin, pubkey });
+  const { doRender, unmount } = mountPanel({ origin, pubkey });
   await doRender();
   await settle(30);
 

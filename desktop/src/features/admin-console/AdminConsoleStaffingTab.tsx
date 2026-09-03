@@ -12,13 +12,12 @@
  */
 
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
 import { nip19 } from "nostr-tools";
 import { LoaderCircle, Trash2 } from "lucide-react";
 import { Button } from "@/shared/ui/button";
 import { Badge } from "@/shared/ui/badge";
 import { truncatePubkey } from "@/shared/lib/pubkey";
-import { getUsersBatch } from "@/shared/api/tauriProfiles";
+import { useUsersBatchQuery } from "@/features/profile/hooks";
 import type { UserProfileSummary } from "@/shared/api/types";
 import {
   AlertDialog,
@@ -154,16 +153,14 @@ export function StaffingTab({
     generation + listGen,
   );
 
-  // Resolve display names for all listed pubkeys in one batch request.
-  // Uses a direct getUsersBatch call (no CommunitiesProvider dependency) since
-  // StaffingTab renders inside the settings panel, outside the main app context.
+  // Resolve display names using the shared hook — normalised delta-fetch with
+  // per-pubkey caching, persisted-label seeding, and focus-recovery retry.
+  // CommunitiesProvider wraps the entire Settings tree (main.tsx) so this is
+  // always in context.
   const listedPubkeys =
     listState.status === "ok" ? listState.data.map((op) => op.pubkey) : [];
-  const profilesQuery = useQuery({
+  const profilesQuery = useUsersBatchQuery(listedPubkeys, {
     enabled: listedPubkeys.length > 0,
-    queryKey: ["staffing-profiles", ...listedPubkeys.slice().sort()],
-    queryFn: () => getUsersBatch(listedPubkeys),
-    staleTime: 5 * 60_000,
   });
 
   const handleAdd = async () => {

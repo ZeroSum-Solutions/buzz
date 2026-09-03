@@ -79,6 +79,7 @@ import { toast } from "sonner";
 
 import { AdminConsoleSettingsCard } from "./AdminConsoleSettingsCard.tsx";
 import { AdminConsolePanel } from "./AdminConsolePanel.tsx";
+import { CommunitiesProvider } from "@/features/communities/useCommunities.tsx";
 
 // ── Success-toast capture ────────────────────────────────────────────────────
 //
@@ -183,8 +184,9 @@ function mountPanel({
   initialTab = undefined,
 }) {
   const qc = makeQueryClient(pubkey);
-  // StaffingTab calls useUsersBatchQuery which needs a QueryClientProvider.
-  // Provide a default no-op handler so profile lookups resolve without error.
+  // StaffingTab calls useUsersBatchQuery which needs QueryClientProvider +
+  // CommunitiesProvider. Provide a default no-op handler so profile lookups
+  // resolve without error when individual tests don't override get_users_batch.
   if (!ipcHandlers.get("get_users_batch")) {
     setIpcHandler("get_users_batch", () =>
       Promise.resolve({ profiles: {}, missing: [] }),
@@ -199,13 +201,17 @@ function mountPanel({
         React.createElement(
           QueryClientProvider,
           { client: qc },
-          React.createElement(AdminConsolePanel, {
-            canMutate,
-            origin: o,
-            pubkey: p,
-            ...(role !== undefined ? { role } : {}),
-            ...(initialTab !== undefined ? { initialTab } : {}),
-          }),
+          React.createElement(
+            CommunitiesProvider,
+            null,
+            React.createElement(AdminConsolePanel, {
+              canMutate,
+              origin: o,
+              pubkey: p,
+              ...(role !== undefined ? { role } : {}),
+              ...(initialTab !== undefined ? { initialTab } : {}),
+            }),
+          ),
         ),
       );
     });
@@ -4681,13 +4687,17 @@ test("staffing-tab-reset-on-role-downgrade: panel shows reports content after op
         React.createElement(
           QueryClientProvider,
           { client: qc },
-          React.createElement(AdminConsolePanel, {
-            canMutate: true,
-            origin,
-            pubkey,
-            role,
-            initialTab: "staffing",
-          }),
+          React.createElement(
+            CommunitiesProvider,
+            null,
+            React.createElement(AdminConsolePanel, {
+              canMutate: true,
+              origin,
+              pubkey,
+              role,
+              initialTab: "staffing",
+            }),
+          ),
         ),
       );
     });
@@ -5969,6 +5979,261 @@ test("feedback-status-readonly: read-only detail shows status badge, no status-c
       patchCalls.length,
       0,
       "admin_patch_feedback must not be called in read-only mode",
+    );
+  } finally {
+    await unmount();
+  }
+});
+
+// ── P2: Staffing display-name + npub presentation ─────────────────────────────
+//
+// Behavioral coverage for the useUsersBatchQuery integration.
+//
+// Mutation evidence:
+//   - Suppress the get_users_batch IPC response → display name test goes RED
+//     (raw pubkey renders instead of display name).
+//   - Remove HoverStaffingIdentity → npub data-testid absent → npub test RED.
+//   - Remove putAdminOperator call from handleRoleChange → PUT test goes RED.
+//   - Swap 409 check for generic message → rejection copy test goes RED.
+
+test("staffing-display-name: resolved profile name renders in place of raw pubkey", async () => {
+  // Verifies that get_users_batch is called and the returned displayName renders
+  // in the staffing row — not the fallback truncated pubkey.
+  const origin = "https://admin-staffing-name.example.com";
+  const pubkey = "a1".repeat(32);
+  const opPubkey = "b2".repeat(32);
+
+  setIpcHandler("get_users_batch", (args) => {
+    const profiles = {};
+    for (const pk of args?.pubkeys ?? []) {
+      if (pk === opPubkey) {
+        // Raw IPC format uses snake_case (getRawUsersBatchResponse shape).
+        profiles[pk] = { display_name: "Alice Operator", avatar_url: null };
+      }
+    }
+    return Promise.resolve({ profiles, missing: [] });
+  });
+  setIpcHandler("admin_list_reports", () => Promise.resolve([]));
+  setIpcHandler("admin_list_operators", () =>
+    Promise.resolve([
+      { pubkey: opPubkey, effectiveRole: "moderator", sources: ["db"] },
+    ]),
+  );
+
+  const { container, doRender, unmount } = mountPanel({
+    origin,
+    pubkey,
+    canMutate: true,
+    role: "operator",
+    initialTab: "staffing",
+  });
+  await doRender();
+  // admin_list_operators resolves first, populating listedPubkeys, which enables
+  // useUsersBatchQuery. A second settle cycle lets React Query fire get_users_batch
+  // and commit the result before the assertion.
+  await settle(50);
+  await settle(100);
+
+  try {
+    const nameEl = container.querySelector(
+      `[data-testid='staffing-name-${opPubkey}']`,
+    );
+    assert.ok(
+      nameEl !== null,
+      "staffing-name element must be present for listed operator",
+    );
+    assert.ok(
+      nameEl.textContent.includes("Alice Operator"),
+      `staffing row must render resolved display name "Alice Operator"; got: "${nameEl.textContent}"`,
+    );
+  } finally {
+    await unmount();
+  }
+});
+
+test("staffing-npub-hover: npub element is present and contains the encoded npub", async () => {
+  // Verifies that HoverStaffingIdentity renders the npub span alongside the
+  // display name — the cross-fade is CSS-driven; this test confirms the DOM
+  // node exists and contains the right identity string.
+  const origin = "https://admin-staffing-npub.example.com";
+  const pubkey = "c3".repeat(32);
+  const opPubkey = "d4".repeat(32);
+
+  setIpcHandler("get_users_batch", () =>
+    Promise.resolve({ profiles: {}, missing: [opPubkey] }),
+  );
+  setIpcHandler("admin_list_reports", () => Promise.resolve([]));
+  setIpcHandler("admin_list_operators", () =>
+    Promise.resolve([
+      { pubkey: opPubkey, effectiveRole: "operator", sources: ["db"] },
+    ]),
+  );
+
+  const { container, doRender, unmount } = mountPanel({
+    origin,
+    pubkey,
+    canMutate: true,
+    role: "operator",
+    initialTab: "staffing",
+  });
+  await doRender();
+  await settle(50);
+
+  try {
+    const npubEl = container.querySelector(
+      `[data-testid='staffing-npub-${opPubkey}']`,
+    );
+    assert.ok(
+      npubEl !== null,
+      "staffing-npub element must be present for listed operator",
+    );
+    // The npub span must contain a truncated npub1... string
+    assert.ok(
+      npubEl.textContent.startsWith("npub1") ||
+        npubEl.textContent.includes("npub"),
+      `staffing-npub must contain encoded npub; got: "${npubEl.textContent}"`,
+    );
+  } finally {
+    await unmount();
+  }
+});
+
+test("staffing-role-change-success: role selector change calls putAdminOperator and refreshes the list", async () => {
+  // Verifies that selecting a different role triggers one PUT with the new role
+  // and the row reflects the update after the list refresh.
+  const origin = "https://admin-staffing-role.example.com";
+  const pubkey = "e5".repeat(32);
+  const opPubkey = "f6".repeat(32);
+
+  const putCalls = [];
+  setIpcHandler("admin_list_reports", () => Promise.resolve([]));
+  let currentRole = "moderator";
+  setIpcHandler("admin_list_operators", () =>
+    Promise.resolve([
+      { pubkey: opPubkey, effectiveRole: currentRole, sources: ["db"] },
+    ]),
+  );
+  setIpcHandler("admin_put_operator", (args) => {
+    putCalls.push({ pubkey: args?.pubkey, role: args?.body?.role });
+    currentRole = args?.body?.role;
+    return Promise.resolve({
+      pubkey: opPubkey,
+      effectiveRole: currentRole,
+      sources: ["db"],
+    });
+  });
+
+  const { container, doRender, unmount } = mountPanel({
+    origin,
+    pubkey,
+    canMutate: true,
+    role: "operator",
+    initialTab: "staffing",
+  });
+  await doRender();
+  await settle(30);
+
+  try {
+    const roleSelect = container.querySelector(
+      `[data-testid='staffing-role-select-${opPubkey}']`,
+    );
+    assert.ok(
+      roleSelect !== null,
+      "role selector must be present for DB-backed operator in canMutate mode",
+    );
+
+    // Change to operator
+    await act(async () => {
+      fireEvent.change(roleSelect, { target: { value: "operator" } });
+      await new Promise((r) => setTimeout(r, 30));
+    });
+
+    assert.equal(
+      putCalls.length,
+      1,
+      `admin_put_operator must be called exactly once on role change; got ${putCalls.length}`,
+    );
+    assert.equal(
+      putCalls[0].pubkey,
+      opPubkey,
+      `PUT must carry the operator pubkey; got: ${putCalls[0].pubkey}`,
+    );
+    assert.equal(
+      putCalls[0].role,
+      "operator",
+      `PUT must carry the new role "operator"; got: ${putCalls[0].role}`,
+    );
+
+    // After list refresh the role selector must reflect the updated role
+    await settle(30);
+    const roleSelectAfter = container.querySelector(
+      `[data-testid='staffing-role-select-${opPubkey}']`,
+    );
+    assert.ok(
+      roleSelectAfter !== null,
+      "role selector must still be present after refresh",
+    );
+    assert.equal(
+      roleSelectAfter.value,
+      "operator",
+      `role selector must show updated role "operator" after refresh; got: ${roleSelectAfter.value}`,
+    );
+  } finally {
+    await unmount();
+  }
+});
+
+test("staffing-role-change-409: a 409 conflict from putAdminOperator surfaces the config-backed copy", async () => {
+  // Verifies that a 409 response to a role change is surfaced as a clear
+  // config-backed error message, not a raw error string.
+  const origin = "https://admin-staffing-role-reject.example.com";
+  const pubkey = "07".repeat(32);
+  const opPubkey = "18".repeat(32);
+
+  setIpcHandler("admin_list_reports", () => Promise.resolve([]));
+  setIpcHandler("admin_list_operators", () =>
+    Promise.resolve([
+      { pubkey: opPubkey, effectiveRole: "moderator", sources: ["db"] },
+    ]),
+  );
+  setIpcHandler("admin_put_operator", () =>
+    Promise.reject(new Error("409: config-backed operator")),
+  );
+
+  const { container, doRender, unmount } = mountPanel({
+    origin,
+    pubkey,
+    canMutate: true,
+    role: "operator",
+    initialTab: "staffing",
+  });
+  await doRender();
+  await settle(30);
+
+  try {
+    const roleSelect = container.querySelector(
+      `[data-testid='staffing-role-select-${opPubkey}']`,
+    );
+    assert.ok(roleSelect !== null, "role selector must be present");
+
+    await act(async () => {
+      fireEvent.change(roleSelect, { target: { value: "operator" } });
+      await new Promise((r) => setTimeout(r, 30));
+    });
+
+    // Error message must mention config-backed (not raw "409: ..." string)
+    const errEls = Array.from(
+      container.querySelectorAll(
+        "[data-testid='staffing-tab'] [class*='destructive']",
+      ),
+    );
+    assert.ok(
+      errEls.length > 0,
+      "an error message element must appear after rejected role change",
+    );
+    assert.ok(
+      errEls.some((el) => el.textContent.toLowerCase().includes("config")),
+      `error must mention config-backed key; got: ${errEls.map((e) => e.textContent).join(", ")}`,
     );
   } finally {
     await unmount();

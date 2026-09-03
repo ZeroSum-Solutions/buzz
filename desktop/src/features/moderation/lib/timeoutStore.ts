@@ -109,10 +109,9 @@ function currentState(state: TimeoutState, nowMs: number): TimeoutState {
  * proactively cleared via an effect so all subscribers see INACTIVE on the
  * next render without waiting for a successful send to call clearTimeoutState.
  *
- * When the timeout has an unknown (null) expiry — the relay gave no parseable
- * timestamp — a 30-second tick is started anyway so the UI can at least
- * re-attempt sending after a short window; the relay's own enforcement is
- * authoritative, so an accepted send will clear the block.
+ * When the timeout has an unknown (null) expiry the interval is not started —
+ * there is no timestamp to compare against, so ticking would never change
+ * derived state. The block remains until a successful send clears it.
  */
 export function useTimeoutState(): TimeoutState {
   const [nowMs, setNowMs] = React.useState(() => Date.now());
@@ -132,21 +131,20 @@ export function useTimeoutState(): TimeoutState {
     }
   }, [derived.active, state.active]);
 
+  // Tick every second only when a known expiry is in play — this drives the
+  // countdown display and the INACTIVE transition exactly at the expiry instant.
   React.useEffect(() => {
-    if (!state.active) {
+    if (!state.active || state.expiresAtMs === null) {
       return;
     }
     setNowMs(Date.now());
-    // Tick every second regardless of whether expiry is known — for a null
-    // expiry this lets the user retry sending (and clear on success) after a
-    // short window rather than waiting for a hard reload.
     const id = window.setInterval(() => {
       setNowMs(Date.now());
     }, 1000);
     return () => {
       window.clearInterval(id);
     };
-  }, [state.active]);
+  }, [state.active, state.expiresAtMs]);
 
   return derived;
 }
