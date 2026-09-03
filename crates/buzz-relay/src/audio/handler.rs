@@ -3195,7 +3195,7 @@ mod tests {
         let state = audio_test_state().await;
 
         // Use a distinct community UUID to avoid hook interference.
-        let community_uuid = uuid::Uuid::from_u128(0x0000_0002_F1_0000_0000_0000_0000_0000);
+        let community_uuid = uuid::Uuid::from_u128(0x0000_0000_02F1_0000_0000_0000_0000_0000);
         let tenant = buzz_core::tenant::TenantContext::resolved(
             buzz_core::tenant::CommunityId::from_uuid(community_uuid),
             "test.local".to_string(),
