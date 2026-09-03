@@ -222,6 +222,29 @@ buzzPushGroupGatewayMigrationsByDelegationAuthority(
   return groups;
 }
 
+@visibleForTesting
+Future<bool> processBuzzPushGatewayMigrationGroups<T>({
+  required Iterable<T> groups,
+  required Future<bool> Function(T group) process,
+  Object? initialError,
+  StackTrace? initialStack,
+}) async {
+  Object? firstError = initialError;
+  StackTrace? firstStack = initialStack;
+  for (final group in groups) {
+    try {
+      if (await process(group)) return true;
+    } catch (error, stack) {
+      firstError ??= error;
+      firstStack ??= stack;
+    }
+  }
+  if (firstError != null) {
+    Error.throwWithStackTrace(firstError, firstStack!);
+  }
+  return false;
+}
+
 /// Owns the APNs-registration side effect so migration-triggered registration
 /// is exercised through the same production boundary as active-community
 /// registration.
@@ -512,28 +535,36 @@ class BuzzPushBootstrap extends HookConsumerWidget {
                 buzzPushGroupGatewayMigrationsByDelegationAuthority(
                   resolution.targets,
                 );
-            for (final authorityTargets in authorityGroups.values) {
-              final queuedOrigins = authorityTargets
-                  .map((target) => target.relayOrigin)
-                  .where(replacementRelayOrigins.contains)
-                  .where(
-                    (origin) => !resolution.blockedOrigins.contains(origin),
-                  )
-                  .toSet();
-              for (var index = 0; index < authorityTargets.length; index += 1) {
-                final target = authorityTargets[index];
-                await _publishCommunityReplacement(
-                  ref,
-                  target.community,
-                  communities,
-                  targetGatewayOrigin,
-                  descriptor: target.descriptor,
-                  forceDelegationRenewal:
-                      queuedOrigins.isNotEmpty && index == 0,
-                );
-              }
-              if (queuedOrigins.isNotEmpty) {
-                if (!attemptIsCurrent()) return;
+            final stopped = await processBuzzPushGatewayMigrationGroups(
+              groups: authorityGroups.values,
+              initialError: resolution.firstError,
+              initialStack: resolution.firstStack,
+              process: (authorityTargets) async {
+                final queuedOrigins = authorityTargets
+                    .map((target) => target.relayOrigin)
+                    .where(replacementRelayOrigins.contains)
+                    .where(
+                      (origin) => !resolution.blockedOrigins.contains(origin),
+                    )
+                    .toSet();
+                for (
+                  var index = 0;
+                  index < authorityTargets.length;
+                  index += 1
+                ) {
+                  final target = authorityTargets[index];
+                  await _publishCommunityReplacement(
+                    ref,
+                    target.community,
+                    communities,
+                    targetGatewayOrigin,
+                    descriptor: target.descriptor,
+                    forceDelegationRenewal:
+                        queuedOrigins.isNotEmpty && index == 0,
+                  );
+                }
+                if (queuedOrigins.isEmpty) return false;
+                if (!attemptIsCurrent()) return true;
                 await checkpointBuzzPushGatewayReplacements(
                   queuedOrigins,
                   replacementGeneration,
@@ -542,10 +573,10 @@ class BuzzPushBootstrap extends HookConsumerWidget {
                 // The checkpoint atomically removes every origin whose grants
                 // share this delegation authority. Let the resulting rebuild
                 // own the next authority so attempts cannot overlap.
-                return;
-              }
-            }
-            resolution.throwIfFailed();
+                return true;
+              },
+            );
+            if (stopped) return;
             if (!attemptIsCurrent()) return;
             await completeBuzzPushGatewayMigration();
             gatewayMigrationFailures.value = 0;

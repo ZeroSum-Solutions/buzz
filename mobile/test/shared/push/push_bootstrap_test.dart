@@ -333,6 +333,27 @@ void main() {
     expect(resolution.throwIfFailed, throwsStateError);
   });
 
+  test(
+    'migration processes later authority groups before propagating',
+    () async {
+      final processed = <String>[];
+
+      await expectLater(
+        processBuzzPushGatewayMigrationGroups(
+          groups: const ['unavailable', 'reachable'],
+          process: (group) async {
+            processed.add(group);
+            if (group == 'unavailable') throw StateError('rejected');
+            return false;
+          },
+        ),
+        throwsStateError,
+      );
+
+      expect(processed, ['unavailable', 'reachable']);
+    },
+  );
+
   test('pending opt-out tombstone keeps active push lifecycle disabled', () {
     final subscription = BuzzPushSubscription(
       filter: BuzzPushFilter(kinds: const [9], pTags: [_hex('a')]),
