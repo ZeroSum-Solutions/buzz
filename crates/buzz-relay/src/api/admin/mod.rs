@@ -2225,6 +2225,18 @@ mod postgres_tests {
             .await
             .expect("insert ban fixture");
 
+        // Also give the same target an active timeout in the same community.
+        // Restriction independence: unban must NOT clear the timeout.
+        db.timeout_community_member(
+            community,
+            &target_pubkey,
+            &actor_pubkey,
+            chrono::Utc::now() + chrono::Duration::hours(2),
+            Some("test-timeout"),
+        )
+        .await
+        .expect("insert timeout fixture alongside ban");
+
         // Tenant isolation: ban a different pubkey in a *different* community so
         // we can verify the DELETE only clears the intended restriction.
         let other_community_uuid = Uuid::new_v4();
@@ -2265,8 +2277,18 @@ mod postgres_tests {
             .await
             .expect("read ban after unban");
         assert!(
-            ban.map_or(true, |r| !r.banned),
+            ban.as_ref().map_or(true, |r| !r.banned),
             "ban must be cleared after successful unban"
+        );
+
+        // Timeout must survive: unban must not clear the co-existing timeout.
+        // A regression that widened the unban UPDATE to also clear muted_until
+        // would fail this assertion.
+        assert!(
+            ban.as_ref()
+                .and_then(|r| r.muted_until)
+                .map_or(false, |t| t > chrono::Utc::now()),
+            "unban must not clear the co-existing active timeout"
         );
 
         // Audit row must exist in the target community.
@@ -2331,6 +2353,30 @@ mod postgres_tests {
         .await
         .expect("insert timeout fixture");
 
+        // Also give the same target an active ban in the same community.
+        // Restriction independence: untimeout must NOT clear the ban.
+        db.ban_community_member(community, &target_pubkey, &actor_pubkey, None, None)
+            .await
+            .expect("insert ban fixture alongside timeout");
+
+        // Cross-community isolation: give the same target a timeout in a second
+        // community. The untimeout must NOT clear it (binds community_id = $1).
+        let other_community_uuid = Uuid::new_v4();
+        let other_host = format!("untimeout-other-{}.example", other_community_uuid.simple());
+        db.ensure_configured_community(&other_host)
+            .await
+            .expect("create other community");
+        let other_community = buzz_core::CommunityId::from_uuid(other_community_uuid);
+        db.timeout_community_member(
+            other_community,
+            &target_pubkey,
+            &actor_pubkey,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            Some("test reason other community"),
+        )
+        .await
+        .expect("insert timeout fixture for other community");
+
         let state = nip98_state_with_real_pool(pool.clone()).await;
         let target_hex = hex::encode(&target_pubkey);
         let path = format!("/members/{target_hex}/timeout?communityId={community_uuid}");
@@ -2353,16 +2399,39 @@ mod postgres_tests {
             "untimeout of an active timeout must return 204"
         );
 
-        // Timeout must be cleared.
-        let ban = db
+        // Timeout must be cleared in the target community.
+        let restriction = db
             .get_community_ban(community, &target_pubkey)
             .await
             .expect("read ban after untimeout");
         assert!(
-            ban.map_or(true, |r| r
+            restriction.as_ref().map_or(true, |r| r
                 .muted_until
                 .map_or(true, |t| t <= chrono::Utc::now())),
             "timeout must be cleared after successful untimeout"
+        );
+
+        // Ban must survive: untimeout must not clear the co-existing ban.
+        // A regression that widened the untimeout UPDATE to also clear banned
+        // would fail this assertion.
+        assert!(
+            restriction.as_ref().map_or(false, |r| r.banned),
+            "untimeout must not clear the co-existing active ban"
+        );
+
+        // Other community's timeout must be untouched (community_id predicate).
+        // A regression that dropped the community_id = $1 WHERE clause would
+        // clear this timeout and fail this assertion.
+        let other_restriction = db
+            .get_community_ban(other_community, &target_pubkey)
+            .await
+            .expect("read other community restriction");
+        assert!(
+            other_restriction
+                .as_ref()
+                .and_then(|r| r.muted_until)
+                .map_or(false, |t| t > chrono::Utc::now()),
+            "untimeout must not affect the same pubkey's timeout in another community"
         );
 
         // Audit row must exist.
