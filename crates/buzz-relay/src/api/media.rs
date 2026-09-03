@@ -389,7 +389,7 @@ fn serving_lease_lost(error: anyhow::Error) -> MediaError {
 /// Returns a [`BlobDescriptor`] JSON on success.
 // TODO(v2): Add persistent per-pubkey storage quotas. Admission limits below
 // bound active parser/storage work, but they do not cap durable bytes stored.
-pub async fn upload_blob(
+pub(crate) async fn upload_blob(
     State(state): State<Arc<AppState>>,
     auth: AuthenticatedUpload,
     headers: HeaderMap,
@@ -722,7 +722,7 @@ const MAX_RANGE_CHUNK: u64 = 16 * 1024 * 1024;
 ///   - Chunk capped at 16 MiB; clients request additional ranges for the rest
 ///
 /// All responses include `Accept-Ranges: bytes` so video players know seeking is supported.
-pub async fn get_blob(
+pub(crate) async fn get_blob(
     State(state): State<Arc<AppState>>,
     Path(sha256_ext): Path<String>,
     req_headers: HeaderMap,
@@ -989,7 +989,7 @@ fn parse_byte_range(range: &str, total: u64) -> Option<(u64, u64)> {
 /// Content-type is derived from the validated sidecar only — never from raw S3
 /// object metadata — to prevent MIME spoofing via tampered storage. If the sidecar
 /// is missing, we return 404 rather than fall back to untrusted metadata.
-pub async fn head_blob(
+pub(crate) async fn head_blob(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(sha256_ext): Path<String>,

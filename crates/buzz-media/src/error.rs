@@ -330,11 +330,12 @@ mod tests {
             MediaError::ServerMismatch,
             MediaError::MissingTag("server"),
         ] {
+            let label = format!("{error:?}");
             let resp = error.into_response();
             assert_eq!(
                 resp.status(),
                 StatusCode::UNAUTHORIZED,
-                "Permissive: expected 401 for {error:?}"
+                "Permissive: expected 401 for {label}"
             );
             let ct = resp
                 .headers()
@@ -343,7 +344,7 @@ mod tests {
                 .unwrap_or("");
             assert!(
                 ct.contains("application/json"),
-                "expected JSON CT for {error:?}, got: {ct}"
+                "expected JSON CT for {label}, got: {ct}"
             );
         }
     }
