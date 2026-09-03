@@ -1734,55 +1734,6 @@ impl Db {
             }
         }
         Ok(result)
-/// Atomically insert a kind:7 reaction event and its reaction row.
-///
-/// Ordering is load-bearing: resolve target, upsert/reactivate the reaction row,
-/// check `rows_affected`, then insert the kind:7 event. Active duplicates return
-/// before event insertion so duplicate reactions never store a duplicate kind:7.
-#[allow(clippy::too_many_arguments)]
-pub async fn insert_reaction_event_with_thread_metadata(
-    pool: &PgPool,
-    community_id: CommunityId,
-    reaction_event: &Event,
-    channel_id: Option<Uuid>,
-    thread_meta: Option<ThreadMetadataParams<'_>>,
-    target_event_id: &[u8],
-    actor_pubkey: &[u8],
-    emoji: &str,
-) -> Result<ReactionEventInsertOutcome> {
-    let mut tx = pool.begin().await?;
-
-    let target_row = sqlx::query(
-        "SELECT created_at FROM events \
-         WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL \
-         ORDER BY created_at DESC LIMIT 1",
-    )
-    .bind(community_id.as_uuid())
-    .bind(target_event_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    let Some(target_row) = target_row else {
-        tx.rollback().await?;
-        return Ok(ReactionEventInsertOutcome::TargetMissing);
-    };
-    let target_created_at: DateTime<Utc> = target_row.get("created_at");
-
-    // Preserve add_reaction's exact new / re-activate / active-duplicate semantics.
-    let reaction_inserted = crate::reaction::add_reaction_tx(
-        &mut tx,
-        community_id,
-        target_event_id,
-        target_created_at,
-        actor_pubkey,
-        emoji,
-        Some(reaction_event.id.as_bytes()),
-    )
-    .await?;
-
-    if !reaction_inserted {
-        tx.rollback().await?;
-        return Ok(ReactionEventInsertOutcome::Duplicate);
     }
 
     /// Queries events matching the given filter parameters.
