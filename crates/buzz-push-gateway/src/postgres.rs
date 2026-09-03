@@ -682,6 +682,30 @@ mod postgres_tests {
             runtime.ready().await.is_ok(),
             "migrated least-privilege runtime is ready"
         );
+        let legacy_uniqueness_constraints: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_constraint
+             WHERE conrelid='push_gateway_installations'::regclass
+               AND conname IN (
+                 'push_gateway_installations_app_attest_key_id_key',
+                 'push_gateway_installations_app_profile_token_fingerprint_key')",
+        )
+        .fetch_one(&migration_pool)
+        .await
+        .expect("inspect retired unconditional uniqueness constraints");
+        assert_eq!(legacy_uniqueness_constraints, 0);
+        let active_uniqueness_indexes: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_indexes
+             WHERE schemaname=current_schema()
+               AND tablename='push_gateway_installations'
+               AND indexname IN (
+                 'push_gateway_installations_active_app_attest_key',
+                 'push_gateway_installations_active_profile_token')
+               AND indexdef LIKE '%WHERE (revoked_at IS NULL)%'",
+        )
+        .fetch_one(&migration_pool)
+        .await
+        .expect("inspect active-only uniqueness indexes");
+        assert_eq!(active_uniqueness_indexes, 2);
         assert!(
             sqlx::query("CREATE TABLE forbidden_runtime_ddl(id INT)")
                 .execute(&runtime_pool)
