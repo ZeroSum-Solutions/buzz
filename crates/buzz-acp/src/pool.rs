@@ -31,8 +31,8 @@ use uuid::Uuid;
 
 use crate::acp::{
     extract_model_config_options, extract_model_state, extract_thought_level_config_id,
-    model_in_catalog, resolve_model_switch_method, AcpClient, AcpError, EnvVar, McpServer,
-    ModelSwitchMethod, StopReason, SystemPromptTransport,
+    model_in_catalog, resolve_model_switch_method, AcpClient, AcpError, ModelSwitchMethod,
+    StopReason, SystemPromptTransport,
 };
 use crate::config::{compose_scoped_session_title, DedupMode, PermissionMode};
 use crate::observer;
@@ -43,6 +43,7 @@ use crate::queue::{
 };
 use crate::relay::{ChannelInfo, RestClient};
 use crate::scope::SessionScope;
+use crate::{McpServerSet, SessionOrigin};
 
 /// Window within which agent activity before a hard-cap death qualifies
 /// the turn as "recently active" (eligible for requeue instead of dead-letter).
@@ -756,7 +757,11 @@ impl ChannelInfoResolver {
 }
 
 pub struct PromptContext {
-    pub mcp_servers: Vec<McpServer>,
+    /// The MCP servers this harness offers, built once from [`crate::Config`].
+    /// Held as an [`McpServerSet`] rather than a bare `Vec` so the only way to
+    /// fill it is the real parser, and the only way to read it back is
+    /// `for_session`, which applies the per-session git origin.
+    pub mcp_servers: McpServerSet,
     pub initial_message: Option<String>,
     pub idle_timeout: Duration,
     pub max_turn_duration: Duration,
@@ -1299,12 +1304,11 @@ async fn create_session_and_apply_model(
             channel.scope.and_then(SessionScope::root_event_id),
         )
     });
-    let mcp_servers = mcp_servers_with_git_origin(
-        &ctx.mcp_servers,
-        channel.scope.map(SessionScope::channel_id),
-        channel.channel_type,
-        ctx.session_title.as_deref(),
-    );
+    let mcp_servers = ctx.mcp_servers.for_session(SessionOrigin {
+        channel_id: channel.scope.map(SessionScope::channel_id),
+        channel_type: channel.channel_type,
+        agent_name: ctx.session_title.as_deref(),
+    });
 
     let resp = agent
         .acp
@@ -1526,34 +1530,6 @@ async fn create_session_and_apply_model(
     }
 
     Ok(resp.session_id)
-}
-
-fn mcp_servers_with_git_origin(
-    servers: &[McpServer],
-    channel_id: Option<Uuid>,
-    channel_type: Option<&str>,
-    agent_name: Option<&str>,
-) -> Vec<McpServer> {
-    let mut servers = servers.to_vec();
-    let origin = match (channel_id, channel_type) {
-        (Some(channel_id), Some("stream")) => Some(EnvVar {
-            name: "BUZZ_GIT_ORIGIN_CHANNEL_ID".into(),
-            value: channel_id.to_string(),
-        }),
-        (Some(_), _) => agent_name
-            .filter(|name| !name.trim().is_empty())
-            .map(|name| EnvVar {
-                name: "BUZZ_GIT_ORIGIN_AGENT_NAME".into(),
-                value: name.trim().to_string(),
-            }),
-        (None, _) => None,
-    };
-    if let Some(origin) = origin {
-        for server in &mut servers {
-            server.env.push(origin.clone());
-        }
-    }
-    servers
 }
 
 /// Outcome of a live model-switch RPC returned by [`apply_model_switch`].
@@ -5145,6 +5121,8 @@ mod tests {
         SessionScope::Conversation { channel_id }
     }
 
+    use crate::acp::McpServer;
+
     fn test_mcp_server() -> McpServer {
         McpServer {
             name: "dev".into(),
@@ -5200,39 +5178,86 @@ mod tests {
         ));
     }
 
+    /// An untrusted extra server, exactly as `build_mcp_servers` emits one for
+    /// a `BUZZ_ACP_EXTRA_MCP_COMMANDS` entry.
+    fn untrusted_mcp_server() -> McpServer {
+        McpServer {
+            name: "extra".into(),
+            command: "third-party-mcp".into(),
+            args: vec![],
+            env: vec![],
+            trusted: false,
+        }
+    }
+
+    fn has_env(server: &McpServer, name: &str) -> bool {
+        server.env.iter().any(|entry| entry.name == name)
+    }
+
     #[test]
     fn public_session_forwards_channel_origin_to_mcp() {
         let channel_id = Uuid::new_v4();
-        let servers = mcp_servers_with_git_origin(
-            &[test_mcp_server()],
-            Some(channel_id),
-            Some("stream"),
-            None,
-        );
+        // A mixed array: the guard is only falsifiable when an untrusted
+        // server is present to be excluded.
+        let servers = McpServerSet::from_servers(vec![test_mcp_server(), untrusted_mcp_server()])
+            .for_session(SessionOrigin {
+                channel_id: Some(channel_id),
+                channel_type: Some("stream"),
+                agent_name: None,
+            });
         assert!(servers[0].env.iter().any(|entry| {
             entry.name == "BUZZ_GIT_ORIGIN_CHANNEL_ID" && entry.value == channel_id.to_string()
         }));
-        assert!(!servers[0]
-            .env
-            .iter()
-            .any(|entry| entry.name == "BUZZ_GIT_ORIGIN_AGENT_NAME"));
+        assert!(!has_env(&servers[0], "BUZZ_GIT_ORIGIN_AGENT_NAME"));
+        assert!(
+            !has_env(&servers[1], "BUZZ_GIT_ORIGIN_CHANNEL_ID"),
+            "an untrusted server was handed the channel UUID: {:?}",
+            servers[1].env
+        );
     }
 
     #[test]
     fn private_session_forwards_agent_name_without_channel_id() {
-        let servers = mcp_servers_with_git_origin(
-            &[test_mcp_server()],
-            Some(Uuid::new_v4()),
-            Some("dm"),
-            Some("Builder"),
-        );
+        let servers = McpServerSet::from_servers(vec![test_mcp_server(), untrusted_mcp_server()])
+            .for_session(SessionOrigin {
+                channel_id: Some(Uuid::new_v4()),
+                channel_type: Some("dm"),
+                agent_name: Some("Builder"),
+            });
         assert!(servers[0].env.iter().any(|entry| {
             entry.name == "BUZZ_GIT_ORIGIN_AGENT_NAME" && entry.value == "Builder"
         }));
-        assert!(!servers[0]
-            .env
-            .iter()
-            .any(|entry| entry.name == "BUZZ_GIT_ORIGIN_CHANNEL_ID"));
+        assert!(!has_env(&servers[0], "BUZZ_GIT_ORIGIN_CHANNEL_ID"));
+        assert!(
+            !has_env(&servers[1], "BUZZ_GIT_ORIGIN_AGENT_NAME"),
+            "an untrusted server was handed the agent name: {:?}",
+            servers[1].env
+        );
+    }
+
+    #[test]
+    fn untrusted_servers_receive_no_origin_on_any_channel_type() {
+        // Both origin shapes and the no-channel case, so no branch can hand a
+        // third-party process Buzz-native context.
+        for (channel_id, channel_type, agent_name) in [
+            (Some(Uuid::new_v4()), Some("stream"), Some("Builder")),
+            (Some(Uuid::new_v4()), Some("dm"), Some("Builder")),
+            (Some(Uuid::new_v4()), None, Some("Builder")),
+            (None, Some("stream"), Some("Builder")),
+        ] {
+            let servers = McpServerSet::from_servers(vec![untrusted_mcp_server()]).for_session(
+                SessionOrigin {
+                    channel_id,
+                    channel_type,
+                    agent_name,
+                },
+            );
+            assert!(
+                servers[0].env.is_empty(),
+                "untrusted server gained env for ({channel_id:?}, {channel_type:?}): {:?}",
+                servers[0].env
+            );
+        }
     }
 
     // These pin the initial_message dispatch path (run_prompt_task, ~line 855):
@@ -8660,7 +8685,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     ) -> PromptContext {
         use crate::relay::RestClient;
         PromptContext {
-            mcp_servers: vec![],
+            mcp_servers: McpServerSet::from_servers(vec![]),
             initial_message: None,
             idle_timeout: Duration::from_secs(60),
             max_turn_duration: Duration::from_secs(120),

@@ -2772,7 +2772,7 @@ async fn tokio_main() -> Result<()> {
     let base_prompt_content = config.base_prompt_content.take();
     let cwd = current_working_directory()?;
     let ctx = Arc::new(PromptContext {
-        mcp_servers: build_mcp_servers(&config)?,
+        mcp_servers: McpServerSet::from_config(&config)?,
         initial_message: config.initial_message.clone(),
         idle_timeout: Duration::from_secs(config.idle_timeout_secs),
         max_turn_duration: Duration::from_secs(config.max_turn_duration_secs),
@@ -5738,88 +5738,183 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
     Ok(())
 }
 
+/// Where a `session/new` request comes from, for the git-origin variable the
+/// trusted MCP servers receive.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SessionOrigin<'a> {
+    /// Channel the session is scoped to, when it has one.
+    pub channel_id: Option<uuid::Uuid>,
+    /// Channel type as the relay reports it (`"stream"`, `"dm"`, …).
+    pub channel_type: Option<&'a str>,
+    /// Sanitized agent name — the git origin outside stream channels.
+    pub agent_name: Option<&'a str>,
+}
+
+/// The MCP servers a harness offers its agent.
+///
+/// This type is the only seam between the `BUZZ_ACP_EXTRA_MCP_COMMANDS` parser
+/// and the `session/new` wire: `PromptContext::mcp_servers` can only be filled
+/// by [`McpServerSet::from_config`], and the pool can only read it back through
+/// `for_session`, which adds the per-session git-origin variable. A caller that
+/// drives those two steps — notably `buzz-agent`'s integration tests, through
+/// [`mcp_servers_wire_json`] — therefore exercises the same bytes the harness
+/// sends, with no second construction path to drift from.
+#[derive(Debug, Clone)]
+pub struct McpServerSet(Vec<McpServer>);
+
+impl McpServerSet {
+    /// Build the set once, at startup, from the harness configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::ConfigFile`] when an entry of
+    /// `BUZZ_ACP_EXTRA_MCP_COMMANDS` is malformed or names no command.
+    pub fn from_config(config: &Config) -> Result<Self, ConfigError> {
+        Ok(Self(build_mcp_servers(config)?))
+    }
+
+    /// The array one `session/new` carries: the configured servers plus the
+    /// git-origin variable for `origin`.
+    ///
+    /// The origin names a Buzz channel or agent, so it reaches only servers the
+    /// harness marked `trusted`. An operator-supplied extra server is a
+    /// third-party process and receives no Buzz-native context — not even the
+    /// channel it happens to be running in.
+    pub(crate) fn for_session(&self, origin: SessionOrigin<'_>) -> Vec<McpServer> {
+        let mut servers = self.0.clone();
+        let var = match (origin.channel_id, origin.channel_type) {
+            (Some(channel_id), Some("stream")) => Some(EnvVar {
+                name: "BUZZ_GIT_ORIGIN_CHANNEL_ID".into(),
+                value: channel_id.to_string(),
+            }),
+            (Some(_), _) => origin
+                .agent_name
+                .filter(|name| !name.trim().is_empty())
+                .map(|name| EnvVar {
+                    name: "BUZZ_GIT_ORIGIN_AGENT_NAME".into(),
+                    value: name.trim().to_string(),
+                }),
+            (None, _) => None,
+        };
+        if let Some(var) = var {
+            for server in servers.iter_mut().filter(|s| s.trusted) {
+                server.env.push(var.clone());
+            }
+        }
+        servers
+    }
+
+    /// Test-only constructor over a fixed server list. Production code goes
+    /// through [`Self::from_config`], so the parser can never be bypassed.
+    #[cfg(test)]
+    pub(crate) fn from_servers(servers: Vec<McpServer>) -> Self {
+        Self(servers)
+    }
+}
+
 /// The `mcpServers` array a `session/new` request carries, serialized exactly
 /// as the harness puts it on the wire.
 ///
-/// Wraps the builder the harness itself uses, so a caller — notably
-/// `buzz-agent`'s integration tests — can drive the real
-/// `BUZZ_ACP_EXTRA_MCP_COMMANDS` parser end to end instead of hand-writing a
-/// copy of the wire shape that could drift away from it.
+/// Runs the whole production path — [`McpServerSet::from_config`] then the
+/// per-session git-origin step — so a caller, notably `buzz-agent`'s
+/// integration tests, can drive the real `BUZZ_ACP_EXTRA_MCP_COMMANDS` parser
+/// end to end instead of hand-writing a copy of the wire shape.
 ///
 /// # Errors
 ///
 /// Returns [`ConfigError::ConfigFile`] when an entry of
-/// `BUZZ_ACP_EXTRA_MCP_COMMANDS` has malformed shell quoting, or when the
-/// resulting array cannot be serialized.
-pub fn mcp_servers_wire_json(config: &Config) -> Result<serde_json::Value, ConfigError> {
-    let servers = build_mcp_servers(config)?;
+/// `BUZZ_ACP_EXTRA_MCP_COMMANDS` is malformed, or when the resulting array
+/// cannot be serialized.
+pub fn mcp_servers_wire_json(
+    config: &Config,
+    origin: SessionOrigin<'_>,
+) -> Result<serde_json::Value, ConfigError> {
+    let servers = McpServerSet::from_config(config)?.for_session(origin);
     serde_json::to_value(&servers)
         .map_err(|e| ConfigError::ConfigFile(format!("failed to serialize mcpServers: {e}")))
 }
 
-/// Maximum length, in bytes, of an MCP server name on the `session/new` wire.
+/// `buzz-agent`'s cap on a *qualified* tool name (`<server>__<tool>`), mirrored
+/// from `MAX_QNAME_LEN` in its `mcp` module. Passing it fails the whole
+/// session, not just the offending server.
+const MAX_MCP_QNAME_LEN: usize = 64;
+
+/// Bytes reserved inside [`MAX_MCP_QNAME_LEN`] for the `__` separator and the
+/// bare tool name. Wider than any tool `buzz-dev-mcp` advertises, so a name
+/// generated here can carry the tools it was generated for.
+const MCP_TOOL_NAME_RESERVE: usize = 32;
+
+/// Maximum length, in bytes, of a generated MCP server name.
 ///
-/// Mirrors `MAX_NAME_LEN` in `buzz-agent`'s `mcp` module: a longer name is
-/// rejected by `McpRegistry::spawn_all`, which fails the entire session rather
-/// than just the offending server.
-const MAX_MCP_NAME_LEN: usize = 128;
+/// The binding constraint is not `buzz-agent`'s 128-byte `MAX_NAME_LEN` on the
+/// name alone. `McpRegistry` registers every tool as `<server>__<tool>` and
+/// rejects the entire session once that qualified name passes
+/// [`MAX_MCP_QNAME_LEN`], so a name cut to 128 bytes is still fatal the moment
+/// the server advertises anything. Budgeting against the qualified name is what
+/// makes a generated name usable.
+const MAX_MCP_NAME_LEN: usize = MAX_MCP_QNAME_LEN - MCP_TOOL_NAME_RESERVE;
 
 fn build_mcp_servers(config: &Config) -> Result<Vec<McpServer>, ConfigError> {
-    if config.mcp_command.is_empty() {
-        return Ok(vec![]);
+    let mut servers: Vec<McpServer> = Vec::new();
+    // The primary server is optional: `BUZZ_ACP_MCP_COMMAND` defaults to empty
+    // and Desktop writes an empty string whenever the runtime has no MCP
+    // command. An extras-only configuration is legitimate and must still
+    // produce servers — returning an empty array here would hand the model no
+    // tools at all, silently, which is a failure reported as a valid result.
+    if !config.mcp_command.is_empty() {
+        servers.push(McpServer {
+            name: std::path::Path::new(&config.mcp_command)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("mcp")
+                .to_string(),
+            command: config.mcp_command.clone(),
+            args: vec![],
+            env: {
+                let mut env = vec![
+                    EnvVar {
+                        name: "BUZZ_RELAY_URL".into(),
+                        value: config.relay_url.clone(),
+                    },
+                    EnvVar {
+                        name: "BUZZ_PRIVATE_KEY".into(),
+                        // bech32 encoding of a valid secret key is infallible.
+                        // Panic here is correct: injecting a bogus secret would cause
+                        // delayed, hard-to-diagnose agent failures downstream.
+                        value: config
+                            .keys
+                            .secret_key()
+                            .to_bech32()
+                            .expect("secret key bech32 encoding should never fail"),
+                    },
+                ];
+                // Forward BUZZ_AUTH_TAG (NIP-OA owner attestation credential)
+                // so the MCP server can attach it to every signed event.
+                if let Ok(auth_tag) = std::env::var("BUZZ_AUTH_TAG") {
+                    if !auth_tag.is_empty() {
+                        env.push(EnvVar {
+                            name: "BUZZ_AUTH_TAG".into(),
+                            value: auth_tag,
+                        });
+                    }
+                }
+                // Forward the agent's display name so dev-mcp can use it as the git
+                // author name instead of the raw npub. Read from the process env
+                // rather than Config: this is a pass-through of a contract owned
+                // upstream, and absent simply means dev-mcp falls back to the npub.
+                if let Ok(display_name) = std::env::var("BUZZ_ACP_DISPLAY_NAME") {
+                    if !display_name.is_empty() {
+                        env.push(EnvVar {
+                            name: "BUZZ_ACP_DISPLAY_NAME".into(),
+                            value: display_name,
+                        });
+                    }
+                }
+                env
+            },
+            trusted: true,
+        });
     }
-    let mut servers = vec![McpServer {
-        name: std::path::Path::new(&config.mcp_command)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("mcp")
-            .to_string(),
-        command: config.mcp_command.clone(),
-        args: vec![],
-        env: {
-            let mut env = vec![
-                EnvVar {
-                    name: "BUZZ_RELAY_URL".into(),
-                    value: config.relay_url.clone(),
-                },
-                EnvVar {
-                    name: "BUZZ_PRIVATE_KEY".into(),
-                    // bech32 encoding of a valid secret key is infallible.
-                    // Panic here is correct: injecting a bogus secret would cause
-                    // delayed, hard-to-diagnose agent failures downstream.
-                    value: config
-                        .keys
-                        .secret_key()
-                        .to_bech32()
-                        .expect("secret key bech32 encoding should never fail"),
-                },
-            ];
-            // Forward BUZZ_AUTH_TAG (NIP-OA owner attestation credential)
-            // so the MCP server can attach it to every signed event.
-            if let Ok(auth_tag) = std::env::var("BUZZ_AUTH_TAG") {
-                if !auth_tag.is_empty() {
-                    env.push(EnvVar {
-                        name: "BUZZ_AUTH_TAG".into(),
-                        value: auth_tag,
-                    });
-                }
-            }
-            // Forward the agent's display name so dev-mcp can use it as the git
-            // author name instead of the raw npub. Read from the process env
-            // rather than Config: this is a pass-through of a contract owned
-            // upstream, and absent simply means dev-mcp falls back to the npub.
-            if let Ok(display_name) = std::env::var("BUZZ_ACP_DISPLAY_NAME") {
-                if !display_name.is_empty() {
-                    env.push(EnvVar {
-                        name: "BUZZ_ACP_DISPLAY_NAME".into(),
-                        value: display_name,
-                    });
-                }
-            }
-            env
-        },
-        trusted: true,
-    }];
 
     // Append extra MCP servers from BUZZ_ACP_EXTRA_MCP_COMMANDS.
     // Each entry is newline-separated and shell-split into command + args
@@ -5832,7 +5927,7 @@ fn build_mcp_servers(config: &Config) -> Result<Vec<McpServer>, ConfigError> {
     // Extra servers do not receive Buzz relay credentials or auth tags —
     // they are third-party tools, not Buzz-native MCP servers.
     let mut seen_names: std::collections::HashSet<String> =
-        std::collections::HashSet::from_iter([servers[0].name.clone()]);
+        servers.iter().map(|s| s.name.clone()).collect();
     for (idx, extra) in config.extra_mcp_commands.iter().enumerate() {
         let trimmed = extra.trim();
         if trimmed.is_empty() {
@@ -5864,9 +5959,20 @@ fn build_mcp_servers(config: &Config) -> Result<Vec<McpServer>, ConfigError> {
             }
             None => (None, trimmed.to_string()),
         };
+        // Fail closed on both shapes of unusable entry. A non-blank entry that
+        // shell-splits to nothing — `memory=`, a lone `#comment`, `"  "` after
+        // the `=` — is as broken as malformed quoting, and dropping it
+        // silently starts the harness with that server missing and nothing
+        // logged. Neither message echoes the entry: it may carry an API key.
         let parts = match shlex::split(&command_str) {
-            Some(p) if !p.is_empty() => p,
-            Some(_) => continue,
+            Some(p) if p.first().is_some_and(|command| !command.is_empty()) => p,
+            Some(_) => {
+                return Err(ConfigError::ConfigFile(format!(
+                    "BUZZ_ACP_EXTRA_MCP_COMMANDS entry {} names no command; \
+                     give it a command or remove the entry and restart",
+                    idx + 1
+                )));
+            }
             None => {
                 return Err(ConfigError::ConfigFile(format!(
                     "BUZZ_ACP_EXTRA_MCP_COMMANDS entry {} has malformed shell quoting; \
@@ -5928,10 +6034,10 @@ fn build_mcp_servers(config: &Config) -> Result<Vec<McpServer>, ConfigError> {
 /// hyphens; leading/trailing hyphens are stripped. An empty result falls back
 /// to `"extra-mcp"`.
 ///
-/// Note the registry applies a second, tighter bound the name alone cannot
-/// satisfy: each tool is registered as `<server>__<tool>` and that qualified
-/// name is capped at 64 bytes, so a name anywhere near the 128-byte ceiling
-/// still fails the session. Prefer short explicit `name=` prefixes.
+/// [`MAX_MCP_NAME_LEN`] is budgeted against the registry's *qualified* tool
+/// name (`<server>__<tool>`, capped at [`MAX_MCP_QNAME_LEN`]), not against its
+/// looser 128-byte bound on the name alone, so a sanitized name always leaves
+/// room for the tools the server advertises.
 fn sanitize_mcp_name(raw: &str) -> String {
     let sanitized: String = raw
         .chars()
@@ -9331,15 +9437,32 @@ mod build_mcp_servers_tests {
     }
 
     #[test]
-    fn extra_mcp_commands_with_empty_mcp_command_returns_no_servers() {
+    fn extra_mcp_commands_without_primary_still_produce_servers() {
+        // `BUZZ_ACP_MCP_COMMAND` defaults to empty, and Desktop writes an
+        // empty string whenever the runtime has no MCP command. An
+        // extras-only configuration must still reach the model: returning an
+        // empty array here would leave the agent with no tools, silently.
         let mut config = test_config();
         config.mcp_command = "".into();
-        config.extra_mcp_commands = vec!["some-extra-server".into()];
+        config.extra_mcp_commands = vec!["memory=memory-mcp --db /tmp/m".into()];
         let servers = build_mcp_servers(&config).unwrap();
-        assert!(
-            servers.is_empty(),
-            "empty primary mcp_command should still short-circuit even with extras"
+        assert_eq!(
+            servers.len(),
+            1,
+            "the extra server must survive: {servers:?}"
         );
+        assert_eq!(servers[0].name, "memory");
+        assert_eq!(servers[0].command, "memory-mcp");
+        assert!(!servers[0].trusted, "an extra server is never trusted");
+    }
+
+    #[test]
+    fn no_mcp_command_and_no_extras_produces_no_servers() {
+        let mut config = test_config();
+        config.mcp_command = "".into();
+        config.extra_mcp_commands = vec![];
+        let servers = build_mcp_servers(&config).unwrap();
+        assert!(servers.is_empty(), "nothing configured, nothing produced");
     }
 
     #[test]
@@ -9386,6 +9509,36 @@ mod build_mcp_servers_tests {
             !err_msg.contains("unmatched-quote"),
             "error must not echo the raw command"
         );
+    }
+
+    #[test]
+    fn extra_mcp_commands_fail_closed_on_entry_with_no_command() {
+        // A non-blank entry that shell-splits to nothing used to be dropped
+        // silently, so the harness started with that server missing and
+        // nothing logged — while malformed quoting aborted startup. Same
+        // posture for both now, and neither message echoes the entry.
+        for (label, entry) in [
+            ("name with nothing after `=`", "memory="),
+            ("whitespace after `=`", "memory=   "),
+            ("empty quoted command", "memory=''"),
+            ("comment-only entry", "# just a note"),
+        ] {
+            let mut config = test_config();
+            config.extra_mcp_commands = vec!["valid-server".into(), entry.into()];
+            let result = build_mcp_servers(&config);
+            let err = match result {
+                Err(e) => format!("{e}"),
+                Ok(servers) => panic!("{label} was accepted, giving {servers:?}"),
+            };
+            assert!(
+                err.contains("entry 2"),
+                "{label}: error should identify the entry index: {err}"
+            );
+            assert!(
+                !err.contains("memory") && !err.contains("just a note"),
+                "{label}: error must not echo the raw entry: {err}"
+            );
+        }
     }
 
     #[test]
@@ -9466,14 +9619,28 @@ mod build_mcp_servers_tests {
     }
 
     /// The contract `McpRegistry::spawn_all` enforces on every server name:
-    /// non-empty, at most 128 bytes, ASCII alphanumeric / `_` / `-` only, and
-    /// no `__` (which would collide with the qualified-tool-name separator).
+    /// non-empty, ASCII alphanumeric / `_` / `-` only, no `__` (which would
+    /// collide with the qualified-tool-name separator), at most 128 bytes —
+    /// and, the bound that actually bites, short enough that
+    /// `<server>__<tool>` still fits `MAX_QNAME_LEN`. The registry rejects the
+    /// whole session on any of these, not just the offending server.
     fn assert_registry_name_contract(name: &str) {
         assert!(!name.is_empty(), "server name must not be empty");
         assert!(
             name.len() <= 128,
             "server name is {} bytes, over McpRegistry's 128-byte limit: {name}",
             name.len()
+        );
+        assert!(
+            name.len() <= MAX_MCP_NAME_LEN,
+            "server name is {} bytes; with the `__` separator and a bare tool \
+             name it cannot fit McpRegistry's {MAX_MCP_QNAME_LEN}-byte \
+             qualified-name limit: {name}",
+            name.len()
+        );
+        assert!(
+            name.len() + "__".len() < MAX_MCP_QNAME_LEN,
+            "no tool name at all fits after `{name}__`"
         );
         assert!(
             name.bytes()
@@ -9487,11 +9654,11 @@ mod build_mcp_servers_tests {
     }
 
     #[test]
-    fn extra_mcp_commands_long_name_truncated_to_registry_limit() {
-        // A raw name longer than the registry's 128-byte ceiling must come
-        // back at or under it. An inclusive slice (`[..=128]`) yields 129
-        // bytes, which McpRegistry rejects with "invalid server name" and
-        // fails the whole session — this test pins the exclusive cut.
+    fn extra_mcp_commands_long_name_cut_to_the_qualified_name_budget() {
+        // The registry's binding limit is on `<server>__<tool>`, not on the
+        // name alone: a name cut to the looser 128-byte ceiling still fails
+        // the whole session the moment the server advertises a tool. The cut
+        // is budgeted against MAX_MCP_QNAME_LEN instead.
         let mut config = test_config();
         let long_explicit = "a".repeat(130);
         let long_stem = "b".repeat(200);
@@ -9503,16 +9670,22 @@ mod build_mcp_servers_tests {
         assert_eq!(servers.len(), 3, "primary + 2 extra = 3 servers");
         assert_eq!(
             servers[1].name.len(),
-            128,
-            "an over-long explicit name is cut to exactly 128 bytes"
+            MAX_MCP_NAME_LEN,
+            "an over-long explicit name is cut to the qualified-name budget"
         );
         assert_eq!(
             servers[2].name.len(),
-            128,
-            "an over-long executable stem is cut to exactly 128 bytes"
+            MAX_MCP_NAME_LEN,
+            "an over-long executable stem is cut to the qualified-name budget"
         );
         for s in &servers {
             assert_registry_name_contract(&s.name);
+            // The point of the budget: a realistically-named tool still fits.
+            assert!(
+                s.name.len() + "__".len() + "search_files".len() <= MAX_MCP_QNAME_LEN,
+                "`{}__search_files` would be rejected by McpRegistry",
+                s.name
+            );
         }
     }
 
@@ -9522,7 +9695,7 @@ mod build_mcp_servers_tests {
         // `-2`, `-3`, ... disambiguation suffix is appended, including once
         // the suffix reaches two digits.
         let mut config = test_config();
-        let at_ceiling = "c".repeat(128);
+        let at_ceiling = "c".repeat(MAX_MCP_NAME_LEN);
         config.extra_mcp_commands = (0..11).map(|i| format!("{at_ceiling}=srv-{i}")).collect();
         let servers = build_mcp_servers(&config).unwrap();
         assert_eq!(servers.len(), 12, "primary + 11 extra = 12 servers");

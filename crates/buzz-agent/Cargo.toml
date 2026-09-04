@@ -85,3 +85,6 @@ hex = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
 tempfile = "3"
+# The extra-MCP end-to-end test names a channel origin, which buzz-acp types
+# as a UUID.
+uuid = { workspace = true }
