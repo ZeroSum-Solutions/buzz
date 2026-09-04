@@ -18,18 +18,25 @@ export type FileFolder = {
   event: RelayEvent;
 };
 
-function folderSlug(name: string): string {
+export function folderSlug(name: string): string {
   return name
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-|-$/g, "");
 }
 
-function folderDTag(channelId: string, slug: string): string {
+export function folderDTag(channelId: string, slug: string): string {
   return `files-${channelId}:${slug}`;
 }
 
-function parseFolder(event: RelayEvent): FileFolder | null {
+/**
+ * Parse a kind:30078 file-folder event into a {@link FileFolder}, or `null`
+ * if the event isn't a well-formed file-folder (wrong `t` tag, missing `d`).
+ * Exported so the write-path helpers below, and their tests, share this
+ * exact parsing — every mutation's round trip (build tags → parse them
+ * back) is bound to the same production code the hook itself calls.
+ */
+export function parseFolder(event: RelayEvent): FileFolder | null {
   const dTag = event.tags.find((t) => t[0] === "d")?.[1];
   const typeTag = event.tags.find((t) => t[0] === "t");
   if (!dTag || typeTag?.[1] !== FILE_FOLDER_TAG) return null;
@@ -46,6 +53,96 @@ function parseFolder(event: RelayEvent): FileFolder | null {
 
 function folderQueryKey(channelId: string) {
   return [FOLDER_QUERY_KEY_PREFIX, channelId] as const;
+}
+
+/** Group file event IDs by owning folder dTag for fast lookup. */
+export function buildFileFolderMap(folders: FileFolder[]): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const folder of folders) {
+    for (const eventId of folder.fileEventIds) {
+      map.set(eventId, folder.dTag);
+    }
+  }
+  return map;
+}
+
+/** Tags for a new file-folder event. */
+export function buildCreateFolderTags(
+  channelId: string,
+  name: string,
+  parentDTag?: string,
+): string[][] {
+  const dTag = folderDTag(channelId, folderSlug(name));
+  const tags: string[][] = [
+    ["d", dTag],
+    ["t", FILE_FOLDER_TAG],
+    ["name", name],
+  ];
+  if (parentDTag) tags.push(["parent", parentDTag]);
+  return tags;
+}
+
+/** Tags for adding one file to a folder — replaces any existing `e` tag for it, adds one otherwise. */
+export function withFileAddedToFolder(
+  folder: FileFolder,
+  eventId: string,
+): string[][] {
+  return [
+    ...folder.event.tags.filter((t) => t[0] !== "e" || t[1] !== eventId),
+    ["e", eventId],
+  ];
+}
+
+/**
+ * Tags for adding multiple files to a folder in one event (avoids the race
+ * of publishing N separate replaceable events). Returns `null` when every
+ * id is already present — no-op, caller should skip the write.
+ */
+export function withFilesAddedToFolder(
+  folder: FileFolder,
+  eventIds: string[],
+): string[][] | null {
+  const existingIds = new Set(folder.fileEventIds);
+  const newIds = eventIds.filter((id) => !existingIds.has(id));
+  if (newIds.length === 0) return null;
+  return [
+    ...folder.event.tags.filter((t) => t[0] !== "e" || existingIds.has(t[1])),
+    ...newIds.map((id) => ["e", id] as [string, string]),
+  ];
+}
+
+/** Tags for removing one file from a folder. */
+export function withFileRemovedFromFolder(
+  folder: FileFolder,
+  eventId: string,
+): string[][] {
+  return folder.event.tags.filter((t) => !(t[0] === "e" && t[1] === eventId));
+}
+
+/** Tags for renaming a folder (new d-tag + name, file refs kept), plus whether the d-tag changed. */
+export function buildRenameFolderTags(
+  folder: FileFolder,
+  channelId: string,
+  newName: string,
+): { tags: string[][]; newDTag: string; dTagChanged: boolean } {
+  const newDTag = folderDTag(channelId, folderSlug(newName));
+  const tags = folder.event.tags
+    .filter((t) => t[0] !== "d" && t[0] !== "name")
+    .concat([
+      ["d", newDTag],
+      ["name", newName],
+    ]);
+  return { tags, newDTag, dTagChanged: newDTag !== folder.dTag };
+}
+
+/** Tags for moving a folder under `parentDTag` (or to root when omitted). */
+export function withFolderParent(
+  folder: FileFolder,
+  parentDTag?: string,
+): string[][] {
+  return folder.event.tags
+    .filter((t) => t[0] !== "parent")
+    .concat(parentDTag ? [["parent", parentDTag]] : []);
 }
 
 export function useFileFolders(
@@ -75,33 +172,16 @@ export function useFileFolders(
 
   const folders = query.data ?? [];
 
-  /** Group file event IDs by folder dTag for fast lookup. */
-  const fileFolderMap = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const folder of folders) {
-      for (const eventId of folder.fileEventIds) {
-        map.set(eventId, folder.dTag);
-      }
-    }
-    return map;
-  }, [folders]);
+  const fileFolderMap = useMemo(() => buildFileFolderMap(folders), [folders]);
 
   const createFolder = useCallback(
     async (name: string, parentDTag?: string): Promise<FileFolder | null> => {
       if (!channelId || !currentPubkey) return null;
-      const slug = folderSlug(name);
-      const dTag = folderDTag(channelId, slug);
-      const tags: string[][] = [
-        ["d", dTag],
-        ["t", FILE_FOLDER_TAG],
-        ["name", name],
-      ];
-      if (parentDTag) tags.push(["parent", parentDTag]);
       try {
         const event = await signRelayEvent({
           kind: FILE_FOLDER_KIND,
           content: "",
-          tags,
+          tags: buildCreateFolderTags(channelId, name, parentDTag),
         });
         await relayClient.publishEvent(
           event,
@@ -126,15 +206,11 @@ export function useFileFolders(
     async (folder: FileFolder, eventId: string) => {
       if (!channelId || !currentPubkey) return;
       if (folder.fileEventIds.includes(eventId)) return;
-      const newTags = [
-        ...folder.event.tags.filter((t) => t[0] !== "e" || t[1] !== eventId),
-        ["e", eventId],
-      ];
       try {
         const event = await signRelayEvent({
           kind: FILE_FOLDER_KIND,
           content: "",
-          tags: newTags,
+          tags: withFileAddedToFolder(folder, eventId),
           createdAt: Math.floor(Date.now() / 1000),
         });
         await relayClient.publishEvent(
@@ -161,16 +237,8 @@ export function useFileFolders(
   const addFilesToFolder = useCallback(
     async (folder: FileFolder, eventIds: string[]) => {
       if (!channelId || !currentPubkey || eventIds.length === 0) return;
-      // Merge: keep existing e-tags that aren't being re-added, then add all new ones
-      const existingIds = new Set(folder.fileEventIds);
-      const newIds = eventIds.filter((id) => !existingIds.has(id));
-      if (newIds.length === 0) return;
-      const newTags = [
-        ...folder.event.tags.filter(
-          (t) => t[0] !== "e" || existingIds.has(t[1]),
-        ),
-        ...newIds.map((id) => ["e", id] as [string, string]),
-      ];
+      const newTags = withFilesAddedToFolder(folder, eventIds);
+      if (newTags === null) return;
       try {
         const event = await signRelayEvent({
           kind: FILE_FOLDER_KIND,
@@ -201,14 +269,11 @@ export function useFileFolders(
   const removeFileFromFolder = useCallback(
     async (folder: FileFolder, eventId: string) => {
       if (!channelId || !currentPubkey) return;
-      const newTags = folder.event.tags.filter(
-        (t) => !(t[0] === "e" && t[1] === eventId),
-      );
       try {
         const event = await signRelayEvent({
           kind: FILE_FOLDER_KIND,
           content: "",
-          tags: newTags,
+          tags: withFileRemovedFromFolder(folder, eventId),
           createdAt: Math.floor(Date.now() / 1000),
         });
         await relayClient.publishEvent(
@@ -267,16 +332,11 @@ export function useFileFolders(
   const renameFolder = useCallback(
     async (folder: FileFolder, newName: string) => {
       if (!channelId || !currentPubkey) return;
-      const slug = folderSlug(newName);
-      const newDTag = folderDTag(channelId, slug);
-
-      // Replace d-tag and name, keep file refs
-      const tags = folder.event.tags
-        .filter((t) => t[0] !== "d" && t[0] !== "name")
-        .concat([
-          ["d", newDTag],
-          ["name", newName],
-        ]);
+      const { tags, dTagChanged } = buildRenameFolderTags(
+        folder,
+        channelId,
+        newName,
+      );
 
       try {
         const event = await signRelayEvent({
@@ -294,7 +354,7 @@ export function useFileFolders(
         // If the d-tag changed, also delete the old event. The rename above
         // has already published, so this old-event cleanup is best-effort:
         // report failure without rolling back the (successful) rename.
-        if (newDTag !== folder.dTag) {
+        if (dTagChanged) {
           const deleteEvent = await signRelayEvent({
             kind: 5,
             content: "",
@@ -329,14 +389,11 @@ export function useFileFolders(
   const setFolderParent = useCallback(
     async (folder: FileFolder, parentDTag?: string) => {
       if (!channelId || !currentPubkey) return;
-      const tags = folder.event.tags
-        .filter((t) => t[0] !== "parent")
-        .concat(parentDTag ? [["parent", parentDTag]] : []);
       try {
         const event = await signRelayEvent({
           kind: FILE_FOLDER_KIND,
           content: "",
-          tags,
+          tags: withFolderParent(folder, parentDTag),
           createdAt: Math.floor(Date.now() / 1000),
         });
         await relayClient.publishEvent(

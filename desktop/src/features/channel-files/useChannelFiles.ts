@@ -83,6 +83,61 @@ export function sortFiles(files: ChannelFile[], sort: FileSort): ChannelFile[] {
 }
 
 /**
+ * Extract all file-bearing events from a list of channel message events and
+ * parse their imeta tags into a flat list of {@link ChannelFile} objects,
+ * ordered newest-first. Pure — exported so the parsing rules (caption
+ * extraction, filename-over-".bin" labeling, imeta field mapping) are
+ * testable directly against the production code path {@link useChannelFiles}
+ * calls, not a test-only reimplementation.
+ */
+export function parseChannelFiles(events: RelayEvent[]): ChannelFile[] {
+  const result: ChannelFile[] = [];
+
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    const tags = event.tags;
+    if (!tags || tags.length === 0) continue;
+
+    const entries = parseImetaTags(tags as string[][]);
+    if (entries.size === 0) continue;
+
+    // Extract first non-empty line of content as caption
+    let caption: string | undefined;
+    const content = event.content;
+    if (content != null) {
+      const firstLine = content.trim().split("\n")[0];
+      if (firstLine) {
+        caption =
+          firstLine.replace(/!\[(?:image|video)\]\([^)]+\)/g, "").trim() ||
+          undefined;
+      }
+    }
+
+    for (const [, entry] of entries) {
+      result.push({
+        key: `${event.id}-${entry.url}`,
+        url: rewriteRelayUrl(entry.url),
+        rawUrl: entry.url,
+        mimeType: entry.m ?? "application/octet-stream",
+        size: entry.size != null && entry.size > 0 ? entry.size : undefined,
+        filename: entry.filename,
+        sha256: entry.x,
+        thumb: entry.thumb ? rewriteRelayUrl(entry.thumb) : undefined,
+        dim: entry.dim,
+        blurhash: entry.blurhash,
+        pubkey: event.pubkey,
+        createdAt: event.created_at,
+        eventId: event.id,
+        caption: caption || undefined,
+        imeta: entry,
+      });
+    }
+  }
+
+  return result;
+}
+
+/**
  * Extract all file-bearing events from a channel and parse their imeta tags
  * into a flat list of {@link ChannelFile} objects, ordered newest-first.
  */
@@ -92,53 +147,10 @@ export function useChannelFiles(activeChannel: Channel | null): {
 } {
   const messagesQuery = useChannelMessagesQuery(activeChannel);
 
-  const files = useMemo(() => {
-    const events: RelayEvent[] = messagesQuery.data ?? [];
-    const result: ChannelFile[] = [];
-
-    for (let i = events.length - 1; i >= 0; i--) {
-      const event = events[i];
-      const tags = event.tags;
-      if (!tags || tags.length === 0) continue;
-
-      const entries = parseImetaTags(tags as string[][]);
-      if (entries.size === 0) continue;
-
-      // Extract first non-empty line of content as caption
-      let caption: string | undefined;
-      const content = event.content;
-      if (content != null) {
-        const firstLine = content.trim().split("\n")[0];
-        if (firstLine) {
-          caption =
-            firstLine.replace(/!\[(?:image|video)\]\([^)]+\)/g, "").trim() ||
-            undefined;
-        }
-      }
-
-      for (const [, entry] of entries) {
-        result.push({
-          key: `${event.id}-${entry.url}`,
-          url: rewriteRelayUrl(entry.url),
-          rawUrl: entry.url,
-          mimeType: entry.m ?? "application/octet-stream",
-          size: entry.size != null && entry.size > 0 ? entry.size : undefined,
-          filename: entry.filename,
-          sha256: entry.x,
-          thumb: entry.thumb ? rewriteRelayUrl(entry.thumb) : undefined,
-          dim: entry.dim,
-          blurhash: entry.blurhash,
-          pubkey: event.pubkey,
-          createdAt: event.created_at,
-          eventId: event.id,
-          caption: caption || undefined,
-          imeta: entry,
-        });
-      }
-    }
-
-    return result;
-  }, [messagesQuery.data]);
+  const files = useMemo(
+    () => parseChannelFiles(messagesQuery.data ?? []),
+    [messagesQuery.data],
+  );
 
   return {
     files,
