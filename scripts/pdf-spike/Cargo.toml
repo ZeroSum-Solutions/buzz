@@ -1,0 +1,15 @@
+[workspace]
+
+[package]
+name = "pdf-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "render_headless_chrome"
+path = "src/render_headless_chrome.rs"
+
+[dependencies]
+headless_chrome = "1.0.22"
+sha2 = "0.10"
