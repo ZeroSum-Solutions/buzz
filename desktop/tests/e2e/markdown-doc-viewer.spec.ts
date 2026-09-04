@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { expect, test } from "@playwright/test";
 import type { Page } from "@playwright/test";
 
@@ -300,4 +301,114 @@ test("non-markdown attachments keep the download-card behavior", async ({
     )
     .toContain("download_file");
   await expect(page.getByTestId("markdown-doc-panel")).toHaveCount(0);
+});
+
+// ── Panel-ready performance (T2 acceptance: fixed ~500 KB fixture, panel-ready
+// under 1.0s, no main-thread task over 200ms, measured three times) ─────────
+
+const LONG_DOC_CONTENT = readFileSync(
+  new URL("../fixtures/long-doc.md", import.meta.url),
+  "utf-8",
+);
+const LONG_DOC_SHA = "c".repeat(64);
+const LONG_DOC_URL = `${RELAY_HTTP_URL}/media/${LONG_DOC_SHA}.bin`;
+const PANEL_READY_BUDGET_MS = 1000;
+const MAIN_THREAD_TASK_BUDGET_MS = 200;
+const MEASURED_RUNS = 3;
+
+test("MEASURE: a fixed ~500 KB document reaches panel-ready under 1.0s with no main-thread task over 200ms", async ({
+  page,
+}) => {
+  test.setTimeout(60_000);
+
+  await installMockBridge(page, {
+    deferredComposerUploads: true,
+    uploadDescriptors: [
+      {
+        url: LONG_DOC_URL,
+        sha256: LONG_DOC_SHA,
+        size: Buffer.byteLength(LONG_DOC_CONTENT),
+        type: "application/octet-stream",
+        uploaded: Math.floor(Date.now() / 1000),
+        filename: "long-doc.md",
+      },
+    ],
+  });
+  await page.route(`**/media/${LONG_DOC_SHA}.bin`, (route) =>
+    route.fulfill({
+      body: LONG_DOC_CONTENT,
+      contentType: "application/octet-stream",
+    }),
+  );
+
+  // Arm a longtask observer before the first navigation so it is present for
+  // every panel-open measured below. `buffered: true` catches entries queued
+  // before a given read; each run clears the buffer immediately before its
+  // own click so only that run's work is attributed to it.
+  await page.addInitScript(() => {
+    const store = window as unknown as { __LONGTASKS__?: number[] };
+    store.__LONGTASKS__ = [];
+    new PerformanceObserver((list) => {
+      for (const entry of list.getEntries()) {
+        store.__LONGTASKS__?.push(entry.duration);
+      }
+    }).observe({ type: "longtask", buffered: true });
+  });
+
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+
+  const [chooser] = await Promise.all([
+    page.waitForEvent("filechooser"),
+    page.getByRole("button", { name: "Attach file" }).click(),
+  ]);
+  await chooser.setFiles({
+    buffer: Buffer.from(LONG_DOC_CONTENT),
+    mimeType: "text/markdown",
+    name: "long-doc.md",
+  });
+  await expect(page.getByTestId("message-composer")).toContainText(
+    "long-doc.md",
+  );
+  await page.getByTestId("send-message").click();
+  await expect(page.getByText("Sending")).toHaveCount(0);
+
+  const card = page.getByTestId("file-card").last();
+  await expect(card).toContainText("long-doc.md");
+
+  const panel = page.getByTestId("markdown-doc-panel");
+  const readyHeading = panel.getByRole("heading", {
+    name: "Long Document Fixture",
+  });
+
+  for (let run = 1; run <= MEASURED_RUNS; run += 1) {
+    await page.evaluate(() => {
+      (window as unknown as { __LONGTASKS__?: number[] }).__LONGTASKS__ = [];
+    });
+
+    const startedAt = Date.now();
+    await card.click();
+    await expect(readyHeading).toBeVisible();
+    const panelReadyMs = Date.now() - startedAt;
+
+    expect(
+      panelReadyMs,
+      `run ${run}: panel-ready took ${panelReadyMs}ms, over the ${PANEL_READY_BUDGET_MS}ms budget`,
+    ).toBeLessThan(PANEL_READY_BUDGET_MS);
+
+    const longtasks = await page.evaluate(
+      () =>
+        (window as unknown as { __LONGTASKS__?: number[] }).__LONGTASKS__ ?? [],
+    );
+    const worstTaskMs = longtasks.length ? Math.max(...longtasks) : 0;
+
+    expect(
+      worstTaskMs,
+      `run ${run}: longest main-thread task was ${worstTaskMs}ms, over the ${MAIN_THREAD_TASK_BUDGET_MS}ms budget`,
+    ).toBeLessThan(MAIN_THREAD_TASK_BUDGET_MS);
+
+    await page.getByTestId("auxiliary-panel-close").click();
+    await expect(page.getByTestId("markdown-doc-panel")).toHaveCount(0);
+  }
 });
