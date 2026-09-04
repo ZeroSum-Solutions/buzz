@@ -322,6 +322,21 @@ Created on the fork only when Devin asks. Titles:
   and the buzz-agent `cancelled_turn_with_usage_emits_notification_before_response` test
   (15 of 15 locally on both the branch and the baseline). Rerun before treating either as a
   regression, and say so in the PR.
+- Desktop Smoke E2E shard 3 is chronically red on the fork's runners, with a rotating cast of
+  specs, and it is not a port regression. Same shard, same 4 workflows, different casualties each
+  run: run 33902000903 (push, `zs/main`, e56a75f - no port code) failed
+  `messaging.spec.ts` "sends a thread message to its parent channel with a root-thread link" on all
+  three attempts plus five flakes; run 33878282349 (`spike/pdf`) failed the same spec plus three
+  flakes; runs 33909701431 and its rerun (`port/6731`) failed that spec, then
+  `profile-custom-emoji-status.spec.ts:196`, with `navigation.spec.ts:448` flaky in every one of
+  them. Almost every failure is a 5 s `expect` timeout on an untouched spec. The `smoke` project
+  takes Playwright's 5 s default while the `integration` project already raises its own to 15 s on
+  CI (`desktop/playwright.config.ts`), so the fork-only fix for this - on `zs/main`, per rule 5
+  above, never inside a port branch - is to give `smoke` the same CI-only expect budget. A full
+  local `just desktop-e2e-smoke` on `port/6731` shows the same shape: 1344 of 1354 passed, the 9
+  failures were a ninth different set in untouched specs, 7 of them that same 5 s timeout, and all
+  four of the run's CI casualties passed. Until the budget changes, rerun the shard and say so in
+  the PR.
 - `zs-land` can report "PR MERGED, but cleanup incomplete". The merge is done; finish by hand and
   do not re-run it.
 - Scratch import branches from ports (`pr-<N>`) are left in place; deleting a branch needs Devin's
