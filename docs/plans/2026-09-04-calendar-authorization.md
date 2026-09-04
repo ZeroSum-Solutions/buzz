@@ -14,6 +14,16 @@ OAuth flow; the desktop holds that grant in the OS keychain and renders exactly 
 account's own API calls return. Buzz membership decides where the surface appears; Google
 decides what it contains. Agents get no calendar credential in v1.
 
+**Driving scenario.** Broken English (the client in the plan's R1) keeps its teaching schedule in a
+Google Workspace calendar. A teacher opens the school's Buzz channel and expects this week's
+classes, and expects to move one when a class is rescheduled. Someone in the same channel who is
+not on that calendar's ACL must see nothing. When the school offboards a teacher in Google
+Workspace on a Friday, that teacher's view has to go away without anyone touching Buzz. The
+decisions below are scored against that scenario.
+
+The contract assumes every member who should see the calendar has an account in the Workspace that
+owns it. Decision 1 states what that assumption costs and what happens when it is false.
+
 `VISION.md:9` argues against stitching outside services into the workspace. Keeping the calendar a
 view onto someone else's system rather than a Buzz data model is what keeps that argument intact.
 
@@ -63,6 +73,35 @@ Google verification for the `calendar.events` scope — a separate ticket, not a
 installed-app client secret ships inside the binary and is **not confidential**; it is an
 identifier, not a credential.
 
+**Who can connect.** Publishing the client Internal is also an eligibility rule: only accounts in
+that Workspace can consent to it. This contract therefore assumes every Buzz member who should see
+the business calendar has a Workspace account. The assumption is not free — Google's calendar ACL
+accepts an address outside the Workspace (decision 3), so a member using a personal Google account
+can hold real read access in Google and still be unable to consent here at all. In v1 that person
+reads the calendar in Google's own web UI and gets no Buzz surface; giving them one means the
+External client and the verification ticket named above. Onboarding someone for the calendar is
+therefore "give them a Workspace account", not "add their address to the ACL".
+
+**When connect fails.** Connect-time failure is its own axis, not one of decision 6's post-connect
+states, and it produces exactly two observables:
+
+- **Google redirects back with an `error` parameter** — the user pressed Cancel (`access_denied`).
+  The surface returns to plain disconnected: "Google Calendar is not connected", Connect still
+  offered, no dialog and no retry loop. The parameter is logged, never shown (decision 8).
+- **No callback arrives** before the loopback listener's five-minute deadline, after which it
+  closes. This one observable covers three causes — the browser window was closed, the account is
+  outside the Workspace (an Internal client answers that in the browser with its own error page and
+  never redirects), or something local blocked the loopback (a firewall, a proxy, a browser that
+  refuses `http://127.0.0.1`). The app cannot tell them apart, so it does not guess: one "Couldn't
+  finish connecting" state that lists those three causes in that order, names the Workspace domain
+  this client accepts, and offers Try again.
+
+The listener binds its port *before* the system browser opens, so a bind failure is reported in the
+app while the user is still looking at it instead of as silence five minutes later. None of these
+states is "not shared with your account" (decisions 4 and 6): that message means a connected
+account the calendar's ACL does not list, and showing it to someone who never reached the consent
+screen sends them to an admin to fix an ACL that is not the problem.
+
 **Reason.** `calendarlist.readonly` is the only way to resolve the business calendar's id and the
 caller's `accessRole` without asking for calendar management. Splitting read from write means a
 member who only ever looks at the calendar never holds a token that can change it. Reading the
@@ -72,7 +111,12 @@ at write time with a raw 403. Naming the publishing status is not paperwork: it 
 setting that decides whether decision 8's terminal branch is rare or weekly, so it belongs in the
 contract rather than in whoever's memory set the project up. PKCE, not the client secret, is what
 binds the authorization code to this app, so nothing in this memo rests on that secret staying
-hidden — decision 2's keychain argument is about tokens, which are the real credential.
+hidden — decision 2's keychain argument is about tokens, which are the real credential. Naming the
+connect-time states is the same kind of correction: the rest of this memo speaks in ACL terms, and
+an account that cannot use this client at all has no ACL problem to fix, so it must not be told it
+has one. Refusing to guess which of the three silent causes occurred is deliberate — a confidently
+wrong message ("your account is not in the Workspace") sends a user who merely closed the browser
+window to a Workspace admin.
 
 ### 2. Which Google account binds to which Buzz identity, and how the binding is stored
 
@@ -81,13 +125,14 @@ is the active identity's pubkey hex (`get_identity`, `desktop/src-tauri/src/comm
 the Google side is the OIDC `sub`, not the email. The record — refresh token, access token,
 expiry, granted scopes, `sub`, email for display — is stored in the OS keychain through
 `SecretStore` under a key namespaced by pubkey hex. `SecretStore` keeps all secrets as one JSON
-blob (username `secrets`, `desktop/src-tauri/src/secret_store.rs:1-21`; the service-name constant
-`buzz-desktop` is at `:50`),
-so this costs no extra keychain prompt. Token exchange, refresh and every Google API call happen
-in Rust. The webview receives a redacted status struct only: connected, email, granted scopes,
-expiry, state. Connecting a different Google account requires an explicit confirm and revokes the
-previous grant first (decision 5). The pubkey → Google-account mapping is never published to the
-relay.
+blob (the `BLOB_KEY` username `secrets`, `desktop/src-tauri/src/secret_store.rs:42-44`; the
+service name is not a constant in that file but comes from `keyring_service()`,
+`desktop/src-tauri/src/app_state_keyring.rs:9-23`, which returns `buzz-desktop` for release builds
+and a `buzz-desktop-dev*` service otherwise), so this costs no extra keychain prompt. Token
+exchange, refresh and every Google API call happen in Rust. The webview receives a redacted status
+struct only: connected, email, granted scopes, expiry, state. Connecting a different Google
+account requires an explicit confirm and revokes the previous grant first (decision 5). The
+pubkey → Google-account mapping is never published to the relay.
 
 **Reason.** `sub` is stable; a Workspace email can be renamed or reassigned to a different human,
 and a binding keyed on email would silently follow the address to the new person. Keeping tokens
@@ -105,7 +150,9 @@ schedule, "See all event details" for everyone else. Buzz never creates, grants,
 revokes a calendar ACL, and holds no scope that would let it. Edit affordances in the UI derive
 from the `accessRole` that `calendarList` returns for that user (`owner`/`writer` enable edit;
 `reader`/`freeBusyReader` disable it), and a write Google rejects surfaces as a failure — never as
-a local "saved" state.
+a local "saved" state. Google's ACL also accepts addresses outside the Workspace, and we do not
+restrict that: such a grant is real read access in Google, it simply produces no Buzz surface,
+because the OAuth client is Internal (decision 1).
 
 **Reason.** Two access-control systems that can disagree is the failure mode the feature audit
 named (`2026-09-04-zs-feature-audit.md:57`). Buzz's only gate is channel membership
@@ -127,9 +174,10 @@ onboarding — so in v1 it is a convention the app does not enforce. Admin-owned
 enforceable only with the relay-synced kind, which needs a new allow-listed event kind and is
 deferred to an upstream-first ticket (see "Why the two obvious alternatives are out"). What T12 can
 bind is therefore the local half: the mapping is per-identity and local, and no mapping grants
-access. The mapping is a *display* choice and carries no authority — a channel member whose Google
-account is not on the calendar's ACL sees an empty surface with "not shared with your account",
-never someone else's events.
+access. The mapping is a *display* choice and carries no authority — a *connected* channel member
+whose Google account is not on the calendar's ACL sees an empty surface with "not shared with your
+account", never someone else's events. That message is about the ACL and nothing else; a member who
+could not connect in the first place gets decision 1's connect-time state instead.
 
 **Reason.** Making the mapping powerless is what lets it be stored loosely. If a wrong or stale
 mapping could expose event data, it would need the same durability and audit as the ACL itself;
@@ -240,9 +288,12 @@ different `sub` is an account change and takes the explicit confirm from decisio
 the reconnect entry lives in two places, one of which does not depend on the broken surface
 rendering. Rule 4 — a terminal auth error must stop the loop, not retry forever against a grant
 that will never come back. Splitting transient from terminal is what stops a flaky network from
-nagging the user to re-consent. That split only holds because the client is published In
-production (decision 1): in Testing status every refresh token dies after seven days, and the
-terminal branch stops being an exception and becomes the normal weekly experience.
+nagging the user to re-consent. The split also depends on the client's publishing status
+(decision 1). Google's seven-day refresh-token expiry binds a client whose user type is External
+and whose publishing status is Testing; decision 1's Internal choice already excludes it, so the
+"In production, never Testing" rule is belt-and-braces here and load-bearing for the External
+client the shipping-beyond-one-Workspace ticket would need. Left in that state, the terminal branch
+would stop being an exception and become the normal weekly experience.
 
 ### 9. What an agent may read or write
 
@@ -274,6 +325,9 @@ scope it, and remove it in the same place they manage everyone else.
   T12 `feat/google-calendar`.
 - Relay-synced channel → calendar mapping, and with it admin-owned rather than per-user mapping
   (needs a new allow-listed kind) — upstream-first, not scheduled.
+- A Buzz calendar surface for members outside the Workspace that owns the client (an External
+  OAuth client plus Google verification for `calendar.events`, decision 1) — a separate ticket,
+  not scheduled.
 - Agent calendar access through a separate Google principal — blocked on RFC #3227 landing
   upstream.
 
