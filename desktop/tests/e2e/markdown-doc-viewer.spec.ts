@@ -420,9 +420,19 @@ const PANEL_READY_BUDGET_MS = 1000;
 const MAIN_THREAD_TASK_BUDGET_MS = 200;
 const MEASURED_RUNS = 3;
 
+// Wall-clock budgets are host-relative: on a GitHub ubuntu runner the same
+// document reached panel-ready in time but spent 448ms in its longest main-thread
+// task, against a 200ms budget met on a developer machine. The repository already
+// keeps that class of assertion out of shared CI (see `just
+// desktop-terminal-performance-test`), so this measurement runs on a known-idle
+// host via `just desktop-markdown-doc-performance-test` and is skipped in CI.
 test("MEASURE: a fixed ~500 KB document reaches panel-ready under 1.0s with no main-thread task over 200ms", async ({
   page,
 }) => {
+  test.skip(
+    !!process.env.CI && process.env.BUZZ_RUN_PERF_MEASURE !== "1",
+    "wall-clock budget: run on a known-idle host with `just desktop-markdown-doc-performance-test`",
+  );
   test.setTimeout(60_000);
 
   await installMockBridge(page, {
