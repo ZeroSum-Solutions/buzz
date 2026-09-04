@@ -394,6 +394,12 @@ test("non-markdown attachments keep the download-card behavior", async ({
 
 // ── Panel-ready performance (T2 acceptance: fixed ~500 KB fixture, panel-ready
 // under 1.0s, no main-thread task over 200ms, measured three times) ─────────
+//
+// Fixture hash (T2 acceptance clause: "hash recorded in the PR"), recompute
+// with `shasum -a 256 desktop/tests/fixtures/long-doc.md` and diff on any
+// change to the fixture:
+//   SHA-256: 2eb8167839c832fea513de6d1d6dd47b55b01a595cb4167d4d54155446044ae1
+//   Bytes:   506681
 
 const LONG_DOC_CONTENT = readFileSync(
   new URL("../fixtures/long-doc.md", import.meta.url),
