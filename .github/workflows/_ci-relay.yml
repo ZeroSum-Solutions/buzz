@@ -34,7 +34,7 @@ env:
 jobs:
   desktop-e2e-relay:
     name: Desktop E2E Relay
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 75  # zs fork: cold relay build with no cache exceeds 30 min
     if: inputs.lane == 'artifacts' && (github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust)
     permissions:
@@ -133,7 +133,7 @@ jobs:
 
   postgres-tests:
     name: PostgreSQL Tests
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     if: inputs.lane == 'postgres' && (github.event_name == 'push' || inputs.rust)
     permissions:
@@ -208,7 +208,7 @@ jobs:
 
   desktop-e2e-integration-shard:
     name: Desktop E2E Integration (${{ matrix.shard }}/2)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     if: inputs.lane == 'required' && (github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust)
     strategy:
@@ -384,7 +384,7 @@ jobs:
 
   desktop-e2e-integration:
     name: Desktop E2E Integration
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     needs: [desktop-e2e-integration-shard]
     if: always() && inputs.lane == 'required' && (github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust)
@@ -401,7 +401,7 @@ jobs:
 
   backend-integration:
     name: Backend Integration (relay e2e)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     if: inputs.lane == 'required' && (github.event_name == 'push' || inputs.rust)
     permissions:
@@ -542,7 +542,7 @@ jobs:
 
   relay-e2e:
     name: Relay E2E
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     if: inputs.lane == 'required' && (github.event_name == 'push' || inputs.rust)
     permissions:
@@ -598,7 +598,7 @@ jobs:
     name: Results
     if: ${{ always() }}
     needs: [desktop-e2e-relay, postgres-tests, desktop-e2e-integration, backend-integration, relay-e2e]
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     permissions: {}
     outputs:
