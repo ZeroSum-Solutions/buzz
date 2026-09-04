@@ -28,12 +28,14 @@ const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
 /// `name`, `command`, `args` and `env` are **required** by the schema (`args`
 /// and `env` may be empty arrays); `trusted` is a Buzz extension and defaults
 /// to `false` when absent.
-/// `trusted` controls whether the agent runtime passes Buzz identity credentials
-/// (`BUZZ_PRIVATE_KEY`, `NOSTR_PRIVATE_KEY`, `BUZZ_RELAY_URL`, `BUZZ_AUTH_TAG`)
-/// into the child process.
-/// Only the built-in `buzz-dev-mcp` server is trusted; extra MCP servers
-/// configured via `BUZZ_ACP_EXTRA_MCP_COMMANDS` are untrusted and receive no
-/// Buzz credentials.
+/// `trusted` is honoured by `buzz-agent` alone, and buys exactly two things
+/// there: the four Buzz identity variables (`BUZZ_PRIVATE_KEY`,
+/// `NOSTR_PRIVATE_KEY`, `BUZZ_RELAY_URL`, `BUZZ_AUTH_TAG`) are absent from an
+/// untrusted child's environment, and an untrusted server never runs a
+/// `_Stop` / `_PostCompact` hook. It is not process isolation: the child runs
+/// under the harness's own UID. Only the built-in `buzz-dev-mcp` server is
+/// trusted; the servers `BUZZ_ACP_EXTRA_MCP_COMMANDS` adds are not, and the
+/// harness refuses those entries outright under any adapter but `buzz-agent`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct McpServer {
     pub name: String,

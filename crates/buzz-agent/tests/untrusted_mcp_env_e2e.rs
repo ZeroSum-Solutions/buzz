@@ -65,10 +65,15 @@ async fn untrusted_mcp_env_extra_command_reaches_tool_list() {
     // The operator's half: the environment variable, parsed by buzz-acp's own
     // clap definition (`env = "BUZZ_ACP_EXTRA_MCP_COMMANDS"`, newline-split).
     std::env::set_var("BUZZ_ACP_EXTRA_MCP_COMMANDS", fake_mcp);
+    // `--agent-command buzz-agent` is not decoration: buzz-acp refuses extra
+    // MCP servers under any other adapter, because only buzz-agent honours the
+    // `trusted` marker this whole test is about.
     let args = buzz_acp::CliArgs::try_parse_from([
         "buzz-acp",
         "--private-key",
         TEST_PRIVATE_KEY,
+        "--agent-command",
+        "buzz-agent",
         "--mcp-command",
         fake_mcp,
     ])
@@ -196,4 +201,17 @@ async fn untrusted_mcp_env_extra_command_reaches_tool_list() {
     );
 
     h.shutdown().await;
+}
+
+/// buzz-acp's startup-side server cap is the registry's cap, not a number that
+/// drifted from it. Mirroring the bound is what keeps an over-long
+/// configuration from producing a harness that starts, announces itself, and
+/// then fails every `session/new`.
+#[test]
+fn mcp_server_cap_mirrors_buzz_agent() {
+    assert_eq!(
+        buzz_acp::MAX_MCP_SERVERS,
+        buzz_agent::MAX_MCP_SERVERS,
+        "buzz-acp's mirrored MCP server cap drifted from McpRegistry's"
+    );
 }

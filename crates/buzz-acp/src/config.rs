@@ -268,19 +268,23 @@ pub struct CliArgs {
     pub mcp_command: String,
 
     /// Additional MCP server commands to pass to the agent session alongside
-    /// the primary MCP server. Entries are newline-separated; each entry is
-    /// shell-split (shlex) into a command and its args, so quoted paths and
-    /// arguments with spaces are preserved. An optional `name=` prefix sets
-    /// the server name explicitly (e.g. `memory=npx -y memory-mcp`); without
-    /// it, the name is derived from the executable stem. Duplicate names are
-    /// disambiguated with a numeric suffix (e.g. two `npx` wrappers become
-    /// `npx` and `npx-2`), but explicit names are preferred so reordering
-    /// entries does not silently rename a server. Names are capped at 128
-    /// bytes; keep them well under that, since `buzz-agent` also caps the
-    /// qualified tool name `<server>__<tool>` at 64 bytes. Entries with
-    /// malformed quoting fail startup with the entry index (the raw command
-    /// is not echoed). Example:
-    /// `memory=npx -y mcp-remote https://mcp.tavily.com/mcp/?tavilyApiKey=...\nother-server --port 8080`
+    /// the primary MCP server. Requires `--agent-command buzz-agent`: only
+    /// that adapter honours the trust marker these servers carry, so any
+    /// other one fails at startup instead of spawning them out of a process
+    /// holding the Buzz private key. Entries are newline-separated; each
+    /// entry is shell-split (shlex) into a command and its args, so quoted
+    /// paths and arguments with spaces are preserved. An optional `name=`
+    /// prefix sets the server name explicitly (e.g. `memory=npx -y
+    /// memory-mcp`); without it, the name is derived from the executable
+    /// stem. Names are capped at 32 bytes, budgeted against `buzz-agent`'s
+    /// 64-byte cap on the qualified tool name `<server>__<tool>`; colliding
+    /// names take a suffix hashed from the entry, so reordering entries never
+    /// renames a server. Startup fails, naming the entry index and never
+    /// echoing the entry, on malformed quoting, an entry naming no command, a
+    /// repeated `name=`, two entries resolving to one name, or more than 16
+    /// servers in total. Do not put a secret in an entry — argv is visible in
+    /// `ps`; prefer a server that reads its own credentials. Example:
+    /// `memory=npx -y memory-mcp --db /var/lib/memory.db\nother-server --port 8080`
     #[arg(long, env = "BUZZ_ACP_EXTRA_MCP_COMMANDS", value_delimiter = '\n')]
     pub extra_mcp_commands: Vec<String>,
 
