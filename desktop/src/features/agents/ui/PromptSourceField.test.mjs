@@ -19,7 +19,11 @@
  *     which file feeds the agent instead of an empty box.
  *   - The seed is fenced: an answer that lost the race to typing, or one for a
  *     definition the dialog has moved off, is discarded.
- *   - An unreadable sidecar is reported, never read as "nothing is bound".
+ *   - An unreadable sidecar is reported, never read as "nothing is bound",
+ *     and arms the reset — the only control that can recover it, since Clear
+ *     has to read the same file.
+ *   - A binding whose prompt no longer matches renders as out of sync instead
+ *     of repeating the claim.
  *
  * Mutation proofs: gating Clear on a seen binding again → the fresh-mount
  * Clear test fails; dropping the `onPromptReloaded` call → the propagation
@@ -58,6 +62,13 @@ let nextResult = { localUpdated: true };
 let storedPromptSource = null;
 /** Every `get_prompt_source` invocation, in order. */
 let seedCalls = [];
+/** Every `reset_prompt_sources` invocation, in order. */
+let resetCalls = [];
+/** What `reset_prompt_sources` answers. */
+let nextResetResult = "/tmp/prompt-sources.corrupt.json";
+
+/** A stored binding, in the shape the backend returns. */
+const bound = (path, inSync = true) => ({ path, inSync });
 
 globalThis.__TAURI_INTERNALS__ = {
   invoke: (cmd, payload) => {
@@ -69,6 +80,12 @@ globalThis.__TAURI_INTERNALS__ = {
       return storedPromptSource instanceof Error
         ? Promise.reject(storedPromptSource)
         : Promise.resolve(storedPromptSource);
+    }
+    if (cmd === "reset_prompt_sources") {
+      resetCalls.push(payload);
+      return nextResetResult instanceof Error
+        ? Promise.reject(nextResetResult)
+        : Promise.resolve(nextResetResult);
     }
     if (cmd !== "set_prompt_source_and_reload") {
       return Promise.reject(new Error(`unmocked: ${cmd}`));
@@ -83,7 +100,7 @@ globalThis.__TAURI_INTERNALS__ = {
 dom.window.__TAURI_INTERNALS__ = globalThis.__TAURI_INTERNALS__;
 
 let act, render, screen, cleanup, fireEvent, createElement;
-let PromptSourceField;
+let PromptSourceField, QueryClient, QueryClientProvider;
 
 before(async () => {
   ({ act, render, screen, cleanup, fireEvent } = await import(
@@ -91,13 +108,18 @@ before(async () => {
   ));
   ({ createElement } = await import("react"));
   ({ PromptSourceField } = await import("./PromptSourceField.tsx"));
+  ({ QueryClient, QueryClientProvider } = await import(
+    "@tanstack/react-query"
+  ));
 });
 
 afterEach(() => {
   cleanup?.();
   calls = [];
   seedCalls = [];
+  resetCalls = [];
   nextResult = { localUpdated: true };
+  nextResetResult = "/tmp/prompt-sources.corrupt.json";
   storedPromptSource = null;
 });
 
@@ -117,18 +139,28 @@ async function mount(overrides = {}) {
     onPromptReloaded: (prompt) => reloaded.push(prompt),
     ...overrides,
   });
+  // The reload runs through a real React Query mutation, so the field needs a
+  // real client: that is what invalidates the persona caches the reload just
+  // made stale.
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, gcTime: 0 } },
+  });
+  const tree = (extra = {}) =>
+    createElement(
+      QueryClientProvider,
+      { client },
+      createElement(PromptSourceField, { ...props(), ...extra }),
+    );
   let rerender;
   await act(async () => {
-    ({ rerender } = render(createElement(PromptSourceField, props())));
+    ({ rerender } = render(tree()));
   });
   return {
     reloaded,
     /** Re-render with a different definition id, as switching agents does. */
     async switchTo(definitionId) {
       await act(async () => {
-        rerender(
-          createElement(PromptSourceField, { ...props(), definitionId }),
-        );
+        rerender(tree({ definitionId }));
       });
     },
   };
@@ -159,7 +191,7 @@ test("Reload sends the typed path once and propagates the reloaded text", async 
   nextResult = {
     localUpdated: true,
     publish: "published",
-    path: "/Users/me/agent-prompts/pm.md",
+    binding: bound("/Users/me/agent-prompts/pm.md"),
     prompt: "Ship the roadmap.\n",
   };
   const { reloaded } = await mount();
@@ -238,7 +270,7 @@ test("both buttons are disabled while the dialog is saving", async () => {
 });
 
 test("the stored binding seeds the field on open", async () => {
-  storedPromptSource = "/Users/me/agent-prompts/pm.md";
+  storedPromptSource = bound("/Users/me/agent-prompts/pm.md");
   await mount();
 
   assert.deepEqual(
@@ -272,7 +304,7 @@ test("a seed that lands after the operator types does not overwrite them", async
   let release;
   storedPromptSource = () =>
     new Promise((resolve) => {
-      release = () => resolve("/Users/me/agent-prompts/stale.md");
+      release = () => resolve(bound("/Users/me/agent-prompts/stale.md"));
     });
   await mount();
 
@@ -293,7 +325,7 @@ test("a seed for the previous definition is discarded after the dialog switches"
   storedPromptSource = (payload) =>
     new Promise((resolve) => {
       releases.push(() =>
-        resolve(`/Users/me/agent-prompts/${payload.definitionId}.md`),
+        resolve(bound(`/Users/me/agent-prompts/${payload.definitionId}.md`)),
       );
     });
   const { switchTo } = await mount();
@@ -323,5 +355,66 @@ test("an unreadable sidecar is reported, not read as nothing bound", async () =>
     clearButton().disabled,
     false,
     "a failed seed must still leave a way to unbind",
+  );
+
+  // Clear cannot actually recover this state — it reads the same file — so the
+  // field offers the reset, warns that it is not scoped to this agent, and the
+  // reset is what makes the field usable again.
+  const reset = screen.getByRole("button", {
+    name: /Reset instructions-file settings/i,
+  });
+  assert.match(
+    screen.getByText(/every agent on this machine/i).textContent,
+    /renamed/i,
+    "the warning must say the file is kept and every binding is affected",
+  );
+  await act(async () => {
+    fireEvent.click(reset);
+  });
+  assert.deepEqual(resetCalls, [{}], "the reset runs its own command");
+  assert.match(status().textContent, /reset/i);
+  assert.equal(
+    screen.queryByRole("button", {
+      name: /Reset instructions-file settings/i,
+    }),
+    null,
+    "once recovered, the machine-wide action is put away again",
+  );
+});
+
+test("a binding whose prompt no longer matches renders as out of sync", async () => {
+  storedPromptSource = bound("/Users/me/agent-prompts/pm.md", false);
+  await mount();
+
+  assert.match(
+    status().textContent,
+    /no longer match \/Users\/me\/agent-prompts\/pm\.md/,
+    "the field must not claim a file feeds an agent it no longer feeds",
+  );
+  assert.match(
+    status().textContent,
+    /Reload .*or Clear/,
+    "and must name both ways back to a true state",
+  );
+});
+
+test("a reload reporting a surviving binding names it in the status line", async () => {
+  nextResult = {
+    localUpdated: true,
+    publish: "published",
+    binding: bound("/Users/me/agent-prompts/a.md", false),
+    mappingError: "failed to write prompt-sources.json.tmp: Is a directory",
+    prompt: "Instructions from B.\n",
+  };
+  await mount();
+  await type("/Users/me/agent-prompts/b.md");
+  await act(async () => {
+    fireEvent.click(reloadButton());
+  });
+
+  assert.match(
+    status().textContent,
+    /still set to \/Users\/me\/agent-prompts\/a\.md/,
+    "the binding that survived the failed write must be named, not hidden",
   );
 });

@@ -25,7 +25,14 @@
 //! [`get_prompt_source`] is the read half. Without it the sidecar would be
 //! write-only: the dialog would open knowing of no binding, so the operator
 //! would retype the whole absolute path on every reload and would be offered
-//! `Clear` with nothing to tell them whether anything is bound.
+//! `Clear` with nothing to tell them whether anything is bound. It resolves the
+//! entry against the definition's current prompt, so a binding another write
+//! path has invalidated reads back as out of sync instead of as fact.
+//!
+//! [`reset_prompt_sources`] is the recovery half. Every read refuses a sidecar
+//! that cannot be parsed, which leaves `Clear` — itself a read-modify-write —
+//! unable to help; this moves the unreadable file aside so the operator is not
+//! stranded.
 
 use tauri::{AppHandle, Manager};
 
@@ -35,7 +42,8 @@ use crate::{
         load_personas,
         prompt_source::{
             commit_prompt_source_at, definition_with_prompt, prepare_prompt_source,
-            prompt_source_at, update_request_from_definition, PromptSourceChange,
+            prompt_source_binding_at, quarantine_prompt_sources_at, update_request_from_definition,
+            PromptSourceBinding, PromptSourceChange,
         },
         UpdatePersonaRequest,
     },
@@ -63,18 +71,30 @@ pub struct SetPromptSourceResult {
     /// The relay's message when the head could not be published.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relay_message: Option<String>,
-    /// The symlink-resolved absolute path now bound to the definition, so the
-    /// dialog shows where a typed path actually landed. Present exactly when a
-    /// mapping is stored: absent on a clear, and absent when the prompt was
-    /// reloaded but the sidecar write failed (`mapping_error` says why).
-    /// Machine-local: it is never part of the published definition.
+    /// The binding stored for this definition **after** the attempt, resolved
+    /// against the prompt the definition now holds. Absent on a clear, and
+    /// absent when nothing is stored at all.
+    ///
+    /// On a failed sidecar write this is the binding that survived, not
+    /// `None`: the write is atomic, so an earlier binding is still on disk and
+    /// still what the next `Reload` would restore. Reporting `None` there would
+    /// tell the dialog nothing is bound while the sidecar says otherwise, and
+    /// the claim would come back — stale — on the next open. It is reported
+    /// with `in_sync: false`, because the prompt that just landed did not come
+    /// from that file. Machine-local: never part of the published definition.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
+    pub binding: Option<PromptSourceBinding>,
     /// Why the mapping could not be stored, when the prompt itself was saved.
     /// Reported rather than swallowed: the prompt is live but the binding the
     /// user asked for is not, and only they can decide what to do about it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mapping_error: Option<String>,
+    /// Why the local sync bookkeeping failed after the relay accepted the head.
+    /// The publish landed and the retained row simply stays pending, so the
+    /// flush loop republishes it; reporting the failure as an error would undo
+    /// a change that is already live locally and on the relay.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bookkeeping_error: Option<String>,
     /// The definition's stored instructions after the reload, so the open
     /// dialog can show the file's text instead of the draft it replaced.
     /// Absent on a clear.
@@ -127,8 +147,9 @@ pub async fn set_prompt_source_and_reload<R: tauri::Runtime>(
                 local_updated: false,
                 publish: None,
                 relay_message: None,
-                path: None,
+                binding: None,
                 mapping_error: None,
+                bookkeeping_error: None,
                 prompt: None,
             });
         }
@@ -136,7 +157,14 @@ pub async fn set_prompt_source_and_reload<R: tauri::Runtime>(
     };
 
     let (expected_updated_at, request) =
-        read_update_request(&app, definition_id.clone(), prompt).await?;
+        read_update_request(&app, definition_id.clone(), prompt.clone()).await?;
+
+    // The window this command cannot lock across. `update_persona_with_precondition`
+    // takes the store lock itself, so the read pass above and the save pass below
+    // are two separate holds and a concurrent save can land between them. Tests
+    // put a writer in exactly this window; in production the hook is not compiled.
+    #[cfg(test)]
+    tests::run_read_save_barrier(&definition_id);
 
     submit_reloaded_prompt(
         app,
@@ -195,22 +223,65 @@ fn prompt_sources_path<R: tauri::Runtime>(
 /// [`set_prompt_source_and_reload`]: on open the field seeds itself from this,
 /// so the stored path is shown rather than retyped.
 ///
-/// Deliberately independent of the definition itself — no existence or
-/// built-in check — so a mapping whose agent was deleted is still visible and
-/// therefore still clearable, matching the clear path's own behaviour.
+/// The entry is resolved against the definition's **current** prompt, so a
+/// binding that some other write path has invalidated — a hand-typed edit, an
+/// inbound kind:30175 replacement, a snapshot import — reads back with
+/// `in_sync: false` instead of being rendered as fact. That check is what keeps
+/// the claim honest without a hook in every one of those paths.
+///
+/// Deliberately independent of the definition's existence and built-in flag: a
+/// mapping whose agent was deleted is still visible (out of sync, because there
+/// is no prompt to match) and therefore still clearable, matching the clear
+/// path's own behaviour.
 #[tauri::command]
 pub async fn get_prompt_source<R: tauri::Runtime>(
     definition_id: String,
     app: AppHandle<R>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<PromptSourceBinding>, String> {
     let app = app.clone();
-    tokio::task::spawn_blocking(move || -> Result<Option<String>, String> {
+    tokio::task::spawn_blocking(move || -> Result<Option<PromptSourceBinding>, String> {
         let state = app.state::<AppState>();
         let _store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|error| error.to_string())?;
-        prompt_source_at(&prompt_sources_path(&app)?, &definition_id)
+        let current_prompt = load_personas(&app)?
+            .into_iter()
+            .find(|record| record.id == definition_id)
+            .map(|record| record.system_prompt);
+        prompt_source_binding_at(
+            &prompt_sources_path(&app)?,
+            &definition_id,
+            current_prompt.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking failed: {e}"))?
+}
+
+/// Move an unreadable prompt-sources sidecar aside, and report where it went.
+///
+/// The recovery path for the one state the ordinary controls cannot leave.
+/// `Clear` is a read-modify-write of the sidecar, so on a malformed file it
+/// fails exactly as the seed did; without this the operator has a field that
+/// reports an error and two buttons that cannot fix it.
+///
+/// **Every agent's binding is affected** — the whole file moves — so the dialog
+/// says so before offering the action, and the file is renamed rather than
+/// deleted. Refused when the sidecar parses, so it can never be used to drop
+/// working bindings.
+#[tauri::command]
+pub async fn reset_prompt_sources<R: tauri::Runtime>(app: AppHandle<R>) -> Result<String, String> {
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let state = app.state::<AppState>();
+        let _store_guard = state
+            .managed_agents_store_lock
+            .lock()
+            .map_err(|error| error.to_string())?;
+        Ok(quarantine_prompt_sources_at(&prompt_sources_path(&app)?)?
+            .to_string_lossy()
+            .into_owned())
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
@@ -245,15 +316,31 @@ async fn submit_reloaded_prompt<R: tauri::Runtime>(
         )
         .await?;
 
-    // Boundary 4 — the mapping. The prompt is durable now, so a failure here
-    // cannot leave a mapping that disagrees with it; it leaves no mapping at
-    // all, which is reported rather than silently dropped.
-    let mapping_error = commit_mapping(&app, definition_id, source_path.clone()).await;
-    let (path, mapping_error) = match mapping_error {
-        Ok(()) => (Some(source_path.to_string_lossy().into_owned()), None),
+    // Boundary 4 — the mapping. The prompt is durable now, so this write can
+    // only add a claim that is already true. A failure here is reported rather
+    // than swallowed, together with whatever binding survived on disk: the
+    // sidecar write is atomic, so a previous binding is still there and still
+    // what the next Reload would restore, and hiding it would let the stale
+    // claim reappear on the next open with nothing to explain it.
+    let (binding, mapping_error) = match commit_mapping(
+        &app,
+        definition_id.clone(),
+        source_path.clone(),
+        &persona.system_prompt,
+    )
+    .await
+    {
+        Ok(()) => (
+            Some(PromptSourceBinding {
+                path: source_path.to_string_lossy().into_owned(),
+                in_sync: true,
+            }),
+            None,
+        ),
         Err(error) => {
             eprintln!("buzz-desktop: prompt-source mapping write failed: {error}");
-            (None, Some(error))
+            let surviving = surviving_binding(&app, &definition_id, &persona.system_prompt).await;
+            (surviving, Some(error))
         }
     };
 
@@ -267,8 +354,9 @@ async fn submit_reloaded_prompt<R: tauri::Runtime>(
                 local_updated: true,
                 publish: Some(format!("failed:{reason}")),
                 relay_message: None,
-                path,
+                binding,
                 mapping_error,
+                bookkeeping_error: None,
                 prompt: Some(persona.system_prompt),
             });
         }
@@ -286,10 +374,36 @@ async fn submit_reloaded_prompt<R: tauri::Runtime>(
             .to_string(),
         ),
         relay_message: published.relay_message,
-        path,
+        binding,
         mapping_error,
+        bookkeeping_error: published.bookkeeping_error,
         prompt: Some(persona.system_prompt),
     })
+}
+
+/// The binding still on disk after a failed mapping write, resolved against the
+/// prompt that did land. Best-effort: if the sidecar cannot be read either, the
+/// `mapping_error` already carries the failure and the dialog shows no binding.
+async fn surviving_binding<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    definition_id: &str,
+    current_prompt: &str,
+) -> Option<PromptSourceBinding> {
+    let app = app.clone();
+    let definition_id = definition_id.to_string();
+    let current_prompt = current_prompt.to_string();
+    tokio::task::spawn_blocking(move || {
+        prompt_source_binding_at(
+            &prompt_sources_path(&app).ok()?,
+            &definition_id,
+            Some(&current_prompt),
+        )
+        .ok()
+        .flatten()
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Store the definition → path mapping under the store lock.
@@ -297,8 +411,10 @@ async fn commit_mapping<R: tauri::Runtime>(
     app: &AppHandle<R>,
     definition_id: String,
     source_path: std::path::PathBuf,
+    prompt: &str,
 ) -> Result<(), String> {
     let app = app.clone();
+    let prompt = prompt.to_string();
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         let state = app.state::<AppState>();
         let _store_guard = state
@@ -308,7 +424,7 @@ async fn commit_mapping<R: tauri::Runtime>(
         commit_prompt_source_at(
             &prompt_sources_path(&app)?,
             &definition_id,
-            Some(&source_path),
+            Some((source_path.as_path(), prompt.as_str())),
         )
     })
     .await

@@ -147,7 +147,45 @@ fn stored_mapping(app: &tauri::AppHandle<tauri::test::MockRuntime>, id: &str) ->
     load_prompt_sources_at(&path)
         .expect("sidecar reads")
         .get(id)
-        .cloned()
+        .map(|stored| stored.path.clone())
+}
+
+/// Register a one-shot hook to run in the window between the command's read
+/// pass and its save pass, keyed by definition id.
+///
+/// The command cannot hold the store lock across both passes, because the
+/// update path takes it itself. That window is the whole reason
+/// `update_persona_with_precondition` exists, and a test that cannot land a
+/// writer inside it can only assert the precondition helper, never the command
+/// — which is how the guard came to be removable without failing anything.
+/// Keyed by id so tests running in parallel cannot arm each other's barrier.
+fn arm_read_save_barrier(definition_id: &str, barrier: impl FnOnce() + Send + 'static) {
+    read_save_barriers()
+        .lock()
+        .expect("barrier registry")
+        .insert(definition_id.to_string(), Box::new(barrier));
+}
+
+type ReadSaveBarrier = Box<dyn FnOnce() + Send>;
+
+fn read_save_barriers(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, ReadSaveBarrier>> {
+    static BARRIERS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, ReadSaveBarrier>>,
+    > = std::sync::OnceLock::new();
+    BARRIERS.get_or_init(Default::default)
+}
+
+/// Called by the command itself, between its two passes. A no-op unless a test
+/// armed a barrier for this definition.
+pub(super) fn run_read_save_barrier(definition_id: &str) {
+    let barrier = read_save_barriers()
+        .lock()
+        .expect("barrier registry")
+        .remove(definition_id);
+    if let Some(barrier) = barrier {
+        barrier();
+    }
 }
 
 #[tokio::test]
@@ -171,7 +209,12 @@ async fn reload_saves_the_prompt_then_the_mapping_and_reports_the_result() {
 
     assert!(result.local_updated);
     assert_eq!(result.prompt.as_deref(), Some("Ship the roadmap.\n"));
-    assert_eq!(result.path.as_deref(), file.to_str());
+    let binding = result.binding.clone().expect("a reload stores a binding");
+    assert_eq!(Some(binding.path.as_str()), file.to_str());
+    assert!(
+        binding.in_sync,
+        "the prompt that just landed came from this file"
+    );
     assert_eq!(result.mapping_error, None);
     let publish = result.publish.clone().expect("a reload submits a head");
     assert!(
@@ -187,8 +230,9 @@ async fn reload_saves_the_prompt_then_the_mapping_and_reports_the_result() {
     let json = serde_json::to_value(&result).expect("result serializes");
     assert_eq!(json["localUpdated"], serde_json::json!(true));
     assert_eq!(json["prompt"], serde_json::json!("Ship the roadmap.\n"));
+    assert_eq!(json["binding"]["inSync"], serde_json::json!(true));
     assert!(
-        json.get("path").is_some(),
+        json["binding"]["path"].is_string(),
         "a stored mapping reports its path"
     );
     assert!(
@@ -348,8 +392,8 @@ async fn a_failed_mapping_write_is_reported_and_stores_nothing() {
         "the prompt is durable before the mapping is attempted"
     );
     assert_eq!(
-        result.path, None,
-        "path is reported only when a mapping was actually stored"
+        result.binding, None,
+        "no binding survived, because none was ever stored"
     );
     assert!(
         result
@@ -385,7 +429,7 @@ async fn clearing_removes_the_mapping_and_leaves_the_prompt() {
 
     assert!(!result.local_updated);
     assert_eq!(result.publish, None, "a clear submits nothing");
-    assert_eq!(result.path, None);
+    assert_eq!(result.binding, None);
     assert_eq!(stored_mapping(app.handle(), "pm"), None);
     assert_eq!(
         stored_prompt(app.handle(), "pm"),
@@ -470,15 +514,20 @@ async fn a_concurrent_edit_is_refused_rather_than_clobbered() {
 /// file's bytes unchanged.
 ///
 /// Every hop is production code, and each hop's output is the next hop's input,
-/// so the seam is bound rather than sampled at two ends:
+/// so the seam is bound rather than sampled at two ends. The spawn hop included:
+/// the environment is not set by the test, it is written by the production
+/// writer ([`apply_system_prompt_env`], the line `runtime.rs` calls on every
+/// spawn) onto a real `Command` and read back off it, so deleting that write
+/// fails this test instead of leaving it green.
+///
 ///
 /// 1. the file on disk and the real `set_prompt_source_and_reload` command;
 /// 2. the definition read back off disk and
 ///    [`resolve_effective_config`] — the same resolve
 ///    `runtime.rs` performs on a restart, with the record's own stale prompt
 ///    bytes losing to the definition;
-/// 3. that value exported under [`SYSTEM_PROMPT_ENV`], the name the spawn
-///    writes, and read back by the harness's own
+/// 3. that value exported by [`apply_system_prompt_env`] under
+///    [`SYSTEM_PROMPT_ENV`], the write the spawn performs, and read back by the harness's own
 ///    [`CliArgs`](buzz_acp_pkg::delivery_seam::CliArgs) /
 ///    [`Config`](buzz_acp_pkg::delivery_seam::Config) env parse — a rename on
 ///    either side fails here;
@@ -547,8 +596,33 @@ async fn a_reloaded_prompt_file_reaches_the_adapter_after_a_restart() {
         .value
         .expect("a restart writes a system prompt");
 
-    // 3. The spawn exports it; the harness process parses its own environment.
-    let _prompt_env = EnvVarGuard::set(SYSTEM_PROMPT_ENV, &spawned);
+    // 3. The spawn exports it. The value under test is taken from the
+    //    production writer, not from this test: `apply_system_prompt_env` is
+    //    the line the spawn path runs, and what it puts on the command is what
+    //    the harness process below is given. Delete that write and `exported`
+    //    is `None` and this test fails, which is the point — the previous
+    //    version set the variable itself and could not tell.
+    let mut spawn_command = std::process::Command::new("true");
+    crate::managed_agents::apply_system_prompt_env(&mut spawn_command, Some(spawned.as_str()));
+    let exported = spawn_command
+        .get_envs()
+        .find(|(key, _)| *key == std::ffi::OsStr::new(SYSTEM_PROMPT_ENV))
+        .and_then(|(_, value)| value)
+        .map(|value| value.to_string_lossy().into_owned())
+        .expect("the spawn path must export the resolved prompt");
+    let _prompt_env = EnvVarGuard::set(SYSTEM_PROMPT_ENV, &exported);
+
+    // The same writer removes a stale inherited value when nothing resolves, so
+    // an agent configured back to "no prompt" cannot keep the previous one.
+    let mut cleared = std::process::Command::new("true");
+    crate::managed_agents::apply_system_prompt_env(&mut cleared, Some("stale"));
+    crate::managed_agents::apply_system_prompt_env(&mut cleared, None);
+    assert!(
+        cleared
+            .get_envs()
+            .any(|(key, value)| key == std::ffi::OsStr::new(SYSTEM_PROMPT_ENV) && value.is_none()),
+        "an unset prompt must remove the inherited variable, not leave it standing"
+    );
     let private_key = nostr::Keys::generate().secret_key().to_secret_hex();
     let cli = CliArgs::try_parse_from(["buzz-acp", "--private-key", &private_key])
         .expect("the harness parses its own environment");
@@ -760,9 +834,11 @@ async fn a_reloaded_binding_reads_back_through_the_command_until_it_is_cleared()
     assert_eq!(
         get_prompt_source("pm".to_string(), app.handle().clone())
             .await
-            .expect("sidecar reads")
-            .as_deref(),
-        file.to_str(),
+            .expect("sidecar reads"),
+        Some(PromptSourceBinding {
+            path: file.to_string_lossy().into_owned(),
+            in_sync: true,
+        }),
         "the binding a reload stored must be readable, or the sidecar is write-only \
          and the dialog opens knowing nothing about it"
     );
@@ -811,10 +887,313 @@ async fn a_binding_whose_definition_is_gone_still_reads_back_so_it_can_be_cleare
     assert_eq!(
         get_prompt_source("pm".to_string(), app.handle().clone())
             .await
-            .expect("sidecar reads")
-            .as_deref(),
-        file.to_str(),
+            .expect("sidecar reads"),
+        Some(PromptSourceBinding {
+            path: file.to_string_lossy().into_owned(),
+            in_sync: false,
+        }),
         "the read half must not depend on the definition, or an orphan mapping \
-         becomes invisible and unclearable"
+         becomes invisible and unclearable — and with no definition there is no \
+         prompt for it to be in sync with"
+    );
+}
+
+/// A failed sidecar write must report the binding that is still on disk.
+///
+/// `commit_prompt_source_at` writes atomically, so a failure leaves the
+/// *previous* entry — file A — in place. Reporting "no binding" there tells the
+/// dialog one thing while the sidecar says another: the next open seeds A back,
+/// the hint claims the instructions come from A, and the next Reload restores
+/// A over the prompt the user just loaded from B. The result carries the
+/// surviving entry instead, marked out of sync because the prompt that landed
+/// did not come from it.
+#[tokio::test]
+async fn a_failed_mapping_write_reports_the_binding_that_survived() {
+    let home = TempHome::new();
+    let app = mock_app();
+    save_personas(
+        app.handle(),
+        &[definition("pm", "Old instructions.", false)],
+    )
+    .expect("seed the definition");
+    let file_a = home.prompt_file("a.md", "Instructions from A.\n");
+    let file_b = home.prompt_file("b.md", "Instructions from B.\n");
+
+    set_prompt_source_and_reload(
+        "pm".to_string(),
+        Some(file_a.to_string_lossy().into_owned()),
+        app.handle().clone(),
+    )
+    .await
+    .expect("the first reload binds A");
+    assert_eq!(
+        stored_mapping(app.handle(), "pm").as_deref(),
+        file_a.to_str()
+    );
+
+    // Injected failure at the mapping boundary only, leaving what the sidecar
+    // already holds intact: the atomic write stages through
+    // `prompt-sources.json.tmp`, so a directory in that slot fails the staging
+    // write while the sidecar itself stays exactly as it is — readable, and
+    // still mapping A.
+    let staged = managed_agents_base_dir(app.handle())
+        .expect("base dir")
+        .join("prompt-sources.json.tmp");
+    std::fs::create_dir_all(&staged).expect("occupy the atomic write's staging path");
+
+    let result = set_prompt_source_and_reload(
+        "pm".to_string(),
+        Some(file_b.to_string_lossy().into_owned()),
+        app.handle().clone(),
+    )
+    .await
+    .expect("the prompt save landed, so the command reports rather than fails");
+
+    assert!(
+        result.mapping_error.is_some(),
+        "the failed sidecar write must be reported"
+    );
+    assert_eq!(
+        stored_prompt(app.handle(), "pm"),
+        "Instructions from B.\n",
+        "the prompt itself landed before the mapping was attempted"
+    );
+    assert_eq!(
+        stored_mapping(app.handle(), "pm").as_deref(),
+        file_a.to_str(),
+        "the atomic write left A on disk"
+    );
+    assert_eq!(
+        result.binding,
+        Some(PromptSourceBinding {
+            path: file_a.to_string_lossy().into_owned(),
+            in_sync: false,
+        }),
+        "the surviving binding must be reported, and reported as no longer matching \
+         the prompt, or the dialog claims B's text is loaded from A"
+    );
+    assert_eq!(
+        get_prompt_source("pm".to_string(), app.handle().clone())
+            .await
+            .expect("sidecar reads"),
+        result.binding,
+        "the next open must see exactly what the failed reload reported"
+    );
+}
+
+/// The binding is a claim about the definition's current text, and three other
+/// paths can make it false. None of them knows the sidecar exists, so the claim
+/// is checked on read rather than maintained on write — and each path is
+/// covered here, because "the read checks it" is only true if it checks the
+/// thing that actually changed.
+#[tokio::test]
+async fn a_prompt_written_by_another_path_reads_back_out_of_sync() {
+    let home = TempHome::new();
+    let app = mock_app();
+    save_personas(
+        app.handle(),
+        &[definition("pm", "Old instructions.", false)],
+    )
+    .expect("seed the definition");
+    let file = home.prompt_file("pm.md", "Instructions from the file.\n");
+    set_prompt_source_and_reload(
+        "pm".to_string(),
+        Some(file.to_string_lossy().into_owned()),
+        app.handle().clone(),
+    )
+    .await
+    .expect("the reload binds the file");
+
+    let bound = |app: tauri::AppHandle<tauri::test::MockRuntime>| async move {
+        get_prompt_source("pm".to_string(), app)
+            .await
+            .expect("sidecar reads")
+    };
+    assert!(
+        bound(app.handle().clone())
+            .await
+            .expect("the binding is stored")
+            .in_sync,
+        "the reload's own prompt is in sync with the file it came from"
+    );
+
+    // 1. A hand-typed edit through the ordinary update command.
+    let typed = crate::managed_agents::prompt_source::update_request_from_definition(
+        &crate::managed_agents::prompt_source::definition_with_prompt(
+            &load_personas(app.handle())
+                .expect("load")
+                .into_iter()
+                .find(|record| record.id == "pm")
+                .expect("definition exists"),
+            "Typed straight into the dialog.",
+        ),
+    );
+    crate::commands::personas::update_persona(typed, app.handle().clone())
+        .await
+        .expect("the typed edit saves");
+    assert_eq!(
+        bound(app.handle().clone())
+            .await
+            .expect("the entry is still stored"),
+        PromptSourceBinding {
+            path: file.to_string_lossy().into_owned(),
+            in_sync: false,
+        },
+        "after a typed edit the file no longer feeds the agent, and the dialog must say so"
+    );
+
+    // 2. An inbound replacement: another device's copy of the definition
+    //    arriving with different instructions.
+    let mut replaced = load_personas(app.handle())
+        .expect("load")
+        .into_iter()
+        .find(|record| record.id == "pm")
+        .expect("definition exists");
+    replaced.system_prompt = "Replaced from another device.".to_string();
+    save_personas(app.handle(), &[replaced]).expect("apply the inbound definition");
+    assert!(
+        !bound(app.handle().clone())
+            .await
+            .expect("the entry is still stored")
+            .in_sync,
+        "an inbound replacement invalidates the binding as surely as a typed edit"
+    );
+
+    // 3. Deletion. Nothing in the UI can reach an entry whose definition is
+    //    gone, so the delete drops it rather than orphaning it.
+    crate::commands::personas::delete_persona("pm".to_string(), app.handle().clone())
+        .await
+        .expect("the definition deletes");
+    assert_eq!(
+        bound(app.handle().clone()).await,
+        None,
+        "deleting the definition must retract its binding, not orphan it"
+    );
+}
+
+/// The precondition the command passes to the save is what stops a concurrent
+/// edit being clobbered, so the test has to run the command with a writer
+/// actually inside its read→save window. Driving the helper directly (with the
+/// expected timestamp handed to it) proves the helper, not the command: change
+/// the command's argument to `None` and that test stays green while this one
+/// fails.
+#[tokio::test]
+async fn a_concurrent_save_inside_the_command_window_is_refused() {
+    let home = TempHome::new();
+    let app = mock_app();
+    save_personas(
+        app.handle(),
+        &[definition("barrier-pm", "Old instructions.", false)],
+    )
+    .expect("seed the definition");
+    let file = home.prompt_file("pm.md", "Instructions from the file.\n");
+
+    // The concurrent writer: a save that lands after the command has read the
+    // definition and before it writes it back.
+    let writer_app = app.handle().clone();
+    arm_read_save_barrier("barrier-pm", move || {
+        let mut personas = load_personas(&writer_app).expect("the writer loads");
+        let record = personas
+            .iter_mut()
+            .find(|record| record.id == "barrier-pm")
+            .expect("definition exists");
+        record.display_name = "Renamed by someone else".to_string();
+        record.updated_at = crate::util::now_iso();
+        save_personas(&writer_app, &personas).expect("the concurrent edit lands");
+    });
+
+    let error = set_prompt_source_and_reload(
+        "barrier-pm".to_string(),
+        Some(file.to_string_lossy().into_owned()),
+        app.handle().clone(),
+    )
+    .await
+    .expect_err("a definition that moved under the command must not be overwritten");
+    assert!(
+        error.contains("edited while its prompt file was being read"),
+        "the refusal must say what happened, got {error:?}"
+    );
+
+    let after = load_personas(app.handle())
+        .expect("load")
+        .into_iter()
+        .find(|record| record.id == "barrier-pm")
+        .expect("definition exists");
+    assert_eq!(
+        after.display_name, "Renamed by someone else",
+        "the concurrent edit must survive the refused reload"
+    );
+    assert_eq!(
+        after.system_prompt, "Old instructions.",
+        "a refused reload writes nothing at all"
+    );
+    assert_eq!(
+        stored_mapping(app.handle(), "barrier-pm"),
+        None,
+        "and stores no mapping, so the sidecar cannot claim a prompt that was never applied"
+    );
+}
+
+/// The recovery command, driven end to end: a corrupt sidecar refuses every
+/// ordinary control, and the reset is what makes the field usable again.
+#[tokio::test]
+async fn resetting_recovers_from_a_sidecar_no_other_command_can_read() {
+    let home = TempHome::new();
+    let app = mock_app();
+    save_personas(
+        app.handle(),
+        &[definition("pm", "Old instructions.", false)],
+    )
+    .expect("seed the definition");
+    let file = home.prompt_file("pm.md", "Instructions from the file.\n");
+    let sidecar = managed_agents_base_dir(app.handle())
+        .expect("base dir")
+        .join("prompt-sources.json");
+    std::fs::create_dir_all(sidecar.parent().expect("parent")).expect("create the store dir");
+    std::fs::write(&sidecar, "{ not json").expect("corrupt the sidecar");
+
+    // Every ordinary way out is closed: reading the binding fails, and so does
+    // Clear, which must read the file before it can remove one entry.
+    assert!(
+        get_prompt_source("pm".to_string(), app.handle().clone())
+            .await
+            .is_err(),
+        "a corrupt sidecar must not read as unbound"
+    );
+    assert!(
+        set_prompt_source_and_reload("pm".to_string(), None, app.handle().clone())
+            .await
+            .is_err(),
+        "Clear cannot recover a corrupt sidecar — this is the state the reset exists for"
+    );
+
+    let quarantined = reset_prompt_sources(app.handle().clone())
+        .await
+        .expect("the reset succeeds");
+    assert!(
+        std::path::Path::new(&quarantined).exists(),
+        "the unreadable file is moved aside, not deleted"
+    );
+
+    assert_eq!(
+        get_prompt_source("pm".to_string(), app.handle().clone())
+            .await
+            .expect("the store reads again"),
+        None,
+        "after the reset every binding is gone, which is what the warning says"
+    );
+    set_prompt_source_and_reload(
+        "pm".to_string(),
+        Some(file.to_string_lossy().into_owned()),
+        app.handle().clone(),
+    )
+    .await
+    .expect("and the field works again");
+    assert_eq!(stored_mapping(app.handle(), "pm").as_deref(), file.to_str());
+
+    assert!(
+        reset_prompt_sources(app.handle().clone()).await.is_err(),
+        "a readable sidecar must not be resettable, or the recovery becomes a way \
+         to drop every working binding at once"
     );
 }

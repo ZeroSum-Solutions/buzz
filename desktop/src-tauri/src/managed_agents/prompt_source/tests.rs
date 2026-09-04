@@ -65,11 +65,21 @@ fn prepare_and_commit(
     let change = prepare_prompt_source(raw_path, home)?;
     match &change {
         PromptSourceChange::Cleared => commit_prompt_source_at(store, definition_id, None)?,
-        PromptSourceChange::Loaded { path, .. } => {
-            commit_prompt_source_at(store, definition_id, Some(path))?
-        }
+        PromptSourceChange::Loaded { path, prompt } => commit_prompt_source_at(
+            store,
+            definition_id,
+            Some((path.as_path(), prompt.as_str())),
+        )?,
     }
     Ok(change)
+}
+
+/// The path stored for `id`, ignoring the digest beside it.
+fn stored_path(store: &std::path::Path, id: &str) -> Option<String> {
+    load_prompt_sources_at(store)
+        .expect("sidecar reads")
+        .get(id)
+        .map(|stored| stored.path.clone())
 }
 
 #[test]
@@ -87,12 +97,10 @@ fn preparing_a_prompt_source_writes_nothing() {
          after the persona save, so an intervening failure leaves no mapping"
     );
 
-    commit_prompt_source_at(&f.store, "pm", Some(&path)).expect("commit the mapping");
+    commit_prompt_source_at(&f.store, "pm", Some((path.as_path(), "Be the PM.")))
+        .expect("commit the mapping");
     assert_eq!(
-        load_prompt_sources_at(&f.store)
-            .expect("reload")
-            .get("pm")
-            .map(String::as_str),
+        stored_path(&f.store, "pm").as_deref(),
         Some(path.to_str().expect("utf-8")),
         "committing after the save is what stores the mapping"
     );
@@ -242,11 +250,19 @@ fn happy_path_stores_the_mapping_and_returns_the_file_text() {
     assert_eq!(prompt, "Ship the roadmap.\n");
     assert_eq!(resolved, path);
 
-    let stored = load_prompt_sources_at(&f.store).expect("reload sidecar");
     assert_eq!(
-        stored.get("pm").map(String::as_str),
+        stored_path(&f.store, "pm").as_deref(),
         Some(path.to_str().expect("utf-8")),
         "the sidecar keeps the resolved absolute path"
+    );
+    assert_eq!(
+        load_prompt_sources_at(&f.store)
+            .expect("reload sidecar")
+            .get("pm")
+            .map(|stored| stored.prompt_sha256.clone()),
+        Some(prompt_digest("Ship the roadmap.\n")),
+        "the entry records the prompt it was read from, so a later read can tell \
+         whether the definition still holds that text"
     );
 }
 
@@ -347,7 +363,8 @@ fn a_stored_binding_reads_back_and_an_unbound_definition_reads_none() {
     std::fs::write(&path, "Be the PM.").expect("write prompt");
 
     assert_eq!(
-        prompt_source_at(&f.store, "pm").expect("a missing sidecar is no binding"),
+        prompt_source_binding_at(&f.store, "pm", Some("Be the PM."))
+            .expect("a missing sidecar is no binding"),
         None,
         "nothing is bound before a commit"
     );
@@ -356,21 +373,51 @@ fn a_stored_binding_reads_back_and_an_unbound_definition_reads_none() {
         .expect("bind the prompt file");
 
     assert_eq!(
-        prompt_source_at(&f.store, "pm").expect("sidecar reads"),
-        Some(path.to_string_lossy().into_owned()),
+        prompt_source_binding_at(&f.store, "pm", Some("Be the PM.")).expect("sidecar reads"),
+        Some(PromptSourceBinding {
+            path: path.to_string_lossy().into_owned(),
+            in_sync: true,
+        }),
         "the stored path must read back, or the dialog has to make the user retype it"
     );
     assert_eq!(
-        prompt_source_at(&f.store, "designer").expect("sidecar reads"),
+        prompt_source_binding_at(&f.store, "designer", Some("Be the PM.")).expect("sidecar reads"),
         None,
         "a definition with no entry is unbound, not the first entry"
     );
 
     prepare_and_commit(&f.store, "pm", None, &f.home).expect("clear the binding");
     assert_eq!(
-        prompt_source_at(&f.store, "pm").expect("sidecar reads"),
+        prompt_source_binding_at(&f.store, "pm", Some("Be the PM.")).expect("sidecar reads"),
         None,
         "a cleared binding must read back as unbound"
+    );
+}
+
+/// A binding is a claim about the definition's current text, so the read must
+/// check it. Nothing else in the app tells the sidecar that some other path
+/// rewrote the prompt.
+#[test]
+fn a_binding_whose_prompt_no_longer_matches_reads_back_out_of_sync() {
+    let f = fixture();
+    let path = f.home.join("pm.md");
+    std::fs::write(&path, "Be the PM.").expect("write prompt");
+    prepare_and_commit(&f.store, "pm", Some(path.to_str().expect("utf-8")), &f.home)
+        .expect("bind the prompt file");
+
+    assert!(
+        !prompt_source_binding_at(&f.store, "pm", Some("Typed over by hand."))
+            .expect("sidecar reads")
+            .expect("the entry is still stored")
+            .in_sync,
+        "a prompt that no longer equals the file's text must not be reported as loaded from it"
+    );
+    assert!(
+        !prompt_source_binding_at(&f.store, "pm", None)
+            .expect("sidecar reads")
+            .expect("an orphaned entry is still visible, so it can be cleared")
+            .in_sync,
+        "a binding whose definition is gone cannot be in sync with it"
     );
 }
 
@@ -378,10 +425,60 @@ fn a_stored_binding_reads_back_and_an_unbound_definition_reads_none() {
 fn reading_a_binding_from_a_corrupt_sidecar_is_an_error_not_unbound() {
     let f = fixture();
     std::fs::write(&f.store, "{ not json").expect("write corrupt sidecar");
-    let error =
-        prompt_source_at(&f.store, "pm").expect_err("a corrupt sidecar must not read as unbound");
+    let error = prompt_source_binding_at(&f.store, "pm", Some("Be the PM."))
+        .expect_err("a corrupt sidecar must not read as unbound");
     assert!(
         error.contains("prompt-sources"),
         "error should name the sidecar, got {error:?}"
+    );
+}
+
+/// The way out of the state every other control refuses. `Clear` reads the
+/// sidecar before it can remove one entry, so on a malformed file it fails
+/// exactly as the seed did; the reset moves the file aside instead.
+#[test]
+fn resetting_quarantines_an_unreadable_sidecar_and_leaves_a_readable_one_alone() {
+    let f = fixture();
+    let path = f.home.join("pm.md");
+    std::fs::write(&path, "Be the PM.").expect("write prompt");
+
+    assert!(
+        quarantine_prompt_sources_at(&f.store).is_err(),
+        "there is nothing to reset before a sidecar exists"
+    );
+
+    prepare_and_commit(&f.store, "pm", Some(path.to_str().expect("utf-8")), &f.home)
+        .expect("bind the prompt file");
+    let refused = quarantine_prompt_sources_at(&f.store)
+        .expect_err("a readable sidecar must not be resettable");
+    assert!(
+        refused.contains("Clear"),
+        "the refusal should point at the per-agent action, got {refused:?}"
+    );
+    assert!(
+        f.store.exists(),
+        "a readable sidecar must survive untouched"
+    );
+
+    std::fs::write(&f.store, "{ not json").expect("corrupt the sidecar");
+    assert!(
+        commit_prompt_source_at(&f.store, "pm", None).is_err(),
+        "Clear cannot recover a corrupt sidecar — that is why the reset exists"
+    );
+
+    let quarantined = quarantine_prompt_sources_at(&f.store).expect("the reset succeeds");
+    assert!(
+        quarantined.exists(),
+        "the unreadable file is moved aside, never deleted"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&quarantined).expect("the quarantined file reads"),
+        "{ not json",
+        "the operator can still inspect exactly what was on disk"
+    );
+    assert_eq!(
+        load_prompt_sources_at(&f.store).expect("the store reads again"),
+        PromptSourceMap::new(),
+        "after the reset the store is usable again, with every binding gone"
     );
 }

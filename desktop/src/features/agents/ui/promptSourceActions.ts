@@ -1,4 +1,7 @@
-import type { PromptSourceResult } from "@/shared/api/tauriPersonas";
+import type {
+  PromptSourceBinding,
+  PromptSourceResult,
+} from "@/shared/api/tauriPersonas";
 
 /**
  * Reload needs something to read. A blank path (or one that is only
@@ -15,12 +18,15 @@ export function canReloadPromptSource(
 /**
  * Clear removes a stored binding, and is offered whenever the field is usable.
  *
- * The field now seeds itself from the stored binding, so Clear is no longer
- * offered blind — but it is still not *gated* on that seed. The seed can fail
- * (an unreadable sidecar) or be out of date (another window bound a file since
- * this dialog opened), and in both cases the operator needs the way out more,
- * not less. Unbinding what is already unbound is a no-op the backend accepts,
- * so offering the action always is the safe direction.
+ * The field seeds itself from the stored binding, so Clear is no longer offered
+ * blind — but it is still not *gated* on that seed, because the seed can be out
+ * of date: another window may have bound a file since this dialog opened, and
+ * unbinding what is already unbound is a no-op the backend accepts.
+ *
+ * Clear is **not** the recovery path for an unreadable sidecar, which is what
+ * this gate was once justified by. Clearing one entry has to read the file
+ * first, so on a malformed sidecar it fails exactly where the seed did. The
+ * reset ({@link canResetPromptSources}) is what recovers that state.
  */
 export function canClearPromptSource(isPending: boolean): boolean {
   return !isPending;
@@ -41,19 +47,26 @@ export function promptSourceStatusMessage(
     return "Prompt file unlinked. Instructions stay as they are.";
   }
   const mapping = result.mappingError
-    ? ` The file was not remembered for next time: ${result.mappingError}`
+    ? ` The file was not remembered for next time: ${result.mappingError}${
+        result.binding
+          ? ` This agent is still set to ${result.binding.path}, which no longer matches these instructions.`
+          : ""
+      }`
+    : "";
+  const bookkeeping = result.bookkeepingError
+    ? ` The local sync record did not update (${result.bookkeepingError}), so the catalog head will be sent again.`
     : "";
   const publish = result.publish ?? "";
   if (publish === "published") {
-    return `Instructions reloaded from the file and published.${mapping}`;
+    return `Instructions reloaded from the file and published.${mapping}${bookkeeping}`;
   }
   if (publish === "queued") {
-    return `Instructions reloaded from the file. The catalog update is queued.${mapping}`;
+    return `Instructions reloaded from the file. The catalog update is queued.${mapping}${bookkeeping}`;
   }
   if (publish.startsWith("failed:")) {
-    return `Instructions reloaded from the file, but the catalog update was not queued: ${publish.slice("failed:".length)}${mapping}`;
+    return `Instructions reloaded from the file, but the catalog update was not queued: ${publish.slice("failed:".length)}${mapping}${bookkeeping}`;
   }
-  return `Instructions reloaded from the file.${mapping}`;
+  return `Instructions reloaded from the file.${mapping}${bookkeeping}`;
 }
 
 /**
@@ -77,10 +90,39 @@ export const DIRTY_EXEMPT_SELECTOR = `[${DIRTY_EXEMPT_ATTRIBUTE}]`;
  * Naming the bound path is what makes the stored binding visible: the value in
  * the input alone cannot say whether it is a live binding or something the
  * operator has just typed and not yet reloaded.
+ *
+ * The out-of-sync sentence is the one that matters. A binding is a claim that
+ * the file's text is what the agent uses, and other paths write those
+ * instructions — a hand-typed edit here, a definition replaced from another
+ * device. Repeating the claim then would state something false about the agent
+ * about to run, so the field says the file has drifted and names both ways out.
  */
-export function promptSourceHint(boundPath: string | null): string {
-  if (boundPath === null) {
+export function promptSourceHint(binding: PromptSourceBinding | null): string {
+  if (binding === null) {
     return "Read this agent's instructions from a file in your home folder.";
   }
-  return `These instructions are loaded from ${boundPath}.`;
+  if (!binding.inSync) {
+    return `These instructions no longer match ${binding.path}. Reload to use the file's text again, or Clear to forget the file.`;
+  }
+  return `These instructions are loaded from ${binding.path}.`;
 }
+
+/**
+ * Whether to offer the sidecar reset.
+ *
+ * Only after a seed failed. The reset moves every agent's binding aside, so it
+ * is not a general control — but a sidecar that cannot be parsed is refused by
+ * the seed *and* by Clear (which must read the file before removing one entry),
+ * and a field with an error and two buttons that cannot act on it is a dead
+ * end. This is the way out of exactly that state.
+ */
+export function canResetPromptSources(
+  seedFailed: boolean,
+  isPending: boolean,
+): boolean {
+  return seedFailed && !isPending;
+}
+
+/** Warning shown beside the reset, because it is not scoped to this agent. */
+export const PROMPT_SOURCE_RESET_WARNING =
+  "This clears the instructions-file setting for every agent on this machine. The unreadable file is kept, renamed.";

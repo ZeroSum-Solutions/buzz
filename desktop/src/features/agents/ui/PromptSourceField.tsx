@@ -1,8 +1,10 @@
 import * as React from "react";
 
+import { useSetPromptSourceMutation } from "@/features/agents/promptSourceMutation";
 import {
   getPromptSource,
-  setPromptSourceAndReload,
+  type PromptSourceBinding,
+  resetPromptSources,
 } from "@/shared/api/tauriPersonas";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
@@ -15,7 +17,9 @@ import {
 import {
   canClearPromptSource,
   canReloadPromptSource,
+  canResetPromptSources,
   DIRTY_EXEMPT_ATTRIBUTE,
+  PROMPT_SOURCE_RESET_WARNING,
   promptSourceHint,
   promptSourceStatusMessage,
 } from "./promptSourceActions";
@@ -38,9 +42,16 @@ type PromptSourceFieldProps = {
  *
  * On open the field seeds itself from the stored binding, so re-opening the
  * dialog shows which file feeds this agent instead of an empty box the
- * operator has to retype an absolute path into. Clear stays available even
- * when the seed found nothing — a seed that failed, or a sidecar written by
- * another window since, must not make an existing binding unclearable.
+ * operator has to retype an absolute path into — and says so only while the
+ * binding still matches the agent's instructions.
+ *
+ * **Every answer that arrives late is fenced.** The dialog is persistent: it
+ * keeps this component mounted across agents and re-mounts it on the next open,
+ * while a reload started on one agent is still in flight. An answer is applied
+ * only if this instance is still mounted and still on the definition that asked
+ * for it; otherwise it is dropped, because `onPromptReloaded` writes straight
+ * into the dialog's shared instructions field and would otherwise put one
+ * agent's prompt into another agent's unsaved draft, where Save persists it.
  */
 export function PromptSourceField({
   definitionId,
@@ -48,41 +59,76 @@ export function PromptSourceField({
   onPromptReloaded,
 }: PromptSourceFieldProps) {
   const [path, setPath] = React.useState("");
-  const [boundPath, setBoundPath] = React.useState<string | null>(null);
-  const [isPending, setIsPending] = React.useState(false);
+  const [binding, setBinding] = React.useState<PromptSourceBinding | null>(
+    null,
+  );
   const [notice, setNotice] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
-  /** Newest seed request. An older answer that arrives late is discarded. */
-  const seedGeneration = React.useRef(0);
-  /** Set once the operator types or acts, so a late seed cannot overwrite. */
-  const interacted = React.useRef(false);
+  const [seedFailed, setSeedFailed] = React.useState(false);
+  const reload = useSetPromptSourceMutation();
+  const [isResetting, setIsResetting] = React.useState(false);
+  /**
+   * Bumped whenever the field starts over on a definition. Every awaited
+   * answer captures it and compares on return, so an older request cannot
+   * write over newer state.
+   */
+  const generation = React.useRef(0);
+  /** The definition this instance is showing right now. */
+  const currentDefinitionId = React.useRef(definitionId);
+  /**
+   * False once this instance is gone. Refs outlive the unmount inside a
+   * closure, so a request in flight when the dialog closes still finds this
+   * and drops its answer instead of writing into whatever opened next.
+   */
+  const isMounted = React.useRef(true);
+
+  /**
+   * Whether an answer captured at `startedAt`, for `requestedDefinitionId`, may
+   * still be applied. Both halves matter: the generation catches a restart on
+   * the same definition, and the id catches a dialog that moved to another
+   * agent without this component unmounting.
+   */
+  const isCurrent = React.useCallback(
+    (startedAt: number, requestedDefinitionId: string): boolean =>
+      isMounted.current &&
+      startedAt === generation.current &&
+      requestedDefinitionId === currentDefinitionId.current,
+    [],
+  );
 
   React.useEffect(() => {
-    const generation = ++seedGeneration.current;
-    interacted.current = false;
-    setBoundPath(null);
+    isMounted.current = true;
+    return () => {
+      isMounted.current = false;
+    };
+  }, []);
+
+  React.useEffect(() => {
+    const seedGeneration = ++generation.current;
+    currentDefinitionId.current = definitionId;
+    setBinding(null);
     setPath("");
     setError(null);
     setNotice(null);
+    setSeedFailed(false);
     void (async () => {
       try {
         const stored = await getPromptSource(definitionId);
-        // Fenced by generation and by the operator: an answer for a definition
-        // the dialog has moved off, or one that lost the race to typing or a
-        // reload, must not land on top of newer state.
-        if (generation !== seedGeneration.current || interacted.current) {
+        if (!isCurrent(seedGeneration, definitionId)) {
           return;
         }
-        setBoundPath(stored);
+        setBinding(stored);
         if (stored !== null) {
-          setPath(stored);
+          setPath(stored.path);
         }
       } catch (caught) {
-        if (generation !== seedGeneration.current || interacted.current) {
+        if (!isCurrent(seedGeneration, definitionId)) {
           return;
         }
         // A corrupt sidecar is reported, not read as "nothing is bound": the
         // operator would otherwise rebind over a mapping that is still there.
+        // It also arms the reset, which is the only control that can clear it.
+        setSeedFailed(true);
         setError(
           `Could not read this agent's instructions file setting: ${
             caught instanceof Error ? caught.message : String(caught)
@@ -90,35 +136,72 @@ export function PromptSourceField({
         );
       }
     })();
-  }, [definitionId]);
+  }, [definitionId, isCurrent]);
 
+  const isPending = reload.isPending || isResetting;
   const busy = disabled || isPending;
   const reloadEnabled = canReloadPromptSource(path, busy);
   const clearEnabled = canClearPromptSource(busy);
+  const resetEnabled = canResetPromptSources(seedFailed, busy);
 
   const run = async (nextPath: string | null) => {
-    interacted.current = true;
-    setIsPending(true);
+    // A deliberate action starts a new round: any seed still in flight has lost.
+    const startedAt = ++generation.current;
+    const requestedDefinitionId = definitionId;
     setError(null);
     setNotice(null);
     try {
-      const result = await setPromptSourceAndReload(definitionId, nextPath);
-      // `path` is set exactly when a mapping was stored, so it is also the
-      // binding the field now shows: null after a clear, and null after a
-      // reload whose sidecar write failed (`mappingError` says which).
-      setBoundPath(result.path);
-      if (result.path !== null) {
-        setPath(result.path);
+      const result = await reload.mutateAsync({
+        definitionId: requestedDefinitionId,
+        path: nextPath,
+      });
+      if (!isCurrent(startedAt, requestedDefinitionId)) {
+        return;
+      }
+      // `binding` is what the sidecar holds now: null after a clear, and after
+      // a failed write the entry that survived (`mappingError` says which).
+      setBinding(result.binding);
+      if (result.binding !== null) {
+        setPath(result.binding.path);
       }
       if (result.prompt !== null) {
         onPromptReloaded(result.prompt);
       }
       setNotice(promptSourceStatusMessage(result));
     } catch (caught) {
+      if (!isCurrent(startedAt, requestedDefinitionId)) {
+        return;
+      }
       // Surfaced, never swallowed: a refused path is the user's next action.
       setError(caught instanceof Error ? caught.message : String(caught));
+    }
+  };
+
+  const runReset = async () => {
+    const startedAt = ++generation.current;
+    const requestedDefinitionId = definitionId;
+    setIsResetting(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const quarantined = await resetPromptSources();
+      if (!isCurrent(startedAt, requestedDefinitionId)) {
+        return;
+      }
+      setSeedFailed(false);
+      setBinding(null);
+      setNotice(
+        `Instructions-file settings were reset. The unreadable file was kept at ${quarantined}.`,
+      );
+    } catch (caught) {
+      if (!isCurrent(startedAt, requestedDefinitionId)) {
+        return;
+      }
+      setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
-      setIsPending(false);
+      if (isMounted.current) {
+        setIsResetting(false);
+      }
     }
   };
 
@@ -151,7 +234,9 @@ export function PromptSourceField({
             disabled={busy}
             id="persona-prompt-source"
             onChange={(event) => {
-              interacted.current = true;
+              // Typing supersedes a seed still in flight: the operator's own
+              // value must not be replaced by an answer they did not wait for.
+              generation.current += 1;
               setPath(event.target.value);
             }}
             placeholder="/Users/you/agent-prompts/pm.md"
@@ -186,8 +271,26 @@ export function PromptSourceField({
         )}
         id="persona-prompt-source-status"
       >
-        {error ?? notice ?? promptSourceHint(boundPath)}
+        {error ?? notice ?? promptSourceHint(binding)}
       </p>
+      {resetEnabled ? (
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            aria-describedby="persona-prompt-source-reset-warning"
+            onClick={() => void runReset()}
+            type="button"
+            variant="ghost"
+          >
+            Reset instructions-file settings
+          </Button>
+          <span
+            className="text-xs leading-5 text-muted-foreground"
+            id="persona-prompt-source-reset-warning"
+          >
+            {PROMPT_SOURCE_RESET_WARNING}
+          </span>
+        </div>
+      ) : null}
     </div>
   );
 }

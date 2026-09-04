@@ -25,6 +25,10 @@ pub struct SetPersonaSharedResult {
     pub publication_status: PersonaSharePublicationStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relay_message: Option<String>,
+    /// Why the local "this head is synced" bookkeeping failed, when the relay
+    /// had already accepted the event. See [`publish_prepared_persona`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bookkeeping_error: Option<String>,
 }
 
 #[tauri::command]
@@ -108,27 +112,52 @@ pub(super) async fn publish_prepared_persona(
 
     match publish_result {
         Ok(_) => {
-            let conn = open_retention_db(&prepared.scope.db_path)?;
-            mark_synced(
-                &conn,
-                prepared.retained.kind,
-                &prepared.retained.pubkey,
-                &prepared.retained.d_tag,
-                prepared.retained.created_at,
-                &prepared.retained.content,
-            )?;
+            // The relay has accepted the head, and the persona and any sidecar
+            // mapping are already durable. Marking the retained row synced is
+            // bookkeeping *after* that point, so its failure must not be
+            // reported as the call failing: a caller that sees `Err` here would
+            // tell the user nothing was applied and, in the reload's case, keep
+            // showing the pre-reload text that the next Save would write back —
+            // undoing a change that is live both locally and on the relay.
+            //
+            // Nothing is swallowed, and nothing is stranded (Review-Proven Rule
+            // 1): the retained row simply stays `pending_sync`, which is the
+            // durable retry record the flush loop already acts on, and the
+            // reason is returned so the UI can say the local sync record did
+            // not update.
+            let bookkeeping_error = mark_prepared_synced(&prepared).err();
+            if let Some(reason) = bookkeeping_error.as_deref() {
+                eprintln!(
+                    "buzz-desktop: persona head published but the sync record did not update: {reason}"
+                );
+            }
             Ok(SetPersonaSharedResult {
                 persona: prepared.persona,
                 publication_status: PersonaSharePublicationStatus::Published,
                 relay_message: None,
+                bookkeeping_error,
             })
         }
         Err(error) => Ok(SetPersonaSharedResult {
             persona: prepared.persona,
             publication_status: PersonaSharePublicationStatus::Queued,
             relay_message: Some(error),
+            bookkeeping_error: None,
         }),
     }
+}
+
+/// Record that the relay accepted this head, so the flush loop stops retrying it.
+fn mark_prepared_synced(prepared: &PreparedPersonaPublication) -> Result<(), String> {
+    let conn = open_retention_db(&prepared.scope.db_path)?;
+    mark_synced(
+        &conn,
+        prepared.retained.kind,
+        &prepared.retained.pubkey,
+        &prepared.retained.d_tag,
+        prepared.retained.created_at,
+        &prepared.retained.content,
+    )
 }
 
 #[cfg(all(test, not(target_os = "windows")))]
@@ -392,5 +421,58 @@ mod tests {
             .expect_err("a directory cannot be opened as the retention database");
 
         assert!(error.contains("failed to open retention db"));
+    }
+
+    /// The relay has accepted the head and the persona is already on disk. If
+    /// the sync bookkeeping that follows turns the whole call into `Err`, every
+    /// caller reports "nothing was applied" about a change that is live both
+    /// locally and on the relay — and the prompt-source dialog goes further,
+    /// keeping the pre-reload text that the next Save would write back over it.
+    /// The failure is reported beside the outcome instead, and the retained row
+    /// is left pending so the flush loop is still the durable retry.
+    #[tokio::test]
+    async fn a_bookkeeping_failure_after_relay_acceptance_is_reported_not_raised() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("retention.db");
+        let keys = nostr::Keys::generate();
+        let owner = keys.public_key().to_hex();
+        let mut prepared = prepared(&db_path, spawn_relay(true).await, keys, Some(true));
+
+        // Inject a failure at the bookkeeping boundary only: the event is
+        // prepared and retained in the real database, and only the connection
+        // the mark-synced pass opens is pointed at something that cannot be one.
+        let unopenable = dir.path().join("not-a-database");
+        std::fs::create_dir_all(&unopenable).unwrap();
+        prepared.scope.db_path = unopenable;
+
+        let result = publish_prepared_persona(&build_app_state(), prepared)
+            .await
+            .expect("the relay accepted the head, so the call must not fail");
+
+        assert_eq!(
+            result.publication_status,
+            PersonaSharePublicationStatus::Published,
+            "the relay accepted it; that is what happened"
+        );
+        assert!(
+            result
+                .bookkeeping_error
+                .as_deref()
+                .is_some_and(|reason| reason.contains("retention db")),
+            "the failure must be reported, not swallowed, got {:?}",
+            result.bookkeeping_error
+        );
+        assert!(
+            get_retained_event(
+                &open_retention_db(&db_path).unwrap(),
+                buzz_core_pkg::kind::KIND_PERSONA,
+                &owner,
+                "catalog-reviewer"
+            )
+            .unwrap()
+            .unwrap()
+            .pending_sync,
+            "the row stays pending, so the flush loop is still the durable retry record"
+        );
     }
 }

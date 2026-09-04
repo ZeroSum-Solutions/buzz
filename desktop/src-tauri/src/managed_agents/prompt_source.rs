@@ -16,9 +16,24 @@
 //! `validate_agent_definition_text` enforces on `system_prompt`, so a file that
 //! passes here cannot be rejected later by the update path.
 //!
-//! The mapping is read back as well as written: [`prompt_source_at`] answers
-//! "which file feeds this agent?" so the dialog can show the stored path when
-//! it re-opens instead of making the operator retype it.
+//! The mapping is read back as well as written:
+//! [`prompt_source_binding_at`] answers "which file feeds this agent?" so the
+//! dialog can show the stored path when it re-opens instead of making the
+//! operator retype it.
+//!
+//! **The claim is verified on read, not maintained on write.** A binding is a
+//! claim that the file's text is the agent's instructions, and any number of
+//! other paths write that prompt — a hand-typed edit in the dialog, an inbound
+//! kind:30175 replacement from another device, a snapshot import. Chasing all
+//! of them with invalidation hooks would leave the next new path stale, so the
+//! entry stores the SHA-256 of the prompt it was made from and every read
+//! compares it against the definition's current prompt. A binding whose hash no
+//! longer matches is reported `in_sync: false` and the dialog says so, instead
+//! of claiming a file feeds an agent it no longer feeds.
+//!
+//! Removing a claim is always safe; adding one is not. That asymmetry is why
+//! `delete_persona` drops the entry before it destroys anything, and why a
+//! reload writes the entry only after the prompt is durable.
 //!
 //! Reloading is a desktop convenience, not a harness capability, so
 //! `KnownAcpRuntime` carries nothing for it.
@@ -36,8 +51,43 @@ use crate::managed_agents::{AgentDefinition, UpdatePersonaRequest};
 /// `validate_agent_definition_text`.
 pub(crate) const MAX_PROMPT_SOURCE_BYTES: usize = 64 * 1024;
 
-/// Definition id → absolute prompt-file path, as stored in the sidecar.
-pub(crate) type PromptSourceMap = BTreeMap<String, String>;
+/// One sidecar entry: which file, and the prompt it was read into.
+///
+/// The digest is what makes the binding falsifiable. Without it the sidecar can
+/// only say "this agent was once loaded from this file", which stays on disk
+/// and keeps being rendered as fact long after another path rewrote the prompt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct StoredPromptSource {
+    /// The symlink-resolved absolute path of the prompt file.
+    pub path: String,
+    /// SHA-256 (lowercase hex) of the prompt text this entry was written from.
+    pub prompt_sha256: String,
+}
+
+/// Definition id → the file bound to it, as stored in the sidecar.
+pub(crate) type PromptSourceMap = BTreeMap<String, StoredPromptSource>;
+
+/// A stored binding resolved against the definition's current prompt.
+///
+/// `in_sync` is the whole point: it is `false` when the definition's prompt is
+/// no longer the text the binding was made from (a typed edit, an inbound
+/// replacement) and when the definition is gone altogether, so the dialog can
+/// render an explicit out-of-sync state rather than a false claim.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PromptSourceBinding {
+    /// The bound file's absolute path.
+    pub path: String,
+    /// Whether the definition's prompt still equals the bound file's text as of
+    /// the last reload.
+    pub in_sync: bool,
+}
+
+/// SHA-256 of a prompt, lowercase hex — the sidecar's record of what was read.
+pub(crate) fn prompt_digest(prompt: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(prompt.as_bytes()))
+}
 
 /// What [`prepare_prompt_source`] resolved, before anything was written.
 ///
@@ -72,20 +122,65 @@ pub(crate) fn load_prompt_sources_at(path: &Path) -> Result<PromptSourceMap, Str
         .map_err(|error| format!("failed to parse prompt-sources.json: {error}"))
 }
 
-/// The prompt file bound to `definition_id` in the sidecar at `store_path`.
+/// The prompt file bound to `definition_id`, resolved against the definition's
+/// current prompt.
+///
+/// `current_prompt` is the definition's stored instructions, or `None` when the
+/// definition no longer exists — an orphaned entry resolves to `in_sync: false`
+/// like any other stale claim, and stays visible so it can still be cleared.
 ///
 /// `Ok(None)` means no binding is stored, which is what the dialog shows as
 /// "no instructions file". A sidecar that exists but cannot be read or parsed
 /// is an error rather than `None`: reporting a corrupt file as "nothing is
 /// bound" would invite the operator to rebind over a mapping that is still
 /// there, and the next save would drop every other definition's entry.
-pub(crate) fn prompt_source_at(
+pub(crate) fn prompt_source_binding_at(
     store_path: &Path,
     definition_id: &str,
-) -> Result<Option<String>, String> {
+    current_prompt: Option<&str>,
+) -> Result<Option<PromptSourceBinding>, String> {
     Ok(load_prompt_sources_at(store_path)?
         .get(definition_id)
-        .cloned())
+        .map(|stored| PromptSourceBinding {
+            path: stored.path.clone(),
+            in_sync: current_prompt
+                .is_some_and(|prompt| prompt_digest(prompt) == stored.prompt_sha256),
+        }))
+}
+
+/// Move a sidecar that cannot be parsed out of the way, and report where it
+/// went.
+///
+/// The recovery affordance for a corrupt sidecar. Every read path refuses a
+/// malformed file — deliberately, so a parse failure is never mistaken for "no
+/// bindings" — which leaves `Clear` unable to help, because clearing one entry
+/// must first read the rest. This is the explicit way out: the file is renamed,
+/// never deleted, so nothing is destroyed and the operator can still inspect it.
+///
+/// Refused when the sidecar parses, so it cannot be used to drop healthy
+/// bindings: recovery is for the state that has no other exit.
+pub(crate) fn quarantine_prompt_sources_at(store_path: &Path) -> Result<PathBuf, String> {
+    if !store_path.exists() {
+        return Err(
+            "There are no instructions-file settings on this machine to reset.".to_string(),
+        );
+    }
+    if load_prompt_sources_at(store_path).is_ok() {
+        return Err(
+            "The instructions-file settings are readable, so there is nothing to reset. Use Clear to unbind one agent."
+                .to_string(),
+        );
+    }
+    // Colons are legal in an RFC-3339 stamp and illegal in a Windows filename.
+    let stamp = crate::util::now_iso().replace(':', "-");
+    let quarantined = store_path.with_extension(format!("corrupt-{stamp}.json"));
+    std::fs::rename(store_path, &quarantined).map_err(|error| {
+        format!(
+            "failed to move the unreadable prompt-sources.json aside: {error} ({})",
+            quarantined.display()
+        )
+    })?;
+    Ok(quarantined)
 }
 
 /// Write the sidecar at `path` atomically.
@@ -185,17 +280,21 @@ pub(crate) fn prepare_prompt_source(
 /// Store (`Some`) or remove (`None`) the mapping for `definition_id` in the
 /// sidecar at `store_path`.
 ///
+/// `entry` carries the file's path *and* the prompt text that was read from it,
+/// because the entry records both: the path to reload from and the digest that
+/// later reads check the definition's prompt against.
+///
 /// The last step of a reload, run only once the prompt is durably the
 /// definition's own: a mapping is a claim that the file's text is what the
 /// agent uses, and this is the first moment that claim is true.
 pub(crate) fn commit_prompt_source_at(
     store_path: &Path,
     definition_id: &str,
-    path: Option<&Path>,
+    entry: Option<(&Path, &str)>,
 ) -> Result<(), String> {
     let mut sources = load_prompt_sources_at(store_path)?;
 
-    let Some(path) = path else {
+    let Some((path, prompt)) = entry else {
         if sources.remove(definition_id).is_some() {
             save_prompt_sources_at(store_path, &sources)?;
         }
@@ -206,7 +305,13 @@ pub(crate) fn commit_prompt_source_at(
         .to_str()
         .ok_or_else(|| format!("Prompt file path is not valid UTF-8: {}", path.display()))?
         .to_string();
-    sources.insert(definition_id.to_string(), stored);
+    sources.insert(
+        definition_id.to_string(),
+        StoredPromptSource {
+            path: stored,
+            prompt_sha256: prompt_digest(prompt),
+        },
+    );
     save_prompt_sources_at(store_path, &sources)
 }
 

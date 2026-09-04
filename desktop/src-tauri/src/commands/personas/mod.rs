@@ -70,6 +70,7 @@ pub use sharing::set_persona_shared;
 pub use sharing::update_persona_and_publish;
 mod prompt_source;
 pub use prompt_source::get_prompt_source;
+pub use prompt_source::reset_prompt_sources;
 pub use prompt_source::set_prompt_source_and_reload;
 mod update;
 pub use update::update_persona;
@@ -149,7 +150,10 @@ fn commit_cascade_agents(
 }
 
 #[tauri::command]
-pub async fn delete_persona(id: String, app: AppHandle) -> Result<(), String> {
+pub async fn delete_persona<R: tauri::Runtime>(
+    id: String,
+    app: AppHandle<R>,
+) -> Result<(), String> {
     use tauri::Manager;
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
@@ -257,6 +261,26 @@ pub async fn delete_persona(id: String, app: AppHandle) -> Result<(), String> {
             //   persona save fails → cascade agents gone, persona survives; a retry
             //                        finds an empty cascade and proceeds cleanly
             // Keys and tombstones are enqueued only after their records leave disk.
+            // Drop the machine-local prompt-file binding first. It is a claim
+            // that a file's text is this definition's instructions, and the
+            // definition is about to stop existing; nothing else in the app can
+            // reach the entry afterwards, so leaving it would orphan a claim
+            // with no UI able to retract it (Review-Proven Rule 2: clear
+            // derived metadata on every removal path).
+            //
+            // First, not last, because removing a claim is always safe while
+            // adding one is not: if a later phase fails and the delete is
+            // retried, the worst case is a lost convenience binding on a
+            // definition whose prompt bytes are unchanged. A failure here is
+            // propagated before anything is destroyed, so the command stays
+            // retryable.
+            crate::managed_agents::prompt_source::commit_prompt_source_at(
+                &crate::managed_agents::managed_agents_base_dir(&app)?
+                    .join("prompt-sources.json"),
+                &id,
+                None,
+            )?;
+
             if !cascade.is_empty() {
                 commit_cascade_agents(&mut agents, &cascade, |recs| {
                     save_managed_agents(&app, recs)

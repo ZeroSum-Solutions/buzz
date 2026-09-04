@@ -122,9 +122,9 @@ type ProfileSyncParams = Vec<(
 )>;
 
 #[tauri::command]
-pub async fn update_persona(
+pub async fn update_persona<R: tauri::Runtime>(
     input: UpdatePersonaRequest,
-    app: AppHandle,
+    app: AppHandle<R>,
 ) -> Result<UpdatePersonaResult, String> {
     let (persona, ()) = update_persona_with(input, app, |app, state, persona| {
         retain_persona_pending(app, state, persona);

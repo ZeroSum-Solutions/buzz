@@ -195,7 +195,7 @@ test("re-opening the dialog shows the file already bound to the agent", async ()
   // The binding this dialog wrote in an earlier session. Without the read the
   // sidecar would be write-only and the operator would retype the whole
   // absolute path on every reload.
-  storedPromptSource = "/Users/me/agent-prompts/pm.md";
+  storedPromptSource = { path: "/Users/me/agent-prompts/pm.md", inSync: true };
   const dirtyReports = [];
   await act(async () =>
     mount(editValues, {
@@ -230,7 +230,7 @@ test("a reload replaces the dialog's instructions text", async () => {
   promptSourceResult = {
     localUpdated: true,
     publish: "published",
-    path: "/Users/me/agent-prompts/pm.md",
+    binding: { path: "/Users/me/agent-prompts/pm.md", inSync: true },
     prompt: "Ship the roadmap.\n",
   };
   await act(async () => mount(editValues));
@@ -274,7 +274,7 @@ test("a reload keeps the dialog's other unsaved edits armed for publish", async 
   promptSourceResult = {
     localUpdated: true,
     publish: "published",
-    path: "/Users/me/agent-prompts/pm.md",
+    binding: { path: "/Users/me/agent-prompts/pm.md", inSync: true },
     prompt: "Ship the roadmap.\n",
   };
   const submissions = [];

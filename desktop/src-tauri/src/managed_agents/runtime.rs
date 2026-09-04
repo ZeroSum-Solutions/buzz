@@ -83,6 +83,26 @@ pub(crate) use spawn_key::bound_runtime_key;
 /// prompt-source test rather than silently dropping the prompt.
 pub(crate) const SYSTEM_PROMPT_ENV: &str = "BUZZ_ACP_SYSTEM_PROMPT";
 
+/// Export the resolved system prompt on a spawn command, or remove it.
+///
+/// This one line is the desktop half of the delivery seam: everything upstream
+/// of it decides *what* the agent's instructions are, and everything downstream
+/// — the harness's own env parse, its standing-prompt composition, the
+/// `session/new` request — reads them from this variable. It is a named
+/// function so a test can drive the real write and read the value back off the
+/// command, instead of setting the variable itself and proving only that the
+/// name is spelled the same in two test lines.
+///
+/// `None` removes the variable rather than exporting an empty one: a spawned
+/// child inherits the parent environment, so a stale value left over from an
+/// earlier configuration would otherwise become this agent's instructions.
+pub(crate) fn apply_system_prompt_env(command: &mut std::process::Command, prompt: Option<&str>) {
+    match prompt {
+        Some(prompt) => command.env(SYSTEM_PROMPT_ENV, prompt),
+        None => command.env_remove(SYSTEM_PROMPT_ENV),
+    };
+}
+
 /// Classify an agent's persona against the live catalog for the Agents-menu
 /// drift indicator. Returns `(out_of_date, orphaned)`.
 ///
@@ -668,11 +688,7 @@ pub fn spawn_agent_child(
     let effective_model = effective_cfg.model.value;
     let effective_provider = effective_cfg.provider.value;
 
-    if let Some(prompt) = &effective_prompt {
-        command.env(SYSTEM_PROMPT_ENV, prompt);
-    } else {
-        command.env_remove(SYSTEM_PROMPT_ENV);
-    }
+    apply_system_prompt_env(&mut command, effective_prompt.as_deref());
     // Shared compute stores `auto`, but the wire name is MeshLLM's virtual
     // `mesh` model. Translate here too, so the harness and the LLM client are
     // told the same thing: `BUZZ_ACP_MODEL=auto` would name a model the mesh

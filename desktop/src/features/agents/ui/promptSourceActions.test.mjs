@@ -4,6 +4,8 @@ import test from "node:test";
 import {
   canClearPromptSource,
   canReloadPromptSource,
+  canResetPromptSources,
+  PROMPT_SOURCE_RESET_WARNING,
   promptSourceHint,
   promptSourceStatusMessage,
 } from "./promptSourceActions.ts";
@@ -26,21 +28,46 @@ test("Reload is disabled while a reload is in flight", () => {
 
 test("Clear stays offered so a moved or deleted source can be unbound", () => {
   // The field seeds itself from the stored binding, but Clear is not gated on
-  // that seed: a failed or stale seed would otherwise strand a live binding.
+  // that seed: a stale seed would otherwise strand a live binding. It is NOT
+  // the recovery path for an unreadable sidecar — see the reset test below.
   assert.equal(canClearPromptSource(false), true);
   assert.equal(canClearPromptSource(true), false);
 });
 
 test("the resting hint names the bound file, or invites one", () => {
-  assert.match(
-    promptSourceHint("/Users/me/agent-prompts/pm.md"),
-    /\/Users\/me\/agent-prompts\/pm\.md/,
-  );
+  const inSync = { path: "/Users/me/agent-prompts/pm.md", inSync: true };
+  assert.match(promptSourceHint(inSync), /\/Users\/me\/agent-prompts\/pm\.md/);
   assert.match(promptSourceHint(null), /file in your home folder/i);
   assert.notEqual(
-    promptSourceHint("/Users/me/agent-prompts/pm.md"),
+    promptSourceHint(inSync),
     promptSourceHint(null),
     "a bound agent must not read the same as an unbound one",
+  );
+});
+
+test("a binding the definition has drifted from reads as out of sync", () => {
+  // Another path wrote the instructions — a hand-typed edit, a definition
+  // replaced from another device. Repeating "these instructions are loaded
+  // from X" would state something false about the agent that is about to run.
+  const drifted = { path: "/Users/me/agent-prompts/pm.md", inSync: false };
+  assert.match(promptSourceHint(drifted), /no longer match/i);
+  assert.match(
+    promptSourceHint(drifted),
+    /Reload[\s\S]*Clear/,
+    "the out-of-sync sentence must name both ways back to a true state",
+  );
+});
+
+test("the reset is offered only after a seed failed, and never while busy", () => {
+  // Clear cannot recover an unreadable sidecar: removing one entry reads the
+  // whole file first, so it fails exactly where the seed did.
+  assert.equal(canResetPromptSources(false, false), false);
+  assert.equal(canResetPromptSources(true, false), true);
+  assert.equal(canResetPromptSources(true, true), false);
+  assert.match(
+    PROMPT_SOURCE_RESET_WARNING,
+    /every agent/i,
+    "the action is machine-wide and must say so before it is taken",
   );
 });
 
@@ -49,7 +76,7 @@ test("a queued head and a failed enqueue read differently", () => {
     localUpdated: true,
     publish: "queued",
     relayMessage: null,
-    path: "/Users/me/agent-prompts/pm.md",
+    binding: { path: "/Users/me/agent-prompts/pm.md", inSync: true },
     mappingError: null,
     prompt: "Ship it.",
   });
@@ -57,7 +84,7 @@ test("a queued head and a failed enqueue read differently", () => {
     localUpdated: true,
     publish: "failed:retention db locked",
     relayMessage: null,
-    path: "/Users/me/agent-prompts/pm.md",
+    binding: { path: "/Users/me/agent-prompts/pm.md", inSync: true },
     mappingError: null,
     prompt: "Ship it.",
   });
@@ -73,7 +100,7 @@ test("clearing reports that the instructions were left alone", () => {
     localUpdated: false,
     publish: null,
     relayMessage: null,
-    path: null,
+    binding: null,
     mappingError: null,
     prompt: null,
   });
@@ -85,7 +112,7 @@ test("a mapping the backend could not store is reported, not hidden", () => {
     localUpdated: true,
     publish: "published",
     relayMessage: null,
-    path: null,
+    binding: null,
     mappingError:
       "failed to read prompt-sources.json: Is a directory (os error 21)",
     prompt: "Ship it.",

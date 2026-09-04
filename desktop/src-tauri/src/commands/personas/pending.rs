@@ -36,8 +36,8 @@ pub(super) struct PreparedPersonaPublication {
 /// never republishes, while `set_persona_shared` must retain because the tag is
 /// relay-authoritative). A byte-identical user-save republish is harmlessly
 /// NIP-33-replaced. The guard is intentionally omitted.
-pub(in crate::commands) fn retain_persona_pending(
-    app: &AppHandle,
+pub(in crate::commands) fn retain_persona_pending<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
     persona: &AgentDefinition,
 ) {
@@ -218,8 +218,8 @@ pub(super) fn prepare_persona_publication_at(
 /// IMMEDIATE` transaction so a crash between them cannot leave the 30175 head
 /// live with its only retry witness gone. Best-effort: a failure is logged and
 /// swallowed so a retention hiccup never blocks the disk-authoritative delete.
-pub(in crate::commands) fn tombstone_persona_pending(
-    app: &AppHandle,
+pub(in crate::commands) fn tombstone_persona_pending<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
     d_tag: &str,
 ) {
