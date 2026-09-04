@@ -275,9 +275,11 @@ pub struct CliArgs {
     /// it, the name is derived from the executable stem. Duplicate names are
     /// disambiguated with a numeric suffix (e.g. two `npx` wrappers become
     /// `npx` and `npx-2`), but explicit names are preferred so reordering
-    /// entries does not silently rename a server. Entries with malformed
-    /// quoting fail startup with the entry index (the raw command is not
-    /// echoed). Example:
+    /// entries does not silently rename a server. Names are capped at 128
+    /// bytes; keep them well under that, since `buzz-agent` also caps the
+    /// qualified tool name `<server>__<tool>` at 64 bytes. Entries with
+    /// malformed quoting fail startup with the entry index (the raw command
+    /// is not echoed). Example:
     /// `memory=npx -y mcp-remote https://mcp.tavily.com/mcp/?tavilyApiKey=...\nother-server --port 8080`
     #[arg(long, env = "BUZZ_ACP_EXTRA_MCP_COMMANDS", value_delimiter = '\n')]
     pub extra_mcp_commands: Vec<String>,

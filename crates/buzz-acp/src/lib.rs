@@ -15,6 +15,17 @@ mod scope;
 mod setup_mode;
 mod usage;
 
+/// The harness's command-line and environment arguments, exactly as the
+/// `buzz-acp` binary parses them (every flag has an env-var fallback).
+///
+/// Public so a caller can build a harness configuration from an explicit
+/// argument vector — `CliArgs::try_parse_from(..)` then
+/// [`Config::from_args`] — instead of from this process's own argv.
+pub use config::CliArgs;
+/// A validated harness configuration, resolved from [`CliArgs`].
+pub use config::Config;
+/// A failure while reading or validating a harness configuration.
+pub use config::ConfigError;
 pub use usage::TurnUsage;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -33,8 +44,8 @@ use buzz_core::observer::{
 };
 use clap::Parser;
 use config::{
-    AuthAgentArgs, AuthMethodsArgs, AuthenticateArgs, Config, ConfigError, DedupMode, ModelsArgs,
-    MultipleEventHandling, RespondTo, SubscribeMode,
+    AuthAgentArgs, AuthMethodsArgs, AuthenticateArgs, DedupMode, ModelsArgs, MultipleEventHandling,
+    RespondTo, SubscribeMode,
 };
 use filter::SubscriptionRule;
 use futures_util::FutureExt;
@@ -5727,6 +5738,32 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
     Ok(())
 }
 
+/// The `mcpServers` array a `session/new` request carries, serialized exactly
+/// as the harness puts it on the wire.
+///
+/// Wraps the builder the harness itself uses, so a caller — notably
+/// `buzz-agent`'s integration tests — can drive the real
+/// `BUZZ_ACP_EXTRA_MCP_COMMANDS` parser end to end instead of hand-writing a
+/// copy of the wire shape that could drift away from it.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::ConfigFile`] when an entry of
+/// `BUZZ_ACP_EXTRA_MCP_COMMANDS` has malformed shell quoting, or when the
+/// resulting array cannot be serialized.
+pub fn mcp_servers_wire_json(config: &Config) -> Result<serde_json::Value, ConfigError> {
+    let servers = build_mcp_servers(config)?;
+    serde_json::to_value(&servers)
+        .map_err(|e| ConfigError::ConfigFile(format!("failed to serialize mcpServers: {e}")))
+}
+
+/// Maximum length, in bytes, of an MCP server name on the `session/new` wire.
+///
+/// Mirrors `MAX_NAME_LEN` in `buzz-agent`'s `mcp` module: a longer name is
+/// rejected by `McpRegistry::spawn_all`, which fails the entire session rather
+/// than just the offending server.
+const MAX_MCP_NAME_LEN: usize = 128;
+
 fn build_mcp_servers(config: &Config) -> Result<Vec<McpServer>, ConfigError> {
     if config.mcp_command.is_empty() {
         return Ok(vec![]);
@@ -5855,10 +5892,15 @@ fn build_mcp_servers(config: &Config) -> Result<Vec<McpServer>, ConfigError> {
             }
         };
         let name = if seen_names.contains(&base_name) {
-            // Append a numeric suffix until we find a unique name.
+            // Append a numeric suffix until we find a unique name. The stem is
+            // re-cut against the suffix so a base name at the length ceiling
+            // does not overflow it again — an over-long name is rejected by
+            // `McpRegistry` and fails the whole session, not just this server.
             let mut i = 2;
             loop {
-                let candidate = format!("{base_name}-{i}");
+                let suffix = format!("-{i}");
+                let head = fit_mcp_name(&base_name, MAX_MCP_NAME_LEN - suffix.len());
+                let candidate = format!("{head}{suffix}");
                 if !seen_names.contains(&candidate) {
                     break candidate;
                 }
@@ -5881,25 +5923,40 @@ fn build_mcp_servers(config: &Config) -> Result<Vec<McpServer>, ConfigError> {
 }
 
 /// Sanitize a raw executable stem into a name that satisfies the downstream
-/// `McpRegistry` validator: ASCII alphanumeric and hyphens only, ≤128 bytes.
-/// Non-conforming characters are replaced with hyphens; leading/trailing
-/// hyphens are stripped. An empty result falls back to `"extra-mcp"`.
+/// `McpRegistry` validator: ASCII alphanumeric and hyphens only, at most
+/// [`MAX_MCP_NAME_LEN`] bytes. Non-conforming characters are replaced with
+/// hyphens; leading/trailing hyphens are stripped. An empty result falls back
+/// to `"extra-mcp"`.
+///
+/// Note the registry applies a second, tighter bound the name alone cannot
+/// satisfy: each tool is registered as `<server>__<tool>` and that qualified
+/// name is capped at 64 bytes, so a name anywhere near the 128-byte ceiling
+/// still fails the session. Prefer short explicit `name=` prefixes.
 fn sanitize_mcp_name(raw: &str) -> String {
     let sanitized: String = raw
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string();
-    let truncated = if sanitized.len() > 128 {
-        sanitized[..=128].to_string()
-    } else {
-        sanitized
+        .collect();
+    fit_mcp_name(&sanitized, MAX_MCP_NAME_LEN)
+}
+
+/// Trim surrounding hyphens from `name` and cut it to at most `max` bytes,
+/// falling back to `"extra-mcp"` when nothing is left.
+///
+/// The cut is taken on a character boundary, so an unsanitized multi-byte
+/// input cannot panic here; for the ASCII output of [`sanitize_mcp_name`] it
+/// is an exact byte cut.
+fn fit_mcp_name(name: &str, max: usize) -> String {
+    let trimmed = name.trim_matches('-');
+    let cut = match trimmed.char_indices().nth(max) {
+        Some((idx, _)) => &trimmed[..idx],
+        None => trimmed,
     };
-    if truncated.is_empty() {
+    let cut = cut.trim_end_matches('-');
+    if cut.is_empty() {
         "extra-mcp".to_string()
     } else {
-        truncated
+        cut.to_string()
     }
 }
 
@@ -9405,6 +9462,91 @@ mod build_mcp_servers_tests {
             servers[1].args,
             vec!["-y", "srv", "--filter", "a,b"],
             "comma inside an argument must survive — no pre-split on comma"
+        );
+    }
+
+    /// The contract `McpRegistry::spawn_all` enforces on every server name:
+    /// non-empty, at most 128 bytes, ASCII alphanumeric / `_` / `-` only, and
+    /// no `__` (which would collide with the qualified-tool-name separator).
+    fn assert_registry_name_contract(name: &str) {
+        assert!(!name.is_empty(), "server name must not be empty");
+        assert!(
+            name.len() <= 128,
+            "server name is {} bytes, over McpRegistry's 128-byte limit: {name}",
+            name.len()
+        );
+        assert!(
+            name.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+            "server name has characters McpRegistry rejects: {name}"
+        );
+        assert!(
+            !name.contains("__"),
+            "server name must not contain the qualified-name separator: {name}"
+        );
+    }
+
+    #[test]
+    fn extra_mcp_commands_long_name_truncated_to_registry_limit() {
+        // A raw name longer than the registry's 128-byte ceiling must come
+        // back at or under it. An inclusive slice (`[..=128]`) yields 129
+        // bytes, which McpRegistry rejects with "invalid server name" and
+        // fails the whole session — this test pins the exclusive cut.
+        let mut config = test_config();
+        let long_explicit = "a".repeat(130);
+        let long_stem = "b".repeat(200);
+        config.extra_mcp_commands = vec![
+            format!("{long_explicit}=srv --port 8080"),
+            format!("/opt/bin/{long_stem} --port 8081"),
+        ];
+        let servers = build_mcp_servers(&config).unwrap();
+        assert_eq!(servers.len(), 3, "primary + 2 extra = 3 servers");
+        assert_eq!(
+            servers[1].name.len(),
+            128,
+            "an over-long explicit name is cut to exactly 128 bytes"
+        );
+        assert_eq!(
+            servers[2].name.len(),
+            128,
+            "an over-long executable stem is cut to exactly 128 bytes"
+        );
+        for s in &servers {
+            assert_registry_name_contract(&s.name);
+        }
+    }
+
+    #[test]
+    fn extra_mcp_commands_disambiguation_suffix_respects_registry_limit() {
+        // A base name already at the ceiling must not grow past it when the
+        // `-2`, `-3`, ... disambiguation suffix is appended, including once
+        // the suffix reaches two digits.
+        let mut config = test_config();
+        let at_ceiling = "c".repeat(128);
+        config.extra_mcp_commands = (0..11).map(|i| format!("{at_ceiling}=srv-{i}")).collect();
+        let servers = build_mcp_servers(&config).unwrap();
+        assert_eq!(servers.len(), 12, "primary + 11 extra = 12 servers");
+
+        let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
+        for name in &names {
+            assert_registry_name_contract(name);
+        }
+        assert_eq!(names[1], at_ceiling, "the first entry keeps the full name");
+        assert!(
+            names[2].ends_with("-2"),
+            "the second entry is disambiguated: {}",
+            names[2]
+        );
+        assert!(
+            names[11].ends_with("-11"),
+            "the eleventh entry carries a two-digit suffix: {}",
+            names[11]
+        );
+        let unique: std::collections::HashSet<&str> = names.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "truncation must not collapse two servers onto one name: {names:?}"
         );
     }
 

@@ -894,6 +894,8 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "buzz-acp",
+ "clap",
  "dirs",
  "fs2",
  "getrandom 0.4.3",

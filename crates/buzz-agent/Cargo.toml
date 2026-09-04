@@ -73,6 +73,11 @@ fs2 = "0.4"
 nix = { version = "0.31", default-features = false, features = ["signal", "process"] }
 
 [dev-dependencies]
+# The extra-MCP-server end-to-end test drives buzz-acp's real
+# BUZZ_ACP_EXTRA_MCP_COMMANDS parser so the `mcpServers` array it asserts on is
+# the one the harness actually sends, not a hand-written copy of it.
+buzz-acp = { path = "../buzz-acp" }
+clap = "4"
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros", "io-std", "io-util", "sync", "process", "time", "net"] }
 nix = { version = "0.31", default-features = false, features = ["signal", "process"] }
 axum = { workspace = true }
