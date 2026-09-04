@@ -315,6 +315,55 @@ pub(crate) fn commit_prompt_source_at(
     save_prompt_sources_at(store_path, &sources)
 }
 
+/// Remove `definition_id`'s entry, tolerating a sidecar nothing can parse.
+///
+/// The retraction half of [`commit_prompt_source_at`], split off because the
+/// two callers want opposite answers to the same failure. `Clear` is a user
+/// action on one agent: a sidecar it cannot read is a state the operator must
+/// be told about, so [`commit_prompt_source_at`] keeps propagating and the
+/// dialog offers [`quarantine_prompt_sources_at`]. This is the *bookkeeping*
+/// call three authoritative deletions make with `?` — `delete_persona`, the
+/// inbound kind:5 tombstone, the team cascade — and there a propagated parse
+/// failure means optional machine-local metadata vetoes the deletion itself:
+/// the agent will not delete, a signed remote tombstone never applies (and
+/// fails again on every subsequent boot, so the agent keeps coming back), and
+/// the team cascade dies part-way.
+///
+/// Skipping is safe **only** because a sidecar that does not parse is a
+/// sidecar no read path resolves: `load_prompt_sources_at` refuses it, so
+/// `prompt_source_binding_at`, the dialog seed and `Reload` all error rather
+/// than return a binding. The entry that stays on disk therefore cannot rebind
+/// the next definition to take a reused id, which is the whole hazard
+/// [`forget_prompt_source`] exists to prevent. A parseable sidecar is a
+/// different matter: an entry in it *is* resolvable, so a failure to save the
+/// removal still propagates.
+///
+/// The unreadable file is left exactly as it is, never rewritten from an
+/// assumed-empty map: that would destroy every other definition's binding, and
+/// the reset is the one path allowed to move it (renamed, not deleted).
+pub(crate) fn retract_prompt_source_at(
+    store_path: &Path,
+    definition_id: &str,
+) -> Result<(), String> {
+    let mut sources = match load_prompt_sources_at(store_path) {
+        Ok(sources) => sources,
+        Err(error) => {
+            // Reported, not silent: the deletion it precedes is authoritative
+            // and proceeds, but the operator's next dialog open still shows
+            // the sidecar error and the reset that clears it.
+            eprintln!(
+                "buzz-desktop: prompt-source retraction for {definition_id} skipped, \
+                 the sidecar is unreadable and binds nothing any reader resolves: {error}"
+            );
+            return Ok(());
+        }
+    };
+    if sources.remove(definition_id).is_some() {
+        save_prompt_sources_at(store_path, &sources)?;
+    }
+    Ok(())
+}
+
 /// Path of the machine-local prompt-source sidecar for this app.
 ///
 /// One definition of the file's location, shared by the command layer and by
@@ -339,11 +388,17 @@ pub(crate) fn prompt_sources_store_path<R: tauri::Runtime>(
 /// always safe, so a later failure costs at most a convenience binding on a
 /// definition whose prompt bytes never changed, while a failure here propagates
 /// before anything is destroyed.
+///
+/// "Removing a claim is always safe" cuts both ways, and this call goes
+/// through [`retract_prompt_source_at`] for the other half: a sidecar that
+/// cannot be parsed must not veto the deletion it precedes. Optional
+/// machine-local metadata never gets to refuse an authoritative state change —
+/// see that function for why the leftover entry is harmless.
 pub(crate) fn forget_prompt_source<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     definition_id: &str,
 ) -> Result<(), String> {
-    commit_prompt_source_at(&prompt_sources_store_path(app)?, definition_id, None)
+    retract_prompt_source_at(&prompt_sources_store_path(app)?, definition_id)
 }
 
 /// The definition a reloaded prompt produces.

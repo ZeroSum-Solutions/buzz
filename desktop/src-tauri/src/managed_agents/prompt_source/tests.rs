@@ -482,3 +482,53 @@ fn resetting_quarantines_an_unreadable_sidecar_and_leaves_a_readable_one_alone()
         "after the reset the store is usable again, with every binding gone"
     );
 }
+
+/// The retraction half, which the three deletion paths call and `Clear` does
+/// not: it must not fail on a sidecar nothing can parse.
+///
+/// The split is the point. `Clear` is a user action on one agent, so
+/// `commit_prompt_source_at` still refuses an unreadable file and the dialog
+/// offers the reset (asserted just above). `retract_prompt_source_at` is
+/// bookkeeping in front of an authoritative deletion, and there the same
+/// refusal would let optional machine-local metadata veto the deletion itself.
+///
+/// Skipping is only safe because the leftover entry is unreachable: every read
+/// path refuses the file, so nothing can resolve it into a binding on the next
+/// definition to take a reused id.
+#[test]
+fn retraction_tolerates_a_corrupt_sidecar_while_clear_still_refuses_one() {
+    let f = fixture();
+    let path = f.home.join("pm.md");
+    std::fs::write(&path, "Be the PM.").expect("write prompt");
+    prepare_and_commit(&f.store, "pm", Some(path.to_str().expect("utf-8")), &f.home)
+        .expect("store the mapping");
+    prepare_and_commit(
+        &f.store,
+        "other",
+        Some(path.to_str().expect("utf-8")),
+        &f.home,
+    )
+    .expect("store a second mapping");
+
+    // On a readable sidecar the retraction behaves exactly like Clear.
+    retract_prompt_source_at(&f.store, "pm").expect("retracting a stored binding succeeds");
+    assert_eq!(stored_path(&f.store, "pm"), None, "the entry is gone");
+    assert!(
+        stored_path(&f.store, "other").is_some(),
+        "retracting one id must not disturb another"
+    );
+
+    std::fs::write(&f.store, "{ not json").expect("corrupt the sidecar");
+    assert!(
+        commit_prompt_source_at(&f.store, "other", None).is_err(),
+        "Clear must still report a sidecar it cannot read — the reset is the way out"
+    );
+    retract_prompt_source_at(&f.store, "other")
+        .expect("a deletion's retraction must not be vetoed by an unreadable sidecar");
+    assert_eq!(
+        std::fs::read_to_string(&f.store).expect("the sidecar is still there"),
+        "{ not json",
+        "the unreadable file is left untouched for the reset, never rewritten \
+         from an assumed-empty map"
+    );
+}

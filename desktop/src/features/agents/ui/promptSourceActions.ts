@@ -40,6 +40,13 @@ export function canClearPromptSource(isPending: boolean): boolean {
  * a durable retry exists, while `failed:` means the local save landed and the
  * catalog head did not — collapsing them would tell the user a retry is coming
  * when none was recorded.
+ *
+ * The surviving-binding sentence branches on `inSync` for the same reason the
+ * resting hint does ({@link promptSourceHint}). A failed mapping write does not
+ * imply the surviving binding is stale: reloading an already-bound file whose
+ * text has not changed saves the same prompt the stored digest was made from,
+ * so the binding that survives still matches. Stating "no longer matches" there
+ * would tell the user the file has drifted when it has not.
  */
 export function promptSourceStatusMessage(
   result: PromptSourceResult,
@@ -50,7 +57,9 @@ export function promptSourceStatusMessage(
   const mapping = result.mappingError
     ? ` The file was not remembered for next time: ${result.mappingError}${
         result.binding
-          ? ` This agent is still set to ${result.binding.path}, which no longer matches these instructions.`
+          ? result.binding.inSync
+            ? ` This agent is still set to ${result.binding.path}, which matches these instructions.`
+            : ` This agent is still set to ${result.binding.path}, which no longer matches these instructions.`
           : ""
       }`
     : "";

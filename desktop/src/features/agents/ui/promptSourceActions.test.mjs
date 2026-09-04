@@ -121,3 +121,35 @@ test("a mapping the backend could not store is reported, not hidden", () => {
   assert.match(message, /not remembered/);
   assert.match(message, /prompt-sources\.json/);
 });
+
+test("a surviving binding is described by its own inSync, not by the mapping failure", () => {
+  // An unchanged reload of an already-bound file: the command saves the same
+  // prompt the stored digest was made from, so the binding that survives the
+  // failed sidecar write still matches these instructions. Saying otherwise
+  // sends the operator to Reload a file that is already loaded.
+  const matching = promptSourceStatusMessage({
+    localUpdated: true,
+    publish: "published",
+    relayMessage: null,
+    binding: { path: "/Users/me/agent-prompts/pm.md", inSync: true },
+    mappingError:
+      "failed to write prompt-sources.json: No space left on device",
+    prompt: "Ship it.",
+  });
+  assert.match(matching, /not remembered/);
+  assert.match(matching, /which matches these instructions/);
+  assert.doesNotMatch(matching, /no longer matches/);
+
+  // A binding to some other file, left standing by the same failure: that one
+  // genuinely does not feed the agent any more, and still says so.
+  const stale = promptSourceStatusMessage({
+    localUpdated: true,
+    publish: "published",
+    relayMessage: null,
+    binding: { path: "/Users/me/agent-prompts/old.md", inSync: false },
+    mappingError:
+      "failed to write prompt-sources.json: No space left on device",
+    prompt: "Ship it.",
+  });
+  assert.match(stale, /no longer matches these instructions/);
+});

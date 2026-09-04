@@ -24,6 +24,10 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+/// A corrupt sidecar must not veto the deletions that retract a binding.
+/// Split out to keep this file under the Rust size ratchet.
+mod corrupt_sidecar_tests;
+
 use super::*;
 use crate::app_state::build_app_state;
 use crate::managed_agents::{
@@ -550,8 +554,18 @@ async fn a_concurrent_edit_is_refused_rather_than_clobbered() {
 /// so the seam is bound rather than sampled at two ends. The spawn hop included:
 /// the environment is not set by the test, it is written by the production
 /// writer ([`apply_system_prompt_env`], the line `runtime.rs` calls on every
-/// spawn) onto a real `Command` and read back off it, so deleting that write
-/// fails this test instead of leaving it green.
+/// spawn) onto a real `Command` and read back off it.
+///
+/// **How the spawn hop is bound.** This test cannot call `spawn_agent_child`
+/// — that needs a live app handle, a records store and an actual child
+/// process — so it drives `apply_system_prompt_env` the way
+/// `effort_cmd_tests` drives `apply_effort_to_spawn_command`, and the
+/// production *call* is bound by the type system instead: the function returns
+/// a `#[must_use]` [`SystemPromptApplied`](crate::managed_agents::SystemPromptApplied)
+/// that `spawn_with_effort_proof` consumes by value, so deleting the call from
+/// `spawn_agent_child` is a compile error. Removing the write itself from
+/// `apply_system_prompt_env` fails this test. Neither half can be deleted
+/// silently; that pairing is the repo's established answer for this seam.
 ///
 ///
 /// 1. the file on disk and the real `set_prompt_source_and_reload` command;
@@ -633,10 +647,15 @@ async fn a_reloaded_prompt_file_reaches_the_adapter_after_a_restart() {
     //    production writer, not from this test: `apply_system_prompt_env` is
     //    the line the spawn path runs, and what it puts on the command is what
     //    the harness process below is given. Delete that write and `exported`
-    //    is `None` and this test fails, which is the point — the previous
-    //    version set the variable itself and could not tell.
+    //    is `None` and this test fails; delete its *call* from
+    //    `spawn_agent_child` and the crate stops compiling, because
+    //    `spawn_with_effort_proof` consumes the token bound here.
     let mut spawn_command = std::process::Command::new("true");
-    crate::managed_agents::apply_system_prompt_env(&mut spawn_command, Some(spawned.as_str()));
+    let prompt_applied =
+        crate::managed_agents::apply_system_prompt_env(&mut spawn_command, Some(spawned.as_str()));
+    // Consumed the same way the spawn site consumes it, so this test also
+    // fails to compile if the proof token is dropped from the seam.
+    let _: crate::managed_agents::SystemPromptApplied = prompt_applied;
     let exported = spawn_command
         .get_envs()
         .find(|(key, _)| *key == std::ffi::OsStr::new(SYSTEM_PROMPT_ENV))
@@ -648,8 +667,8 @@ async fn a_reloaded_prompt_file_reaches_the_adapter_after_a_restart() {
     // The same writer removes a stale inherited value when nothing resolves, so
     // an agent configured back to "no prompt" cannot keep the previous one.
     let mut cleared = std::process::Command::new("true");
-    crate::managed_agents::apply_system_prompt_env(&mut cleared, Some("stale"));
-    crate::managed_agents::apply_system_prompt_env(&mut cleared, None);
+    let _ = crate::managed_agents::apply_system_prompt_env(&mut cleared, Some("stale"));
+    let _ = crate::managed_agents::apply_system_prompt_env(&mut cleared, None);
     assert!(
         cleared
             .get_envs()

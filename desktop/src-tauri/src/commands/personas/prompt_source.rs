@@ -346,7 +346,7 @@ async fn submit_reloaded_prompt<R: tauri::Runtime>(
         Ok(binding) => (binding, None),
         Err(error) => {
             eprintln!("buzz-desktop: prompt-source mapping write failed: {error}");
-            let surviving = surviving_binding(&app, &definition_id, &persona.system_prompt).await;
+            let surviving = surviving_binding(&app, &definition_id).await;
             (surviving, Some(error))
         }
     };
@@ -389,21 +389,34 @@ async fn submit_reloaded_prompt<R: tauri::Runtime>(
 }
 
 /// The binding still on disk after a failed mapping write, resolved against the
-/// prompt that did land. Best-effort: if the sidecar cannot be read either, the
-/// `mapping_error` already carries the failure and the dialog shows no binding.
+/// prompt the persona store holds **now**. Best-effort: if the sidecar cannot be
+/// read either, the `mapping_error` already carries the failure and the dialog
+/// shows no binding.
+///
+/// One blocking pass under `managed_agents_store_lock`, exactly as
+/// [`commit_mapping`] resolves the success case — and for the same reason. The
+/// prompt this reload submitted is not the store's current value once another
+/// writer lands, so comparing the sidecar's digest against it would report an
+/// `in_sync` the next [`get_prompt_source`] contradicts. Holding the lock across
+/// the persona read and the sidecar read makes the two answers agree.
 async fn surviving_binding<R: tauri::Runtime>(
     app: &AppHandle<R>,
     definition_id: &str,
-    current_prompt: &str,
 ) -> Option<PromptSourceBinding> {
     let app = app.clone();
     let definition_id = definition_id.to_string();
-    let current_prompt = current_prompt.to_string();
     tokio::task::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let _store_guard = state.managed_agents_store_lock.lock().ok()?;
+        let current_prompt = load_personas(&app)
+            .ok()?
+            .into_iter()
+            .find(|record| record.id == definition_id)
+            .map(|record| record.system_prompt);
         prompt_source_binding_at(
             &prompt_sources_path(&app).ok()?,
             &definition_id,
-            Some(&current_prompt),
+            current_prompt.as_deref(),
         )
         .ok()
         .flatten()

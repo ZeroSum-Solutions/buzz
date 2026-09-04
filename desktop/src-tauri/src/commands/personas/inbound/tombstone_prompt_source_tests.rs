@@ -171,3 +171,52 @@ fn an_inbound_tombstone_retracts_the_deleted_definition_s_prompt_binding() {
         "the binding must not outlive the definition — the id is reusable, and a re-received head would rebind the new definition to a file nobody chose for it"
     );
 }
+
+/// The same tombstone against a sidecar nothing can parse.
+///
+/// A signed deletion from another device is authoritative; optional
+/// machine-local convenience metadata does not get to refuse it. Before
+/// `retract_prompt_source_at`, the retraction inside the store-mutation closure
+/// read the whole map before it could drop one key, so an unparseable file
+/// returned `Err` from this whole reconcile: the local definition survived, the
+/// corrupt file survived the restart, and the next boot's reconcile failed the
+/// same way — an agent the user deleted elsewhere kept coming back on this
+/// machine, with nothing in the error naming the reset that would clear it.
+///
+/// Restoring `commit_prompt_source_at` in `forget_prompt_source` turns this RED.
+#[test]
+fn an_inbound_tombstone_applies_even_when_the_sidecar_cannot_be_parsed() {
+    let _home = TempHome::new();
+    let keys = nostr::Keys::generate();
+    let app = mock_app(&keys);
+    let handle = app.handle().clone();
+
+    let record = definition("pm");
+    let d_tag = persona_d_tag(&record);
+    save_personas(&handle, &[record]).expect("seed the definition");
+
+    let sidecar = sidecar_path(&handle);
+    std::fs::create_dir_all(sidecar.parent().expect("parent")).expect("create the store dir");
+    std::fs::write(&sidecar, "{ not json").expect("corrupt the sidecar");
+
+    reconcile_inbound_persona_event_blocking(
+        signed_persona_tombstone(&keys, &d_tag).as_json(),
+        RELAY.to_string(),
+        handle.clone(),
+    )
+    .expect("an unreadable convenience sidecar must not veto a signed remote deletion");
+
+    assert!(
+        load_personas(&handle)
+            .expect("load personas")
+            .iter()
+            .all(|record| record.id != "pm"),
+        "the tombstone must still remove the definition"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&sidecar).expect("the sidecar is still there"),
+        "{ not json",
+        "and must leave the unreadable file for the reset to move aside, never \
+         rewrite it from an assumed-empty map"
+    );
+}
