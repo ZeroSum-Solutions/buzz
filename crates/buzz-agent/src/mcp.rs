@@ -361,6 +361,16 @@ impl McpRegistry {
         // regardless of HashMap iteration order or task completion order.
         let mut targets: Vec<(usize, String, String)> = Vec::new();
         for (idx, server) in self.servers.iter().enumerate() {
+            // Hooks are agent-control surface, not ordinary tools: `_Stop`
+            // decides whether a turn may end, and `_PostCompact` text is
+            // spliced into the fresh context after a handoff. Only a server
+            // the harness marked `trusted` may run them. Operator-supplied
+            // extra servers (`BUZZ_ACP_EXTRA_MCP_COMMANDS`) are untrusted and
+            // are never hook targets, whatever the allowlist says — including
+            // the wildcard hook-capable runtimes are launched with.
+            if !server.spec.trusted {
+                continue;
+            }
             if !allowed.allows(&server.name) {
                 continue;
             }
@@ -758,6 +768,15 @@ async fn spawn_one(
         }
     }
     for (k, v) in &spec.env {
+        // The wire-declared env is filtered on the same rule as the ambient
+        // one. Without this the withholding above is bypassable by
+        // declaration: the harness itself puts variables in
+        // `mcpServers[].env`, so an identity credential named there would
+        // reach an untrusted child even though the same name was just dropped
+        // from the passthrough set.
+        if !spec.trusted && is_buzz_identity_env(k) {
+            continue;
+        }
         cmd.env(k, v);
     }
     cmd.current_dir(&spec.cwd);

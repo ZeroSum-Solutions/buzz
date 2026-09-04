@@ -60,6 +60,23 @@ fn server_decl(name: &str, trusted: bool) -> Value {
     decl
 }
 
+/// Declare one fake MCP server that also names the Buzz identity variables in
+/// its own wire `env` block — the shape produced when a harness puts
+/// credentials in `mcpServers[].env` instead of relying on the parent
+/// environment. The values are throwaway strings; only names travel back.
+fn server_decl_declaring_identity(name: &str, trusted: bool) -> Value {
+    let mut decl = server_decl(name, trusted);
+    let env = decl["env"]
+        .as_array_mut()
+        .expect("declaration has an env array");
+    for (k, v) in identity_env() {
+        if IDENTITY_VARS.contains(&k) {
+            env.push(json!({ "name": k, "value": v }));
+        }
+    }
+    decl
+}
+
 /// Open a session over the given server declarations and return its id.
 async fn new_session(h: &mut Harness, servers: Vec<Value>) -> String {
     h.send(
@@ -152,6 +169,62 @@ async fn untrusted_mcp_env_withheld_from_untrusted_kept_for_trusted() {
         assert!(
             trusted_names.contains(var),
             "trusted MCP server lost {var}; \
+             the untrusted assertion above would pass vacuously"
+        );
+    }
+
+    h.shutdown().await;
+}
+
+/// The filter covers the wire-declared env too, not just the ambient one.
+///
+/// The agent process here is spawned with **no** identity variables, so the
+/// only way one can reach a child is the `mcpServers[].env` block the harness
+/// wrote. An untrusted server must still not receive them; a trusted one must,
+/// or the untrusted assertion proves nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn untrusted_mcp_env_withheld_when_declared_on_the_wire() {
+    let llm = spawn_capturing_llm(vec![
+        openai_tool_call("tc1", "extra__tool_0", json!({})),
+        openai_tool_call("tc2", "devmcp__tool_0", json!({})),
+        openai_text("done"),
+    ])
+    .await;
+    let mut h = Harness::spawn(&llm.url).await;
+    let sid = new_session(
+        &mut h,
+        vec![
+            server_decl_declaring_identity("devmcp", true),
+            server_decl_declaring_identity("extra", false),
+        ],
+    )
+    .await;
+
+    let p = h
+        .send(
+            "session/prompt",
+            json!({"sessionId": sid, "prompt": [{"type":"text","text":"go"}]}),
+        )
+        .await;
+    let r = h.recv_until_approving(|v| v["id"] == json!(p)).await;
+    assert!(r.get("error").is_none(), "prompt errored: {r}");
+
+    let captured = llm.captured.lock().await;
+    let untrusted = tool_result_text(&captured, 1);
+    let untrusted_names = env_names(&untrusted);
+    for var in IDENTITY_VARS {
+        assert!(
+            !untrusted_names.contains(var),
+            "untrusted MCP server received {var} through its wire-declared env"
+        );
+    }
+
+    let trusted = tool_result_text(&captured, 2);
+    let trusted_names = env_names(&trusted);
+    for var in IDENTITY_VARS {
+        assert!(
+            trusted_names.contains(var),
+            "trusted MCP server did not receive wire-declared {var}; \
              the untrusted assertion above would pass vacuously"
         );
     }
