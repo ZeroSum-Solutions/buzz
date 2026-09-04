@@ -5817,7 +5817,10 @@ fn build_mcp_servers(config: &Config) -> Result<Vec<McpServer>, ConfigError> {
                         .all(|c| c.is_ascii_alphanumeric() || c == '-')
                     && !candidate.contains('/')
                 {
-                    (Some(candidate.to_string()), trimmed[pos + 1..].trim().to_string())
+                    (
+                        Some(candidate.to_string()),
+                        trimmed[pos + 1..].trim().to_string(),
+                    )
                 } else {
                     (None, trimmed.to_string())
                 }
@@ -5884,13 +5887,7 @@ fn build_mcp_servers(config: &Config) -> Result<Vec<McpServer>, ConfigError> {
 fn sanitize_mcp_name(raw: &str) -> String {
     let sanitized: String = raw
         .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c
-            } else {
-                '-'
-            }
-        })
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect::<String>()
         .trim_matches('-')
         .to_string();
