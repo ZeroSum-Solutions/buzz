@@ -742,6 +742,7 @@ pub fn run() {
             create_persona,
             update_persona,
             update_persona_and_publish,
+            set_prompt_source_and_reload,
             delete_persona,
             set_persona_active,
             set_persona_shared,

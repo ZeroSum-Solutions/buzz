@@ -93,7 +93,7 @@ pub async fn update_persona_and_publish(
     publish_prepared_persona(&state, prepared).await
 }
 
-async fn publish_prepared_persona(
+pub(super) async fn publish_prepared_persona(
     state: &AppState,
     prepared: PreparedPersonaPublication,
 ) -> Result<SetPersonaSharedResult, String> {
