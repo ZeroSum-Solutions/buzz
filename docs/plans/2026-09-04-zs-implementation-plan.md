@@ -2,7 +2,7 @@
 
 Date: 2026-09-04. Source: `2026-09-04-zs-feature-audit.md` (Sol pass 1 applied). This plan turns
 the seven asks into branches, tickets, bars and evals, and fixes the loop every ticket runs
-through. Revision 2 folds in Sol's pass 1 on this plan (27 findings; log at the end).
+through. Revision 3 folds in Sol's passes 1 and 2 on this plan (log at the end).
 
 ## Branch and landing model
 
@@ -12,6 +12,7 @@ through. Revision 2 folds in Sol's pass 1 on this plan (27 findings; log at the 
   `zs/main` = one PR = one squash commit. DCO on every commit: `git commit -s`; for imported
   commits `git cherry-pick --signoff` and `git rebase --signoff`. Before push:
   `git log --format=%B origin/zs/main..HEAD | grep -c Signed-off-by` equals the commit count.
+- Port procedure: `git fetch upstream pull/N/head:pr-N`, then `git cherry-pick --signoff $(git merge-base upstream/main pr-N)..pr-N` onto the ticket branch, resolving conflicts. This replays the PR's complete commit range with sign-off and is the same result as rebasing the PR head onto `zs/main`; the audit's "port, not cherry-pick" wording meant "not a clean pick". Pin the module path the PR actually uses at import time; a rename is a fork deviation.
 - Port tickets carry upstream parity only. Fork deviations on a ported feature are their own
   ticket, so an upstream merge can retire the port without losing fork work (range-diff the
   upstream merge against the port, then drop the port commit).
@@ -20,8 +21,12 @@ through. Revision 2 folds in Sol's pass 1 on this plan (27 findings; log at the 
   2. Rerun the ticket's gates and the Sol audit on the rebased branch.
   3. Open the PR ourselves with the full body (`gh pr create --base zs/main --body-file`):
      gates run and their results, the tested base OID, the Gemini verdict, the Sol verdict.
-  4. `~/bin/zs-land`. It reuses the open PR, requires green CI, squash-merges, syncs `zs/main`.
-     If `origin/zs/main` moved since `BASE`, stop and go back to step 1.
+  4. Immediately before `~/bin/zs-land`: `git fetch origin && test "$(git rev-parse origin/zs/main)" = "$BASE"`;
+     if it fails, go back to step 1. `zs-land` reuses the open PR, requires green CI, squash-merges
+     and syncs `zs/main`. It checks the base branch name, not the base SHA, so landings are
+     strictly one at a time from this session and nothing else pushes to `zs/main` meanwhile.
+     After a PR is open, updates from `zs/main` come in by `git merge -s origin/zs/main`, never
+     by rebase, because force-push is blocked on this machine.
   5. If a CI job fails on the fork for a reason outside the diff (missing secret, upstream-only
      runner), the fix is a fork-only edit to that job on `zs/main`. Never `--allow-no-ci`.
 - Hooks and differential lanes compare against `origin/main` (`AGENTS.md:128`,
@@ -42,9 +47,14 @@ through. Revision 2 folds in Sol's pass 1 on this plan (27 findings; log at the 
    just desktop-test
    just desktop-tauri-test
    ```
-   plus the ticket's own eval commands. Every Rust filter is run twice: once with `-- --list`
-   piped to a count that must be at least the ticket's stated number, then for real. A filter
-   that matches nothing is a failed gate, not a pass.
+   plus the ticket's own eval commands, always in a shell that ran `. ./bin/activate-hermit`
+   first (same invocation, since shell state does not persist). Every Rust filter is run
+   twice: once with `-- --list` and an enforced count, then for real:
+   ```
+   n=$(cargo test <filter> -- --list 2>/dev/null | grep -c ': test'); test "$n" -ge <N> || { echo "only $n tests match"; exit 1; }
+   ```
+   Desktop test names are crate-root qualified (`managed_agents::discovery::tests::…`), and
+   a filter that matches nothing is a failed gate, not a pass.
 3. **Tester** (Gemini 3.8 Flash): a disposable worktree of the branch, run as
    `agy -p --model gemini-3.8-flash-high --mode accept-edits --sandbox "<ticket brief>"` from
    the worktree root. It reads the diff and the acceptance checks, runs the fast gates itself,
@@ -61,8 +71,9 @@ through. Revision 2 folds in Sol's pass 1 on this plan (27 findings; log at the 
 5. **Full gate** `just ci` on the rebased branch (it adds `test-unit`, `desktop-build`,
    `desktop-tauri-check`, `web-build`, `mobile-test`). Integration tests (`just test`) when
    relay, auth or db code changed.
-6. **Audit** (GPT-5.6 Sol, `codex exec review -c model="gpt-5.6-sol" -c
-   model_reasoning_effort="xhigh"`, adversarial prompt, scope "this branch against zs/main").
+6. **Audit** (GPT-5.6 Sol): from the worktree,
+   `codex exec -s read-only -c model="gpt-5.6-sol" -c model_reasoning_effort="xhigh" -o <report> "<adversarial prompt naming the scope git diff origin/zs/main...HEAD>"`
+   (the `review --base` form cannot take a custom prompt, so the scope lives in the prompt).
    Every BLOCK and WARN is verified against the code by the driver before it is fixed or
    discarded with a written reason. Re-run until nothing above NIT.
 7. **Land** as above.
@@ -115,10 +126,10 @@ the root workspace excludes that manifest (`Cargo.toml:35`).
 
 - Branch `port/6731` (`block:fizz/md-viewer`). Cherry-pick with sign-off, resolve, keep tests.
 - Tests that must exist and pass: `desktop/src-tauri/src/commands/media_download_tests.rs`, `desktop/src/features/channels/ui/ChannelPane.helpers.test.mjs`, `channelPaneAuxiliaryLayout.test.mjs`, `markdownDocFocus.test.mjs`, `desktop/src/shared/ui/markdown/markdownDocFile.test.mjs`, `desktop/tests/e2e/markdown-doc-viewer.spec.ts` (added to the smoke allow-list).
-- Eval:
+- The imported `media_download_tests.rs` must be registered in `commands/mod.rs` (the existing `media_download` module already has inline tests, so a broad filter proves nothing). Eval:
   ```
-  cd desktop/src-tauri && cargo test media_download -- --list | grep -c ': test'   # >= 1
-  cd desktop/src-tauri && cargo test media_download
+  cd desktop/src-tauri && n=$(cargo test commands::media_download_tests -- --list | grep -c ': test'); test "$n" -ge 1
+  cd desktop/src-tauri && cargo test commands::media_download_tests
   just desktop-test
   just desktop-e2e-smoke   # output lists markdown-doc-viewer
   ```
@@ -128,23 +139,28 @@ the root workspace excludes that manifest (`Cargo.toml:35`).
 ### T3 · port/4316 — channel Files tab, parity (M)
 
 - Branch `port/4316` (`mismai-li:feat/channel-files-tab`). Cherry-pick with sign-off, resolve. The PR ships no tests; the port adds them.
-- Tests first: `desktop/src/features/channel-files/useChannelFiles.test.mjs` (imeta parsing, a Markdown attachment labeled by `filename` not `.bin`, newest-first order), `useFileFolders.test.mjs` (folder assignment round-trip). A smoke e2e spec `channel-files-tab.spec.ts` added to the allow-list.
-- Eval: those files through the node runner, `just desktop-test`, `just desktop-e2e-smoke` listing the new spec.
+- The PR's files live under `desktop/src/features/channel-files/` (`ChannelFilesTab.tsx`, `FileCard.tsx`, `useChannelFiles.ts`, `useFileFolders.ts`); keep that path. Tests first: `desktop/src/features/channel-files/useChannelFiles.test.mjs` (imeta parsing, a Markdown attachment labeled by `filename` not `.bin`, newest-first order), `desktop/src/features/channel-files/useFileFolders.test.mjs` (folder assignment round-trip), `desktop/tests/e2e/channel-files-tab.spec.ts` registered in the smoke allow-list.
+- Eval:
+  ```
+  cd desktop && node --import ./test-loader.mjs --experimental-strip-types --test src/features/channel-files/useChannelFiles.test.mjs src/features/channel-files/useFileFolders.test.mjs
+  just desktop-test
+  just desktop-e2e-smoke   # output lists channel-files-tab
+  ```
 - Acceptance: the tab lists the attachments in the loaded window with folders, bulk select and drag-drop as in the PR. Bulk upload stays as the PR ships it in this ticket; T3b changes the default.
 - Bar: PR #4316's diff.
 
 ### T3b · feat/files-index — dedicated attachment index and bulk-upload default (M)
 
-- After T3. `useChannelFiles` reads the loaded window (`useChannelMessagesQuery`), which is top-level only and 200 per page (`commands/channel_window.rs:19, 38`). This ticket adds an attachment index: open the live subscription first, then paginate the channel's history including reply kinds, keep only events with `imeta`, overlay edits and deletions, expose deterministic pagination. Bulk drag-drop moves behind a setting that defaults off with a batch cap of 20.
+- After T3 has landed. `useChannelFiles` reads the loaded window (`useChannelMessagesQuery`), which is top-level only and 200 per page (`commands/channel_window.rs:28, 48`). This ticket adds an attachment index: open the live subscription first, then paginate the channel's history including reply kinds, keep only events with `imeta`, overlay edits and deletions, expose deterministic pagination. Bulk drag-drop moves behind a setting that defaults off with a batch cap of 20.
 - Tests first: more than 250 entries paginate without loss, a reply attachment appears, an arrival during backfill appears once, a deleted message's file disappears, an interrupted backfill resumes without duplicates, the setting gates bulk drop.
-- Eval: the index test file through the node runner with the stated six cases; `just desktop-test`; the Files tab with the 250-file e2e seed lists all files and renders in under 500 ms, three runs, measured in the spec.
+- Eval: `desktop/src/features/channel-files/useChannelFilesIndex.test.mjs` through the node runner with the six named cases; `just desktop-test`; `desktop/tests/e2e/channel-files-index.spec.ts` (smoke allow-list) seeds 250 files, asserts all are listed and render in under 500 ms over three runs.
 - Bar: PR #4316's tab as the baseline it must not regress; issue #4428 as the failure it must close.
 
 ### T4 · port/6651 — extra MCP servers via env (S)
 
 - Branch `port/6651` (`BradGroux:agent/extra-mcp-servers`, mergeable today). Cherry-pick with sign-off. The PR adds a `trusted` flag and withholds `BUZZ_PRIVATE_KEY`, `NOSTR_PRIVATE_KEY`, `BUZZ_RELAY_URL` and `BUZZ_AUTH_TAG` in `buzz-agent`'s `spawn_one` for untrusted servers.
 - Tests that must exist and pass: the PR's `extra_mcp_commands_*` tests in `crates/buzz-acp/src/lib.rs` and `desktop/src-tauri/src/managed_agents/env_vars/tests.rs`.
-- Test added by the port: an end-to-end spawn test in `crates/buzz-agent` that registers a fake MCP executable (a script that prints its environment variable names as its first tool result) as an untrusted server and asserts none of the four identity names appear, and that the trusted built-in still receives them.
+- Test added by the port: extend the existing `fake-mcp` test binary (`crates/buzz-agent/Cargo.toml:21-25`) to report its environment variable names in a tool result; an end-to-end spawn test in `crates/buzz-agent` registers it as an untrusted server and asserts none of the four identity names appear, and that a trusted spec still receives them.
 - Eval:
   ```
   cargo test -p buzz-acp extra_mcp -- --list | grep -c ': test'    # >= 4
@@ -158,7 +174,7 @@ the root workspace excludes that manifest (`Cargo.toml:35`).
 
 ### T5 · feat/prompt-source — reload an agent prompt from a file (S)
 
-- Branch `feat/prompt-source`. Machine-local sidecar `<app-data>/agents/prompt-sources.json` (definition id to absolute path). One backend command `set_prompt_source_and_reload(definition_id, path: Option<String>)`: `None` clears the mapping; `Some` validates the path (inside the user's home after symlink resolution, UTF-8, at most 64 KiB), stores the mapping, reads the file, and submits through the existing update request (`types/requests.rs:103`) so validation, the kind:30175 publish and the persona hash follow the normal path. It returns `{ local_updated: bool, publish: "published" | "queued" | "failed:<reason>" }` because the update path can return after queueing (`commands/personas/update.rs:124`). The dialog gets a path field, Reload and Clear.
+- Branch `feat/prompt-source`. Machine-local sidecar `<app-data>/agents/prompt-sources.json` (definition id to absolute path). One backend command `set_prompt_source_and_reload(definition_id, path: Option<String>)`: `None` clears the mapping; `Some` validates the path (inside the user's home after symlink resolution, UTF-8, at most 64 KiB), reads the file, submits through the existing update request (`types/requests.rs:103`) so validation, the kind:30175 publish and the persona hash follow the normal path, and only after the persona save succeeds (`commands/personas/update.rs:192-215`) writes the mapping. Order is validate, read, persona save, then mapping, so a failure at any step leaves the mapping and the effective prompt agreeing; a test injects a failure at each boundary. It returns `{ local_updated: bool, publish: "published" | "queued" | "failed:<reason>" }` because publication is a later step that can queue (`commands/personas/sharing.rs:66-130`). The dialog gets a path field, Reload and Clear.
 - Runtime capability fact: prompt-from-file is a desktop feature, not a harness capability, so `KnownAcpRuntime` is unchanged; the PR says so in `desktop/src/features/agents/AGENTS.md` per its rule at line 382.
 - Tests first (Rust, module `managed_agents::prompt_source`): missing file, symlink outside home, over-limit, invalid UTF-8, clear removes the mapping, happy path updates `system_prompt` and changes `persona_content_hash`, and the emitted kind:30175 event deserializes to `PersonaEventContent` whose content contains the prompt text and no path string. Frontend test: Reload disabled when no path is set.
 - Eval:
@@ -167,25 +183,25 @@ the root workspace excludes that manifest (`Cargo.toml:35`).
   cd desktop/src-tauri && cargo test prompt_source
   just desktop-test
   ```
-- Acceptance: edit `agent-prompts/pm.md`, click Reload, restart the agent, and `BUZZ_ACP_SYSTEM_PROMPT` in the agent's process environment equals the file.
+- Acceptance: edit `agent-prompts/pm.md`, click Reload, restart the agent, and the prompt the adapter receives equals the file bytes at the delivery seam: the ACP `session/new` request's system prompt (`crates/buzz-acp/src/acp.rs:632-676`), captured with the harness's request logging; the env variable alone is not proof.
 - Bar: `custom_harnesses.rs` for the file-input validation posture; upstream's `AgentDefinitionDialog.tsx` for the dialog pattern.
 
 ### T6 · OpenSEO through runtime config (S, blocked on vendor approval)
 
 - Precondition: Devin approves DataForSEO as a metered vendor and sets a monthly spend limit in the DataForSEO dashboard, and the key is added with `zsvault add`. Before that, nothing of OpenSEO runs. What may run before approval: config generation validated against a fake MCP server (the T4 fixture) to prove the discovery path.
-- Config placement, verified against the config bridge: Claude reads `mcpServers` from `<CLAUDE_CONFIG_DIR>/.claude.json` (`config_bridge/claude.rs:3-18`, `reader.rs:270`) or a project `.mcp.json` in the spawned working directory (`~/.buzz`, `runtime.rs:563`); Codex reads `<CODEX_HOME>/config.toml`. The ticket uses per-agent `CLAUDE_CONFIG_DIR` and `CODEX_HOME` set on the child so the operator's own config is untouched.
+- Config placement, verified against the config bridge: Claude reads `mcpServers` from `<CLAUDE_CONFIG_DIR>/.claude.json` (`config_bridge/claude.rs:3-18`, `reader.rs:270`) or a project `.mcp.json` in the spawned working directory (`~/.buzz`, `runtime.rs:563`); Codex reads `<CODEX_HOME>/config.toml`. A custom `CLAUDE_CONFIG_DIR` creates a fresh keychain namespace and leaves Claude logged out unless `CLAUDE_SECURESTORAGE_CONFIG_DIR` is also managed (`config_bridge/types.rs:191-197`, `AgentConfigPanel.tsx:292-310`), and Codex has the same shape with `CODEX_HOME`. So the ticket uses the project `.mcp.json` in the agent working directory for Claude and a per-agent `CODEX_HOME` only after its login behavior is proven from a Dock launch; the operator's own config is untouched either way. Skills: Claude discovers `.claude/skills`, Codex `.codex/skills` (`discovery/catalog.rs:50-101`); the eval asserts each runtime lists one named pinned skill.
 - Steps after approval: run OpenSEO self-hosted (`docker`, `AUTH_MODE=local_noauth`, bound to localhost); add the MCP to the Copy and Audit agents' runtime config; install `plugins/openseo/skills/` at a pinned revision into the agent skill path.
-- Eval, before approval: spawn a Claude runtime agent from a Dock launch with the fake server in its config; the agent lists the fake tool. After approval: same with OpenSEO; the agent runs one site-audit tool (locally computed, no DataForSEO call) on brokenenglishjewelry.com and the reply names the audit id; the smoke script asserts no DataForSEO-billed tool was called by reading the OpenSEO container log.
+- Eval, scripted as `scripts/zs/openseo-smoke.sh <runtime>`: before approval, spawn a Claude runtime agent from a Dock launch with the fake server in its config and assert the reply lists the fake tool. After approval: same with OpenSEO; the agent runs one site-audit tool (locally computed) on brokenenglishjewelry.com and the reply names the audit id; DataForSEO traffic is pointed at a local counting sentinel (`DATAFORSEO_BASE_URL` override in the container) that rejects every request, and the script asserts its counter is zero.
 - Acceptance: both smoke tests pass for the Claude and Codex runtimes from a Dock launch.
 - Bar: OpenSEO's documented `plugins/openseo` install path.
 
 ### T7 · feat/mcp-registry — MCP registry with trust model (L)
 
 - Branch `feat/mcp-registry`, after T4. Depends on the T4 fake-server fixture and a fake HTTP MCP fixture (a tiny Streamable HTTP server in the test tree). OpenSEO is not a dependency; the T6 post-approval run is a separate integration check.
-- Design memo first, `docs/plans/2026-09-xx-mcp-registry-design.md`, half a page, reviewed by Sol before code. It must answer: the two server classes and the env each receives; the runtime capability matrix (buzz-agent: stdio only, since `McpServer` is the ACP `McpServerStdio` shape at `buzz-acp/src/acp.rs:25` and `buzz-agent/src/types.rs:536`; Claude and Codex: stdio and HTTP through native config); the process boundary for stdio servers under Claude and Codex, where the adapter inherits Buzz identity variables (`runtime.rs:563`, `buzz-acp/src/acp.rs:454`) and its MCP children inherit them again, solved by a small launcher binary `buzz-mcp-launch` that the generated config names as the command, which removes the four identity variables and execs the real server; where secrets live (keychain references resolved by the launcher at spawn, never written into JSON or TOML); name collision rule with built-ins; per-agent toggle storage; isolated config roots per agent.
+- Design memo first, `docs/plans/2026-09-xx-mcp-registry-design.md`, one page, reviewed by Sol before code. It must answer: the two server classes and the env each receives; the runtime capability matrix (buzz-agent: stdio only, since `McpServer` is the ACP `McpServerStdio` shape at `buzz-acp/src/acp.rs:25` and `buzz-agent/src/types.rs:536`; Claude and Codex: stdio and HTTP through native config); the process boundary for stdio servers under Claude and Codex, where the adapter inherits the whole harness environment including provider keys and user-defined values (`runtime.rs:563, 692-701, 753-757`, `buzz-acp/src/acp.rs:454-517`), solved by a launcher `buzz-mcp-launch` that builds the child environment from empty with only platform essentials and the server's approved values, following the `env_clear` plus allow-list pattern in `buzz-agent/src/mcp.rs:733-754`, and on Windows supervises the child rather than exec; HTTP credentials, which no launcher can inject, handled by a local credential-resolving stdio proxy in front of Streamable HTTP upstreams (the same binary in proxy mode), so no secret is ever written to JSON or TOML; where secrets live (a shared read-only secret-store crate extracted from `desktop/src-tauri/src/secret_store.rs`, since a workspace binary cannot call the private Tauri module); the launcher's crate path, workspace membership (`Cargo.toml:2-34`), sidecar stubs (`justfile:167-180`), release build list (`justfile:306-309`), `scripts/bundle-sidecars.sh` and `tauri.conf.json:52-62` plus the Windows manifest, with generated config naming the bundled launcher by absolute path; name collision rule with built-ins; per-agent toggle storage; config roots per agent with the login caveat from T6.
 - Capability facts added to `KnownAcpRuntime` (`mcp_transports`, `mcp_config_root_env`) and projected through core to the UI per `desktop/src/features/agents/AGENTS.md:13, 34`; the guide is updated in the same PR.
 - Then: `mcp_servers.json` schema and loader with `custom_harnesses`-style structure validation; Settings panel to add stdio and HTTP servers with an approve step that shows the exact command or URL; per-agent toggles in the definition dialog; generation of `BUZZ_ACP_EXTRA_MCP_COMMANDS` for buzz-acp and of native config for Claude and Codex under per-agent `CLAUDE_CONFIG_DIR` and `CODEX_HOME`.
-- Tests first (Rust, module `managed_agents::mcp_registry`, and the launcher crate): loader rejects a server named like a built-in, rejects an inline secret value, resolves a keychain reference; HTTP entry is refused for buzz-agent and accepted for Claude and Codex; generated Claude and Codex config round-trips through the config bridge readers; launcher end-to-end: spawned with the identity variables set, the fake server it execs reports none of them; the toggle changes only the named agent's generated config. Frontend test: approve step required before save.
+- Tests first (Rust, module `managed_agents::mcp_registry`, and the launcher crate): loader rejects a server named like a built-in, rejects an inline secret value, resolves a keychain reference; HTTP entry is refused for buzz-agent and accepted for Claude and Codex; generated Claude and Codex config is asserted structurally (command, args, URL, env references) by parsing the written files, because the config bridge readers keep only name, kind and enabled (`config_bridge/types.rs:226-233`) and cannot detect a wrong command; launcher end-to-end: spawned with the identity variables and two unrelated sentinel secrets set, the fake server it starts reports none of them; proxy end-to-end: a fake authenticated HTTP MCP fixture is invoked through Claude and Codex via the proxy and the credential appears in no generated file; the toggle changes only the named agent's generated config. Frontend test: approve step required before save.
 - Eval:
   ```
   cd desktop/src-tauri && cargo test mcp_registry -- --list | grep -c ': test'   # >= 8
@@ -193,13 +209,13 @@ the root workspace excludes that manifest (`Cargo.toml:35`).
   cargo test -p buzz-mcp-launch
   just desktop-test
   ```
-- Acceptance: add the fake stdio server from Settings, toggle it on for Copy only; Copy lists its tool and Brand does not; add the fake HTTP server, it is enabled only on runtimes whose matrix allows it; delete a server and the agent stops seeing it after restart.
+- Acceptance: add the fake stdio server from Settings, toggle it on for Copy only; Copy lists its tool and Brand does not; add the fake HTTP server and invoke its tool from a Claude runtime and a Codex runtime through the proxy; on a buzz-agent runtime the HTTP entry shows as unsupported; delete a server and the agent stops seeing it after restart.
 - Bar: PR #5321 for the schema shape; `custom_harnesses.rs` for the loader.
 
 ### T8 · spike/pdf — PDF route decision (S)
 
 - Branch `spike/pdf`, throwaway. Render one real Broken English document (an approval page from `brand/render-approval.py`, with a table, a code block, a remote image, and enough text for three pages; fixture hash recorded) through (a) webview print-to-PDF behind a Tauri command and (b) one Rust HTML-to-PDF crate.
-- Validation per output, scripted: `pdftotext` extracts the three headings, the table cells and the code line; `pdftoppm` renders every page to PNG without error and the page count is 3; size and wall time recorded; the offline run executes with outbound network blocked (`pfctl` rule or the process launched with no network entitlement) and the remote image is reported as placeholder or fetched-from-cache.
+- Validation per output, scripted in `scripts/zs/pdf-validate.sh <pdf>`: `pdftotext` extracts the three headings, the table cells and the code line; `pdftoppm` renders every page to PNG without error and the page count is 3; size and wall time recorded. The offline case runs the render with the fixture's remote image pointed at a local sentinel HTTP server that logs and refuses every request; the sentinel log must show the attempt and the PDF must show the placeholder. No firewall rules are changed.
 - Deliverable: memo in `docs/plans/2026-09-xx-pdf-route.md` with the measurements, hashes of the PDFs and PNGs, and the pick. No production code lands.
 - Bar: the memo answers the question with numbers.
 
@@ -221,7 +237,7 @@ the root workspace excludes that manifest (`Cargo.toml:35`).
 
 - Branch `feat/assets-facets`, after T3b. Sort by date, name, size, author; filter by type; a Documents facet (md, pdf, html, docx, csv); the channel canvas pinned at the top, opening the existing Canvas surface (`features/canvas/ChannelCanvas.tsx`), not the attachment viewer, so editing keeps working.
 - Tests first: facet classification from `imeta` `filename` and MIME (md-as-octet-stream case), sort stability, pinned canvas present only when the channel has one, pinned row opens the Canvas surface and an edit saves.
-- Eval: the facet test file through the node runner, `just desktop-test`, `just desktop-e2e-smoke` listing the spec; sort or filter over the 250-file seed completes in under 100 ms measured in the spec, three runs.
+- Eval: `desktop/src/features/channel-files/fileFacets.test.mjs` through the node runner, `just desktop-test`, `just desktop-e2e-smoke` listing `desktop/tests/e2e/channel-files-facets.spec.ts`; sort or filter over the 250-file seed completes in under 100 ms measured in the spec, three runs.
 - Bar: the T3b tab as the baseline it must not regress.
 
 ### T11 · docs/calendar-authz — calendar authorization contract (S)
@@ -232,12 +248,13 @@ the root workspace excludes that manifest (`Cargo.toml:35`).
 
 ### T12a · docs/calendar-view-design — event model and view design (S)
 
-- After T11. `shared/ui/calendar.tsx` is a `react-day-picker` wrapper with no event layout. Memo: event model (all-day, multi-day, timezone, recurrence expansion window), month and agenda rendering, paging, keyboard operation and screen-reader semantics, create and edit conflict handling, and the component or library chosen. Reviewed by Sol.
+- After T11. `shared/ui/calendar.tsx` is a `react-day-picker` wrapper with no event layout. Memo at `docs/plans/2026-09-xx-calendar-view-design.md`: event model (all-day, multi-day, timezone, recurrence expansion window), month and agenda rendering, paging, keyboard operation and screen-reader semantics, create and edit conflict handling, and the component or library chosen.
+- Eval: every item above has a decision; Sol reviews the memo; nothing above NIT remains.
 
 ### T12 · feat/google-calendar — Google Calendar as a scoped integration (L)
 
 - Branch `feat/google-calendar`, after T11 and T12a. Revive PR #1382's approach: per-user OAuth through desktop commands, tokens in the keychain (`secret_store` pattern), the T12a view, create and edit for events the account can edit, a sidebar entry gated by the T11 contract.
-- Tests first (Rust): token storage and refresh; refresh failure surfaces a reconnect state; no token in logs. A mock Google Calendar server in the test tree with two principals, one calendar shared to both, and an ACL-loss case; frontend tests render both principals' views and disable edit when write ACL is absent.
+- Tests first (Rust): token storage and refresh; refresh failure surfaces a reconnect state; no token in logs. A mock Google Calendar server in the test tree with two principals, one calendar shared to both, and an ACL-loss case; frontend tests render both principals' views and disable edit when write ACL is absent. Traceability: the PR carries a table mapping every T11 decision to a named test, including two Buzz principals, Buzz membership removal hiding the calendar in that channel, cached events purged on disconnect and on membership loss, revocation propagation within the bounded window, and agent read and write authority checked separately.
 - Eval:
   ```
   cd desktop/src-tauri && cargo test google_calendar -- --list | grep -c ': test'   # >= 5
@@ -254,8 +271,9 @@ the root workspace excludes that manifest (`Cargo.toml:35`).
 - Test first, in `managed_agents::discovery::tests`, named `bundle_exe_prefers_bundle_over_workspace_target`: a bundle-shaped path resolves to the bundle's binary even when a workspace `target/release` binary exists; existing discovery tests unchanged.
 - Eval:
   ```
-  cd desktop/src-tauri && cargo test discovery::tests::bundle_exe_prefers_bundle_over_workspace_target -- --exact
-  cd desktop/src-tauri && cargo test discovery
+  cd desktop/src-tauri && n=$(cargo test managed_agents::discovery::tests::bundle_exe_prefers_bundle_over_workspace_target -- --list | grep -c ': test'); test "$n" -eq 1
+  cd desktop/src-tauri && cargo test managed_agents::discovery::tests::bundle_exe_prefers_bundle_over_workspace_target -- --exact
+  cd desktop/src-tauri && cargo test managed_agents::discovery
   just desktop-tauri-clippy
   ```
 - Bar: upstream's `command_search_dirs` semantics for dev builds unchanged.
@@ -263,7 +281,7 @@ the root workspace excludes that manifest (`Cargo.toml:35`).
 ## Order and parallelism
 
 Wave 1 (parallel build; serialized landing): T1, T2, T4, T5, T13, T8, T11.
-Wave 2: T3 and T3b (after wave 1 lands), T7 memo then T7 (after T4), T12a (after T11), T6 config-generation half (fake server; the OpenSEO half waits for approval).
+Wave 2: T3 (after wave 1 lands), then T3b after T3 lands; T7 memo then T7 (after T4); T12a (after T11); T6 config-generation half (fake server; the OpenSEO half waits for approval).
 Wave 3: T9 (after T2 and T8), T10 (after T3b), T12 (after T12a).
 
 ## Ticket list for GitHub issues
@@ -293,5 +311,6 @@ Created on the fork only when Devin asks. Titles:
 - Sol pass 1 on this plan (2026-09-04, gpt-5.6-sol, xhigh): verdict BLOCK, 18 BLOCK and 8 WARN findings, one provenance NIT. All checked against the code.
   - Accepted and applied: `just ci` as the full gate (1); tester in a writable worktree with a clean-tree assertion (2); serialized landing with rebase, re-gate and recorded base OID (3); PR body written by us before `zs-land` (4); exact node test invocation (5); relay mutation moved to runbook R1 (6); Rust commands from `desktop/src-tauri` (7); named test files and smoke allow-list entries (8); dedicated attachment index as T3b (9); spawn-boundary end-to-end test (10); explicit set, reload and clear with publish status (11); Claude config file names (12); nothing of OpenSEO runs before approval (13); runtime capability matrix, HTTP not on buzz-agent (14); launcher as the process boundary (15); T7 depends on fixtures, not OpenSEO (16); PDF parse and render checks (17); T11 checklist and T12 mock plus live checklist (18); parity and deviation split (19); `--signoff` on imports (20); canvas opens its own surface (21); T12a design ticket (22); list-and-count on every Rust filter (23); hook base noted as stricter cumulative (24); latency thresholds with fixtures and three runs (25); finite critic exit and corrected provenance (26); capability facts in the runtime catalog (27).
   - Corrected on verification: finding 10 described the tree before the port. PR #6651 patches `buzz-agent`'s `spawn_one` with a `trusted` flag and withholds the four identity variables from untrusted servers. The end-to-end test Sol asked for is kept because it binds that seam.
-- Sol pass 2: running at commit time; findings are folded in during execution rather than blocking wave 1 (Devin, 2026-09-04: if the plan looks solid, troubleshoot during implementation).
+- Sol pass 2 (2026-09-04): 12 BLOCK, 8 WARN, 1 NIT. Applied in revision 3: base-SHA check before `zs-land` and merge-not-rebase after push (1); every eval a path and a command, sentinel servers instead of firewall rules (2); `media_download_tests` registration and module-qualified filter (3); crate-root qualified T13 test name (4); T5 write order and failure-injection tests (5); T5 acceptance at the `session/new` seam (6); Claude config-dir login caveat, project `.mcp.json` instead (7); launcher builds env from empty with sentinel-secret test (8); credential-resolving stdio proxy for HTTP (9); launcher build, bundle and secret-store crate listed (10); structural config assertions instead of the lossy bridge round-trip (11); T11-to-T12 traceability table (12); enforced counts (13); Hermit in every gate shell (14); full Sol command (15); `fake-mcp` binary (16); skill discovery and counting sentinel (17); T3b after T3 lands (18); port procedure stated once (19); `channel-files` path pinned (20); line cites (21).
+- Execution started after pass 2 was folded in; wave 1 builders had already begun on revision 2 text, so the critic and audit stages carry the revision 3 evals (Devin, 2026-09-04: if the plan looks solid, troubleshoot during implementation).
 - Step 0 baseline: `just ci` exit 0 on `zs/main` at 63a169e52 (2026-09-04).

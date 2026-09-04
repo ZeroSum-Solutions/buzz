@@ -21,8 +21,9 @@ corrections are folded into the sections below and the log is at the end.
 | 6 | OpenSEO | its MCP at `/mcp` (Streamable HTTP, `oseo_` API key) + 9 curated skills in `plugins/openseo/skills/` | No | none | Blocked on DataForSEO vendor approval; then runtime-native config + smoke test | S |
 | 7 | Prompt files as source of truth | `AgentDefinitionDialog.tsx:783-791` textarea; `definition_validation.rs` (64 KiB cap); `persona_events.rs` (prompt is published in kind 30175) | No | PR #584 merged (base prompt layer only) | Local "reload from file" action that writes through the normal update path | S |
 
-All three CONFLICTING PRs need a port (rebase onto `zs/main`, resolve, re-run their tests), not a
-cherry-pick. Each port is judged against the PR's own diff and test files as the bar.
+All three CONFLICTING PRs need a port: replay the PR's full commit range onto `zs/main` with
+`git cherry-pick --signoff`, resolve conflicts, re-run their tests. A clean pick will not apply.
+Each port is judged against the PR's own diff and test files as the bar.
 
 ## 1. Agent hover cards and mention descriptions
 
