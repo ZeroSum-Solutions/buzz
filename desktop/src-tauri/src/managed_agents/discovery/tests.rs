@@ -1,15 +1,9 @@
 use std::path::PathBuf;
 
 use super::overrides::{divergent_agent_command_override, update_time_agent_command_override};
-use super::{
-    apply_agent_command_update, apply_env_vars_then_effort_transition, classify_runtime,
-    codex_adapter_availability, codex_adapter_is_outdated, create_time_agent_command_override,
-    default_agent_command, effective_agent_command, find_nvm_default_bin,
-    is_login_shell_path_uninit, is_safe_nvm_tag, managed_agent_avatar_url, normalize_agent_args,
-    parse_semver_tag, probe_codex_acp_version, record_agent_command, refresh_login_shell_path,
-    remove_record_effort_aliases, try_record_agent_command, BUZZ_AGENT_AVATAR_URL,
-    CLAUDE_CODE_AVATAR_URL, CODEX_AVATAR_URL, GOOSE_AVATAR_URL,
-};
+// Glob, not a named list: this file is frozen at the file-size ratchet
+// ceiling and the named-import list this replaced had no spare line budget.
+use super::*;
 use crate::managed_agents::AcpAvailabilityStatus;
 
 #[test]
@@ -612,6 +606,10 @@ fn update_time_override_preserves_pin_for_persona_less_agent() {
 mod effort_clear;
 mod forced_discovery;
 mod managed_path_resolution;
+// `include!`, not `mod`: the ticket names this test's module path exactly as
+// `discovery::tests::bundle_exe_prefers_bundle_over_workspace_target`, which
+// only textual inclusion at this scope (no extra module segment) can produce.
+include!("tests/bundle_search.rs");
 #[cfg(unix)]
 #[test]
 fn probe_codex_acp_version_parses_full_semver_output() {

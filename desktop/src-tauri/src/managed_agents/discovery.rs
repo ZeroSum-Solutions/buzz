@@ -362,13 +362,15 @@ fn profile_target_dirs(root: &Path) -> [PathBuf; 2] {
 
 /// True when `path` sits inside a macOS `.app` bundle — i.e. some ancestor
 /// component ends in `.app`. `path` is typically the current exe's parent
-/// directory (`Contents/MacOS/` inside a bundle).
+/// directory (`Contents/MacOS/` inside a bundle). Case-insensitive: the
+/// default macOS filesystem (APFS) is case-insensitive-but-preserving, so
+/// `.App`/`.APP` name the same bundle as `.app`.
 fn is_inside_app_bundle(path: &Path) -> bool {
     path.components().any(|component| {
         component
             .as_os_str()
             .to_str()
-            .is_some_and(|s| s.ends_with(".app"))
+            .is_some_and(|s| s.to_ascii_lowercase().ends_with(".app"))
     })
 }
 
@@ -1293,9 +1295,10 @@ pub fn managed_agent_avatar_url(command: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests;
-// `discovery/tests.rs` is already at the repo's file-size ratchet ceiling
-// (no lines may be added), so this coverage lives in its own file, declared
-// directly here rather than via `mod tests;`.
+// Extra bundle-search coverage that doesn't need `discovery::tests`'s exact
+// module path (see `discovery/tests/bundle_search.rs`, `include!`d there for
+// the one test that does). Declared directly here, not via `tests`' own
+// `mod`, so it stays reachable without adding a line to the frozen file.
 #[cfg(test)]
 #[path = "discovery/bundle_search_tests.rs"]
 mod bundle_search_tests;
