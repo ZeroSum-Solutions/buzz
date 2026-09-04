@@ -360,23 +360,54 @@ fn profile_target_dirs(root: &Path) -> [PathBuf; 2] {
     }
 }
 
-fn command_search_dirs() -> Vec<PathBuf> {
-    let mut dirs = profile_target_dirs(&workspace_root_dir()).to_vec();
-    if let Ok(current_dir) = std::env::current_dir() {
-        dirs.extend(profile_target_dirs(&current_dir));
+/// True when `path` sits inside a macOS `.app` bundle — i.e. some ancestor
+/// component ends in `.app`. `path` is typically the current exe's parent
+/// directory (`Contents/MacOS/` inside a bundle).
+fn is_inside_app_bundle(path: &Path) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|s| s.ends_with(".app"))
+    })
+}
+
+/// Order the harness search directories, deduplicated, so a bundle's own
+/// binaries win over a workspace `target/` dir that happens to exist on the
+/// same machine (a stray sibling checkout must not shadow the shipped
+/// binary). `exe_parent` is the current executable's parent directory;
+/// `workspace_dirs` are the workspace/current-dir `target/` profile
+/// directories a dev build would search.
+fn order_search_dirs(exe_parent: Option<PathBuf>, workspace_dirs: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    let bundle_dir = exe_parent.as_ref().filter(|p| is_inside_app_bundle(p));
+    if let Some(bundle) = bundle_dir {
+        dirs.push(bundle.clone());
     }
 
-    dirs.extend(
-        std::env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(Path::to_path_buf)),
-    );
+    dirs.extend(workspace_dirs);
+    dirs.extend(exe_parent);
+
     dirs.into_iter().fold(Vec::new(), |mut unique, dir| {
         if !unique.contains(&dir) {
             unique.push(dir);
         }
         unique
     })
+}
+
+fn command_search_dirs() -> Vec<PathBuf> {
+    let mut workspace_dirs = profile_target_dirs(&workspace_root_dir()).to_vec();
+    if let Ok(current_dir) = std::env::current_dir() {
+        workspace_dirs.extend(profile_target_dirs(&current_dir));
+    }
+
+    let exe_parent = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+
+    order_search_dirs(exe_parent, workspace_dirs)
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -399,17 +430,24 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-fn resolve_workspace_command(command: &str) -> Option<PathBuf> {
+/// Resolve `command` against an explicit, already-ordered list of search
+/// directories. Extracted from [`resolve_workspace_command`] so the ordering
+/// produced by [`order_search_dirs`] can be exercised end-to-end in tests
+/// without depending on the real `current_exe()`/`current_dir()`.
+fn resolve_workspace_command_from(command: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
     if command_looks_like_path(command) {
         let path = PathBuf::from(command);
         return is_executable_file(&path).then_some(path);
     }
 
     let file_name = executable_basename(command);
-    command_search_dirs()
-        .into_iter()
+    dirs.iter()
         .map(|dir| dir.join(&file_name))
         .find(|candidate| is_executable_file(candidate))
+}
+
+fn resolve_workspace_command(command: &str) -> Option<PathBuf> {
+    resolve_workspace_command_from(command, &command_search_dirs())
 }
 
 fn resolve_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<PathBuf>>>
@@ -1255,3 +1293,9 @@ pub fn managed_agent_avatar_url(command: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests;
+// `discovery/tests.rs` is already at the repo's file-size ratchet ceiling
+// (no lines may be added), so this coverage lives in its own file, declared
+// directly here rather than via `mod tests;`.
+#[cfg(test)]
+#[path = "discovery/bundle_search_tests.rs"]
+mod bundle_search_tests;
