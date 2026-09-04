@@ -1,5 +1,12 @@
+building release binaries...
+    Finished `release` profile [optimized] target(s) in 0.21s
+== egress surface check (Sol audit finding 6) ==
+  PASS: fixtures/approval.html has exactly 0 external-reference pattern hit(s)
+  PASS: fixtures/approval-offline.html has exactly 1 external-reference pattern hit(s)
+  PASS: fixtures/approval-negative.html has exactly 0 external-reference pattern hit(s)
+  PASS: fixtures/approval-offline-noinstrument.html has exactly 1 external-reference pattern hit(s)
 == mode: online ==
-  render: {"bytes":491106,"wall_ms":3847,"image_wait_ms":81,"print_ms":182,"image_state":"loaded","sha256":"f91b3493f59a7bfc95203c55b74923234f42f4e1c5aa7345daf453ea85ea5a3f"}
+  render: {"bytes":491106,"wall_ms":3501,"image_wait_ms":38,"print_ms":176,"image_state":"loaded","sha256":"6c057e5bcd68abe95cd7f0fbc72484a8e97db8523e86ffff555f148652e76beb"}
   PASS: online render image_state=loaded (local hash-pinned <img> confirmed via its load event, not inferred from a sleep)
 == validating out/approval-headless-chrome-online.pdf ==
   PASS: page count == 3 (got 3)
@@ -12,17 +19,19 @@
   PASS: table cell token (delta-fixture-row) present (got 1)
   PASS: code marker line (full text) present (got 1)
   PASS: pdftoppm produced 3 PNGs without error (got 3)
-  pdf: bytes=491106 sha256=f91b3493f59a7bfc95203c55b74923234f42f4e1c5aa7345daf453ea85ea5a3f
+  PASS: embedded reference image present at its native 800x600 (image rows: 800 600;)
+  pdf: bytes=491106 sha256=6c057e5bcd68abe95cd7f0fbc72484a8e97db8523e86ffff555f148652e76beb
 VALIDATION PASSED
   png: out/png-online/page-1.png sha256=b2860fd4e19a151f628e4b88271ac43434b9938385a0a61bdab36676125c4360 bytes=196557
   png: out/png-online/page-2.png sha256=32b3a92be78f36e1f650a2614c73ea62af2b5d29f0ec35cc14347e20cee02a7e bytes=193040
   png: out/png-online/page-3.png sha256=c915b59398c7536cd434197f5cbe4edb23aa1c67c7b027752a6dfc09c63e21c7 bytes=132766
-== mode: offline ==
-  render: {"bytes":107811,"wall_ms":3663,"image_wait_ms":20,"print_ms":165,"image_state":"failed","sha256":"80ac6953a7d217e9aad4a9601a206d2331a5b0ba99f5f518cc79b3465249d17b"}
-  PASS: sentinel log shows the remote fetch was attempted (got 1 line(s))
+  PASS: online PDF size >= 300000 bytes (got 491106; reference image embedded)
+== mode: offline (nonce=83f817bc9cca30e4) ==
+  render: {"bytes":107811,"wall_ms":3384,"image_wait_ms":87,"print_ms":154,"image_state":"failed","sha256":"f721364cc68c6969ef795709e1b5119e554575115a73820c85019aced7245444"}
   sentinel log:
-    1788521072933 refused peer=127.0.0.1:62810 request=GET /remote-image.png HTTP/1.1
-  PASS: offline render image_state=failed (not loaded, consistent with the sentinel's 403 refusal)
+    1788526252112 refused peer=127.0.0.1:63923 request=GET /remote-image.png?nonce=83f817bc9cca30e4 HTTP/1.1
+  PASS: sentinel log has a well-formed GET carrying this run's nonce (direct proof the renderer issued the request)
+  PASS: offline render image_state=failed (the in-page load/error promise measured a genuine failure)
 == validating out/approval-headless-chrome-offline.pdf ==
   PASS: page count == 3 (got 3)
   PASS: heading 1 (Approval Page One) present (got 1)
@@ -34,13 +43,20 @@ VALIDATION PASSED
   PASS: table cell token (delta-fixture-row) present (got 1)
   PASS: code marker line (full text) present (got 1)
   PASS: pdftoppm produced 3 PNGs without error (got 3)
-  pdf: bytes=107811 sha256=80ac6953a7d217e9aad4a9601a206d2331a5b0ba99f5f518cc79b3465249d17b
+  (info) no full-size image embedded (max width 14px) -- expected for an offline placeholder, checking alt text is extracted
+  PASS: offline placeholder alt text (remote reference image) present in extracted text (got 1)
+  pdf: bytes=107811 sha256=f721364cc68c6969ef795709e1b5119e554575115a73820c85019aced7245444
 VALIDATION PASSED
   png: out/png-offline/page-1.png sha256=cd6ccde512ac530e69ec4e2c108d17213234ea150785960e32067894d8ade7e3 bytes=194736
   png: out/png-offline/page-2.png sha256=87760dfb778cff2b607524cef3dd3a1694db7dc0017fe1a5d40f4e2f1f8fb18d bytes=201408
   png: out/png-offline/page-3.png sha256=23952bd61cff2eccf6da0c1cc2a9e3f566d2d2957c4e809bfe7577e378f2d199 bytes=103855
+  PASS: offline PDF size < 300000 bytes (got 107811; reference image not embedded)
+== mode: offline negative control (img.remote class removed, src untouched; nonce=142f53f3bae83c3b) ==
+  render: {"bytes":106760,"wall_ms":3177,"image_wait_ms":44,"print_ms":152,"image_state":"missing","sha256":"177bf268108bb5fc2bc0e7273137e3dacfda5534d4a2516c70e5f6b10fbd86d6"}
+  (expected) sentinel log shows the fetch was still attempted — this control isolates the image_state gate, not the sentinel-log gate
+  PASS: negative control got image_state=missing (not 'failed') — confirms the tightened image_state=='failed' gate in run_offline would correctly FAIL this broken-instrumentation case
 == mode: negative fixture (row tokens + code marker removed, page count preserved) ==
-  render: {"bytes":488722,"wall_ms":3528,"image_wait_ms":71,"print_ms":185,"image_state":"loaded","sha256":"7fbf0e9ab7809b1cfd2f4d85ab938051f876caeab88dd596bf6098844ddb40d0"}
+  render: {"bytes":488722,"wall_ms":3400,"image_wait_ms":40,"print_ms":175,"image_state":"loaded","sha256":"af64f2ebb04986c4a10532ecbc81c07163698bde179ff8ea3798ca280cbedc1c"}
   PASS: negative fixture still renders to 3 pages
     == validating out/approval-negative.pdf ==
       PASS: page count == 3 (got 3)
@@ -53,7 +69,8 @@ VALIDATION PASSED
       FAIL: table cell token (delta-fixture-row) present (got 0, want >= 1)
       FAIL: code marker line (full text) present (got 0, want >= 1)
       PASS: pdftoppm produced 3 PNGs without error (got 3)
-      pdf: bytes=488722 sha256=7fbf0e9ab7809b1cfd2f4d85ab938051f876caeab88dd596bf6098844ddb40d0
+      PASS: embedded reference image present at its native 800x600 (image rows: 800 600;)
+      pdf: bytes=488722 sha256=af64f2ebb04986c4a10532ecbc81c07163698bde179ff8ea3798ca280cbedc1c
     VALIDATION FAILED
   PASS: scripts/zs/pdf-validate.sh FAILED against the negative fixture (nonzero exit), as required
   PASS: 'table cell token (alpha-fixture-row) present' correctly reports FAIL when its structure is removed
@@ -67,5 +84,6 @@ VALIDATION PASSED
   PASS: 'heading 3 (Approval ID Generator) present' still reports PASS (structure was not touched by the negative fixture)
 fixture sha256 (online)=668773332a295ba28dc9fb6694c89203782ec4c3a1b9dd22ebcee895ef7c6318
 fixture sha256 (offline)=6eb69bb7078a4b22f8d6ab393ec4bcfb74bbe66ee4941b3f6826b00b478479f4
+fixture sha256 (offline-noinstrument)=c0c178ed5ec22efed374a03a13950f62a39faee60794bb386fe8dcd9651586e9
 fixture sha256 (negative)=da863212176141d05ca9d05b1f4a30f3276dd061271787478395f31d9af6069f
 VALIDATION PASSED

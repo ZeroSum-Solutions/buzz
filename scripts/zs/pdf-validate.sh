@@ -61,6 +61,45 @@ pdftoppm -png -r 100 "$PDF" "$pngdir/page"
 pngcount=$(ls "$pngdir"/page-*.png 2>/dev/null | wc -l | tr -d ' ')
 check_eq "pdftoppm produced 3 PNGs without error" 3 "$pngcount"
 
+# Bind the remote <img> to what actually rendered, not to a JS event fired
+# in the page (AGENTS.md Review-Proven Rule 3). image_state=="loaded" only
+# proves the DOM fired a load event; it says nothing about whether an image
+# XObject exists in the printed PDF. Reproduced: a scratch copy of the
+# online fixture with only `display:none` set on the <img> still reports
+# image_state=="loaded" (the browser still loads the resource even though
+# it isn't laid out) while the PDF drops from ~491KB to 105,374 bytes and
+# `pdfimages -list` shows zero embedded images — none of the checks above
+# would have caught that. Distinguish "the real reference image is
+# embedded" from "a broken-image placeholder icon is embedded" from
+# "nothing is embedded" by reading the PDF's own image XObjects.
+image_rows=$(pdfimages -list "$PDF" | awk 'NR>2 && $3=="image"{print $4, $5}')
+if [ -z "$image_rows" ]; then
+  echo "  FAIL: no embedded image XObject found in the PDF (the remote <img> did not bind to rendered output, or was stripped/hidden)"
+  fail=1
+else
+  max_width=$(echo "$image_rows" | awk '{print $1}' | sort -rn | head -1)
+  if [ "$max_width" -ge 100 ]; then
+    # A real photo, not the browser's small broken-image glyph: must match
+    # the known reference image's native dimensions exactly, not merely
+    # "some image exists".
+    match=$(echo "$image_rows" | awk '$1==800 && $2==600{print; exit}')
+    if [ -n "$match" ]; then
+      echo "  PASS: embedded reference image present at its native 800x600 (image rows: $(echo "$image_rows" | tr '\n' ';'))"
+    else
+      echo "  FAIL: embedded image XObject present but not the 800x600 reference image (image rows: $(echo "$image_rows" | tr '\n' ';'))"
+      fail=1
+    fi
+  else
+    # Small enough to be the browser's broken-image glyph, not a real photo
+    # (measured: 14x16 for this Chrome build) -- this is the expected
+    # offline shape, so confirm it degrades to a visible, labeled
+    # placeholder rather than a blank rectangle a reviewer can't tell apart
+    # from a rendering bug.
+    echo "  (info) no full-size image embedded (max width ${max_width}px) -- expected for an offline placeholder, checking alt text is extracted"
+    check "offline placeholder alt text (remote reference image) present in extracted text" 1 "$(echo "$text" | grep -c "remote reference image")"
+  fi
+fi
+
 size=$(stat -f%z "$PDF" 2>/dev/null || stat -c%s "$PDF")
 sha=$(shasum -a 256 "$PDF" | awk '{print $1}')
 echo "  pdf: bytes=$size sha256=$sha"
