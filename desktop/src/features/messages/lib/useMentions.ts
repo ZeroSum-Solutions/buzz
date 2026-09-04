@@ -54,7 +54,11 @@ import {
   type MentionPickerMode,
   useMentionSelection,
 } from "./useMentionSelection";
-import { rankMentionCandidates } from "./mentionRanking";
+import {
+  MENTION_SUGGESTION_LIMIT,
+  rankVisibleMentionCandidates,
+  selectAgentProfileFallbackPubkeys,
+} from "./mentionFallbackWindow";
 import { mapMentionCandidateToSuggestion } from "./mentionSuggestionMapping";
 import { getMentionMemberPubkeys } from "./mentionMemberPubkeys";
 import {
@@ -64,8 +68,7 @@ import {
   type MentionCandidate,
 } from "./mentionCandidates";
 import { buildMentionCandidates } from "./buildMentionCandidates";
-const MENTION_DEBOUNCE_MS = 120,
-  MENTION_SUGGESTION_LIMIT = 50;
+const MENTION_DEBOUNCE_MS = 120;
 type UseMentionsOptions = {
   channelType?: ChannelType | null;
   recentMentionPubkeys?: readonly string[];
@@ -320,27 +323,38 @@ export function useMentions(
   const ownerProfilesQuery = useUsersBatchQuery(ownerPubkeys, {
     enabled: ownerPubkeys.length > 0,
   });
+  // Candidates ranked against the in-progress query and cut to
+  // MENTION_SUGGESTION_LIMIT — the same window the picker renders. Empty
+  // while the picker is closed (`mentionQuery === null`). Shared below by
+  // the agent profile fallback and by `matchingSuggestions`, so both agree
+  // on exactly which candidates are visible. See mentionFallbackWindow.ts
+  // for why the fallback must stay bounded to this window.
+  const rankedVisibleMentionCandidates = React.useMemo(
+    () =>
+      mentionQuery === null
+        ? []
+        : rankVisibleMentionCandidates(
+            mentionCandidatesWithTeams,
+            mentionQuery,
+            activePersonaIds,
+          ),
+    [activePersonaIds, mentionCandidatesWithTeams, mentionQuery],
+  );
   // Agent candidates whose kind-0 `about` is not already known — neither
   // resolved at candidate-build time (search results) nor present in the
   // caller's profile lookup. Batch-resolve them so the selector can show a
   // role line even for agents who haven't authored anything in the loaded
   // timeline. The per-pubkey entry cache behind useUsersBatchQuery keeps
-  // repeat lookups off the network.
+  // repeat lookups off the network. See mentionFallbackWindow.ts's
+  // selectAgentProfileFallbackPubkeys for why this is bounded to
+  // `rankedVisibleMentionCandidates` rather than every mentionable agent.
   const agentProfilePubkeys = React.useMemo(
-    () => [
-      ...new Set(
-        mentionCandidates
-          .filter(
-            (candidate) =>
-              candidate.isAgent &&
-              candidate.pubkey &&
-              candidate.description === undefined &&
-              !profiles?.[candidate.pubkey],
-          )
-          .map((candidate) => candidate.pubkey as string),
+    () =>
+      selectAgentProfileFallbackPubkeys(
+        rankedVisibleMentionCandidates,
+        profiles,
       ),
-    ],
-    [mentionCandidates, profiles],
+    [rankedVisibleMentionCandidates, profiles],
   );
   const agentProfilesQuery = useUsersBatchQuery(agentProfilePubkeys, {
     enabled: agentProfilePubkeys.length > 0,
@@ -401,17 +415,9 @@ export function useMentions(
     },
     [],
   );
-  const matchingSuggestions = React.useMemo<MentionSuggestion[]>(() => {
-    if (mentionQuery === null) {
-      return [];
-    }
-    return rankMentionCandidates(
-      mentionCandidatesWithTeams,
-      mentionQuery,
-      activePersonaIds,
-    )
-      .slice(0, MENTION_SUGGESTION_LIMIT)
-      .map(({ candidate, label }) =>
+  const matchingSuggestions = React.useMemo<MentionSuggestion[]>(
+    () =>
+      rankedVisibleMentionCandidates.map(({ candidate, label }) =>
         mapMentionCandidateToSuggestion({
           agentProvenanceReady: agentDirectoriesReady,
           candidate,
@@ -421,17 +427,16 @@ export function useMentions(
           ownerProfiles: ownerProfilesQuery.data?.profiles,
           profiles: mentionProfiles,
         }),
-      );
-  }, [
-    activePersonaIds,
-    agentDirectoriesReady,
-    currentPubkey,
-    mentionCandidatesWithTeams,
-    mentionProfiles,
-    mentionQuery,
-    options?.channelType,
-    ownerProfilesQuery.data?.profiles,
-  ]);
+      ),
+    [
+      agentDirectoriesReady,
+      currentPubkey,
+      mentionProfiles,
+      options?.channelType,
+      ownerProfilesQuery.data?.profiles,
+      rankedVisibleMentionCandidates,
+    ],
+  );
   const getDefaultAgentSuggestion = useDefaultAgentSuggestion({
     activePersonaIds,
     agentProvenanceReady: agentDirectoriesReady,

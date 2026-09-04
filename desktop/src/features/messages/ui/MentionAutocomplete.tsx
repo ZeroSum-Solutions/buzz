@@ -281,6 +281,15 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
               suggestion.pubkey &&
                 lockedAgentPubkeys?.has(suggestion.pubkey.toLowerCase()),
             );
+            // The row's `aria-label` overrides all descendant text as the
+            // accessible name, so the role line below is otherwise announced
+            // to no one — the exact disambiguation it exists to provide
+            // (two same-named agents with different roles) is unavailable to
+            // screen-reader users without this.
+            const descriptionId =
+              suggestion.isAgent && suggestion.description
+                ? `mention-agent-description-${index}`
+                : undefined;
 
             return (
               <div
@@ -295,6 +304,7 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
                 key={suggestionKey}
               >
                 <button
+                  aria-describedby={descriptionId}
                   aria-label={`Mention ${suggestion.displayName}`}
                   className={cn(
                     "flex min-w-0 flex-1 items-center gap-2 rounded-lg px-3 py-1.5 text-left",
@@ -356,6 +366,7 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
                               <span
                                 className="min-w-0 truncate"
                                 data-testid="mention-agent-description"
+                                id={descriptionId}
                                 title={suggestion.description}
                               >
                                 {suggestion.description}
