@@ -562,3 +562,306 @@ test("MEASURE: a fixed ~500 KB document reaches panel-ready under 1.0s with no m
     await expect(page.getByTestId("markdown-doc-panel")).toHaveCount(0);
   }
 });
+
+// ── Adversarial complexity, not just bytes (Sol audit finding 1) ──────────
+//
+// A valid under-cap document can still carry hundreds of thousands of
+// block-level nodes if it is mostly one-line list items — the audit's own
+// reproduction shape ("- a\n" repeated) parses at superlinear cost through
+// mdast/micromark, well under the byte cap and before any React element
+// exists. Both views must stay responsive without ever attempting that
+// parse: Preview refuses it for a bounded fallback; Code view (which never
+// runs the mdast parse) stays available but bounds its own rendering
+// instead of one <span> per line.
+//
+// Fixture hash, recompute with
+// `shasum -a 256 desktop/tests/fixtures/adversarial-list.md`:
+//   SHA-256: b036c0de7e913846674358b662d4e47dc20b1cc64a63420ed287eacd95d0a43e
+//   Bytes:   2000000
+//   Lines:   500000
+
+const ADVERSARIAL_LIST_CONTENT = readFileSync(
+  new URL("../fixtures/adversarial-list.md", import.meta.url),
+  "utf-8",
+);
+const ADVERSARIAL_LIST_SHA = "d".repeat(64);
+const ADVERSARIAL_LIST_URL = `${RELAY_HTTP_URL}/media/${ADVERSARIAL_LIST_SHA}.bin`;
+
+test("an adversarially list-dense document shows a bounded Preview fallback and a bounded Code view, not a freeze", async ({
+  page,
+}) => {
+  test.setTimeout(30_000);
+
+  await installMockBridge(page, {
+    deferredComposerUploads: true,
+    uploadDescriptors: [
+      {
+        url: ADVERSARIAL_LIST_URL,
+        sha256: ADVERSARIAL_LIST_SHA,
+        size: Buffer.byteLength(ADVERSARIAL_LIST_CONTENT),
+        type: "application/octet-stream",
+        uploaded: Math.floor(Date.now() / 1000),
+        filename: "adversarial-list.md",
+      },
+    ],
+  });
+  await page.route(`**/media/${ADVERSARIAL_LIST_SHA}.bin`, (route) =>
+    route.fulfill({
+      body: ADVERSARIAL_LIST_CONTENT,
+      contentType: "application/octet-stream",
+    }),
+  );
+
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+
+  const [chooser] = await Promise.all([
+    page.waitForEvent("filechooser"),
+    page.getByRole("button", { name: "Attach file" }).click(),
+  ]);
+  await chooser.setFiles({
+    buffer: Buffer.from(ADVERSARIAL_LIST_CONTENT),
+    mimeType: "text/markdown",
+    name: "adversarial-list.md",
+  });
+  await expect(page.getByTestId("message-composer")).toContainText(
+    "adversarial-list.md",
+  );
+  await page.getByTestId("send-message").click();
+  await expect(page.getByText("Sending")).toHaveCount(0);
+
+  const card = page.getByTestId("file-card").last();
+  await expect(card).toContainText("adversarial-list.md");
+
+  const openedAt = Date.now();
+  await card.click();
+
+  const panel = page.getByTestId("markdown-doc-panel");
+  await expect(panel).toBeVisible();
+
+  // Preview refuses the full mdast parse — a bounded fallback message, not
+  // 500,000 rendered list items.
+  await expect(
+    page.getByTestId("markdown-doc-preview-too-complex"),
+  ).toBeVisible({ timeout: 5000 });
+  expect(Date.now() - openedAt).toBeLessThan(5000);
+
+  // Code view stays available — bounded, not one <span> per line.
+  await page.getByTestId("markdown-doc-view-code").click();
+  const codeView = page.getByTestId("markdown-doc-code");
+  await expect(codeView).toBeVisible({ timeout: 5000 });
+  await expect(codeView).toContainText("- a");
+  await expect(codeView).toContainText("more lines not shown");
+  const renderedLineCount = await codeView.locator("[data-line]").count();
+  expect(renderedLineCount).toBeLessThan(2100);
+});
+
+test("Code view for a large-but-few-lines document skips synchronous tokenization (highlight byte bound)", async ({
+  page,
+}) => {
+  // long-doc.md (122 lines, 506,681 bytes) sits under the Code view's
+  // 150-line highlight cap but well over its byte cap — the sub-axis the
+  // MEASURE spec above never exercises (it never opens Code view).
+  test.setTimeout(30_000);
+
+  await installMockBridge(page, {
+    deferredComposerUploads: true,
+    uploadDescriptors: [
+      {
+        url: LONG_DOC_URL,
+        sha256: LONG_DOC_SHA,
+        size: Buffer.byteLength(LONG_DOC_CONTENT),
+        type: "application/octet-stream",
+        uploaded: Math.floor(Date.now() / 1000),
+        filename: "long-doc.md",
+      },
+    ],
+  });
+  await page.route(`**/media/${LONG_DOC_SHA}.bin`, (route) =>
+    route.fulfill({
+      body: LONG_DOC_CONTENT,
+      contentType: "application/octet-stream",
+    }),
+  );
+
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+
+  const [chooser] = await Promise.all([
+    page.waitForEvent("filechooser"),
+    page.getByRole("button", { name: "Attach file" }).click(),
+  ]);
+  await chooser.setFiles({
+    buffer: Buffer.from(LONG_DOC_CONTENT),
+    mimeType: "text/markdown",
+    name: "long-doc.md",
+  });
+  await expect(page.getByTestId("message-composer")).toContainText(
+    "long-doc.md",
+  );
+  await page.getByTestId("send-message").click();
+  await expect(page.getByText("Sending")).toHaveCount(0);
+
+  const card = page.getByTestId("file-card").last();
+  await card.click();
+  const panel = page.getByTestId("markdown-doc-panel");
+  await expect(panel).toBeVisible();
+
+  await page.getByTestId("markdown-doc-view-code").click();
+  const codeView = page.getByTestId("markdown-doc-code");
+  await expect(codeView).toBeVisible({ timeout: 5000 });
+  await expect(codeView).toContainText("Long Document Fixture");
+  // Well under the 2,000-line plain-text bound, so no truncation notice —
+  // proves the byte gate routed this to the (fast, bounded) plain-text
+  // path rather than hanging in synchronous tokenization.
+  await expect(page.getByTestId("code-block-truncated-notice")).toHaveCount(0);
+});
+
+// ── Held-request cancellation (Sol audit finding 3) ────────────────────────
+//
+// `fetchMarkdownDocBytes` now shares `fetchMediaBytes`' renderer-owned
+// cancellation handshake, so closing, replacing, or otherwise unmounting the
+// panel while its native fetch is in flight must cancel the native request
+// rather than leaving it (and its socket) running for up to the download
+// timeout. `__BUZZ_E2E_HOLD_MEDIA_FETCHES__` holds every mock fetch open
+// until cancelled, so `__BUZZ_E2E_MEDIA_FETCH_STATE__.active` staying pinned
+// at the open count — and returning to zero only once every panel is truly
+// gone — proves the cancellation handshake actually fires, not just that
+// the UI stopped showing the request.
+
+/** Reconfigures the mock's single upload descriptor and route to a distinct
+ * document, then attaches + sends it — used to prove a *replacement* fetch
+ * (a different `doc` URL opened over an in-flight one) is cancelled, not
+ * just a same-URL reopen (which would share the in-flight query). */
+async function attachAndSendDistinctMarkdown(
+  page: Page,
+  {
+    url,
+    sha,
+    content,
+    filename,
+  }: { url: string; sha: string; content: string; filename: string },
+) {
+  await page.evaluate(
+    ({ url, sha, content, filename }) => {
+      const e2e = (
+        window as Window & {
+          __BUZZ_E2E__?: {
+            mock?: { uploadDescriptors?: Array<Record<string, unknown>> };
+          };
+        }
+      ).__BUZZ_E2E__;
+      if (e2e?.mock) {
+        e2e.mock.uploadDescriptors = [
+          {
+            url,
+            sha256: sha,
+            size: content.length,
+            type: "application/octet-stream",
+            uploaded: Math.floor(Date.now() / 1000),
+            filename,
+          },
+        ];
+      }
+    },
+    { url, sha, content, filename },
+  );
+  await page.route(`**/media/${sha}.bin`, (route) =>
+    route.fulfill({ body: content, contentType: "application/octet-stream" }),
+  );
+  const [chooser] = await Promise.all([
+    page.waitForEvent("filechooser"),
+    page.getByRole("button", { name: "Attach file" }).click(),
+  ]);
+  await chooser.setFiles({
+    buffer: Buffer.from(content),
+    mimeType: "text/markdown",
+    name: filename,
+  });
+  await expect(page.getByTestId("message-composer")).toContainText(filename);
+  await page.getByTestId("send-message").click();
+  await expect(page.getByText("Sending")).toHaveCount(0);
+}
+
+test("closing, replacing, and switching channels releases held native document fetches", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    window.__BUZZ_E2E_HOLD_MEDIA_FETCHES__ = true;
+  });
+  await sendMarkdownAttachment(page);
+
+  const activeCount = () =>
+    page.evaluate(() => window.__BUZZ_E2E_MEDIA_FETCH_STATE__?.active ?? -1);
+  const commandCounts = () =>
+    page.evaluate(() => {
+      const commands = window.__BUZZ_E2E_COMMANDS__ ?? [];
+      return {
+        fetched: commands.filter((c) => c === "fetch_markdown_doc_bytes")
+          .length,
+        cancelled: commands.filter((c) => c === "cancel_media_fetch").length,
+        released: commands.filter((c) => c === "release_media_fetch").length,
+      };
+    });
+
+  // Locators scoped by `data-doc-url` rather than `.last()`: two distinct
+  // cards exist by the "replacement" step below, and `.last()` re-resolves
+  // to whichever card is newest at click time — not necessarily the one
+  // captured here.
+  const firstCard = page.locator(
+    `[data-testid="file-card"][data-doc-url="${DOC_URL}"]`,
+  );
+
+  // ── close ──────────────────────────────────────────────────────────────
+  await firstCard.click();
+  await expect(page.getByTestId("markdown-doc-panel")).toBeVisible();
+  await expect.poll(activeCount).toBe(1);
+
+  await page.getByTestId("auxiliary-panel-close").click();
+  await expect(page.getByTestId("markdown-doc-panel")).toHaveCount(0);
+  await expect.poll(activeCount).toBe(0);
+
+  // ── replacement (a different document opened over an in-flight one) ────
+  const secondUrl = `${RELAY_HTTP_URL}/media/${"e".repeat(64)}.bin`;
+  await attachAndSendDistinctMarkdown(page, {
+    url: secondUrl,
+    sha: "e".repeat(64),
+    content: "# Second Doc\n\nMore content.\n",
+    filename: "second-doc.md",
+  });
+  const secondCard = page.locator(
+    `[data-testid="file-card"][data-doc-url="${secondUrl}"]`,
+  );
+  await secondCard.click();
+  await expect(page.getByTestId("markdown-doc-panel")).toBeVisible();
+  await expect.poll(activeCount).toBe(1);
+
+  // Opening the (still-open, held) first document again over the second —
+  // MarkdownDocAuxiliaryPanel keys by `doc.url`, so this unmounts the
+  // second document's panel (and its query) and mounts a fresh one for the
+  // first document's URL. `active` must settle back at 1, not 2: the
+  // superseded fetch has to actually release, not just stop being shown.
+  await firstCard.click();
+  await expect.poll(activeCount).toBe(1);
+
+  await page.getByTestId("auxiliary-panel-close").click();
+  await expect(page.getByTestId("markdown-doc-panel")).toHaveCount(0);
+  await expect.poll(activeCount).toBe(0);
+
+  // ── channel switch (unmounts the whole channel section, panel included —
+  // the same full-unmount shape as a community switch) ───────────────────
+  await secondCard.click();
+  await expect(page.getByTestId("markdown-doc-panel")).toBeVisible();
+  await expect.poll(activeCount).toBe(1);
+
+  await page.getByTestId("channel-random").click();
+  await expect(page.getByTestId("markdown-doc-panel")).toHaveCount(0);
+  await expect.poll(activeCount).toBe(0);
+
+  const counts = await commandCounts();
+  expect(counts.fetched).toBeGreaterThanOrEqual(4);
+  expect(counts.cancelled).toBe(counts.fetched);
+  expect(counts.released).toBe(counts.fetched);
+});

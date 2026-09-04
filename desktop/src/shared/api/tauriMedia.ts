@@ -75,17 +75,19 @@ export async function pickAndUploadImage(): Promise<BlobDescriptor | null> {
 }
 
 /**
- * Fetch relay media bytes over IPC (Rust reqwest, VPN-tunneled).
- *
- * Used by the composer image editor: wrapping the bytes in a same-origin
- * `blob:` URL gives the canvas pixel access without CORS, so the media
- * proxy needs no special headers. The Rust side enforces the same URL
- * validation and size cap as the download commands.
+ * Fetch relay media bytes over IPC with an optional renderer-owned
+ * cancellation handshake, shared by every command that streams through
+ * `fetch_blob_bytes_with_cap` on the Rust side: registers a `requestId`
+ * before the native fetch, threads an aborting `signal` through
+ * `cancel_media_fetch`, and always releases the registry entry in a
+ * `finally` — so a closed or superseded caller never leaves the native
+ * request (and its socket) running past its own lifetime.
  */
-export async function fetchMediaBytes(
-  url: string,
+async function invokeCancellableMediaFetch(
+  command: "fetch_media_bytes" | "fetch_markdown_doc_bytes",
+  params: Record<string, unknown>,
   signal?: AbortSignal,
-): Promise<Uint8Array<ArrayBuffer>> {
+): Promise<ArrayBuffer> {
   if (signal?.aborted) {
     throw new DOMException("Media fetch cancelled", "AbortError");
   }
@@ -93,11 +95,8 @@ export async function fetchMediaBytes(
   const requestId = signal ? crypto.randomUUID() : undefined;
   // The Rust command replies with `tauri::ipc::Response`, so the bytes
   // arrive as a raw ArrayBuffer rather than a JSON number array.
-  const request = invokeTauri<ArrayBuffer>("fetch_media_bytes", {
-    requestId,
-    url,
-  });
-  if (!signal || !requestId) return new Uint8Array(await request);
+  const request = invokeTauri<ArrayBuffer>(command, { ...params, requestId });
+  if (!signal || !requestId) return request;
 
   let rejectCancellation: ((reason?: unknown) => void) | undefined;
   const cancellation = new Promise<never>((_resolve, reject) => {
@@ -115,14 +114,33 @@ export async function fetchMediaBytes(
   signal.addEventListener("abort", onAbort, { once: true });
 
   try {
-    const bytes = await Promise.race([request, cancellation]);
-    return new Uint8Array(bytes);
+    return await Promise.race([request, cancellation]);
   } finally {
     signal.removeEventListener("abort", onAbort);
     await invokeTauri("release_media_fetch", { requestId }).catch(
       () => undefined,
     );
   }
+}
+
+/**
+ * Fetch relay media bytes over IPC (Rust reqwest, VPN-tunneled).
+ *
+ * Used by the composer image editor: wrapping the bytes in a same-origin
+ * `blob:` URL gives the canvas pixel access without CORS, so the media
+ * proxy needs no special headers. The Rust side enforces the same URL
+ * validation and size cap as the download commands.
+ */
+export async function fetchMediaBytes(
+  url: string,
+  signal?: AbortSignal,
+): Promise<Uint8Array<ArrayBuffer>> {
+  const bytes = await invokeCancellableMediaFetch(
+    "fetch_media_bytes",
+    { url },
+    signal,
+  );
+  return new Uint8Array(bytes);
 }
 
 /**
@@ -133,13 +151,21 @@ export async function fetchMediaBytes(
  * Content-Length before the body is read and aborting mid-stream when the
  * header is missing or dishonest — so a forged imeta `size` can never buy
  * a 50 MiB download and IPC copy.
+ *
+ * Shares `fetchMediaBytes`' cancellation handshake: passing the query's
+ * `AbortSignal` lets a closed or superseded document panel cancel its
+ * in-flight native fetch instead of leaving it running for up to the
+ * download timeout.
  */
 export async function fetchMarkdownDocBytes(
   url: string,
+  signal?: AbortSignal,
 ): Promise<Uint8Array<ArrayBuffer>> {
-  const bytes = await invokeTauri<ArrayBuffer>("fetch_markdown_doc_bytes", {
-    url,
-  });
+  const bytes = await invokeCancellableMediaFetch(
+    "fetch_markdown_doc_bytes",
+    { url },
+    signal,
+  );
   return new Uint8Array(bytes);
 }
 

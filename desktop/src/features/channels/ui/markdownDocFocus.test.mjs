@@ -228,3 +228,44 @@ test("aborts when another control already claimed focus", async () => {
 
   assert.equal(dom.window.document.activeElement, claimed);
 });
+
+test("a transient unmount while the doc URL state persists does not consume the opener record", async () => {
+  // Reproduces the Sol audit finding (port/6731): document -> a
+  // higher-priority pane (profile) takes ChannelPane's slot without
+  // clearing `doc`/`docName` -> the panel unmounts, but the document is not
+  // actually closing -> the pane closes and the document reappears -> the
+  // document closes for real. The true opener (the second card) must win
+  // over the first same-URL card at the REAL close, proving the record
+  // survived the intervening transient unmount instead of being consumed
+  // (and lost) by it.
+  const { recordMarkdownDocOpener, restoreFocusToMarkdownDocOpener } =
+    await loadModule();
+  const first = addCard(DOC_URL, "message-first");
+  const opener = addCard(DOC_URL, "message-second");
+  recordMarkdownDocOpener(DOC_URL, opener);
+
+  try {
+    // The URL still carries `doc=<url>` — ChannelPane's own unmount
+    // cleanup fires here (MarkdownDocPanel.tsx's effect cleanup calls
+    // restoreFocusToMarkdownDocOpener on every unmount, transient or not).
+    dom.reconfigure({
+      url: `http://localhost/?doc=${encodeURIComponent(DOC_URL)}`,
+    });
+    restoreFocusToMarkdownDocOpener(DOC_URL);
+    await settleFrames();
+
+    // The real close: `doc` is gone from the URL.
+    dom.reconfigure({ url: "http://localhost" });
+    restoreFocusToMarkdownDocOpener(DOC_URL);
+    await settleFrames();
+
+    assert.equal(
+      dom.window.document.activeElement,
+      opener,
+      "the true opener must still win — the record must not have been consumed by the transient unmount",
+    );
+    assert.notEqual(dom.window.document.activeElement, first);
+  } finally {
+    dom.reconfigure({ url: "http://localhost" });
+  }
+});

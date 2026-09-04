@@ -7,6 +7,7 @@ use crate::app_state::AppState;
 use crate::commands::clipboard::with_clipboard;
 use crate::commands::export_util::save_bytes_with_dialog;
 use crate::commands::media::{detect_and_validate_mime, mint_media_get_auth};
+use crate::commands::media_fetch_cancellation::{begin_media_fetch, finish_media_fetch};
 use crate::commands::media_filename::sanitize_filename;
 use crate::commands::{
     personas::{
@@ -167,19 +168,31 @@ pub async fn download_file(
 /// `.md` file may open with bytes that sniff as a blocked type — e.g. an
 /// SVG snippet pasted at the top of the file. Binary payloads fail the
 /// frontend's fatal UTF-8 decode and fall back to download.
+///
+/// Shares `fetch_media_bytes`' renderer-owned cancellation handshake (same
+/// `request_id` registry, same `cancel_media_fetch` / `release_media_fetch`
+/// commands): opening and closing distinct document cards leaves no
+/// superseded native request alive past the caller's own lifetime — the 2
+/// MiB per-request cap bounds one request's bytes, not how many concurrent
+/// requests a fast-clicking caller can leave running.
 #[tauri::command]
 pub async fn fetch_markdown_doc_bytes(
     url: String,
+    request_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<tauri::ipc::Response, String> {
-    let relay_base = relay_api_base_url_with_override(&state);
-    validate_download_url(&url, &relay_base)?;
-
-    // The markdown viewer has no renderer-owned cancellation handshake (no
-    // request_id), unlike `fetch_media_bytes`; the doc's 2 MiB cap keeps
-    // this fetch inherently bounded.
-    let bytes = fetch_blob_bytes_with_cap(&url, &state, MAX_MARKDOWN_DOC_BYTES, None).await?;
-    Ok(tauri::ipc::Response::new(bytes))
+    let cancellation = begin_media_fetch(request_id.as_deref());
+    let result = async {
+        let relay_base = relay_api_base_url_with_override(&state);
+        validate_download_url(&url, &relay_base)?;
+        let bytes =
+            fetch_blob_bytes_with_cap(&url, &state, MAX_MARKDOWN_DOC_BYTES, cancellation.as_ref())
+                .await?;
+        Ok(tauri::ipc::Response::new(bytes))
+    }
+    .await;
+    finish_media_fetch(request_id.as_deref());
+    result
 }
 
 /// Copy an image from a relay media URL directly to the system clipboard.

@@ -26,6 +26,7 @@ import { Button } from "@/shared/ui/button";
 import { Markdown, SyntaxHighlightedCode } from "@/shared/ui/markdown";
 import {
   decodeMarkdownDocBytes,
+  isMarkdownDocTooComplexForPreview,
   type MarkdownDocDecodeResult,
 } from "@/shared/ui/markdown/markdownDocFile";
 import { SegmentedControl } from "@/shared/ui/segmented-control";
@@ -54,6 +55,9 @@ function decodeErrorMessage(kind: "too-large" | "binary"): string {
     ? "This file is too large to preview."
     : "This file isn't valid text, so it can't be previewed.";
 }
+
+const PREVIEW_TOO_COMPLEX_MESSAGE =
+  "This document has too many lines to render a formatted preview. Switch to Code view, or download it.";
 
 /**
  * Right auxiliary panel rendering a shared markdown attachment in-app.
@@ -94,9 +98,9 @@ export function MarkdownDocPanel({
   // document never changes under its URL — cache it for the session.
   const docQuery = useQuery<MarkdownDocDecodeResult>({
     queryKey: ["markdown-doc", url],
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       try {
-        return decodeMarkdownDocBytes(await fetchMarkdownDocBytes(url));
+        return decodeMarkdownDocBytes(await fetchMarkdownDocBytes(url, signal));
       } catch (err) {
         // The native 2 MiB cap refuses oversized documents during the fetch
         // (the in-frontend decode check never sees their bytes). Surface it
@@ -122,6 +126,14 @@ export function MarkdownDocPanel({
     : decoded && decoded.kind !== "ok"
       ? decodeErrorMessage(decoded.kind)
       : null;
+
+  // Bounds Preview's mdast/micromark parse by line count, independent of the
+  // byte cap above: a flat list of one-line items well under 2 MiB still
+  // parses at superlinear cost (see markdownDocFile.ts). Code view is safe
+  // without this gate — SyntaxHighlightedCode bounds its own highlighting
+  // and plain-text fallback independently, so it stays available here.
+  const previewTooComplex =
+    decoded?.kind === "ok" && isMarkdownDocTooComplexForPreview(decoded.text);
 
   return (
     <AuxiliaryPanel
@@ -191,12 +203,31 @@ export function MarkdownDocPanel({
             </div>
           ) : decoded?.kind === "ok" ? (
             view === "preview" ? (
-              <Markdown
-                blockCode
-                className="pt-3 text-sm"
-                content={decoded.text}
-                hardLineBreaks={false}
-              />
+              previewTooComplex ? (
+                <div
+                  className="flex flex-col items-center gap-3 py-12 text-center"
+                  data-testid="markdown-doc-preview-too-complex"
+                >
+                  <p className="text-sm text-muted-foreground">
+                    {PREVIEW_TOO_COMPLEX_MESSAGE}
+                  </p>
+                  <Button
+                    onClick={handleDownload}
+                    size="sm"
+                    variant="secondary"
+                  >
+                    <Download className="mr-1.5 h-4 w-4" />
+                    Download file
+                  </Button>
+                </div>
+              ) : (
+                <Markdown
+                  blockCode
+                  className="pt-3 text-sm"
+                  content={decoded.text}
+                  hardLineBreaks={false}
+                />
+              )
             ) : (
               <pre
                 className="overflow-x-auto pt-3 text-xs leading-relaxed"

@@ -5,8 +5,11 @@
 // not only as a side effect of a broader `media_download` filter.
 
 use super::media_download::*;
+use crate::app_state::build_app_state;
 use crate::commands::personas::{MAX_SNAPSHOT_JSON_BYTES, MAX_SNAPSHOT_PNG_BYTES};
 use crate::commands::team_snapshot::MAX_TEAM_SNAPSHOT_JSON_BYTES;
+use tauri::Manager;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[test]
 fn snapshot_kind_json_returns_json_kind_and_correct_cap() {
@@ -518,4 +521,169 @@ fn streamed_bytes_hit_markdown_cap_without_content_length() {
         cap,
         "no bytes past the cap were buffered"
     );
+}
+
+// ── Command-level cap enforcement (Sol audit finding 2, port/6731) ───────
+//
+// The tests above call `declared_length_refusal_error` / `append_chunk_within_cap`
+// with an explicit cap argument, so they are independent of whatever cap
+// `fetch_markdown_doc_bytes` itself passes to `fetch_blob_bytes_with_cap` —
+// mutating that call site (widening it toward `MAX_DOWNLOAD_BYTES`, or
+// dropping the cap) fails none of them. These instead drive the *registered
+// command* through a real Tauri app and a loopback HTTP server, so such a
+// mutation makes them fail. Every declared/actual size here is over the 2
+// MiB markdown cap but comfortably under the 50 MiB download cap, so a cap
+// swap to `MAX_DOWNLOAD_BYTES` would admit it.
+
+/// Read a raw HTTP request off `stream` until the header terminator, ignoring
+/// its content — these tests don't assert on the request, only the client's
+/// handling of the response.
+async fn drain_request_headers(stream: &mut tokio::net::TcpStream) {
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// A Tauri app managing a fresh `AppState` pointed at `addr` as its relay,
+/// so `relay_api_base_url_with_override` (and therefore
+/// `validate_download_url`) accepts a `http://{addr}/media/...` URL.
+fn mock_app_pointed_at(addr: std::net::SocketAddr) -> tauri::App<tauri::test::MockRuntime> {
+    let state = build_app_state();
+    *state.relay_url_override.lock().unwrap() = Some(format!("ws://{addr}"));
+    tauri::test::mock_builder()
+        .manage(state)
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn fetch_markdown_doc_bytes_command_refuses_declared_length_over_cap() {
+    let over_cap = MAX_MARKDOWN_DOC_BYTES + 1;
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {over_cap}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        drain_request_headers(&mut stream).await;
+        // Headers alone are enough for the client's declared-length check;
+        // no body is sent (or needed) before the cap refuses the request.
+        let _ = stream.write_all(&response).await;
+        let _ = stream.flush().await;
+    });
+
+    let app = mock_app_pointed_at(addr);
+    let url = format!("http://{addr}/media/oversized-doc.bin");
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fetch_markdown_doc_bytes(url, None, app.state()),
+    )
+    .await
+    .expect("command must not hang");
+
+    assert!(
+        result.is_err(),
+        "a declared length over the markdown cap must be refused",
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn fetch_markdown_doc_bytes_command_aborts_chunked_body_over_cap() {
+    // No Content-Length (chunked transfer, one chunk) — the streamed
+    // byte-count enforcement is the only thing standing between an
+    // oversized body and memory.
+    let over_cap = MAX_MARKDOWN_DOC_BYTES as usize + 300_000;
+    let body = vec![b'a'; over_cap];
+    let mut response =
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n"
+            .to_vec();
+    response.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
+    response.extend_from_slice(&body);
+    response.extend_from_slice(b"\r\n0\r\n\r\n");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        drain_request_headers(&mut stream).await;
+        let _ = stream.write_all(&response).await;
+        let _ = stream.flush().await;
+    });
+
+    let app = mock_app_pointed_at(addr);
+    let url = format!("http://{addr}/media/oversized-chunked-doc.bin");
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fetch_markdown_doc_bytes(url, None, app.state()),
+    )
+    .await
+    .expect("command must not hang");
+
+    assert!(
+        result.is_err(),
+        "a chunked body with no honest Content-Length must still be capped mid-stream",
+    );
+
+    // Best-effort join: the server may still be mid-write when the client
+    // aborts the streaming read, so don't fail the test on that — only on
+    // the server task never completing at all.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
+}
+
+#[tokio::test]
+async fn fetch_markdown_doc_bytes_command_returns_bytes_within_cap() {
+    use tauri::ipc::{InvokeResponseBody, IpcResponse};
+
+    let payload = vec![b'm'; 1024];
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+        payload.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(&payload);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        drain_request_headers(&mut stream).await;
+        let _ = stream.write_all(&response).await;
+        let _ = stream.flush().await;
+    });
+
+    let app = mock_app_pointed_at(addr);
+    let url = format!("http://{addr}/media/small-doc.bin");
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fetch_markdown_doc_bytes(url, None, app.state()),
+    )
+    .await
+    .expect("command must not hang")
+    .expect("a within-cap payload must succeed");
+
+    match response.body().expect("response body must resolve") {
+        InvokeResponseBody::Raw(bytes) => assert_eq!(bytes.len(), 1024),
+        InvokeResponseBody::Json(_) => panic!("expected raw bytes, not JSON"),
+    }
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
 }

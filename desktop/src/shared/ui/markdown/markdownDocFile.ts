@@ -27,6 +27,41 @@ const MARKDOWN_DOC_EXTENSIONS = [".md", ".markdown", ".mdx"] as const;
  */
 export const MAX_MARKDOWN_DOC_BYTES = 2 * 1024 * 1024;
 
+/**
+ * Above this many lines, a full Preview render (react-markdown → remark →
+ * mdast → micromark) is refused in favor of a bounded fallback.
+ *
+ * The byte cap above bounds memory, not parsed-node count: a flat list of
+ * one-line items ("- a\n" repeated) parses at superlinear cost on the
+ * project's pinned parser — measured 854ms at 16,384 items and climbing to
+ * tens of seconds well under the byte cap, before any React element or DOM
+ * node exists. 3,000 lines keeps the worst case (every line a separate
+ * block) comfortably under the panel-ready budget even by the most
+ * pessimistic (quadratic) extrapolation from those measurements, while
+ * admitting any realistic long document — the branch's own long-doc
+ * fixture is 506,681 bytes across only 122 lines. Code view is bounded
+ * separately (`CodeBlock.tsx`'s highlighting caps) since it never runs the
+ * mdast parse.
+ */
+export const MAX_MARKDOWN_DOC_PREVIEW_LINES = 3000;
+
+/**
+ * Whether decoded markdown text is safe to run through the full Preview
+ * parse. A single `charCodeAt` scan is linear and cheap — nothing like the
+ * parse it is gating — so it is safe to run unconditionally before the
+ * expensive path.
+ */
+export function isMarkdownDocTooComplexForPreview(text: string): boolean {
+  let lines = 1;
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) === 10 /* "\n" */) {
+      lines++;
+      if (lines > MAX_MARKDOWN_DOC_PREVIEW_LINES) return true;
+    }
+  }
+  return false;
+}
+
 /** Whether an imeta filename should open in the in-app markdown viewer. */
 export function isMarkdownDocFilename(filename: string): boolean {
   const lower = filename.trim().toLowerCase();

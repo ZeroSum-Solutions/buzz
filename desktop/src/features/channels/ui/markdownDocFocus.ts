@@ -51,6 +51,20 @@ function findThreadSummary(threadHeadId: string): HTMLElement | null {
 }
 
 /**
+ * Whether the URL's `doc` search param is still this exact document. Used to
+ * tell an authoritative close (the document is actually going away) apart
+ * from a transient unmount: ChannelPane's pane-priority chain unmounts this
+ * panel whenever a higher-priority pane (profile, thread, agent session)
+ * opens, without touching `doc`/`docName` — the panel remounts with the same
+ * URL once that pane closes, no new open event. `doc` and this module's
+ * `url` argument are the same relay URL by construction
+ * (`openMarkdownDoc` in useChannelPanelHistoryState.ts sets both together).
+ */
+function docSearchStateStillHoldsUrl(url: string): boolean {
+  return new URLSearchParams(window.location.search).get("doc") === url;
+}
+
+/**
  * Remember the logical surface that invoked the open while its card is still
  * mounted. A detached/null opener (for example URL history restoration) clears
  * the record, leaving close to use the first matching card when available.
@@ -139,6 +153,13 @@ export function focusMarkdownDocPanelClose(): () => void {
  * we fall back to another card for the same immutable attachment URL.
  */
 export function restoreFocusToMarkdownDocOpener(url: string): void {
+  // A transient unmount (see `docSearchStateStillHoldsUrl`) must not consume
+  // the opener record or search for a restore target: the panel is about to
+  // remount with no new open event, and the eventual real close needs the
+  // record to still identify the true opener rather than falling back to
+  // the first same-URL card.
+  if (docSearchStateStillHoldsUrl(url)) return;
+
   const record = lastOpenerRecord?.url === url ? lastOpenerRecord : null;
   // Only clear the record when this call actually consumes it. A mismatched
   // url means some *other* document's unmount is racing this one (opening a
