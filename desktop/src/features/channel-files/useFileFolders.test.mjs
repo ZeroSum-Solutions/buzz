@@ -131,6 +131,82 @@ test("parseFolder rejects events without the file-folder type tag", () => {
   assert.equal(parseFolder(event), null);
 });
 
+test("parseFolder caps an oversized relay-sourced name and d-tag", () => {
+  const event = folderEvent([
+    ["d", "d".repeat(1000)],
+    ["t", "file-folder"],
+    ["name", "n".repeat(1000)],
+  ]);
+
+  const folder = parseFolder(event);
+
+  assert.ok(folder);
+  assert.ok(
+    folder.name.length <= 200,
+    `name should be capped, got ${folder.name.length} chars`,
+  );
+  assert.ok(
+    folder.dTag.length <= 300,
+    `dTag should be capped, got ${folder.dTag.length} chars`,
+  );
+});
+
+test("parseFolder caps the number of file ids exposed from an oversized folder", () => {
+  const manyFileTags = Array.from({ length: 600 }, (_, i) => ["e", `f${i}`]);
+  const event = folderEvent([
+    ["d", "files-chan-1:huge"],
+    ["t", "file-folder"],
+    ["name", "Huge"],
+    ...manyFileTags,
+  ]);
+
+  const folder = parseFolder(event);
+
+  assert.ok(folder);
+  assert.ok(
+    folder.fileEventIds.length <= 500,
+    `fileEventIds should be capped, got ${folder.fileEventIds.length}`,
+  );
+});
+
+test("withFilesAddedToFolder still dedupes correctly against a folder past the display cap", () => {
+  // A folder with more "e" tags than MAX_FOLDER_FILES: withFilesAddedToFolder
+  // must read the raw tags, not the capped fileEventIds view, or it would
+  // treat already-present ids past the cap as new and could — worse — drop
+  // real tags when filtering by the truncated existingIds set.
+  const manyFileTags = Array.from({ length: 600 }, (_, i) => ["e", `f${i}`]);
+  const event = folderEvent([
+    ["d", "files-chan-1:huge"],
+    ["t", "file-folder"],
+    ["name", "Huge"],
+    ...manyFileTags,
+  ]);
+  const folder = parseFolder(event);
+  assert.ok(folder.fileEventIds.length < 600, "sanity: the cap is in effect");
+
+  // f599 is past the 500-item display cap but genuinely already present.
+  const result = withFilesAddedToFolder(folder, ["f599"]);
+  assert.equal(
+    result,
+    null,
+    "an id already present past the cap must not be re-added",
+  );
+
+  const merged = parseFolder(
+    folderEvent(withFilesAddedToFolder(folder, ["f599", "brand-new"]), {
+      id: "e-merged",
+    }),
+  );
+  // The pre-existing f599 tag must survive the merge unduplicated.
+  assert.equal(
+    merged.event.tags.filter((t) => t[0] === "e" && t[1] === "f599").length,
+    1,
+  );
+  assert.ok(
+    merged.event.tags.some((t) => t[0] === "e" && t[1] === "brand-new"),
+  );
+});
+
 test("buildFileFolderMap groups every file id under its folder's d-tag", () => {
   const a = parseFolder(
     folderEvent(buildCreateFolderTags(CHANNEL_ID, "A"), { id: "e-a" }),

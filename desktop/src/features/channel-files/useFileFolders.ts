@@ -9,6 +9,17 @@ const FILE_FOLDER_KIND = 30078;
 const FILE_FOLDER_TAG = "file-folder";
 const FOLDER_QUERY_KEY_PREFIX = "channel-file-folders";
 
+// Relay-sourced string/count caps applied at the DTO boundary (parseFolder)
+// — a hostile or buggy folder event must not be able to hand the UI an
+// unbounded name/d-tag to render, or an unbounded file list to enumerate.
+const MAX_FOLDER_NAME_LENGTH = 200;
+const MAX_FOLDER_DTAG_LENGTH = 300;
+const MAX_FOLDER_FILES = 500;
+
+function capString(value: string, maxLength: number): string {
+  return value.length > maxLength ? value.slice(0, maxLength) : value;
+}
+
 export type FileFolder = {
   dTag: string;
   name: string;
@@ -37,16 +48,23 @@ export function folderDTag(channelId: string, slug: string): string {
  * back) is bound to the same production code the hook itself calls.
  */
 export function parseFolder(event: RelayEvent): FileFolder | null {
-  const dTag = event.tags.find((t) => t[0] === "d")?.[1];
+  const rawDTag = event.tags.find((t) => t[0] === "d")?.[1];
   const typeTag = event.tags.find((t) => t[0] === "t");
-  if (!dTag || typeTag?.[1] !== FILE_FOLDER_TAG) return null;
+  if (!rawDTag || typeTag?.[1] !== FILE_FOLDER_TAG) return null;
+  const dTag = capString(rawDTag, MAX_FOLDER_DTAG_LENGTH);
 
-  const name = event.tags.find((t) => t[0] === "name")?.[1] ?? "Untitled";
-  const parentDTag = event.tags.find((t) => t[0] === "parent")?.[1];
+  const rawName = event.tags.find((t) => t[0] === "name")?.[1] ?? "Untitled";
+  const name = capString(rawName, MAX_FOLDER_NAME_LENGTH);
+  const rawParentDTag = event.tags.find((t) => t[0] === "parent")?.[1];
+  const parentDTag =
+    rawParentDTag != null
+      ? capString(rawParentDTag, MAX_FOLDER_DTAG_LENGTH)
+      : undefined;
   const fileEventIds = event.tags
     .filter((t) => t[0] === "e")
     .map((t) => t[1])
-    .filter(Boolean);
+    .filter(Boolean)
+    .slice(0, MAX_FOLDER_FILES);
 
   return { dTag, name, fileEventIds, parentDTag, event };
 }
@@ -102,7 +120,13 @@ export function withFilesAddedToFolder(
   folder: FileFolder,
   eventIds: string[],
 ): string[][] | null {
-  const existingIds = new Set(folder.fileEventIds);
+  // Read existing ids from the folder's raw tags, not `folder.fileEventIds`
+  // — that field is capped at MAX_FOLDER_FILES for display, and merging
+  // against the truncated view would drop real "e" tags past the cap when
+  // the filter below runs.
+  const existingIds = new Set(
+    folder.event.tags.filter((t) => t[0] === "e").map((t) => t[1]),
+  );
   const newIds = eventIds.filter((id) => !existingIds.has(id));
   if (newIds.length === 0) return null;
   return [

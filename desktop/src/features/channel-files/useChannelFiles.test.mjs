@@ -168,6 +168,50 @@ test("sortFiles orders newest-first by default and supports name/size/oldest", (
   );
 });
 
+test("parseChannelFiles caps an oversized relay-sourced filename and caption", () => {
+  const event = relayEvent({
+    id: "event-oversized-strings",
+    content: "x".repeat(1000),
+    tags: [
+      imetaTag({
+        url: "https://relay.example/media/abc.png",
+        m: "image/png",
+        filename: "n".repeat(1000),
+      }),
+    ],
+  });
+
+  const [file] = parseChannelFiles([event]);
+
+  assert.ok(
+    file.filename.length <= 300,
+    `filename should be capped, got ${file.filename.length} chars`,
+  );
+  assert.ok(
+    file.caption.length <= 500,
+    `caption should be capped, got ${file.caption.length} chars`,
+  );
+});
+
+test("parseChannelFiles caps the number of attachments pulled from a single event", () => {
+  const fields = [];
+  for (let i = 0; i < 40; i++) {
+    fields.push([
+      "imeta",
+      `url https://relay.example/media/file-${i}.png`,
+      "m image/png",
+    ]);
+  }
+  const event = relayEvent({ id: "event-many-attachments", tags: fields });
+
+  const files = parseChannelFiles([event]);
+
+  assert.ok(
+    files.length <= 20,
+    `expected the per-event attachment count to be capped, got ${files.length}`,
+  );
+});
+
 test("categorizeFile maps mime types to categories", () => {
   assert.equal(categorizeFile("image/png"), "image");
   assert.equal(categorizeFile("video/mp4"), "video");

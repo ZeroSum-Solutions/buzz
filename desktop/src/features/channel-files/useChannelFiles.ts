@@ -38,6 +38,19 @@ export type ChannelFile = {
   imeta: ParsedImetaEntry;
 };
 
+// Relay-sourced string/count caps applied at the DTO boundary — a hostile
+// or buggy event must not be able to hand the UI an unbounded string to
+// render or an unbounded number of attachments to parse from one message.
+const MAX_FILENAME_LENGTH = 300;
+const MAX_CAPTION_LENGTH = 500;
+const MAX_MIME_TYPE_LENGTH = 100;
+/** A real message carries at most a handful of attachments; this is generous headroom, not a product limit. */
+const MAX_IMETA_ENTRIES_PER_EVENT = 20;
+
+function capString(value: string, maxLength: number): string {
+  return value.length > maxLength ? value.slice(0, maxLength) : value;
+}
+
 /** File type categories for filtering. */
 export type FileCategory = "all" | "image" | "video" | "document" | "other";
 
@@ -112,15 +125,28 @@ export function parseChannelFiles(events: RelayEvent[]): ChannelFile[] {
           undefined;
       }
     }
+    if (caption != null) caption = capString(caption, MAX_CAPTION_LENGTH);
 
+    // Cap the number of attachments pulled from a single event, not just
+    // their string fields — an event with an unrealistic imeta-tag count
+    // must not translate into an unbounded render list.
+    let entryCount = 0;
     for (const [, entry] of entries) {
+      if (entryCount >= MAX_IMETA_ENTRIES_PER_EVENT) break;
+      entryCount += 1;
       result.push({
         key: `${event.id}-${entry.url}`,
         url: rewriteRelayUrl(entry.url),
         rawUrl: entry.url,
-        mimeType: entry.m ?? "application/octet-stream",
+        mimeType: capString(
+          entry.m ?? "application/octet-stream",
+          MAX_MIME_TYPE_LENGTH,
+        ),
         size: entry.size != null && entry.size > 0 ? entry.size : undefined,
-        filename: entry.filename,
+        filename:
+          entry.filename != null
+            ? capString(entry.filename, MAX_FILENAME_LENGTH)
+            : undefined,
         sha256: entry.x,
         thumb: entry.thumb ? rewriteRelayUrl(entry.thumb) : undefined,
         dim: entry.dim,
