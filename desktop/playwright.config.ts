@@ -174,6 +174,12 @@ export default defineConfig({
         "**/needs-restart-screenshots.spec.ts",
         "**/team-catalog-screenshots.spec.ts",
       ],
+      // zs fork: the fork's GitHub runners are slower than upstream's and the smoke
+      // shards fail unrelated specs on Playwright's 5 s default expect budget. Match
+      // the CI budget the integration project already uses; local runs keep the default.
+      expect: {
+        timeout: process.env.CI ? 15_000 : 5_000,
+      },
       use: {
         ...devices["Desktop Chrome"],
       },
