@@ -51,7 +51,10 @@ pub struct UserProfileSummaryInfo {
     pub name: Option<String>,
     pub avatar_url: Option<String>,
     /// Kind-0 `about` field — one-line role/description surfaced in the
-    /// @-mention selector for agents.
+    /// @-mention selector for agents. Untrusted, and capped to
+    /// `nostr_convert::MENTION_ABOUT_MAX_BYTES` bytes at the point it is
+    /// built from the event (`nostr_convert::users_batch_from_events`), not
+    /// merely at render — see that constant's doc comment.
     #[serde(default)]
     pub about: Option<String>,
     pub nip05_handle: Option<String>,
@@ -72,7 +75,10 @@ pub struct UserSearchResultInfo {
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
     /// Kind-0 `about` field — one-line role/description surfaced in the
-    /// @-mention selector for agents.
+    /// @-mention selector for agents. Untrusted, and capped to
+    /// `nostr_convert::MENTION_ABOUT_MAX_BYTES` bytes at the point it is
+    /// built from the event (`nostr_convert::user_search_result_from_event`),
+    /// not merely at render — see that constant's doc comment.
     #[serde(default)]
     pub about: Option<String>,
     pub nip05_handle: Option<String>,

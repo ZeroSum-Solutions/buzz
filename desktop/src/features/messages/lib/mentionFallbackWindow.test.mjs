@@ -97,6 +97,46 @@ test("excludes agents already covered by the caller's profiles prop", () => {
   assert.deepEqual(pubkeys, [uncovered.pubkey]);
 });
 
+test("includes an agent whose lookup entry exists but carries no about — the mergeAgentNamesIntoProfiles shape", () => {
+  // Production seam: mergeAgentNamesIntoProfiles (useChannelActivityTyping.ts)
+  // synthesizes a profile-lookup entry for every managed/relay agent with
+  // displayName / avatarUrl / nip05Handle / ownerPubkey / isAgent and NO
+  // `about` key at all — a real entry, not a hypothetical one. Treating
+  // entry presence as "about known" would suppress the fallback for exactly
+  // the agents it exists to cover; the fix must key off `about` being
+  // present, not the entry.
+  const candidate = agentCandidate(1);
+  const visible = rankVisibleMentionCandidates([candidate], "", new Set());
+  const pubkeys = selectAgentProfileFallbackPubkeys(visible, {
+    [candidate.pubkey]: {
+      displayName: "Bumble",
+      avatarUrl: null,
+      nip05Handle: null,
+      ownerPubkey: null,
+      isAgent: true,
+    },
+  });
+  assert.deepEqual(pubkeys, [candidate.pubkey]);
+});
+
+test("matches the caller's profiles lookup by normalized pubkey, like the mapper does", () => {
+  const candidate = agentCandidate(1, {
+    pubkey: agentCandidate(1).pubkey.toUpperCase(),
+  });
+  const visible = rankVisibleMentionCandidates([candidate], "", new Set());
+  const pubkeys = selectAgentProfileFallbackPubkeys(visible, {
+    [candidate.pubkey.toLowerCase()]: {
+      displayName: null,
+      name: null,
+      avatarUrl: null,
+      about: "Known via the caller, keyed lowercase",
+      nip05Handle: null,
+      ownerPubkey: null,
+    },
+  });
+  assert.deepEqual(pubkeys, []);
+});
+
 test("excludes non-agent candidates even when their description is unknown", () => {
   const person = agentCandidate(1, { isAgent: false });
   const agent = agentCandidate(2);

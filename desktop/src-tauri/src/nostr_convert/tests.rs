@@ -301,6 +301,53 @@ fn users_batch_carries_about_when_present() {
 }
 
 #[test]
+fn users_batch_truncates_oversized_about_at_the_seam() {
+    // A batch response has no per-request limit (`get_users_batch` sends the
+    // filter with no `limit`) and a kind:0 `content` may reach 256 KiB
+    // (`MAX_EVENT_CONTENT_BYTES`), so the DTO must not carry the untrusted
+    // `about` verbatim across the Tauri IPC boundary — the frontend's
+    // 120-grapheme render cap runs downstream and does not bound this.
+    let oversized_about = "a".repeat(MENTION_ABOUT_MAX_BYTES * 4);
+    let event = ev(
+        0,
+        &format!(r#"{{"display_name":"Bumble","about":"{oversized_about}"}}"#),
+        vec![],
+    );
+    let pk = event.pubkey.to_hex();
+
+    let resp = users_batch_from_events(std::slice::from_ref(&event), std::slice::from_ref(&pk));
+
+    let capped = resp.profiles[&pk].about.as_deref().expect("about present");
+    assert!(
+        capped.len() <= MENTION_ABOUT_MAX_BYTES,
+        "capped about is {} bytes, expected <= {MENTION_ABOUT_MAX_BYTES}",
+        capped.len()
+    );
+    assert!(capped.len() < oversized_about.len());
+}
+
+#[test]
+fn truncate_mention_about_cuts_on_a_char_boundary() {
+    // Every grapheme here is a 4-byte UTF-8 scalar (outside the BMP), chosen
+    // so a naive byte-index slice would land mid-character and panic.
+    let about = "\u{1F600}".repeat(MENTION_ABOUT_MAX_BYTES); // far over the cap
+    let truncated = truncate_mention_about(Some(about)).expect("some");
+    assert!(truncated.len() <= MENTION_ABOUT_MAX_BYTES);
+    assert!(truncated.is_char_boundary(truncated.len()));
+    // Sanity: the result is still valid UTF-8 (would already panic above if not).
+    assert!(!truncated.is_empty());
+}
+
+#[test]
+fn truncate_mention_about_leaves_short_strings_untouched() {
+    assert_eq!(
+        truncate_mention_about(Some("short bio".to_string())).as_deref(),
+        Some("short bio")
+    );
+    assert_eq!(truncate_mention_about(None), None);
+}
+
+#[test]
 fn user_notes_builds_cursor_from_last() {
     let e1 = ev(1, "first", vec![]);
     let e2 = ev(1, "second", vec![]);

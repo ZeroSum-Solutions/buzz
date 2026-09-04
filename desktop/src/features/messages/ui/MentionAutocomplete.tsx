@@ -298,9 +298,22 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
               ownerLabel || suggestion.notInChannel
                 ? `mention-agent-provenance-${index}`
                 : undefined;
+            // In the name-collision branch `ownerLabel` is deliberately
+            // nulled above and the npub becomes the only trusted
+            // disambiguator between two rows that otherwise render and
+            // announce identically ("Mention Rex" for both). It needs the
+            // same treatment as `provenanceId`: without an id wired into
+            // `aria-describedby`, a screen-reader user hears two identical,
+            // self-authored-only descriptions and has no way to tell the
+            // agents apart, even though the sighted user sees the distinct
+            // npub.
+            const collisionNpubId = collisionNpub
+              ? `mention-collision-npub-${index}`
+              : undefined;
             const describedBy =
-              [descriptionId, provenanceId].filter(Boolean).join(" ") ||
-              undefined;
+              [descriptionId, provenanceId, collisionNpubId]
+                .filter(Boolean)
+                .join(" ") || undefined;
 
             return (
               <div
@@ -420,6 +433,7 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
                           <span
                             className="-translate-y-0.5 shrink-0 font-mono leading-none"
                             data-testid="mention-collision-npub"
+                            id={collisionNpubId}
                             title={collisionNpub}
                           >
                             {truncatePubkey(collisionNpub)}

@@ -55,6 +55,42 @@ fn tags_named<'a>(event: &'a Event, name: &'a str) -> impl Iterator<Item = &'a [
     })
 }
 
+/// Byte cap applied to a kind:0 `about` before it crosses the Tauri IPC
+/// boundary in [`crate::models::UserProfileSummaryInfo`] and
+/// [`crate::models::UserSearchResultInfo`].
+///
+/// `about` is untrusted kind-0 content: the relay allows up to 256 KiB of
+/// kind-0 `content` (`MAX_EVENT_CONTENT_BYTES`,
+/// `crates/buzz-relay/src/handlers/ingest.rs`), and `get_users_batch` sends a
+/// batch filter with no limit, so a single batch response could otherwise
+/// carry hundreds of MiB of untrusted text across the IPC boundary and into
+/// the React Query cache. The frontend's 120-grapheme render cap
+/// (`MENTION_DESCRIPTION_MAX_GRAPHEMES`,
+/// `desktop/src/features/messages/lib/mentionSuggestionMapping.ts`) runs
+/// downstream of this and does not bound what crosses the seam. 512 bytes
+/// comfortably covers that render cap (grapheme clusters are a handful of
+/// bytes each in the common case) while cutting the untrusted payload from
+/// 256 KiB to 512 B per profile at the boundary itself.
+pub(crate) const MENTION_ABOUT_MAX_BYTES: usize = 512;
+
+/// Truncate `about` to at most [`MENTION_ABOUT_MAX_BYTES`] bytes on a UTF-8
+/// character boundary. Used by the mention-picker DTOs
+/// ([`crate::models::UserProfileSummaryInfo`],
+/// [`crate::models::UserSearchResultInfo`]); the full, uncapped `about`
+/// remains available on the `get_profile` detail path.
+pub(crate) fn truncate_mention_about(about: Option<String>) -> Option<String> {
+    about.map(|s| {
+        if s.len() <= MENTION_ABOUT_MAX_BYTES {
+            return s;
+        }
+        let mut end = MENTION_ABOUT_MAX_BYTES;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s[..end].to_string()
+    })
+}
+
 /// Return the owner pubkey from a valid NIP-OA owner tag on a kind:0 profile.
 ///
 /// NIP-OA requires a valid event and exactly one well-formed `auth` tag whose
@@ -358,7 +394,9 @@ pub fn users_batch_from_events(
                 .map(str::to_string),
             name: v.get("name").and_then(Value::as_str).map(str::to_string),
             avatar_url: v.get("picture").and_then(Value::as_str).map(str::to_string),
-            about: v.get("about").and_then(Value::as_str).map(str::to_string),
+            about: truncate_mention_about(
+                v.get("about").and_then(Value::as_str).map(str::to_string),
+            ),
             nip05_handle: v.get("nip05").and_then(Value::as_str).map(str::to_string),
             is_agent: owner_pubkey.is_some(),
             owner_pubkey,

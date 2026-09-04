@@ -1,4 +1,5 @@
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
+import { normalizePubkey } from "@/shared/lib/pubkey";
 import {
   type MentionCandidateForRanking,
   rankMentionCandidates,
@@ -51,6 +52,20 @@ export type AgentProfileFallbackCandidate = MentionCandidateForRanking & {
  * show a role line even for agents who haven't authored anything in the
  * loaded timeline, without the unbounded-batch failure mode
  * {@link MENTION_SUGGESTION_LIMIT} documents.
+ *
+ * Coverage is judged by `about` being present, not by the lookup entry
+ * existing: `mergeAgentNamesIntoProfiles` and `mergeMemberAgentFlagsIntoProfiles`
+ * (`useChannelActivityTyping.ts`) synthesize a profile-lookup entry for every
+ * managed/relay/member-flagged agent with `displayName` / `avatarUrl` /
+ * `nip05Handle` / `ownerPubkey` / `isAgent` and **no `about` key at all** —
+ * that entry is a real production shape, not a hypothetical one. Treating
+ * entry presence as "about known" (the old `!profiles?.[...]` check) skips
+ * those candidates permanently, so the fallback never runs the one time it
+ * would recover their role line. Checking `about === undefined` instead
+ * distinguishes "profile known, about absent" (skip — there is nothing to
+ * fetch) from "profile not fetched" (include). The key is normalized to
+ * match {@link mapMentionCandidateToSuggestion}'s lookup
+ * (`profiles?.[normalizePubkey(pubkey)]?.about`) in mentionSuggestionMapping.ts.
  */
 export function selectAgentProfileFallbackPubkeys<
   T extends AgentProfileFallbackCandidate,
@@ -66,7 +81,7 @@ export function selectAgentProfileFallbackPubkeys<
             candidate.isAgent &&
             candidate.pubkey &&
             candidate.description === undefined &&
-            !profiles?.[candidate.pubkey],
+            profiles?.[normalizePubkey(candidate.pubkey)]?.about === undefined,
         )
         .map(({ candidate }) => candidate.pubkey as string),
     ),
