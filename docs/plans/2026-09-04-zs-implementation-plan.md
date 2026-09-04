@@ -47,49 +47,56 @@ through. Revision 3 folds in Sol's passes 1 and 2 on this plan (log at the end).
 
 ## The loop every ticket runs
 
-1. **Builder** (Claude subagent; Sonnet 5 for ports and UI, Opus 5 for Rust plumbing and the
-   MCP registry) implements on the branch in its own worktree. Test first where the ticket
-   names a test.
-2. **Fast gates** on the branch, all must pass before anyone else looks:
+Revised 2026-09-05 per `2026-09-05-zs-throughput-plan.md` (accepted by Devin). The original
+serial loop and its measurements are in that document.
+
+1. **Builder** (Claude subagent; Sonnet 5 for ports and UI, Opus 5 for Rust plumbing) in its
+   own worktree, with the defect checklist: cap every relay-sourced string at the DTO; order
+   writes so every prefix is consistent; give every child process or external server an
+   explicit environment; bound every gate by the quantity that costs (nodes, not bytes); write
+   the test that fails when the guard is removed. Tests first where the ticket names a test.
+   Local gates are the fast set only, in a shell that ran `. ./bin/activate-hermit`:
    ```
    just fmt-check clippy desktop-check desktop-tauri-fmt-check desktop-tauri-clippy file-size-check
-   just desktop-test
-   just desktop-tauri-test
    ```
-   plus the ticket's own eval commands, always in a shell that ran `. ./bin/activate-hermit`
-   first (same invocation, since shell state does not persist). Every Rust filter is run
-   twice: once with `-- --list` and an enforced count, then for real:
-   ```
-   n=$(cargo test <filter> -- --list 2>/dev/null | grep -c ': test'); test "$n" -ge <N> || { echo "only $n tests match"; exit 1; }
-   ```
-   Desktop test names are crate-root qualified (`managed_agents::discovery::tests::…`), and
-   a filter that matches nothing is a failed gate, not a pass.
-3. **Tester** (Gemini 3.8 Flash): a disposable worktree of the branch, run as
-   `agy -p --model gemini-3.8-flash-high --mode accept-edits --sandbox "<ticket brief>"` from
-   the worktree root. It reads the diff and the acceptance checks, runs the fast gates itself,
-   tries to break the feature (wrong input, empty state, missing file, hostile filename,
-   concurrent arrival), and returns PASS or FAIL with a repro, plus any acceptance check that
-   has no test. After it returns, `git status --porcelain` in that worktree must be empty; any
-   change it made is discarded and reported. A FAIL or a missing test goes back to the builder.
-4. **Critic** (fresh-context Claude subagent, Opus 5, high effort) does the gauntlet
-   comparison against the ticket's bar with labels stripped and reports one of: ours is better,
-   the bar is better with the single biggest gap named, or parity. The exit checklist is finite:
-   source parity with the bar (for ports: the PR's tests pass on our branch), every fork
-   deviation named in the PR body, every acceptance check measurable and met, nothing above NIT
-   open. Parity with an upstream PR counts as passing for a port. Otherwise back to the builder.
-5. **Full gate** `just ci` on the rebased branch (it adds `test-unit`, `desktop-build`,
-   `desktop-tauri-check`, `web-build`, `mobile-test`). Integration tests (`just test`) when
-   relay, auth or db code changed.
-6. **Audit** (GPT-5.6 Sol): from the worktree,
-   `codex exec -s read-only -c model="gpt-5.6-sol" -c model_reasoning_effort="xhigh" -o <report> "<adversarial prompt naming the scope git diff origin/zs/main...HEAD>"`
-   (the `review --base` form cannot take a custom prompt, so the scope lives in the prompt).
-   Every BLOCK and WARN is verified against the code by the driver before it is fixed or
-   discarded with a written reason. Re-run until nothing above NIT.
-7. **Land** through the merge queue as above.
+   plus the ticket's own test files with enforced counts (`n=$(cargo test <filter> -- --list | grep -c ': test'); test "$n" -ge <N>`).
+   No local `just ci`; CI on Blacksmith is the full gate. At most four builders at once, on a
+   heavy-command semaphore of two for `cargo test`, `desktop-test` and E2E runs.
+2. **In parallel after the build**, on the auditor semaphore of two external processes:
+   - **Tester** (Gemini 3.8 Flash, `agy -p --model gemini-3.8-flash-high --mode accept-edits`,
+     disposable worktree, clean-tree assertion after): reads the diff and acceptance checks,
+     runs the fast gates, tries to break the feature. Returns PASS or FAIL with a repro. A
+     missing-test note that describes an untested crash or race is a FAIL; other notes are
+     follow-ups.
+   - **Sol full pass** (`codex exec -s read-only -c model="gpt-5.6-sol" -c model_reasoning_effort=<effort> -o <report> "<adversarial prompt naming the scope git diff origin/zs/main...HEAD>"`).
+     Effort is `xhigh` when the diff touches `crates/buzz-agent/src/mcp.rs`, `crates/buzz-acp/`,
+     `managed_agents/runtime.rs`, spawn or env code, `secret_store`, keychain, relay crates, or a
+     DTO carrying relay-sourced data; `high` otherwise. The driver verifies every BLOCK and WARN
+     against the code.
+   - **Critic** (in-process Claude agent, features only, once): blind comparison against the
+     bar plus the checklist. Ports get a single non-blind check instead: PR tests present and
+     passing, eval counts met, every deviation named against the port diff. Memos get neither.
+3. **Severity rubric.** BLOCK: unbounded untrusted input, missing containment or credential
+   exposure, an unbounded resource, loop or process tree, a swallowed failure, torn multi-write
+   state, a guard whose removal fails no test, a complexity or resource gate that bounds the
+   wrong quantity. Verified WARNs outside that list are follow-ups in the PR body and issues on
+   the fork; they do not loop.
+4. **One consolidated fix round** for every BLOCK, every FAIL, and every failed checklist item.
+   A fix agent that needs more than 90 minutes stops, commits what passes, and reports; only
+   WARN and out-of-scope work may be parked, and an unfixed BLOCK keeps the ticket open (the
+   driver splits the ticket, never the BLOCK).
+5. **Sol delta pass** on the fix diff, the prior findings, and a re-scan of every
+   untrusted-input surface in the whole diff. It may raise new BLOCKs; if it does, one more fix
+   and one more delta, then the driver. Gemini retests once if it had FAILed. Three Sol runs at
+   most.
+6. **PR.** Opened as a draft with the full body (gates and exit codes, tested base OID, Gemini
+   verdict, critic result, Sol rounds and final state, follow-ups, test plan); marked ready when
+   the loop is done, which runs CI once; then enqueued. A ticket with an open verified BLOCK is
+   never enqueued.
 
-Concurrency: builders and critics are in-process agents (cap 10). Gemini and Sol are external
-processes (cap 4, shared with anything else on the machine); at most two tickets sit in the
-tester or audit stage at once. Fan out is by ticket, never by file inside a ticket.
+Memos: hard length in the builder prompt (one page), one Sol pass, the driver decides which
+findings change a decision and lists the rest as risks. Tickets that cross the Rust and UI
+boundary are split into a backend half and a UI half, each with its own loop.
 
 ## Bars (what "better" means)
 

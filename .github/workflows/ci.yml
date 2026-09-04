@@ -1,8 +1,9 @@
 name: CI
 on:
   push:
-    branches: [main, release, zs/main]  # zs fork: warm caches on the integration branch
+    branches: [main, release]  # zs fork: zs/main is covered by merge_group runs, which also save the caches
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]  # zs fork: drafts do not run CI; marking ready does
   merge_group:  # zs fork: GitHub merge queue on zs/main
 
 concurrency:
@@ -17,6 +18,8 @@ env:
 jobs:
   changes:
     name: Detect Changed Paths
+    # zs fork: a draft PR runs no CI; every other job needs this one, so skipping it skips them all.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 2
     permissions:
