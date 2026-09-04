@@ -14,11 +14,13 @@ OAuth flow; the desktop holds that grant in the OS keychain and renders exactly 
 account's own API calls return. Buzz membership decides where the surface appears; Google
 decides what it contains. Agents get no calendar credential in v1.
 
-This is the shape upstream RFC #3227 argues for: an outside service reaches Buzz as a
-*scoped integration* with a narrow credential that never enters the agent sandbox, not as a
-platform primitive. `VISION.md:9` argues against stitching outside services into the workspace;
-the scoped-integration shape is what keeps that argument intact — the calendar is a view onto
-someone else's system, not a Buzz data model.
+`VISION.md:9` argues against stitching outside services into the workspace. Keeping the calendar a
+view onto someone else's system rather than a Buzz data model is what keeps that argument intact.
+
+Upstream RFC #3227 is narrower than this memo and only decision 9 follows it: it asks for an
+extension point so an installed app can supply a managed agent carrying its own scoped credential
+that never enters the agent sandbox. It says nothing about a human authorizing a third-party API
+from the desktop, which is what decisions 1–8 are; those stand on their own arguments below.
 
 ## Why the two obvious alternatives are out
 
@@ -49,12 +51,28 @@ Never requested: `https://www.googleapis.com/auth/calendar` (full calendar manag
 response and persisted; a user who unchecks a box gets the read-only surface, not a broken write
 path.
 
+**The OAuth client itself.** The client lives in a Google Cloud project owned by the same Workspace
+that owns the business calendar (decision 3), and is of type **Desktop app** — the type the
+loopback-plus-PKCE flow above requires. Its consent screen is published **Internal**, which limits
+it to that Workspace's own accounts and needs no Google verification review. Publishing status is
+**In production**, never **Testing**: a client left in Testing expires every refresh token after
+seven days, which would turn decision 8's terminal `invalid_grant` from an exception into a weekly
+reconnect prompt for every user, and would make decision 7's propagation bound read as working
+when the grant is simply dead. Shipping this beyond one Workspace means an **External** client and
+Google verification for the `calendar.events` scope — a separate ticket, not a config toggle. The
+installed-app client secret ships inside the binary and is **not confidential**; it is an
+identifier, not a credential.
+
 **Reason.** `calendarlist.readonly` is the only way to resolve the business calendar's id and the
 caller's `accessRole` without asking for calendar management. Splitting read from write means a
 member who only ever looks at the calendar never holds a token that can change it. Reading the
 granted scopes back rather than assuming them is what makes the read-only fallback real: Google's
 consent screen lets the user drop a scope, and an app that assumes it got what it asked for fails
-at write time with a raw 403.
+at write time with a raw 403. Naming the publishing status is not paperwork: it is the single
+setting that decides whether decision 8's terminal branch is rare or weekly, so it belongs in the
+contract rather than in whoever's memory set the project up. PKCE, not the client secret, is what
+binds the authorization code to this app, so nothing in this memo rests on that secret staying
+hidden — decision 2's keychain argument is about tokens, which are the real credential.
 
 ### 2. Which Google account binds to which Buzz identity, and how the binding is stored
 
@@ -63,7 +81,8 @@ is the active identity's pubkey hex (`get_identity`, `desktop/src-tauri/src/comm
 the Google side is the OIDC `sub`, not the email. The record — refresh token, access token,
 expiry, granted scopes, `sub`, email for display — is stored in the OS keychain through
 `SecretStore` under a key namespaced by pubkey hex. `SecretStore` keeps all secrets as one JSON
-blob (service `buzz-desktop`, username `secrets`, `desktop/src-tauri/src/secret_store.rs:1-21`),
+blob (username `secrets`, `desktop/src-tauri/src/secret_store.rs:1-21`; the service-name constant
+`buzz-desktop` is at `:50`),
 so this costs no extra keychain prompt. Token exchange, refresh and every Google API call happen
 in Rust. The webview receives a redacted status struct only: connected, email, granted scopes,
 expiry, state. Connecting a different Google account requires an explicit confirm and revokes the
@@ -99,19 +118,26 @@ take the calendar with them.
 
 ### 4. Which channels show the calendar, and who chooses
 
-**Decision.** The calendar surface is opt-in per channel. A channel admin (kind:39001, with
-membership at kind:39002 — `crates/buzz-core/src/kind.rs:424-426`) chooses which calendar id a
-channel maps to. For v1 that mapping is a local per-identity desktop setting in the app-data dir
-next to the archive DB; a relay-synced mapping needs a new event kind and is deferred to an
-upstream-first ticket (see "Why the two obvious alternatives are out"). The mapping is a
-*display* choice and carries no authority: a channel member whose Google account is not on the
-calendar's ACL sees an empty surface with "not shared with your account", never someone else's
-events.
+**Decision.** The calendar surface is opt-in per channel, and **in v1 each user sets the mapping
+locally**: it is a per-identity desktop setting in the app-data dir next to the archive DB, and
+nothing carries one person's choice to anyone else's installation. The channel admin (kind:39001,
+with membership at kind:39002 — `crates/buzz-core/src/kind.rs:424-426`) decides which calendar id
+the channel *should* use and conveys that choice out of band — a pinned message, the channel topic,
+onboarding — so in v1 it is a convention the app does not enforce. Admin-owned mapping becomes
+enforceable only with the relay-synced kind, which needs a new allow-listed event kind and is
+deferred to an upstream-first ticket (see "Why the two obvious alternatives are out"). What T12 can
+bind is therefore the local half: the mapping is per-identity and local, and no mapping grants
+access. The mapping is a *display* choice and carries no authority — a channel member whose Google
+account is not on the calendar's ACL sees an empty surface with "not shared with your account",
+never someone else's events.
 
 **Reason.** Making the mapping powerless is what lets it be stored loosely. If a wrong or stale
 mapping could expose event data, it would need the same durability and audit as the ACL itself;
 because every read is made with the viewer's own token, the worst outcome of a bad mapping is an
-empty panel in the wrong channel. That trade buys v1 out of a relay change we cannot make.
+empty panel in the wrong channel. That trade buys v1 out of a relay change we cannot make, and it
+is also what makes the v1 authority gap tolerable: an admin whose choice nobody's client enforces
+cannot leak anything by being ignored, because the setting they would be enforcing has no power in
+the first place.
 
 ### 5. Disconnect behavior
 
@@ -130,11 +156,23 @@ caught error. Full sign-out already covers both halves: the boot reset renames t
 and calls `delete_all_with_legacy()` then `verify_fully_wiped()` on the keychain
 (`desktop/src-tauri/src/reset.rs:273,315`).
 
+**This is not a per-device action.** Google's revocation endpoint revokes the grant for that OAuth
+client and that Google account, not one machine's copy of it — and a Buzz identity is a pubkey that
+can be live on more than one installation (decision 2 binds one Google account per identity *per
+installation*). Disconnecting on the laptop therefore ends the desktop's grant too, and the second
+installation finds out only as an `invalid_grant` on its next refresh (decision 8). We accept that
+rather than engineer around it, but we do not let it arrive unexplained: the disconnect confirm
+says so in words — "this disconnects Google Calendar on all your Buzz installations" — and the
+resulting `needs_reconnect` elsewhere names the cause instead of showing a bare auth error.
+
 **Reason.** `AGENTS.md` Review-Proven Rule 1 — a caught failure leaves a durable retry record or
 propagates; deleting the journal before the retry succeeds is exactly the PR #6269 defect. Rule 5
 — one user action is one atomic persist, ordered so every prefix is consistent: a crash after step
 3 leaves a revoked-or-pending grant and no local token, which is safe. Rule 2 — the generation
-fence stops a completing refresh from resurrecting a deleted binding.
+fence stops a completing refresh from resurrecting a deleted binding. Per-device revocation would
+need a distinct OAuth client or a distinct Google account per machine; both are worse than the
+cross-device effect, and a "disconnect" that quietly leaves a live grant on a machine the user no
+longer has is the worst option of the three.
 
 ### 6. Cached event data on disconnect and on membership loss
 
@@ -202,7 +240,9 @@ different `sub` is an account change and takes the explicit confirm from decisio
 the reconnect entry lives in two places, one of which does not depend on the broken surface
 rendering. Rule 4 — a terminal auth error must stop the loop, not retry forever against a grant
 that will never come back. Splitting transient from terminal is what stops a flaky network from
-nagging the user to re-consent.
+nagging the user to re-consent. That split only holds because the client is published In
+production (decision 1): in Testing status every refresh token dies after seven days, and the
+terminal branch stops being an exception and becomes the normal weekly experience.
 
 ### 9. What an agent may read or write
 
@@ -232,14 +272,15 @@ scope it, and remove it in the same place they manage everyone else.
   semantics — T12a `docs/calendar-view-design`.
 - Implementation of this contract, the mock Google server and the live two-account checklist —
   T12 `feat/google-calendar`.
-- Relay-synced channel → calendar mapping (needs a new allow-listed kind) — upstream-first,
-  not scheduled.
+- Relay-synced channel → calendar mapping, and with it admin-owned rather than per-user mapping
+  (needs a new allow-listed kind) — upstream-first, not scheduled.
 - Agent calendar access through a separate Google principal — blocked on RFC #3227 landing
   upstream.
 
 ## Relates to
 
-- Upstream RFC #3227 — app-integration agents with scoped credentials (the shape this follows).
+- Upstream RFC #3227 — app-integration agents with scoped credentials (the shape decision 9
+  follows; it does not cover decisions 1–8).
 - Upstream PR #1382 — the closed Google Calendar work T12 revives for the OAuth and storage half.
 - `2026-09-04-zs-feature-audit.md` §4 — the audit that ruled out a native kind, Cal.com and
   iframes.
