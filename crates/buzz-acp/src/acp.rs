@@ -25,13 +25,29 @@ const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
 /// An MCP server configuration passed to `session/new`.
 ///
 /// Corresponds to the `McpServerStdio` variant in the ACP schema.
-/// All four fields are **required** by the schema (`args` and `env` may be empty arrays).
+/// `name`, `command`, `args` and `env` are **required** by the schema (`args`
+/// and `env` may be empty arrays); `trusted` is a Buzz extension and defaults
+/// to `false` when absent.
+/// `trusted` is honoured by `buzz-agent` alone, and buys exactly two things
+/// there: the four Buzz identity variables (`BUZZ_PRIVATE_KEY`,
+/// `NOSTR_PRIVATE_KEY`, `BUZZ_RELAY_URL`, `BUZZ_AUTH_TAG`) are absent from an
+/// untrusted child's environment, and an untrusted server never runs a
+/// `_Stop` / `_PostCompact` hook. It is not process isolation: the child runs
+/// under the harness's own UID. Only the built-in `buzz-dev-mcp` server is
+/// trusted; the servers `BUZZ_ACP_EXTRA_MCP_COMMANDS` adds are not, and the
+/// harness refuses those entries outright under any adapter but `buzz-agent`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct McpServer {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
     pub env: Vec<EnvVar>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub trusted: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 /// A single environment variable for an MCP server.
@@ -2538,6 +2554,7 @@ mod tests {
                     value: "nsec1abc".into(),
                 },
             ],
+            trusted: true,
         };
         let serialized = serde_json::to_value(&server).unwrap();
         assert_eq!(serialized["name"].as_str(), Some("test-mcp"));

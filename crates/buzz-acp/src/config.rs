@@ -267,6 +267,27 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_MCP_COMMAND", default_value = "")]
     pub mcp_command: String,
 
+    /// Additional MCP server commands to pass to the agent session alongside
+    /// the primary MCP server. Requires `--agent-command buzz-agent`: only
+    /// that adapter honours the trust marker these servers carry, so any
+    /// other one fails at startup instead of spawning them out of a process
+    /// holding the Buzz private key. Entries are newline-separated; each
+    /// entry is shell-split (shlex) into a command and its args, so quoted
+    /// paths and arguments with spaces are preserved. An optional `name=`
+    /// prefix sets the server name explicitly (e.g. `memory=npx -y
+    /// memory-mcp`); without it, the name is derived from the executable
+    /// stem. Names are capped at 32 bytes, budgeted against `buzz-agent`'s
+    /// 64-byte cap on the qualified tool name `<server>__<tool>`; colliding
+    /// names take a suffix hashed from the entry, so reordering entries never
+    /// renames a server. Startup fails, naming the entry index and never
+    /// echoing the entry, on malformed quoting, an entry naming no command, a
+    /// repeated `name=`, two entries resolving to one name, or more than 16
+    /// servers in total. Do not put a secret in an entry — argv is visible in
+    /// `ps`; prefer a server that reads its own credentials. Example:
+    /// `memory=npx -y memory-mcp --db /var/lib/memory.db\nother-server --port 8080`
+    #[arg(long, env = "BUZZ_ACP_EXTRA_MCP_COMMANDS", value_delimiter = '\n')]
+    pub extra_mcp_commands: Vec<String>,
+
     /// Idle timeout: max seconds of silence before killing a turn.
     /// Resets on any agent stdout activity.
     #[arg(long, env = "BUZZ_ACP_IDLE_TIMEOUT")]
@@ -543,6 +564,7 @@ pub struct Config {
     pub agent_command: String,
     pub agent_args: Vec<String>,
     pub mcp_command: String,
+    pub extra_mcp_commands: Vec<String>,
     pub idle_timeout_secs: u64,
     pub max_turn_duration_secs: u64,
     pub agents: u32,
@@ -1156,6 +1178,7 @@ impl Config {
             agent_command,
             agent_args,
             mcp_command: args.mcp_command,
+            extra_mcp_commands: args.extra_mcp_commands,
             idle_timeout_secs,
             max_turn_duration_secs,
             agents: args.agents,
@@ -1540,6 +1563,7 @@ mod tests {
             agent_command: "goose".into(),
             agent_args: vec!["acp".into()],
             mcp_command: "".into(),
+            extra_mcp_commands: vec![],
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
