@@ -1,0 +1,554 @@
+//! Tests for the managed-agent runtime config generator.
+//!
+//! Every ceiling and charset rule below has its own test, so removing the guard
+//! turns a test red rather than only widening what is accepted.
+
+use super::*;
+
+fn stdio_server() -> McpServerSpec {
+    McpServerSpec::stdio(
+        "openseo-fake",
+        "/opt/fake-mcp",
+        &["--stdio".to_string()],
+        &["OPENSEO_TOKEN".to_string()],
+    )
+    .expect("valid stdio server")
+}
+
+fn skill(name: &str) -> PinnedSkill {
+    PinnedSkill::new(name, "---\nname: probe\n---\n\n# Probe\n").expect("valid skill")
+}
+
+fn spec_with(servers: Vec<McpServerSpec>, skills: Vec<PinnedSkill>) -> AgentRuntimeConfigSpec {
+    AgentRuntimeConfigSpec::new(servers, skills).expect("valid spec")
+}
+
+fn long(n: usize) -> String {
+    "a".repeat(n)
+}
+
+// ---------------------------------------------------------------- count caps
+
+#[test]
+fn servers_over_the_cap_are_rejected() {
+    let servers: Vec<McpServerSpec> = (0..=MAX_SERVERS)
+        .map(|i| McpServerSpec::http(&format!("s{i}"), "https://example.test/mcp").expect("http"))
+        .collect();
+    let err = AgentRuntimeConfigSpec::new(servers, Vec::new()).expect_err("cap must reject");
+    assert_eq!(
+        err,
+        ConfigGenError::TooMany {
+            field: "servers",
+            limit: MAX_SERVERS,
+            got: MAX_SERVERS + 1
+        }
+    );
+}
+
+#[test]
+fn servers_at_the_cap_are_accepted() {
+    let servers: Vec<McpServerSpec> = (0..MAX_SERVERS)
+        .map(|i| McpServerSpec::http(&format!("s{i}"), "https://example.test/mcp").expect("http"))
+        .collect();
+    assert!(AgentRuntimeConfigSpec::new(servers, Vec::new()).is_ok());
+}
+
+#[test]
+fn skills_over_the_cap_are_rejected() {
+    let skills: Vec<PinnedSkill> = (0..=MAX_SKILLS).map(|i| skill(&format!("s{i}"))).collect();
+    let err = AgentRuntimeConfigSpec::new(Vec::new(), skills).expect_err("cap must reject");
+    assert_eq!(
+        err,
+        ConfigGenError::TooMany {
+            field: "skills",
+            limit: MAX_SKILLS,
+            got: MAX_SKILLS + 1
+        }
+    );
+}
+
+#[test]
+fn args_over_the_cap_are_rejected() {
+    let args: Vec<String> = (0..=MAX_ARGS).map(|i| i.to_string()).collect();
+    let err = McpServerSpec::stdio("s", "/bin/true", &args, &[]).expect_err("cap must reject");
+    assert!(matches!(
+        err,
+        ConfigGenError::TooMany {
+            field: "server.args",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn env_passthrough_over_the_cap_is_rejected() {
+    let keys: Vec<String> = (0..=MAX_ENV_PASSTHROUGH).map(|i| format!("K{i}")).collect();
+    let err = McpServerSpec::stdio("s", "/bin/true", &[], &keys).expect_err("cap must reject");
+    assert!(matches!(
+        err,
+        ConfigGenError::TooMany {
+            field: "server.env_passthrough",
+            ..
+        }
+    ));
+}
+
+// ----------------------------------------------------------------- byte caps
+
+#[test]
+fn over_long_server_name_is_rejected() {
+    let err = McpServerSpec::http(&long(MAX_NAME_BYTES + 1), "https://example.test/mcp")
+        .expect_err("cap must reject");
+    assert!(matches!(
+        err,
+        ConfigGenError::TooLong {
+            field: "server.name",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn over_long_command_is_rejected() {
+    let err =
+        McpServerSpec::stdio("s", &long(MAX_COMMAND_BYTES + 1), &[], &[]).expect_err("cap rejects");
+    assert!(matches!(
+        err,
+        ConfigGenError::TooLong {
+            field: "server.command",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn over_long_argument_is_rejected() {
+    let err = McpServerSpec::stdio("s", "/bin/true", &[long(MAX_ARG_BYTES + 1)], &[])
+        .expect_err("cap rejects");
+    assert!(matches!(
+        err,
+        ConfigGenError::TooLong {
+            field: "server.args",
+            index: 0,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn over_long_url_is_rejected() {
+    let url = format!("https://example.test/{}", long(MAX_URL_BYTES));
+    let err = McpServerSpec::http("s", &url).expect_err("cap rejects");
+    assert!(matches!(
+        err,
+        ConfigGenError::TooLong {
+            field: "server.url",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn over_long_env_name_is_rejected() {
+    let err = McpServerSpec::stdio("s", "/bin/true", &[], &[long(MAX_ENV_NAME_BYTES + 1)])
+        .expect_err("cap rejects");
+    assert!(matches!(
+        err,
+        ConfigGenError::TooLong {
+            field: "server.env_passthrough",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn over_long_skill_body_is_rejected() {
+    let err = PinnedSkill::new("probe", &long(MAX_SKILL_BODY_BYTES + 1)).expect_err("cap rejects");
+    assert!(matches!(
+        err,
+        ConfigGenError::TooLong {
+            field: "skill.body",
+            ..
+        }
+    ));
+}
+
+// ------------------------------------------------------------------ charsets
+
+#[test]
+fn server_name_charset_is_enforced() {
+    for bad in ["../evil", "a b", "a.b", "-lead", "", "sérver"] {
+        assert!(
+            McpServerSpec::http(bad, "https://example.test/mcp").is_err(),
+            "{bad:?} must be rejected"
+        );
+    }
+    assert_eq!(
+        McpServerSpec::http("openseo-fake_1", "https://example.test/mcp")
+            .expect("valid name")
+            .name(),
+        "openseo-fake_1"
+    );
+}
+
+#[test]
+fn skill_name_cannot_traverse_or_shadow_the_nest_skill() {
+    for bad in ["../evil", "a/b", ".", "..", "buzz-cli"] {
+        assert!(
+            PinnedSkill::new(bad, "body").is_err(),
+            "{bad:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn env_name_charset_is_enforced() {
+    for bad in ["1LEAD", "with-dash", "with space", ""] {
+        assert!(
+            McpServerSpec::stdio("s", "/bin/true", &[], &[bad.to_string()]).is_err(),
+            "{bad:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn non_http_url_is_rejected() {
+    assert!(McpServerSpec::http("s", "file:///etc/passwd").is_err());
+    assert!(McpServerSpec::http("s", "ws://example.test").is_err());
+}
+
+#[test]
+fn empty_command_and_empty_body_are_rejected() {
+    assert!(McpServerSpec::stdio("s", "   ", &[], &[]).is_err());
+    assert!(PinnedSkill::new("probe", "").is_err());
+}
+
+#[test]
+fn duplicate_names_are_rejected() {
+    let dup_servers = vec![
+        McpServerSpec::http("same", "https://a.test/mcp").expect("http"),
+        McpServerSpec::http("same", "https://b.test/mcp").expect("http"),
+    ];
+    assert!(matches!(
+        AgentRuntimeConfigSpec::new(dup_servers, Vec::new()),
+        Err(ConfigGenError::Duplicate {
+            field: "servers",
+            index: 1
+        })
+    ));
+    let dup_skills = vec![skill("same"), skill("same")];
+    assert!(matches!(
+        AgentRuntimeConfigSpec::new(Vec::new(), dup_skills),
+        Err(ConfigGenError::Duplicate {
+            field: "skills",
+            index: 1
+        })
+    ));
+    assert!(McpServerSpec::stdio(
+        "s",
+        "/bin/true",
+        &[],
+        &["DUP".to_string(), "DUP".to_string()]
+    )
+    .is_err());
+}
+
+// ------------------------------------------------------- structural emission
+
+#[test]
+fn claude_json_parses_back_to_the_declared_structure() {
+    let spec = spec_with(vec![stdio_server()], vec![skill("probe")]);
+    let rendered = render_claude_mcp_json(&spec).expect("render");
+    let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+    let entry = &parsed["mcpServers"]["openseo-fake"];
+    assert_eq!(entry["type"], "stdio");
+    assert_eq!(entry["command"], "/opt/fake-mcp");
+    assert_eq!(entry["args"][0], "--stdio");
+    let env = entry["env"].as_object().expect("env object");
+    assert_eq!(
+        env.keys().collect::<Vec<_>>(),
+        vec!["OPENSEO_TOKEN"],
+        "env carries names only"
+    );
+    assert_eq!(env["OPENSEO_TOKEN"], "${OPENSEO_TOKEN}");
+}
+
+#[test]
+fn claude_http_entry_uses_the_published_openseo_shape() {
+    let spec = spec_with(
+        vec![McpServerSpec::http("openseo", "https://app.openseo.so/mcp").expect("http")],
+        Vec::new(),
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&render_claude_mcp_json(&spec).expect("render")).expect("JSON");
+    assert_eq!(parsed["mcpServers"]["openseo"]["type"], "http");
+    assert_eq!(
+        parsed["mcpServers"]["openseo"]["url"],
+        "https://app.openseo.so/mcp"
+    );
+}
+
+#[test]
+fn codex_toml_parses_back_to_the_declared_structure() {
+    let spec = spec_with(vec![stdio_server()], vec![skill("probe")]);
+    let rendered = render_codex_config_toml(&spec).expect("render");
+    let table: toml::Table = rendered.parse().expect("valid TOML");
+    let entry = &table["mcp_servers"]["openseo-fake"];
+    assert_eq!(entry["command"].as_str(), Some("/opt/fake-mcp"));
+    assert_eq!(
+        entry["args"].as_array().expect("args")[0].as_str(),
+        Some("--stdio")
+    );
+    let env = entry["env"].as_table().expect("env table");
+    assert_eq!(env.keys().collect::<Vec<_>>(), vec!["OPENSEO_TOKEN"]);
+    assert_eq!(env["OPENSEO_TOKEN"].as_str(), Some("${OPENSEO_TOKEN}"));
+}
+
+/// The generated Claude document is one Buzz's own Claude reader understands.
+/// The reader resolves `mcpServers` from `<dir>/.claude.json`; a project
+/// `.mcp.json` uses the identical object, so the document is copied under that
+/// name to run the production parser over it.
+#[test]
+fn generated_claude_document_round_trips_through_the_production_reader() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let spec = spec_with(
+        vec![
+            stdio_server(),
+            McpServerSpec::http("openseo", "https://app.openseo.so/mcp").expect("http"),
+        ],
+        Vec::new(),
+    );
+    std::fs::write(
+        dir.path().join(".claude.json"),
+        render_claude_mcp_json(&spec).expect("render"),
+    )
+    .expect("write");
+    let cfg = crate::managed_agents::config_bridge::read_claude_config_at(dir.path())
+        .expect("reader accepts the generated document");
+    let mut names: Vec<&str> = cfg.extensions.iter().map(|e| e.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, vec!["openseo", "openseo-fake"]);
+}
+
+/// The generated Codex document is one Buzz's own Codex parser understands.
+#[test]
+fn generated_codex_document_round_trips_through_the_production_reader() {
+    let spec = spec_with(
+        vec![
+            stdio_server(),
+            McpServerSpec::http("openseo", "https://app.openseo.so/mcp").expect("http"),
+        ],
+        Vec::new(),
+    );
+    let cfg = crate::managed_agents::config_bridge::parse_codex_config_str(
+        &render_codex_config_toml(&spec).expect("render"),
+    )
+    .expect("parser accepts the generated document");
+    let mut names: Vec<&str> = cfg.extensions.iter().map(|e| e.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, vec!["openseo", "openseo-fake"]);
+}
+
+#[test]
+fn no_generated_file_carries_an_environment_value() {
+    let spec = spec_with(
+        vec![
+            McpServerSpec::stdio("s", "/bin/true", &[], &["SECRET_TOKEN".to_string()])
+                .expect("stdio"),
+        ],
+        Vec::new(),
+    );
+    for rendered in [
+        render_claude_mcp_json(&spec).expect("json"),
+        render_codex_config_toml(&spec).expect("toml"),
+    ] {
+        assert!(rendered.contains("SECRET_TOKEN"), "the name is declared");
+        assert!(
+            rendered.contains("${SECRET_TOKEN}"),
+            "and only as a placeholder: {rendered}"
+        );
+    }
+}
+
+// ------------------------------------------------------- placement and paths
+
+#[test]
+fn skill_directories_come_from_the_runtime_catalog() {
+    assert_eq!(runtime_skill_dir("claude"), Ok(".claude/skills"));
+    assert_eq!(runtime_skill_dir("codex"), Ok(".codex/skills"));
+    assert!(matches!(
+        runtime_skill_dir("not-a-runtime"),
+        Err(ConfigGenError::UnknownRuntime { .. })
+    ));
+}
+
+#[test]
+fn claude_project_root_is_the_spawn_working_directory() {
+    assert_eq!(
+        claude_project_config_root(),
+        crate::managed_agents::default_agent_workdir(),
+        "the project .mcp.json must land in the directory runtime.rs gives the child"
+    );
+}
+
+#[test]
+fn claude_write_places_skills_then_the_project_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let spec = spec_with(vec![stdio_server()], vec![skill("probe")]);
+
+    let planned = plan_claude_paths(root, &spec).expect("plan");
+    let written = write_claude_project_config(root, &spec).expect("write");
+    assert_eq!(planned, written, "the plan is exactly what is written");
+    assert_eq!(
+        written,
+        vec![
+            root.join(".claude/skills/probe/SKILL.md"),
+            root.join(".mcp.json"),
+        ],
+        "skills first, the config that activates them last"
+    );
+    assert!(root.join(".claude/skills/probe/SKILL.md").is_file());
+    let on_disk = std::fs::read_to_string(root.join(".mcp.json")).expect("read");
+    assert_eq!(on_disk, render_claude_mcp_json(&spec).expect("render"));
+}
+
+#[test]
+fn codex_write_places_skills_then_the_codex_home_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("workdir");
+    let codex_home = dir.path().join("codex-home");
+    let spec = spec_with(vec![stdio_server()], vec![skill("probe")]);
+
+    let planned = plan_codex_paths(&root, &codex_home, &spec).expect("plan");
+    let written = write_codex_config(&root, &codex_home, &spec).expect("write");
+    assert_eq!(planned, written);
+    assert_eq!(
+        written,
+        vec![
+            root.join(".codex/skills/probe/SKILL.md"),
+            codex_home.join("config.toml"),
+        ]
+    );
+    assert!(codex_home.join("config.toml").is_file());
+}
+
+/// The catalog places one named pinned skill where each runtime discovers it.
+#[test]
+fn each_runtime_discovers_its_pinned_skill_at_the_catalog_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let spec = spec_with(Vec::new(), vec![skill("openseo-smoke")]);
+    write_claude_project_config(root, &spec).expect("claude write");
+    write_codex_config(root, &root.join("codex-home"), &spec).expect("codex write");
+    for runtime in ["claude", "codex"] {
+        let skill_dir = runtime_skill_dir(runtime).expect("catalog skill dir");
+        let listed: Vec<String> = std::fs::read_dir(root.join(skill_dir))
+            .expect("skill dir exists")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            listed,
+            vec!["openseo-smoke".to_string()],
+            "{runtime} catalog lists exactly the pinned skill"
+        );
+        assert!(root
+            .join(skill_dir)
+            .join("openseo-smoke")
+            .join("SKILL.md")
+            .is_file());
+    }
+}
+
+// ------------------------------------------------------------- torn state
+
+/// A failure part-way through must leave a consistent prefix: the config file
+/// that grants the agent the servers is never written when a skill write fails.
+#[test]
+fn a_failed_skill_write_leaves_no_mcp_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    // Occupy the second skill's directory path with a regular file so
+    // `create_dir_all` for it fails inside the production writer.
+    std::fs::create_dir_all(root.join(".claude/skills")).expect("mkdir");
+    std::fs::write(root.join(".claude/skills/second"), b"blocker").expect("write blocker");
+
+    let spec = spec_with(vec![stdio_server()], vec![skill("first"), skill("second")]);
+    let err = write_claude_project_config(root, &spec).expect_err("must fail");
+    assert!(
+        matches!(&err, ConfigGenError::Io { path, .. } if path.contains("second")),
+        "the failure names the path it failed on: {err}"
+    );
+    assert!(
+        root.join(".claude/skills/first/SKILL.md").is_file(),
+        "the prefix written before the failure is complete"
+    );
+    assert!(
+        !root.join(".mcp.json").exists(),
+        "no server is activated by a partial write"
+    );
+}
+
+#[test]
+fn no_temporary_file_survives_a_successful_write() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    write_claude_project_config(root, &spec_with(vec![stdio_server()], vec![skill("probe")]))
+        .expect("write");
+    let leftovers: Vec<String> = std::fs::read_dir(root)
+        .expect("read root")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("buzz-config-gen"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "temp files left behind: {leftovers:?}"
+    );
+}
+
+// -------------------------------------------- the operator's config is safe
+
+/// Nothing this module writes can land in the operator's own Claude or Codex
+/// configuration. The planners report the complete write set, and every path in
+/// it is under the caller's root.
+#[test]
+fn generation_never_targets_the_operators_own_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let codex_home = root.join("codex-home");
+    let spec = spec_with(vec![stdio_server()], vec![skill("probe")]);
+
+    let home = dirs::home_dir().expect("home");
+    let forbidden = [
+        home.join(".claude.json"),
+        home.join(".claude").join("settings.json"),
+        home.join(".codex").join("config.toml"),
+        home.join(".mcp.json"),
+    ];
+    let home_state: Vec<bool> = forbidden.iter().map(|p| p.exists()).collect();
+
+    let mut all = plan_claude_paths(root, &spec).expect("claude plan");
+    all.extend(plan_codex_paths(root, &codex_home, &spec).expect("codex plan"));
+    all.extend(write_claude_project_config(root, &spec).expect("claude write"));
+    all.extend(write_codex_config(root, &codex_home, &spec).expect("codex write"));
+
+    for path in &all {
+        assert!(
+            path.starts_with(root),
+            "{} escapes the caller's root",
+            path.display()
+        );
+        assert!(
+            !forbidden.contains(path),
+            "{} is the operator's own config",
+            path.display()
+        );
+    }
+    assert_eq!(
+        home_state,
+        forbidden.iter().map(|p| p.exists()).collect::<Vec<bool>>(),
+        "generation changed whether an operator config file exists"
+    );
+}
