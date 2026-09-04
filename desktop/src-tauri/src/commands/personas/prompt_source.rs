@@ -49,6 +49,11 @@ pub struct SetPromptSourceResult {
     /// Machine-local: it is never part of the published definition.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// The definition's stored instructions after the reload, so the open
+    /// dialog can show the file's text instead of the draft it replaced.
+    /// Absent on a clear.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
 }
 
 /// Set (or clear) the prompt file bound to `definition_id` and reload it.
@@ -107,6 +112,7 @@ pub async fn set_prompt_source_and_reload(
             publish: None,
             relay_message: None,
             path: None,
+            prompt: None,
         });
     };
 
@@ -130,7 +136,7 @@ async fn submit_reloaded_prompt(
     path: String,
     request: UpdatePersonaRequest,
 ) -> Result<SetPromptSourceResult, String> {
-    let (_, prepared): (_, Result<PreparedPersonaPublication, String>) =
+    let (persona, prepared): (_, Result<PreparedPersonaPublication, String>) =
         super::update::update_persona_with(request, app.clone(), |app, state, persona| {
             let prepared = prepare_persona_publication(app, state, persona, None);
             crate::commands::refresh_team_catalog_heads_for_persona(app, state, &persona.id);
@@ -149,6 +155,7 @@ async fn submit_reloaded_prompt(
                 publish: Some(format!("failed:{reason}")),
                 relay_message: None,
                 path: Some(path),
+                prompt: Some(persona.system_prompt),
             });
         }
     };
@@ -166,5 +173,6 @@ async fn submit_reloaded_prompt(
         ),
         relay_message: published.relay_message,
         path: Some(path),
+        prompt: Some(persona.system_prompt),
     })
 }

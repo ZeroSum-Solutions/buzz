@@ -210,6 +210,52 @@ export type PersonaSharePublicationResult = {
   relayMessage: string | null;
 };
 
+/**
+ * Outcome of `set_prompt_source_and_reload`.
+ *
+ * `publish` is a string, not the two-state publication status, because a
+ * reload has a third outcome: the local record can be saved while the durable
+ * enqueue fails (`failed:<reason>`). It is `null` when nothing was submitted —
+ * the clear path. `path` is machine-local and is never published.
+ */
+export type PromptSourceResult = {
+  localUpdated: boolean;
+  publish: string | null;
+  relayMessage: string | null;
+  path: string | null;
+  prompt: string | null;
+};
+
+type RawPromptSourceResult = {
+  localUpdated: boolean;
+  publish?: string;
+  relayMessage?: string;
+  path?: string;
+  prompt?: string;
+};
+
+/**
+ * Bind an agent definition to a prompt file on this machine and reload it.
+ *
+ * `path` `null` clears the binding and leaves the stored instructions alone.
+ */
+export async function setPromptSourceAndReload(
+  definitionId: string,
+  path: string | null,
+): Promise<PromptSourceResult> {
+  const raw = await invokeTauri<RawPromptSourceResult>(
+    "set_prompt_source_and_reload",
+    { definitionId, path },
+  );
+  return {
+    localUpdated: raw.localUpdated,
+    publish: raw.publish ?? null,
+    relayMessage: raw.relayMessage ?? null,
+    path: raw.path ?? null,
+    prompt: raw.prompt ?? null,
+  };
+}
+
 export type SnapshotMemoryLevel = "none" | "core" | "everything";
 export type SnapshotFormat = "json" | "png";
 

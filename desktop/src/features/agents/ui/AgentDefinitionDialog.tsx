@@ -85,6 +85,7 @@ import { useProviderApiKeyFieldState } from "./providerApiKeyFieldState";
 import { buildRuntimeModelProviderPayload } from "./agentDefinitionSubmitPayload";
 import { AgentDefinitionDialogFooter } from "./AgentDefinitionDialogFooter";
 import { AgentDefinitionDialogShell } from "./AgentDefinitionDialogShell";
+import { PromptSourceField } from "./PromptSourceField";
 import { AddCustomHarnessDialog } from "./AddCustomHarnessDialog";
 import {
   ADD_CUSTOM_HARNESS_OPTION,
@@ -189,6 +190,10 @@ export function AgentDefinitionDialog({
     [globalConfig.preferred_runtime, runtimes],
   );
   const isCreateMode = Boolean(initialValues && !("id" in initialValues));
+  // Reloading writes straight to a stored definition, so the field only
+  // exists in edit mode, where there is an id to write to.
+  const editedDefinitionId =
+    initialValues && "id" in initialValues ? initialValues.id : null;
   const shouldReduceMotion = useReducedMotion();
   const initialModelProviderEditableWithoutRuntime = Boolean(
     initialValues &&
@@ -792,6 +797,18 @@ export function AgentDefinitionDialog({
               value={systemPrompt}
             />
           </div>
+          {editedDefinitionId ? (
+            <PromptSourceField
+              definitionId={editedDefinitionId}
+              disabled={isPending}
+              onPromptReloaded={(prompt) => {
+                setSystemPrompt(prompt);
+                // The reload already saved the definition, so the dialog is
+                // showing what is stored, not an unsaved edit.
+                setHasUserChanges(false);
+              }}
+            />
+          ) : null}
         </div>
 
         {modelFieldVisible ? (

@@ -329,6 +329,31 @@ buzz messages send --channel <channel-id> --reply-to <thread-root-id> \
   --mention <agent-pubkey> --content '!cancel'
 ```
 
+## Instructions from a file (prompt source)
+
+An agent's instructions can be bound to a file on the operator's machine and
+reloaded into the definition. Three facts about this feature are load-bearing:
+
+1. **It is a desktop feature, not a harness capability.** No harness advertises
+   or receives anything about it, so `KnownAcpRuntime` is unchanged and nothing
+   is projected through the agent config core. The binding is stored in a
+   machine-local sidecar (`<app-data>/agents/prompt-sources.json`, definition id
+   to absolute path) that never reaches the relay; only the prompt *text* is
+   published, in the ordinary kind:30175 head.
+2. **Reload is an ordinary definition save.** `set_prompt_source_and_reload`
+   submits the file's text through the same persona update path a typed edit
+   takes (`update_persona_with`), so definition-text validation, the kind:30175
+   publish, and `persona_content_hash` all behave identically. Do not add a
+   second write path for it.
+3. **`publish` has three outcomes, not two.** `published`, `queued`, and
+   `failed:<reason>` — the local save can land while the durable enqueue does
+   not, and reporting that as `queued` would claim a retry that was never
+   recorded. `publish` is absent on the clear path, where nothing is submitted.
+
+The field is edit-mode only (a reload writes to a stored definition, so it
+needs an id). Reload stays disabled until a path is typed and Clear until a
+binding exists.
+
 ## The tests that enforce this
 
 - `lib/agentConfigCore.test.mjs` — field model per harness × scope, clearing
@@ -372,6 +397,14 @@ buzz messages send --channel <channel-id> --reply-to <thread-root-id> \
 - `lib/agentDescription.test.mjs` — authored-description resolution: trim,
   blank/missing → null.
 - Rust: `runtime_metadata_env_vars` tests pin spawn-time key application.
+- `ui/promptSourceActions.test.mjs` — Reload disabled with no path (and while a
+  reload is in flight), Clear disabled with no stored binding, and the
+  `queued` vs `failed:` messages staying distinguishable.
+- Rust: `managed_agents::prompt_source` tests pin the path rules (missing file,
+  symlink out of home, over the 64 KiB cap, non-UTF-8, relative, directory),
+  that clearing removes only the named mapping, and that a reload moves
+  `persona_content_hash` while the published kind:30175 content carries the
+  prompt text and never the file path.
 - Rust: persona sharing/retention tests pin relay+owner scoping, durable
   enqueue errors, relay rejection/unavailability, and accepted publication.
 - Rust: `definition_validation` and inbound persona tests pin the shared
