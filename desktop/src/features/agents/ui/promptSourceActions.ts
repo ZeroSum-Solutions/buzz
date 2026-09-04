@@ -13,15 +13,17 @@ export function canReloadPromptSource(
 }
 
 /**
- * Clear removes a stored binding. It is enabled only once one exists — before
- * the first successful reload there is nothing on disk to remove, and offering
- * the action would suggest otherwise.
+ * Clear removes a stored binding, and is offered whenever the field is usable.
+ *
+ * The dialog cannot read the sidecar back — the feature has one backend
+ * command and no getter — so on every re-open it knows of no binding even when
+ * one exists. Gating Clear on what the dialog has seen this session would make
+ * a binding whose file has been moved or deleted unclearable, which is exactly
+ * when a user needs it. Unbinding what is already unbound is a no-op the
+ * backend accepts, so offering the action always is the safe direction.
  */
-export function canClearPromptSource(
-  hasStoredSource: boolean,
-  isPending: boolean,
-): boolean {
-  return !isPending && hasStoredSource;
+export function canClearPromptSource(isPending: boolean): boolean {
+  return !isPending;
 }
 
 /**
@@ -38,15 +40,18 @@ export function promptSourceStatusMessage(
   if (!result.localUpdated) {
     return "Prompt file unlinked. Instructions stay as they are.";
   }
+  const mapping = result.mappingError
+    ? ` The file was not remembered for next time: ${result.mappingError}`
+    : "";
   const publish = result.publish ?? "";
   if (publish === "published") {
-    return "Instructions reloaded from the file and published.";
+    return `Instructions reloaded from the file and published.${mapping}`;
   }
   if (publish === "queued") {
-    return "Instructions reloaded from the file. The catalog update is queued.";
+    return `Instructions reloaded from the file. The catalog update is queued.${mapping}`;
   }
   if (publish.startsWith("failed:")) {
-    return `Instructions reloaded from the file, but the catalog update was not queued: ${publish.slice("failed:".length)}`;
+    return `Instructions reloaded from the file, but the catalog update was not queued: ${publish.slice("failed:".length)}${mapping}`;
   }
-  return "Instructions reloaded from the file.";
+  return `Instructions reloaded from the file.${mapping}`;
 }

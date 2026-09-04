@@ -342,17 +342,26 @@ reloaded into the definition. Three facts about this feature are load-bearing:
    published, in the ordinary kind:30175 head.
 2. **Reload is an ordinary definition save.** `set_prompt_source_and_reload`
    submits the file's text through the same persona update path a typed edit
-   takes (`update_persona_with`), so definition-text validation, the kind:30175
-   publish, and `persona_content_hash` all behave identically. Do not add a
-   second write path for it.
+   takes (`update_persona_with_precondition`), so definition-text validation,
+   the kind:30175 publish, and `persona_content_hash` all behave identically.
+   Do not add a second write path for it. The order inside the command is
+   validate, read, persona save, **then** the sidecar mapping: the mapping is a
+   claim that the file's text is what the agent uses, so a failure at any
+   earlier boundary must leave no mapping. Because the definition is read in one
+   store-lock hold and saved in another, the read pass captures `updated_at` and
+   the save refuses if it moved — a concurrent dialog edit is reported, never
+   clobbered by the request's replace-everything fields.
 3. **`publish` has three outcomes, not two.** `published`, `queued`, and
    `failed:<reason>` — the local save can land while the durable enqueue does
    not, and reporting that as `queued` would claim a retry that was never
    recorded. `publish` is absent on the clear path, where nothing is submitted.
 
 The field is edit-mode only (a reload writes to a stored definition, so it
-needs an id). Reload stays disabled until a path is typed and Clear until a
-binding exists.
+needs an id). Reload stays disabled until a path is typed. Clear stays offered
+whenever the field is usable: the feature has one backend command and no
+getter, so the dialog cannot read the stored binding back on re-open, and
+gating Clear on what it has seen this session would strand a binding whose file
+has been moved or deleted. Unbinding what is already unbound is a no-op.
 
 ## The tests that enforce this
 
@@ -398,13 +407,29 @@ binding exists.
   blank/missing → null.
 - Rust: `runtime_metadata_env_vars` tests pin spawn-time key application.
 - `ui/promptSourceActions.test.mjs` — Reload disabled with no path (and while a
-  reload is in flight), Clear disabled with no stored binding, and the
-  `queued` vs `failed:` messages staying distinguishable.
+  reload is in flight), Clear offered regardless of a seen binding, and the
+  `queued` / `failed:` / mapping-error messages staying distinguishable.
+- `ui/PromptSourceField.test.mjs` — the field mounted in JSDOM: button gating,
+  one command per click with the typed path, the resolved path replacing what
+  was typed, a refused path surfaced in the status line, and Clear sending
+  `path: null`.
+- `ui/agentDefinitionDialogPromptSource.test.mjs` — the field inside the real
+  dialog: edit-mode only, and a reload replacing the text in the dialog's own
+  "Agent instructions" textarea.
 - Rust: `managed_agents::prompt_source` tests pin the path rules (missing file,
   symlink out of home, over the 64 KiB cap, non-UTF-8, relative, directory),
-  that clearing removes only the named mapping, and that a reload moves
-  `persona_content_hash` while the published kind:30175 content carries the
-  prompt text and never the file path.
+  that preparation writes nothing until the mapping is committed, that clearing
+  removes only the named mapping, that a reload moves `persona_content_hash`
+  while the published kind:30175 content carries the prompt text and never the
+  file path, and that the reloaded bytes are what a restart resolves into
+  `BUZZ_ACP_SYSTEM_PROMPT`.
+- Rust: `commands::personas::prompt_source` tests drive the command itself over
+  a mock runtime — the result schema, and one injected failure per boundary
+  (validate, read, persona save, mapping write) each asserting the stored
+  mapping and the effective prompt still agree — plus the lost-update guard.
+- Rust: `buzz-acp`'s `session_new_delivers_reloaded_prompt_source_file_bytes`
+  closes the delivery seam: the same bytes reach the ACP `session/new` request
+  in both the bare-field and Claude `_meta` framings.
 - Rust: persona sharing/retention tests pin relay+owner scoping, durable
   enqueue errors, relay rejection/unavailability, and accepted publication.
 - Rust: `definition_validation` and inbound persona tests pin the shared

@@ -28,8 +28,9 @@ type PromptSourceFieldProps = {
  * text into the definition.
  *
  * The path is machine-local: only the prompt text is published. Reload is
- * disabled until a path is typed; Clear is disabled until a binding exists,
- * so neither button offers an action that has nothing to act on.
+ * disabled until a path is typed. Clear stays available, because the dialog
+ * cannot read the stored binding back and must still be able to unbind a
+ * prompt file that has been moved or deleted.
  */
 export function PromptSourceField({
   definitionId,
@@ -37,14 +38,13 @@ export function PromptSourceField({
   onPromptReloaded,
 }: PromptSourceFieldProps) {
   const [path, setPath] = React.useState("");
-  const [storedPath, setStoredPath] = React.useState<string | null>(null);
   const [isPending, setIsPending] = React.useState(false);
   const [notice, setNotice] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
 
   const busy = disabled || isPending;
   const reloadEnabled = canReloadPromptSource(path, busy);
-  const clearEnabled = canClearPromptSource(storedPath !== null, busy);
+  const clearEnabled = canClearPromptSource(busy);
 
   const run = async (nextPath: string | null) => {
     setIsPending(true);
@@ -52,7 +52,6 @@ export function PromptSourceField({
     setNotice(null);
     try {
       const result = await setPromptSourceAndReload(definitionId, nextPath);
-      setStoredPath(result.path);
       if (result.path !== null) {
         setPath(result.path);
       }

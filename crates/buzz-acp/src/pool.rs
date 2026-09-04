@@ -279,7 +279,7 @@ pub struct OwnedAgent {
 /// on `session/new` — the feature landed in v0.6.0 (Oct 2025), before the
 /// `@zed-industries/claude-code-acp` → `@agentclientprotocol/claude-agent-acp`
 /// rename, so the new name is a reliable capability gate.
-const CLAUDE_AGENT_ACP_NAME: &str = "@agentclientprotocol/claude-agent-acp";
+pub(crate) const CLAUDE_AGENT_ACP_NAME: &str = "@agentclientprotocol/claude-agent-acp";
 
 fn has_system_prompt_support(
     protocol_version: u32,
@@ -295,7 +295,11 @@ fn has_system_prompt_support(
     }
 }
 
-fn session_new_system_prompt<'a>(
+/// The `session/new` system-prompt transport for an adapter.
+///
+/// `pub(crate)` so the delivery-seam test in [`crate::acp`] can put a prompt
+/// through the same choice production makes, rather than restating it.
+pub(crate) fn session_new_system_prompt<'a>(
     is_goose: bool,
     protocol_version: u32,
     agent_name: &str,

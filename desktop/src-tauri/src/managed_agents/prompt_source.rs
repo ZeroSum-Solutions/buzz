@@ -35,14 +35,19 @@ pub(crate) const MAX_PROMPT_SOURCE_BYTES: usize = 64 * 1024;
 /// Definition id → absolute prompt-file path, as stored in the sidecar.
 pub(crate) type PromptSourceMap = BTreeMap<String, String>;
 
-/// What [`set_prompt_source_at`] did.
+/// What [`prepare_prompt_source`] resolved, before anything was written.
+///
+/// Preparation performs no writes at all: the sidecar is only touched by
+/// [`commit_prompt_source_at`], which the command calls **after** the persona
+/// save succeeded. That order is what keeps the stored mapping and the
+/// effective prompt in agreement when any earlier step fails.
 #[derive(Debug)]
 pub(crate) enum PromptSourceChange {
-    /// The mapping for the definition was removed; nothing was read.
+    /// The caller asked to unbind the definition; nothing was read.
     Cleared,
-    /// The mapping was stored and the file read.
+    /// The path validated and the file was read.
     Loaded {
-        /// The symlink-resolved absolute path that was stored.
+        /// The symlink-resolved absolute path to store.
         path: PathBuf,
         /// The file's text, to be submitted as the definition's prompt.
         prompt: String,
@@ -135,46 +140,54 @@ pub(crate) fn read_prompt_source(path: &Path) -> Result<String, String> {
         .map_err(|_| format!("Prompt file is not valid UTF-8: {}", path.display()))
 }
 
-/// Set or clear the prompt source for `definition_id` in the sidecar at
-/// `store_path`, returning the prompt text the caller should submit.
+/// Validate `raw_path` and read the file it names, writing nothing.
 ///
-/// `raw_path` `None` clears the mapping. `Some` validates and reads the file
-/// **before** the sidecar is written, so a rejected path never leaves a
-/// mapping that points at something unusable.
-pub(crate) fn set_prompt_source_at(
-    store_path: &Path,
-    definition_id: &str,
+/// `raw_path` `None` resolves to [`PromptSourceChange::Cleared`]. `Some`
+/// validates the path and reads the file. No sidecar write happens here, so a
+/// caller that fails later — definition-text validation, the persona save —
+/// leaves no mapping behind that points at a prompt the agent never received.
+pub(crate) fn prepare_prompt_source(
     raw_path: Option<&str>,
     home: &Path,
 ) -> Result<PromptSourceChange, String> {
-    let mut sources = load_prompt_sources_at(store_path)?;
-
     let Some(raw_path) = raw_path else {
-        if sources.remove(definition_id).is_some() {
-            save_prompt_sources_at(store_path, &sources)?;
-        }
         return Ok(PromptSourceChange::Cleared);
     };
 
     let resolved = resolve_prompt_source_path(raw_path, home)?;
     let prompt = read_prompt_source(&resolved)?;
-
-    let stored = resolved
-        .to_str()
-        .ok_or_else(|| {
-            format!(
-                "Prompt file path is not valid UTF-8: {}",
-                resolved.display()
-            )
-        })?
-        .to_string();
-    sources.insert(definition_id.to_string(), stored);
-    save_prompt_sources_at(store_path, &sources)?;
-
     Ok(PromptSourceChange::Loaded {
         path: resolved,
         prompt,
     })
+}
+
+/// Store (`Some`) or remove (`None`) the mapping for `definition_id` in the
+/// sidecar at `store_path`.
+///
+/// The last step of a reload, run only once the prompt is durably the
+/// definition's own: a mapping is a claim that the file's text is what the
+/// agent uses, and this is the first moment that claim is true.
+pub(crate) fn commit_prompt_source_at(
+    store_path: &Path,
+    definition_id: &str,
+    path: Option<&Path>,
+) -> Result<(), String> {
+    let mut sources = load_prompt_sources_at(store_path)?;
+
+    let Some(path) = path else {
+        if sources.remove(definition_id).is_some() {
+            save_prompt_sources_at(store_path, &sources)?;
+        }
+        return Ok(());
+    };
+
+    let stored = path
+        .to_str()
+        .ok_or_else(|| format!("Prompt file path is not valid UTF-8: {}", path.display()))?
+        .to_string();
+    sources.insert(definition_id.to_string(), stored);
+    save_prompt_sources_at(store_path, &sources)
 }
 
 /// The definition a reloaded prompt produces.

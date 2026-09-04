@@ -1,0 +1,215 @@
+/**
+ * The prompt-source field inside its real parent, AgentDefinitionDialog.
+ *
+ * `PromptSourceField.test.mjs` holds the field's own button behaviour. This
+ * mounts the production dialog and holds the wiring only the parent can show:
+ *
+ *   - the field appears in edit mode (an `initialValues` with an `id`) and not
+ *     in create mode, because a reload writes to a stored definition;
+ *   - a reload replaces the text in the dialog's own "Agent instructions"
+ *     textarea — the propagation the feature exists for;
+ *   - Clear leaves that textarea alone.
+ *
+ * Mutation proofs: dropping `setSystemPrompt` from the dialog's
+ * `onPromptReloaded` → the propagation assertion fails; rendering the field
+ * unconditionally → the create-mode assertion fails.
+ */
+
+import assert from "node:assert/strict";
+import { after, afterEach, before, test } from "node:test";
+import { JSDOM } from "jsdom";
+
+const dom = new JSDOM("<!doctype html><html><body></body></html>", {
+  url: "http://localhost",
+});
+
+Object.assign(globalThis, {
+  document: dom.window.document,
+  window: dom.window,
+  IS_REACT_ACT_ENVIRONMENT: true,
+  localStorage: dom.window.localStorage,
+  self: dom.window,
+  ResizeObserver: class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  },
+});
+Object.defineProperty(globalThis, "navigator", {
+  configurable: true,
+  value: dom.window.navigator,
+  writable: true,
+});
+dom.window.requestAnimationFrame = (cb) => setTimeout(cb, 0);
+globalThis.requestAnimationFrame = dom.window.requestAnimationFrame;
+dom.window.matchMedia ??= (query) => ({
+  matches: false,
+  media: query,
+  onchange: null,
+  addListener: () => {},
+  removeListener: () => {},
+  addEventListener: () => {},
+  removeEventListener: () => {},
+  dispatchEvent: () => false,
+});
+globalThis.matchMedia = dom.window.matchMedia;
+for (const key of Object.getOwnPropertyNames(dom.window)) {
+  if (key === "window" || key === "document" || key === "globalThis") continue;
+  const value = dom.window[key];
+  if (
+    typeof value === "function" &&
+    /^(HTML|SVG)|Element$|Event$|EventTarget$|^Node|^Document|Observer$/.test(
+      key,
+    )
+  ) {
+    globalThis[key] = value;
+  }
+}
+globalThis.getComputedStyle = dom.window.getComputedStyle.bind(dom.window);
+
+let promptSourceCalls = [];
+let promptSourceResult = { localUpdated: true };
+
+globalThis.__TAURI_INTERNALS__ = {
+  invoke: (cmd, payload) => {
+    if (cmd === "set_prompt_source_and_reload") {
+      promptSourceCalls.push(payload);
+      return Promise.resolve(promptSourceResult);
+    }
+    if (cmd === "get_global_agent_config") {
+      return Promise.resolve({
+        env_vars: {},
+        provider: null,
+        model: null,
+        preferred_runtime: null,
+      });
+    }
+    if (cmd === "get_baked_build_env" || cmd === "get_baked_build_env_keys") {
+      return Promise.resolve([]);
+    }
+    if (cmd === "discover_agent_models") {
+      return Promise.resolve({ options: [], is_optional: true });
+    }
+    if (cmd === "get_runtime_file_config") return Promise.resolve(null);
+    return Promise.resolve(null);
+  },
+  transformCallback: () => 1,
+};
+dom.window.__TAURI_INTERNALS__ = globalThis.__TAURI_INTERNALS__;
+
+const clients = [];
+let act, render, screen, cleanup, fireEvent, createElement;
+let AgentDefinitionDialog, QueryClient, QueryClientProvider;
+
+before(async () => {
+  ({ act, render, screen, cleanup, fireEvent } = await import(
+    "@testing-library/react"
+  ));
+  ({ createElement } = await import("react"));
+  ({ AgentDefinitionDialog } = await import("./AgentDefinitionDialog.tsx"));
+  ({ QueryClient, QueryClientProvider } = await import(
+    "@tanstack/react-query"
+  ));
+});
+
+afterEach(() => {
+  cleanup?.();
+  for (const client of clients.splice(0)) {
+    client.cancelQueries();
+    client.clear();
+  }
+  promptSourceCalls = [];
+  promptSourceResult = { localUpdated: true };
+});
+
+after(() => dom.window.close());
+
+function mount(initialValues) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, gcTime: 0 } },
+  });
+  clients.push(client);
+  render(
+    createElement(
+      QueryClientProvider,
+      { client },
+      createElement(AgentDefinitionDialog, {
+        description: "Edit the agent definition.",
+        embedded: true,
+        error: null,
+        initialValues,
+        isPending: false,
+        onOpenChange: () => {},
+        onSubmit: async () => {},
+        open: true,
+        runtimes: [],
+        runtimesLoading: false,
+        submitLabel: "Save",
+        title: "Edit agent",
+      }),
+    ),
+  );
+}
+
+const editValues = {
+  id: "pm",
+  displayName: "PM",
+  systemPrompt: "Old instructions.",
+};
+
+const instructions = () => screen.getByLabelText(/Agent instructions/i);
+const promptSourceInput = () => screen.getByLabelText(/Instructions file/i);
+
+test("the instructions-file field is edit-mode only", async () => {
+  await act(async () => mount({ displayName: "New", systemPrompt: "" }));
+  assert.equal(
+    screen.queryByLabelText(/Instructions file/i),
+    null,
+    "create mode has no stored definition to reload into",
+  );
+
+  cleanup();
+  await act(async () => mount(editValues));
+  assert.ok(promptSourceInput(), "edit mode offers the field");
+});
+
+test("a reload replaces the dialog's instructions text", async () => {
+  promptSourceResult = {
+    localUpdated: true,
+    publish: "published",
+    path: "/Users/me/agent-prompts/pm.md",
+    prompt: "Ship the roadmap.\n",
+  };
+  await act(async () => mount(editValues));
+  assert.equal(instructions().value, "Old instructions.");
+
+  await act(async () => {
+    fireEvent.change(promptSourceInput(), {
+      target: { value: "/Users/me/agent-prompts/pm.md" },
+    });
+  });
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Reload" }));
+  });
+
+  assert.deepEqual(promptSourceCalls, [
+    { definitionId: "pm", path: "/Users/me/agent-prompts/pm.md" },
+  ]);
+  assert.equal(
+    instructions().value,
+    "Ship the roadmap.\n",
+    "the file's text must land in the instructions the dialog shows",
+  );
+});
+
+test("Clear unbinds without touching the instructions text", async () => {
+  promptSourceResult = { localUpdated: false };
+  await act(async () => mount(editValues));
+
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+  });
+
+  assert.deepEqual(promptSourceCalls, [{ definitionId: "pm", path: null }]);
+  assert.equal(instructions().value, "Old instructions.");
+});

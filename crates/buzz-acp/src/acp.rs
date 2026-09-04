@@ -3507,6 +3507,85 @@ mod tests {
         );
     }
 
+    /// The delivery seam, harness half: a prompt reloaded from a file on the
+    /// desktop must reach the ACP `session/new` request byte-for-byte after the
+    /// agent restarts.
+    ///
+    /// A restart writes the definition's prompt into `BUZZ_ACP_SYSTEM_PROMPT`
+    /// (`desktop/src-tauri/src/managed_agents/runtime.rs:650`), which lands in
+    /// `Config::system_prompt` and is handed to `session_new_full` through
+    /// `pool::session_new_system_prompt`. This drives real file bytes through
+    /// that production transport choice and asserts what the adapter actually
+    /// receives, for both framings. The desktop half — those bytes being what a
+    /// restart resolves — is
+    /// `reloaded_prompt_bytes_reach_the_spawn_env_after_a_restart` in
+    /// `desktop/src-tauri/src/managed_agents/prompt_source/tests.rs`.
+    #[tokio::test]
+    async fn session_new_delivers_reloaded_prompt_source_file_bytes() {
+        // Layout characters, non-ASCII and a trailing newline: everything a
+        // hand-edited prompt file carries that a naive trim would eat.
+        let file_text = "You are the PM.\n\n\tKeep a decision log — ünïcode, emoji 🐝.\n";
+        let path = std::env::temp_dir().join(format!(
+            "buzz-prompt-source-{}-{}.md",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, file_text).expect("write prompt file");
+        let prompt = std::fs::read_to_string(&path).expect("read prompt file back");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(prompt, file_text, "the reload carries the file's bytes");
+
+        // `read -r`: without it bash eats the backslashes in the JSON string
+        // escapes, and the echo-back would corrupt exactly the bytes under test.
+        let script = r#"
+            read -r -t 2 _init
+            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":2,"agentCapabilities":{}}}'
+            read -r -t 2 REQ
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_reload","_receivedRequest":'"$REQ"'}}'
+            sleep 1
+        "#;
+
+        // Field framing (buzz-agent and every non-Claude adapter on v2).
+        let mut client = spawn_script(script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        let transport =
+            crate::pool::session_new_system_prompt(false, 2, "buzz-agent", Some(prompt.as_str()));
+        let resp = client
+            .session_new_full("/tmp", vec![], transport, None)
+            .await
+            .expect("session_new_full should succeed");
+        assert_eq!(
+            resp.raw["_receivedRequest"]["params"]["systemPrompt"].as_str(),
+            Some(file_text),
+            "the adapter must receive the prompt file's bytes unchanged"
+        );
+
+        // Claude framing keeps the adapter's own preset and appends ours.
+        let mut client = spawn_script(script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        let transport = crate::pool::session_new_system_prompt(
+            false,
+            2,
+            crate::pool::CLAUDE_AGENT_ACP_NAME,
+            Some(prompt.as_str()),
+        );
+        let resp = client
+            .session_new_full("/tmp", vec![], transport, None)
+            .await
+            .expect("session_new_full should succeed");
+        assert_eq!(
+            resp.raw["_receivedRequest"]["params"]["_meta"]["systemPrompt"]["append"].as_str(),
+            Some(file_text),
+            "the Claude framing must append the prompt file's bytes unchanged"
+        );
+    }
+
     #[tokio::test]
     async fn goose_system_prompt_request_uses_set_contract() {
         let script = r#"

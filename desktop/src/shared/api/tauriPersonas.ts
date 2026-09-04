@@ -216,13 +216,16 @@ export type PersonaSharePublicationResult = {
  * `publish` is a string, not the two-state publication status, because a
  * reload has a third outcome: the local record can be saved while the durable
  * enqueue fails (`failed:<reason>`). It is `null` when nothing was submitted —
- * the clear path. `path` is machine-local and is never published.
+ * the clear path. `path` is machine-local and is never published; it is set
+ * exactly when a binding was stored, so it is `null` both after a clear and
+ * after a reload whose sidecar write failed — `mappingError` says which.
  */
 export type PromptSourceResult = {
   localUpdated: boolean;
   publish: string | null;
   relayMessage: string | null;
   path: string | null;
+  mappingError: string | null;
   prompt: string | null;
 };
 
@@ -231,6 +234,7 @@ type RawPromptSourceResult = {
   publish?: string;
   relayMessage?: string;
   path?: string;
+  mappingError?: string;
   prompt?: string;
 };
 
@@ -252,6 +256,7 @@ export async function setPromptSourceAndReload(
     publish: raw.publish ?? null,
     relayMessage: raw.relayMessage ?? null,
     path: raw.path ?? null,
+    mappingError: raw.mappingError ?? null,
     prompt: raw.prompt ?? null,
   };
 }
