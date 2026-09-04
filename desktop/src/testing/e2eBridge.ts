@@ -1739,6 +1739,60 @@ let mockMediaFetchControllers = new Map<string, AbortController>();
 let deferNextChannelsRead = false;
 let deferredChannelsReadResolve: (() => void) | null = null;
 
+/**
+ * Shared mock for `fetch_media_bytes` and `fetch_markdown_doc_bytes`: both
+ * real Rust commands stream through the same `request_id`-keyed
+ * cancellation registry (`begin_media_fetch` / `finish_media_fetch`), so
+ * this mirrors that with one `AbortController` per `requestId` — a spec
+ * asserting `__BUZZ_E2E_MEDIA_FETCH_STATE__.active` returns to zero after
+ * close/replace/community-switch exercises both commands identically.
+ */
+async function runCancellableMediaFetch(
+  input: { requestId?: string; url: string },
+  options?: { maxBytes?: number },
+): Promise<ArrayBuffer> {
+  const requestId = input.requestId ?? crypto.randomUUID();
+  const controller = new AbortController();
+  mockMediaFetchControllers.set(requestId, controller);
+  if (cancelledMediaFetchIds.has(requestId)) controller.abort();
+  if (!window.__BUZZ_E2E_MEDIA_FETCH_STATE__) {
+    window.__BUZZ_E2E_MEDIA_FETCH_STATE__ = { active: 0, peak: 0 };
+  }
+  const stats = window.__BUZZ_E2E_MEDIA_FETCH_STATE__;
+  stats.active += 1;
+  stats.peak = Math.max(stats.peak, stats.active);
+  try {
+    if (window.__BUZZ_E2E_HOLD_MEDIA_FETCHES__) {
+      await new Promise<never>((_resolve, reject) => {
+        const rejectCancelled = () =>
+          reject(new DOMException("fetch cancelled", "AbortError"));
+        if (controller.signal.aborted) {
+          rejectCancelled();
+          return;
+        }
+        controller.signal.addEventListener("abort", rejectCancelled, {
+          once: true,
+        });
+      });
+    }
+    const response = await fetch(input.url, { signal: controller.signal });
+    if (!response.ok) throw new Error(`fetch failed: ${response.status}`);
+    const buffer = await response.arrayBuffer();
+    if (
+      options?.maxBytes !== undefined &&
+      buffer.byteLength > options.maxBytes
+    ) {
+      throw new Error(
+        `file too large (max ${options.maxBytes / (1024 * 1024)} MiB)`,
+      );
+    }
+    return buffer;
+  } finally {
+    stats.active -= 1;
+    mockMediaFetchControllers.delete(requestId);
+  }
+}
+
 const mockDisplayNames = new Map<string, string>([
   [MOCK_IDENTITY_PUBKEY, DEFAULT_MOCK_IDENTITY.display_name],
   [ALICE_PUBKEY, "alice"],
@@ -14396,45 +14450,10 @@ export function maybeInstallE2eTauriMocks() {
           },
           activeConfig,
         );
-      case "fetch_media_bytes": {
-        // The real command fetches relay media through Rust reqwest and
-        // replies with raw bytes (`tauri::ipc::Response` → ArrayBuffer). In
-        // E2E the browser fetch suffices — specs serve the URL via page.route.
-        const input = payload as { requestId?: string; url: string };
-        const requestId = input.requestId ?? crypto.randomUUID();
-        const controller = new AbortController();
-        mockMediaFetchControllers.set(requestId, controller);
-        if (cancelledMediaFetchIds.has(requestId)) controller.abort();
-        if (!window.__BUZZ_E2E_MEDIA_FETCH_STATE__) {
-          window.__BUZZ_E2E_MEDIA_FETCH_STATE__ = { active: 0, peak: 0 };
-        }
-        const stats = window.__BUZZ_E2E_MEDIA_FETCH_STATE__;
-        stats.active += 1;
-        stats.peak = Math.max(stats.peak, stats.active);
-        try {
-          if (window.__BUZZ_E2E_HOLD_MEDIA_FETCHES__) {
-            await new Promise<never>((_resolve, reject) => {
-              const rejectCancelled = () =>
-                reject(new DOMException("fetch cancelled", "AbortError"));
-              if (controller.signal.aborted) {
-                rejectCancelled();
-                return;
-              }
-              controller.signal.addEventListener("abort", rejectCancelled, {
-                once: true,
-              });
-            });
-          }
-          const response = await fetch(input.url, {
-            signal: controller.signal,
-          });
-          if (!response.ok) throw new Error(`fetch failed: ${response.status}`);
-          return await response.arrayBuffer();
-        } finally {
-          stats.active -= 1;
-          mockMediaFetchControllers.delete(requestId);
-        }
-      }
+      case "fetch_media_bytes":
+        return runCancellableMediaFetch(
+          payload as { requestId?: string; url: string },
+        );
       case "cancel_media_fetch": {
         const requestId = (payload as { requestId?: string }).requestId;
         if (requestId) {
@@ -14451,6 +14470,16 @@ export function maybeInstallE2eTauriMocks() {
         }
         return null;
       }
+      case "fetch_markdown_doc_bytes":
+        // Shares `fetch_media_bytes`' cancellation registry (real Rust side
+        // shares the same `request_id`-keyed registry too) and additionally
+        // mirrors the real command's native 2 MiB viewer cap (enforced in
+        // Rust during the streamed fetch) so specs can prove the oversized
+        // fallback: the refusal message must match the Rust cap error shape.
+        return runCancellableMediaFetch(
+          payload as { requestId?: string; url: string },
+          { maxBytes: 2 * 1024 * 1024 },
+        );
       case "fetch_snapshot_bytes": {
         // The real command fetches + validates a snapshot attachment in memory
         // (size cap, SHA-256, decode). In E2E the bridge returns a minimal
