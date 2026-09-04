@@ -25,9 +25,12 @@ const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
 /// An MCP server configuration passed to `session/new`.
 ///
 /// Corresponds to the `McpServerStdio` variant in the ACP schema.
-/// All four fields are **required** by the schema (`args` and `env` may be empty arrays).
+/// `name`, `command`, `args` and `env` are **required** by the schema (`args`
+/// and `env` may be empty arrays); `trusted` is a Buzz extension and defaults
+/// to `false` when absent.
 /// `trusted` controls whether the agent runtime passes Buzz identity credentials
-/// (`BUZZ_PRIVATE_KEY`, `BUZZ_RELAY_URL`, `BUZZ_AUTH_TAG`) into the child process.
+/// (`BUZZ_PRIVATE_KEY`, `NOSTR_PRIVATE_KEY`, `BUZZ_RELAY_URL`, `BUZZ_AUTH_TAG`)
+/// into the child process.
 /// Only the built-in `buzz-dev-mcp` server is trusted; extra MCP servers
 /// configured via `BUZZ_ACP_EXTRA_MCP_COMMANDS` are untrusted and receive no
 /// Buzz credentials.
