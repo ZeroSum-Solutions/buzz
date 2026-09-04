@@ -25,7 +25,7 @@ through. Revision 3 folds in Sol's passes 1 and 2 on this plan (log at the end).
      if it fails, go back to step 1. `zs-land` reuses the open PR, requires green CI, squash-merges
      and syncs `zs/main`. It checks the base branch name, not the base SHA, so landings are
      strictly one at a time from this session and nothing else pushes to `zs/main` meanwhile.
-     After a PR is open, updates from `zs/main` come in by `git merge -s origin/zs/main`, never
+     After a PR is open, updates from `zs/main` come in by `git merge --signoff origin/zs/main`, never
      by rebase, because force-push is blocked on this machine.
   5. If a CI job fails on the fork for a reason outside the diff (missing secret, upstream-only
      runner), the fix is a fork-only edit to that job on `zs/main`. Never `--allow-no-ci`.
@@ -305,6 +305,26 @@ Created on the fork only when Devin asks. Titles:
 15. feat: Google Calendar scoped integration
 16. fix: harness discovery prefers the app bundle
 17. runbook: descriptions on the nine Broken English agents (operational)
+
+## Operational notes from wave 1 (2026-09-04)
+
+- The fork had Actions disabled (GitHub disables workflows on a fork that carried them). Enabled
+  once through the repository's Actions page; PR CI runs from then on.
+- Image and release workflows (`docker.yml`, `sprig-image.yml`, both helm charts,
+  `auto-tag-on-release-pr-merge.yml`, `desktop-release-candidate.yml`, `benchmark-harbor.yml`)
+  push to Block's registries and fail on the fork with `permission_denied`. They are disabled as a
+  repository setting, not by editing the files, so the fork keeps upstream parity.
+- `ci.yml` runs push CI on `zs/main` (fork-only edit) because the relay artifact cache is written
+  only on push events; without it every PR built the relay cold. The relay job's own limit is 75
+  minutes on the fork for the same reason.
+- Two flaky specs seen under load and green on rerun: `desktop/tests/e2e/empty-edit-delete.spec.ts`
+  and the buzz-agent `cancelled_turn_with_usage_emits_notification_before_response` test
+  (15 of 15 locally on both the branch and the baseline). Rerun before treating either as a
+  regression, and say so in the PR.
+- `zs-land` can report "PR MERGED, but cleanup incomplete". The merge is done; finish by hand and
+  do not re-run it.
+- Scratch import branches from ports (`pr-<N>`) are left in place; deleting a branch needs Devin's
+  explicit go-ahead on this machine.
 
 ## Review log
 
