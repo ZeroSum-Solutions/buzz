@@ -360,23 +360,113 @@ fn profile_target_dirs(root: &Path) -> [PathBuf; 2] {
     }
 }
 
-fn command_search_dirs() -> Vec<PathBuf> {
-    let mut dirs = profile_target_dirs(&workspace_root_dir()).to_vec();
-    if let Ok(current_dir) = std::env::current_dir() {
-        dirs.extend(profile_target_dirs(&current_dir));
+/// True when `path` sits inside a macOS `.app` bundle — i.e. some ancestor
+/// component ends in `.app`. `path` is typically the current exe's parent
+/// directory (`Contents/MacOS/` inside a bundle). Case-insensitive: the
+/// default macOS filesystem (APFS) is case-insensitive-but-preserving, so
+/// `.App`/`.APP` name the same bundle as `.app`.
+fn is_inside_app_bundle(path: &Path) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|s| s.to_ascii_lowercase().ends_with(".app"))
+    })
+}
+
+/// Order the harness search directories, deduplicated, so a bundle's own
+/// binaries win over a workspace `target/` dir that happens to exist on the
+/// same machine (a stray sibling checkout must not shadow the shipped
+/// binary). `exe_parent` is the current executable's parent directory;
+/// `workspace_dirs` are the workspace/current-dir `target/` profile
+/// directories a dev build would search.
+fn order_search_dirs(exe_parent: Option<PathBuf>, workspace_dirs: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    let bundle_dir = exe_parent.as_ref().filter(|p| is_inside_app_bundle(p));
+    if let Some(bundle) = bundle_dir {
+        dirs.push(bundle.clone());
     }
 
-    dirs.extend(
-        std::env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(Path::to_path_buf)),
-    );
+    dirs.extend(workspace_dirs);
+    dirs.extend(exe_parent);
+
     dirs.into_iter().fold(Vec::new(), |mut unique, dir| {
         if !unique.contains(&dir) {
             unique.push(dir);
         }
         unique
     })
+}
+
+fn command_search_dirs() -> Vec<PathBuf> {
+    let mut workspace_dirs = profile_target_dirs(&workspace_root_dir()).to_vec();
+    if let Ok(current_dir) = std::env::current_dir() {
+        workspace_dirs.extend(profile_target_dirs(&current_dir));
+    }
+
+    order_search_dirs(exe_parent_for_search(), workspace_dirs)
+}
+
+/// The exe parent [`command_search_dirs`] searches from: the real
+/// `std::env::current_exe()`'s parent, unless a test has set
+/// [`set_exe_parent_override_for_test`].
+///
+/// The override exists because `std::env::current_exe()` inside a `cargo
+/// test` process is always the test runner's own binary, which is never
+/// itself packaged inside a `.app` bundle — there is no way to make the
+/// *real* exe parent bundle-shaped from inside a test. The override lets
+/// the production entry points (`command_search_dirs`, `resolve_command`,
+/// `resolve_command_cached`, `resolve_workspace_command`) be exercised
+/// end-to-end with a bundle-shaped path instead of only through the
+/// extracted `order_search_dirs`/`resolve_workspace_command_from` helpers.
+fn exe_parent_for_search() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        if let Some(overridden) = exe_parent_override_cell()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            return Some(overridden);
+        }
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+}
+
+/// Process-global cell backing [`set_exe_parent_override_for_test`]. Test-only.
+#[cfg(test)]
+fn exe_parent_override_cell() -> &'static std::sync::Mutex<Option<PathBuf>> {
+    use std::sync::{Mutex, OnceLock};
+    static CELL: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+/// Set (or clear, with `None`) the exe-parent override consulted by
+/// [`exe_parent_for_search`]. The override is process-global: hold
+/// [`exe_parent_override_test_lock`] for the lifetime of the override so a
+/// concurrently-running test's own `command_search_dirs()` call can't
+/// observe it.
+#[cfg(test)]
+fn set_exe_parent_override_for_test(path: Option<PathBuf>) {
+    *exe_parent_override_cell()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = path;
+}
+
+/// Serializes tests that use the exe-parent override. Same pattern as
+/// `custom_harnesses::registry_test_lock` — a process-global `Mutex<()>`
+/// guard, not a data mutex, so callers hold it across their whole
+/// override-set → call → override-clear sequence.
+#[cfg(test)]
+fn exe_parent_override_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -399,17 +489,24 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-fn resolve_workspace_command(command: &str) -> Option<PathBuf> {
+/// Resolve `command` against an explicit, already-ordered list of search
+/// directories. Extracted from [`resolve_workspace_command`] so the ordering
+/// produced by [`order_search_dirs`] can be exercised end-to-end in tests
+/// without depending on the real `current_exe()`/`current_dir()`.
+fn resolve_workspace_command_from(command: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
     if command_looks_like_path(command) {
         let path = PathBuf::from(command);
         return is_executable_file(&path).then_some(path);
     }
 
     let file_name = executable_basename(command);
-    command_search_dirs()
-        .into_iter()
+    dirs.iter()
         .map(|dir| dir.join(&file_name))
         .find(|candidate| is_executable_file(candidate))
+}
+
+fn resolve_workspace_command(command: &str) -> Option<PathBuf> {
+    resolve_workspace_command_from(command, &command_search_dirs())
 }
 
 fn resolve_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<PathBuf>>>
@@ -1255,3 +1352,10 @@ pub fn managed_agent_avatar_url(command: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests;
+// Extra bundle-search coverage that doesn't need `discovery::tests`'s exact
+// module path (see `discovery/tests/bundle_search.rs`, `include!`d there for
+// the one test that does). Declared directly here, not via `tests`' own
+// `mod`, so it stays reachable without adding a line to the frozen file.
+#[cfg(test)]
+#[path = "discovery/bundle_search_tests.rs"]
+mod bundle_search_tests;
