@@ -476,15 +476,70 @@ test("MEASURE: a fixed ~500 KB document reaches panel-ready under 1.0s with no m
       (window as unknown as { __LONGTASKS__?: number[] }).__LONGTASKS__ = [];
     });
 
-    const startedAt = Date.now();
-    await card.click();
-    await expect(readyHeading).toBeVisible();
-    const panelReadyMs = Date.now() - startedAt;
+    // The panel's `useQuery` uses `staleTime: Infinity` (deliberately — a
+    // fetched document never changes under its content-addressed URL). Left
+    // alone, that means only the FIRST of these three runs pays for the
+    // fetch + UTF-8 decode; runs 2 and 3 would hit the warm cache and time
+    // nothing but a re-render. Remove the cached entry before every run
+    // (through the harness's existing E2E query-client handle) so all three
+    // measurements are genuine cold panel-opens.
+    await page.evaluate(() => {
+      const client = (
+        window as unknown as {
+          __BUZZ_E2E_QUERY_CLIENT__?: {
+            removeQueries: (filters: { queryKey: unknown[] }) => void;
+          };
+        }
+      ).__BUZZ_E2E_QUERY_CLIENT__;
+      client?.removeQueries({ queryKey: ["markdown-doc"] });
+    });
+
+    // Measure entirely inside the page: dispatch the click and detect the
+    // ready heading via `requestAnimationFrame` polling, timed with
+    // `performance.now()` (sub-millisecond resolution, per the ticket's
+    // named Performance API) rather than a Node-side `Date.now()` wrapped
+    // around a Playwright locator wait — whose own polling cadence adds
+    // slack that is significant against a 1000ms budget.
+    const panelReadyMs = await page.evaluate(() => {
+      const HEADING_TEXT = "Long Document Fixture";
+      return new Promise<number>((resolve, reject) => {
+        const cards = document.querySelectorAll<HTMLElement>(
+          '[data-testid="file-card"]',
+        );
+        const target = cards[cards.length - 1];
+        if (!target) {
+          reject(new Error("No file-card found to open the panel."));
+          return;
+        }
+        const start = performance.now();
+        target.click();
+        const poll = () => {
+          const heading = Array.from(
+            document.querySelectorAll<HTMLElement>(
+              '[data-testid="markdown-doc-panel"] h1',
+            ),
+          ).find((el) => el.textContent?.trim() === HEADING_TEXT);
+          if (heading) {
+            const rect = heading.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) {
+              resolve(performance.now() - start);
+              return;
+            }
+          }
+          requestAnimationFrame(poll);
+        };
+        requestAnimationFrame(poll);
+      });
+    });
 
     expect(
       panelReadyMs,
       `run ${run}: panel-ready took ${panelReadyMs}ms, over the ${PANEL_READY_BUDGET_MS}ms budget`,
     ).toBeLessThan(PANEL_READY_BUDGET_MS);
+
+    // Re-confirm through the normal Playwright API too — cheap, since the
+    // in-page wait above has already resolved by the time this runs.
+    await expect(readyHeading).toBeVisible();
 
     const longtasks = await page.evaluate(
       () =>
