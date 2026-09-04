@@ -86,6 +86,7 @@ import { buildRuntimeModelProviderPayload } from "./agentDefinitionSubmitPayload
 import { AgentDefinitionDialogFooter } from "./AgentDefinitionDialogFooter";
 import { AgentDefinitionDialogShell } from "./AgentDefinitionDialogShell";
 import { PromptSourceField } from "./PromptSourceField";
+import { DIRTY_EXEMPT_SELECTOR } from "./promptSourceActions";
 import { AddCustomHarnessDialog } from "./AddCustomHarnessDialog";
 import {
   ADD_CUSTOM_HARNESS_OPTION,
@@ -750,7 +751,18 @@ export function AgentDefinitionDialog({
     <form
       className="grid gap-5 lg:grid-cols-[220px_minmax(0,1fr)]"
       id="persona-dialog-form"
-      onChangeCapture={() => setHasUserChanges(true)}
+      onChangeCapture={(event) => {
+        // Controls in a dirty-exempt subtree hold machine-local values that
+        // are neither submitted nor published (the instructions-file path).
+        // Counting them as edits would arm a catalog publish for a field the
+        // catalog never carries. This runs in the capture phase from the
+        // form down, so the check must live here: a child cannot stop an
+        // ancestor's capture listener that has already fired.
+        if ((event.target as HTMLElement).closest(DIRTY_EXEMPT_SELECTOR)) {
+          return;
+        }
+        setHasUserChanges(true);
+      }}
       onSubmit={handleSubmitForm}
     >
       <AgentCreationPreview
@@ -802,10 +814,11 @@ export function AgentDefinitionDialog({
               definitionId={editedDefinitionId}
               disabled={isPending}
               onPromptReloaded={(prompt) => {
+                // Only the instructions are now stored. `hasUserChanges` is
+                // the whole dialog's dirty state, so clearing it here would
+                // drop an unsaved edit to another field out of the save's
+                // catalog publish and let local and relay diverge silently.
                 setSystemPrompt(prompt);
-                // The reload already saved the definition, so the dialog is
-                // showing what is stored, not an unsaved edit.
-                setHasUserChanges(false);
               }}
             />
           ) : null}

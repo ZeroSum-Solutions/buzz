@@ -12,6 +12,7 @@ import {
 import {
   canClearPromptSource,
   canReloadPromptSource,
+  DIRTY_EXEMPT_ATTRIBUTE,
   promptSourceStatusMessage,
 } from "./promptSourceActions";
 
@@ -27,7 +28,8 @@ type PromptSourceFieldProps = {
  * Bind an agent's instructions to a file on this machine and pull the file's
  * text into the definition.
  *
- * The path is machine-local: only the prompt text is published. Reload is
+ * The path is machine-local: only the prompt text is published, and typing it
+ * leaves the parent dialog's unsaved-changes state untouched. Reload is
  * disabled until a path is typed. Clear stays available, because the dialog
  * cannot read the stored binding back and must still be able to unbind a
  * prompt file that has been moved or deleted.
@@ -68,7 +70,10 @@ export function PromptSourceField({
   };
 
   return (
-    <div className="space-y-1.5">
+    // The path never leaves this machine and is never submitted with the
+    // definition, so the marker keeps the parent dialog from counting a
+    // keystroke here as an unsaved edit to the agent.
+    <div className="space-y-1.5" {...{ [DIRTY_EXEMPT_ATTRIBUTE]: "" }}>
       <label
         className="text-sm font-medium text-foreground"
         htmlFor="persona-prompt-source"

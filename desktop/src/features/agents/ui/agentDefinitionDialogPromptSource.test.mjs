@@ -8,11 +8,18 @@
  *     in create mode, because a reload writes to a stored definition;
  *   - a reload replaces the text in the dialog's own "Agent instructions"
  *     textarea — the propagation the feature exists for;
- *   - Clear leaves that textarea alone.
+ *   - Clear leaves that textarea alone;
+ *   - the two directions of the dialog's own dirty flag, which decides whether
+ *     a save republishes the community catalog head: a reload must not drop an
+ *     unsaved edit to another field out of that publish, and typing the
+ *     machine-local path must not arm one.
  *
  * Mutation proofs: dropping `setSystemPrompt` from the dialog's
  * `onPromptReloaded` → the propagation assertion fails; rendering the field
- * unconditionally → the create-mode assertion fails.
+ * unconditionally → the create-mode assertion fails; restoring
+ * `setHasUserChanges(false)` to `onPromptReloaded` → the reload-keeps-edits
+ * assertion fails; dropping the dirty-exempt check from the form's
+ * `onChangeCapture` → the typing-a-path assertion fails.
  */
 
 import assert from "node:assert/strict";
@@ -124,7 +131,7 @@ afterEach(() => {
 
 after(() => dom.window.close());
 
-function mount(initialValues) {
+function mount(initialValues, overrides = {}) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: 0 } },
   });
@@ -146,6 +153,7 @@ function mount(initialValues) {
         runtimesLoading: false,
         submitLabel: "Save",
         title: "Edit agent",
+        ...overrides,
       }),
     ),
   );
@@ -162,9 +170,10 @@ const promptSourceInput = () => screen.getByLabelText(/Instructions file/i);
 
 test("the instructions-file field is edit-mode only", async () => {
   await act(async () => mount({ displayName: "New", systemPrompt: "" }));
-  assert.equal(
-    screen.queryByLabelText(/Instructions file/i),
-    null,
+  // Compared as a boolean: node:assert would try to render a whole JSDOM node
+  // into the failure message, which does not terminate.
+  assert.ok(
+    screen.queryByLabelText(/Instructions file/i) === null,
     "create mode has no stored definition to reload into",
   );
 
@@ -212,4 +221,93 @@ test("Clear unbinds without touching the instructions text", async () => {
 
   assert.deepEqual(promptSourceCalls, [{ definitionId: "pm", path: null }]);
   assert.equal(instructions().value, "Old instructions.");
+});
+
+test("a reload keeps the dialog's other unsaved edits armed for publish", async () => {
+  // A shared agent: the save republishes the catalog head only when the dialog
+  // reports user changes. The reload's own publish carries the definition as it
+  // sits on disk, so it cannot stand in for an edit made in this dialog.
+  promptSourceResult = {
+    localUpdated: true,
+    publish: "published",
+    path: "/Users/me/agent-prompts/pm.md",
+    prompt: "Ship the roadmap.\n",
+  };
+  const submissions = [];
+  await act(async () =>
+    mount(editValues, {
+      onSubmit: async (input, options) => {
+        submissions.push({ input, options });
+      },
+      publishCatalogUpdatesOnSave: true,
+    }),
+  );
+
+  await act(async () => {
+    fireEvent.change(screen.getByLabelText(/Agent name/i), {
+      target: { value: "Product Manager" },
+    });
+  });
+  await act(async () => {
+    fireEvent.change(promptSourceInput(), {
+      target: { value: "/Users/me/agent-prompts/pm.md" },
+    });
+  });
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Reload" }));
+  });
+
+  assert.ok(
+    screen.queryByTestId("persona-dialog-catalog-publish-notice"),
+    "the unsaved name edit still publishes on save after a reload",
+  );
+
+  await act(async () => {
+    fireEvent.click(screen.getByTestId("persona-dialog-submit"));
+  });
+
+  assert.equal(submissions.length, 1);
+  assert.equal(submissions[0].input.displayName, "Product Manager");
+  assert.equal(
+    submissions[0].options.publishCatalogUpdates,
+    true,
+    "clearing the dialog's dirty flag on reload would strand the name edit locally",
+  );
+});
+
+test("typing an instructions-file path does not arm a catalog publish", async () => {
+  const submissions = [];
+  const dirtyReports = [];
+  await act(async () =>
+    mount(editValues, {
+      onDirtyChange: (dirty) => dirtyReports.push(dirty),
+      onSubmit: async (input, options) => {
+        submissions.push({ input, options });
+      },
+      publishCatalogUpdatesOnSave: true,
+    }),
+  );
+
+  await act(async () => {
+    fireEvent.change(promptSourceInput(), {
+      target: { value: "/Users/me/agent-prompts/pm.md" },
+    });
+  });
+
+  assert.ok(
+    screen.queryByTestId("persona-dialog-catalog-publish-notice") === null,
+    "the path is machine-local and is never part of the published head",
+  );
+  assert.deepEqual(
+    dirtyReports.filter(Boolean),
+    [],
+    "a machine-local keystroke must not report the dialog dirty",
+  );
+
+  await act(async () => {
+    fireEvent.click(screen.getByTestId("persona-dialog-submit"));
+  });
+
+  assert.equal(submissions.length, 1);
+  assert.equal(submissions[0].options.publishCatalogUpdates, false);
 });

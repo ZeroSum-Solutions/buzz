@@ -55,3 +55,18 @@ export function promptSourceStatusMessage(
   }
   return `Instructions reloaded from the file.${mapping}`;
 }
+
+/**
+ * Attribute marking a subtree of the agent dialog whose controls are
+ * machine-local.
+ *
+ * The dialog treats any change inside its form as a user edit, and that flag
+ * both warns about unsaved work and arms a catalog publish on save. The
+ * instructions-file path is neither submitted with the definition nor
+ * published: it is consumed immediately by Reload and Clear. Typing one must
+ * therefore leave the dialog exactly as dirty as it already was.
+ */
+export const DIRTY_EXEMPT_ATTRIBUTE = "data-dirty-exempt";
+
+/** Selector for {@link DIRTY_EXEMPT_ATTRIBUTE}, for ancestor lookups. */
+export const DIRTY_EXEMPT_SELECTOR = `[${DIRTY_EXEMPT_ATTRIBUTE}]`;
