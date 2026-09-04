@@ -548,29 +548,50 @@ async fn description_clamping_enforced() {
 
 /// Helper: spawn a session with a fake MCP server exposing one regular tool
 /// plus an optional `_Stop` hook controlled by env vars.
+///
+/// The server is declared `trusted`, standing in for the harness's built-in
+/// server. Hooks only run on trusted servers, so an untrusted declaration here
+/// would silently disable every `_Stop` / `_PostCompact` test below —
+/// `hook_never_invoked_on_untrusted_server` pins that boundary.
 async fn init_session_with_fake_mcp(h: &mut Harness, extra_mcp_env: &[(&str, &str)]) -> String {
+    init_session_with_fake_mcp_trust(h, extra_mcp_env, true).await
+}
+
+/// As [`init_session_with_fake_mcp`], with the server's `trusted` flag under
+/// the caller's control. `Some(false)` is how `buzz-acp` declares an
+/// operator-supplied `BUZZ_ACP_EXTRA_MCP_COMMANDS` server; `None` omits the
+/// field entirely, which is how every ACP client that predates the extension
+/// declares every server.
+async fn init_session_with_fake_mcp_trust(
+    h: &mut Harness,
+    extra_mcp_env: &[(&str, &str)],
+    trusted: impl Into<Option<bool>>,
+) -> String {
+    let trusted = trusted.into();
     let fake_mcp = env!("CARGO_BIN_EXE_fake-mcp");
     let env: Vec<Value> = extra_mcp_env
         .iter()
         .map(|(k, v)| json!({ "name": k, "value": v }))
         .collect();
+    let marker = trusted.map(Value::from);
     h.send(
         "initialize",
         json!({"protocolVersion":1,"clientCapabilities":{}}),
     )
     .await;
     let _ = h.recv().await;
+    let mut decl = json!({
+        "name": "fake",
+        "command": fake_mcp,
+        "args": [],
+        "env": env,
+    });
+    if let Some(marker) = marker {
+        decl["trusted"] = marker;
+    }
     h.send(
         "session/new",
-        json!({
-            "cwd": "/tmp",
-            "mcpServers": [{
-                "name": "fake",
-                "command": fake_mcp,
-                "args": [],
-                "env": env,
-            }],
-        }),
+        json!({ "cwd": "/tmp", "mcpServers": [decl] }),
     )
     .await;
     let r = h
@@ -667,6 +688,126 @@ async fn hook_stop_blocks_premature_end() {
     assert!(
         objection_present,
         "objection (role=tool, JSON-encoded) missing from messages: {msgs:?}"
+    );
+    h.shutdown().await;
+}
+
+/// An untrusted MCP server never runs a hook, even under the wildcard
+/// allowlist the Desktop launches hook-capable runtimes with.
+///
+/// `MCP_HOOK_SERVERS="*"` matches every server name, so the allowlist alone
+/// would make an operator-supplied `BUZZ_ACP_EXTRA_MCP_COMMANDS` server a
+/// `_Stop` / `_PostCompact` target — a third-party process deciding when the
+/// agent may stop and splicing text into its fresh context. The trust flag is
+/// the guard; this test is its falsifier. Remove the `spec.trusted` check in
+/// `McpRegistry::call_hooks` and the objection lands, the agent loops, and the
+/// LLM-call count below goes from 1 to 2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hook_never_invoked_on_untrusted_server() {
+    // Two scripted responses: with the guard only the first is consumed; a
+    // regression consumes both instead of starving the fake LLM.
+    let llm = spawn_capturing_llm(vec![openai_text("done"), openai_text("looped")]).await;
+    let mut h = Harness::spawn_with_env(
+        &llm.url,
+        &[
+            ("MCP_HOOK_SERVERS", "*"),
+            ("BUZZ_AGENT_STOP_MAX_REJECTIONS", "10"),
+        ],
+    )
+    .await;
+    let sid = init_session_with_fake_mcp_trust(
+        &mut h,
+        &[
+            ("FAKE_MCP_TOOL_COUNT", "1"),
+            ("FAKE_MCP_STOP_HOOK", "1"),
+            ("FAKE_MCP_STOP_TEXT", "you have open work"),
+            ("FAKE_MCP_STOP_COUNT", "1"),
+        ],
+        false,
+    )
+    .await;
+
+    let p = h
+        .send(
+            "session/prompt",
+            json!({"sessionId": sid, "prompt": [{"type":"text","text":"go"}]}),
+        )
+        .await;
+    let r = h.recv_until_approving(|v| v["id"] == json!(p)).await;
+    assert!(r.get("result").is_some(), "errored: {r}");
+    assert_eq!(r["result"]["stopReason"], "end_turn");
+
+    let captured = llm.captured.lock().await;
+    assert_eq!(
+        captured.len(),
+        1,
+        "an untrusted server's _Stop hook objected and made the agent loop: \
+         {} LLM calls",
+        captured.len()
+    );
+    let objection_present = captured.iter().any(|req| {
+        req["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|m| m["content"].as_str().unwrap_or("").contains("_Stop"))
+    });
+    assert!(
+        !objection_present,
+        "an untrusted server's hook output reached the model: {:?}",
+        *captured
+    );
+    h.shutdown().await;
+}
+
+/// A server declared with **no** `trusted` field runs no hooks either.
+///
+/// `trusted` is `#[serde(default)]`, so an ACP client that predates the
+/// extension — Zed, JetBrains, anything but `buzz-acp` — declares every server
+/// untrusted by omission, including the built-in `buzz-dev-mcp` it spawned
+/// itself. That is a real compatibility break for hooks, documented on
+/// `McpServerStdio::trusted` and in `crates/buzz-acp/README.md`; this test
+/// pins the behavior so it cannot change silently in either direction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hook_never_invoked_when_trusted_marker_absent() {
+    let llm = spawn_capturing_llm(vec![openai_text("done"), openai_text("looped")]).await;
+    let mut h = Harness::spawn_with_env(
+        &llm.url,
+        &[
+            ("MCP_HOOK_SERVERS", "fake"),
+            ("BUZZ_AGENT_STOP_MAX_REJECTIONS", "10"),
+        ],
+    )
+    .await;
+    // `None`: the declaration carries no `trusted` key at all.
+    let sid = init_session_with_fake_mcp_trust(
+        &mut h,
+        &[
+            ("FAKE_MCP_TOOL_COUNT", "1"),
+            ("FAKE_MCP_STOP_HOOK", "1"),
+            ("FAKE_MCP_STOP_TEXT", "you have open work"),
+            ("FAKE_MCP_STOP_COUNT", "1"),
+        ],
+        None,
+    )
+    .await;
+
+    let p = h
+        .send(
+            "session/prompt",
+            json!({"sessionId": sid, "prompt": [{"type":"text","text":"go"}]}),
+        )
+        .await;
+    let r = h.recv_until_approving(|v| v["id"] == json!(p)).await;
+    assert!(r.get("result").is_some(), "errored: {r}");
+    assert_eq!(r["result"]["stopReason"], "end_turn");
+
+    let captured = llm.captured.lock().await;
+    assert_eq!(
+        captured.len(),
+        1,
+        "a marker-absent server's _Stop hook ran and made the agent loop: {} LLM calls",
+        captured.len()
     );
     h.shutdown().await;
 }

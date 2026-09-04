@@ -288,7 +288,11 @@ Example: a single echo MCP server.
 }
 ```
 
-Multiple servers: just add more entries. Tool calls fan out to the right server by namespace prefix.
+Multiple servers: just add more entries, up to 16 per session. Tool calls fan out to the right server by namespace prefix.
+
+**The `trusted` marker.** Each entry takes an optional boolean `trusted`, defaulting to `false`. A server the client does not mark `trusted` is spawned without the four Buzz identity variables (`BUZZ_PRIVATE_KEY`, `NOSTR_PRIVATE_KEY`, `BUZZ_RELAY_URL`, `BUZZ_AUTH_TAG`), whether they come from this process's environment or from the entry's own `env` block, and never runs a `_Stop` or `_PostCompact` hook, whatever `MCP_HOOK_SERVERS` allows. That is all it does: the child still runs under the agent's UID with `HOME` and `SSH_AUTH_SOCK`, so it can read what that user can read. It is not a sandbox.
+
+Because the field defaults to `false`, **a client that does not know about it declares every server untrusted** — fail-safe for credentials, but a behavior change for hooks: a client that spawns `buzz-dev-mcp` itself and relies on `_Stop` must now send `"trusted": true` for it. The agent logs the skip once per server when `MCP_HOOK_SERVERS` names a server that is not trusted.
 
 **Transport: stdio only.** No HTTP, no SSE. We advertise this in `agentCapabilities` (`mcpCapabilities.http: false`, `mcpCapabilities.sse: false`); spec-compliant clients won't ask for what we don't have.
 

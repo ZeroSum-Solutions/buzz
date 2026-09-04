@@ -592,10 +592,23 @@ pub fn spawn_agent_child(
         }
     }
     // Enable MCP hook tools (_Stop, _PostCompact) for agents that need them.
-    // Uses "*" because build_mcp_servers() hard-codes the server name to "buzz-mcp".
+    // Name the built-in server rather than passing "*": since
+    // BUZZ_ACP_EXTRA_MCP_COMMANDS, the harness can put operator-supplied
+    // third-party servers in the same array, and a wildcard would nominate
+    // those as hook targets too. (buzz-agent refuses to run a hook on a server
+    // that is not marked `trusted`, so this is the second gate, not the only
+    // one.) The name is the MCP command's file stem, which is how
+    // buzz-acp's build_mcp_servers() derives it — it is not a fixed
+    // "buzz-mcp". With no MCP command there is no built-in server to hook.
     let runtime_meta = known_acp_runtime(effective_command);
     if runtime_meta.is_some_and(|r| r.mcp_hooks) {
-        command.env("MCP_HOOK_SERVERS", "*");
+        if let Some(server_name) = resolved_mcp_command
+            .as_deref()
+            .and_then(std::path::Path::file_stem)
+            .and_then(|stem| stem.to_str())
+        {
+            command.env("MCP_HOOK_SERVERS", server_name);
+        }
     }
 
     // ── Readiness check: set setup-payload if agent is not ready ─────────────

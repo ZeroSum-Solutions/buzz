@@ -185,7 +185,10 @@ async fn init(
     let servers = if mcp_env.is_empty() {
         json!([])
     } else {
-        json!([{ "name": "fake", "command": fake_mcp, "args": [], "env": env }])
+        // `trusted` stands in for the harness's built-in server. Lifecycle
+        // hooks run only on trusted servers, so the `_Stop` exemption test
+        // below would pass vacuously without it.
+        json!([{ "name": "fake", "command": fake_mcp, "args": [], "env": env, "trusted": true }])
     };
     h.send("session/new", json!({ "cwd": cwd, "mcpServers": servers }))
         .await;
