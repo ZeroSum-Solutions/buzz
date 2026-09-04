@@ -3511,15 +3511,20 @@ mod tests {
     /// desktop must reach the ACP `session/new` request byte-for-byte after the
     /// agent restarts.
     ///
-    /// A restart writes the definition's prompt into `BUZZ_ACP_SYSTEM_PROMPT`
-    /// (`desktop/src-tauri/src/managed_agents/runtime.rs:650`), which lands in
-    /// `Config::system_prompt` and is handed to `session_new_full` through
+    /// A restart writes the definition's prompt into `BUZZ_ACP_SYSTEM_PROMPT`,
+    /// which lands in `Config::system_prompt`, is framed by
+    /// `pool::combined_system_prompt` and handed to `session_new_full` through
     /// `pool::session_new_system_prompt`. This drives real file bytes through
-    /// that production transport choice and asserts what the adapter actually
-    /// receives, for both framings. The desktop half — those bytes being what a
-    /// restart resolves — is
-    /// `reloaded_prompt_bytes_reach_the_spawn_env_after_a_restart` in
-    /// `desktop/src-tauri/src/managed_agents/prompt_source/tests.rs`.
+    /// that composition and that transport choice, and asserts what the adapter
+    /// actually receives, for both framings. The adapter does not receive the
+    /// bare file — the harness frames it in `<system>` — so the falsifiable
+    /// claim is that the file's bytes survive the framing verbatim.
+    ///
+    /// This test guards the harness on its own (`cargo test -p buzz-acp`, with
+    /// no desktop build). The whole chain from the file on disk through the
+    /// desktop reload and restart into this request is
+    /// `a_reloaded_prompt_file_reaches_the_adapter_after_a_restart` in
+    /// `desktop/src-tauri/src/commands/personas/prompt_source/tests.rs`.
     #[tokio::test]
     async fn session_new_delivers_reloaded_prompt_source_file_bytes() {
         // Layout characters, non-ASCII and a trailing newline: everything a
@@ -3545,6 +3550,24 @@ mod tests {
             sleep 1
         "#;
 
+        // A base prompt is present, as on every spawn that does not pass
+        // `--no-base-prompt`, so this asserts the file's bytes survive the
+        // framing rather than asserting the framing is absent.
+        let composed = crate::pool::combined_system_prompt(
+            "/tmp",
+            Some("Base harness instructions."),
+            Some(prompt.as_str()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("a system prompt composes");
+        assert!(
+            composed.contains(file_text),
+            "the composed prompt must carry the file's bytes verbatim: {composed:?}"
+        );
+
         // Field framing (buzz-agent and every non-Claude adapter on v2).
         let mut client = spawn_script(script).await;
         client
@@ -3552,14 +3575,14 @@ mod tests {
             .await
             .expect("initialize should succeed");
         let transport =
-            crate::pool::session_new_system_prompt(false, 2, "buzz-agent", Some(prompt.as_str()));
+            crate::pool::session_new_system_prompt(false, 2, "buzz-agent", Some(composed.as_str()));
         let resp = client
             .session_new_full("/tmp", vec![], transport, None)
             .await
             .expect("session_new_full should succeed");
         assert_eq!(
             resp.raw["_receivedRequest"]["params"]["systemPrompt"].as_str(),
-            Some(file_text),
+            Some(composed.as_str()),
             "the adapter must receive the prompt file's bytes unchanged"
         );
 
@@ -3573,7 +3596,7 @@ mod tests {
             false,
             2,
             crate::pool::CLAUDE_AGENT_ACP_NAME,
-            Some(prompt.as_str()),
+            Some(composed.as_str()),
         );
         let resp = client
             .session_new_full("/tmp", vec![], transport, None)
@@ -3581,7 +3604,7 @@ mod tests {
             .expect("session_new_full should succeed");
         assert_eq!(
             resp.raw["_receivedRequest"]["params"]["_meta"]["systemPrompt"]["append"].as_str(),
-            Some(file_text),
+            Some(composed.as_str()),
             "the Claude framing must append the prompt file's bytes unchanged"
         );
     }

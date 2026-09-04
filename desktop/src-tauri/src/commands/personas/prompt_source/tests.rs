@@ -464,3 +464,268 @@ async fn a_concurrent_edit_is_refused_rather_than_clobbered() {
         "the refused request must write nothing at all"
     );
 }
+
+/// The ticket's acceptance check, end to end: edit `agent-prompts/pm.md`, click
+/// Reload, restart the agent, and the prompt the adapter receives carries the
+/// file's bytes unchanged.
+///
+/// Every hop is production code, and each hop's output is the next hop's input,
+/// so the seam is bound rather than sampled at two ends:
+///
+/// 1. the file on disk and the real `set_prompt_source_and_reload` command;
+/// 2. the definition read back off disk and
+///    [`resolve_effective_config`] — the same resolve
+///    `runtime.rs` performs on a restart, with the record's own stale prompt
+///    bytes losing to the definition;
+/// 3. that value exported under [`SYSTEM_PROMPT_ENV`], the name the spawn
+///    writes, and read back by the harness's own
+///    [`CliArgs`](buzz_acp_pkg::delivery_seam::CliArgs) /
+///    [`Config`](buzz_acp_pkg::delivery_seam::Config) env parse — a rename on
+///    either side fails here;
+/// 4. the harness's standing-prompt composition
+///    ([`combined_system_prompt`](buzz_acp_pkg::delivery_seam::combined_system_prompt))
+///    and per-adapter transport choice
+///    ([`session_new_system_prompt`](buzz_acp_pkg::delivery_seam::session_new_system_prompt));
+/// 5. a real `session/new` request over a real child process, echoed back by
+///    the adapter script and asserted as the adapter received it.
+///
+/// The load-bearing assertion is that the composed prompt *contains the file's
+/// bytes verbatim* — trimming, a line-ending rewrite or a re-encode anywhere on
+/// the path fails it. The prompt the adapter receives is not the bare file (the
+/// harness frames it in `<system>` alongside the base prompt), which is why the
+/// framed value is also compared against the harness's own composition.
+///
+/// What this cannot do in-process: relaunch the desktop app or exec the
+/// `buzz-acp` binary. It restarts the harness half for real — the adapter is a
+/// spawned child — and reproduces the desktop half's restart by re-resolving
+/// from disk, which is exactly what the spawn path reads.
+#[tokio::test]
+async fn a_reloaded_prompt_file_reaches_the_adapter_after_a_restart() {
+    use crate::managed_agents::effective_config::resolve_effective_config;
+    use crate::managed_agents::global_config::GlobalAgentConfig;
+    use crate::managed_agents::SYSTEM_PROMPT_ENV;
+    use buzz_acp_pkg::delivery_seam::{
+        combined_system_prompt, session_new_system_prompt, AcpClient, CliArgs, Config, Parser,
+        CLAUDE_AGENT_ACP_NAME,
+    };
+
+    let home = TempHome::new();
+    let app = mock_app();
+    save_personas(
+        app.handle(),
+        &[definition("pm", "Old instructions.", false)],
+    )
+    .expect("seed the definition");
+
+    // 1. The operator edits the prompt file. Layout characters, non-ASCII and a
+    //    trailing newline: everything a hand-edited prompt carries that a naive
+    //    trim or line-ending rewrite would eat.
+    let file_text = "You are the PM.\n\n\tKeep a decision log — ünïcode, emoji 🐝.\n";
+    let file = home.prompt_file("pm.md", file_text);
+
+    // ...and clicks Reload.
+    let result = set_prompt_source_and_reload(
+        "pm".to_string(),
+        Some(file.to_string_lossy().into_owned()),
+        app.handle().clone(),
+    )
+    .await
+    .expect("the reload succeeds");
+    assert!(result.local_updated, "the reload must save the prompt");
+
+    // 2. The restart re-resolves the effective config from what is on disk now.
+    //    The instance carries its own legacy prompt bytes; the definition is
+    //    authoritative for a linked agent, so the reload must still win.
+    let personas = load_personas(app.handle()).expect("definitions read back from disk");
+    let mut record = linked_record("pm");
+    record.system_prompt = Some("Stale instance instructions.".to_string());
+    let effective = resolve_effective_config(&record, &personas, &GlobalAgentConfig::default())
+        .require_resolved()
+        .expect("a linked record with a live definition resolves");
+    let spawned = effective
+        .system_prompt
+        .value
+        .expect("a restart writes a system prompt");
+
+    // 3. The spawn exports it; the harness process parses its own environment.
+    let _prompt_env = EnvVarGuard::set(SYSTEM_PROMPT_ENV, &spawned);
+    let private_key = nostr::Keys::generate().secret_key().to_secret_hex();
+    let cli = CliArgs::try_parse_from(["buzz-acp", "--private-key", &private_key])
+        .expect("the harness parses its own environment");
+    let config = Config::from_args(cli).expect("the harness config resolves");
+    assert_eq!(
+        config.system_prompt.as_deref(),
+        Some(file_text),
+        "the harness must read the file's bytes out of {SYSTEM_PROMPT_ENV}"
+    );
+
+    // 4. The harness composes the standing prompt it sends on `session/new`.
+    //    A base prompt is present, as it is on every spawn that does not pass
+    //    `--no-base-prompt`, so the assertion below is about the file's bytes
+    //    surviving the framing, not about the framing being absent.
+    let composed = combined_system_prompt(
+        "/tmp",
+        Some("Base harness instructions."),
+        config.system_prompt.as_deref(),
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("a system prompt composes");
+    assert!(
+        composed.contains(file_text),
+        "the composed prompt must carry the file's bytes verbatim, got {composed:?}"
+    );
+
+    // 5. `session/new` to a real adapter process, which echoes the request it
+    //    received. `read -r`, or bash eats the JSON string escapes and corrupts
+    //    exactly the bytes under test.
+    let script = r#"
+        read -r -t 5 _init
+        echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":2,"agentCapabilities":{}}}'
+        read -r -t 5 REQ
+        printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_reload","_receivedRequest":'"$REQ"'}}'
+        sleep 1
+    "#;
+
+    for (agent_name, pointer) in [
+        ("buzz-agent", vec!["systemPrompt"]),
+        (
+            CLAUDE_AGENT_ACP_NAME,
+            vec!["_meta", "systemPrompt", "append"],
+        ),
+    ] {
+        let mut client = AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
+            .await
+            .expect("the adapter process starts");
+        let handshake = client.initialize().await.expect("initialize succeeds");
+        let protocol_version = handshake["protocolVersion"]
+            .as_u64()
+            .expect("the adapter advertises a protocol version")
+            as u32;
+
+        let transport = session_new_system_prompt(
+            agent_name == "goose",
+            protocol_version,
+            agent_name,
+            Some(composed.as_str()),
+        );
+        let response = client
+            .session_new_full("/tmp", vec![], transport, None)
+            .await
+            .expect("session/new succeeds");
+        client.shutdown().await;
+
+        let mut received = &response.raw["_receivedRequest"]["params"];
+        for key in &pointer {
+            received = &received[key];
+        }
+        let received = received
+            .as_str()
+            .unwrap_or_else(|| panic!("{agent_name} must receive a system prompt on session/new"));
+        assert!(
+            received.contains(file_text),
+            "{agent_name} must receive the prompt file's bytes unchanged, got {received:?}"
+        );
+        assert_eq!(
+            received, composed,
+            "{agent_name} must receive exactly what the harness composed"
+        );
+    }
+}
+
+/// Set a process environment variable for the life of the guard, restoring the
+/// previous value on drop — including when the test panics.
+///
+/// Safe here only because every test in this module holds the process-env lock
+/// through [`TempHome`].
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
+/// A managed-agent record linked to `persona_id`, with only the fields this
+/// module's assertions read set to anything meaningful.
+fn linked_record(persona_id: &str) -> crate::managed_agents::ManagedAgentRecord {
+    use crate::managed_agents::{BackendKind, ManagedAgentRecord, RespondTo};
+    ManagedAgentRecord {
+        description: None,
+        pubkey: "agent-pk".to_string(),
+        name: "PM".to_string(),
+        persona_id: Some(persona_id.to_string()),
+        private_key_nsec: String::new(),
+        auth_tag: None,
+        relay_url: "ws://localhost:3000".to_string(),
+        avatar_url: None,
+        acp_command: "buzz-acp".to_string(),
+        // Not "goose": goose takes its system prompt through its own extension
+        // request, so `session_new_system_prompt` deliberately returns no
+        // `session/new` transport for it.
+        agent_command: "buzz-agent".to_string(),
+        agent_command_override: None,
+        agent_args: vec![],
+        mcp_command: String::new(),
+        turn_timeout_seconds: 300,
+        idle_timeout_seconds: None,
+        max_turn_duration_seconds: None,
+        parallelism: 1,
+        system_prompt: None,
+        model: None,
+        provider: None,
+        persona_source_version: None,
+        env_vars: BTreeMap::new(),
+        start_on_app_launch: false,
+        runtime_pid: None,
+        backend: BackendKind::Local,
+        backend_agent_id: None,
+        provider_policy_pending: false,
+        provider_binary_path: None,
+        team_id: None,
+        persona_team_dir: None,
+        persona_name_in_team: None,
+        created_at: String::new(),
+        updated_at: String::new(),
+        last_started_at: None,
+        last_stopped_at: None,
+        last_exit_code: None,
+        last_error: None,
+        last_error_code: None,
+        respond_to: RespondTo::OwnerOnly,
+        respond_to_allowlist: vec![],
+        display_name: None,
+        slug: None,
+        runtime: None,
+        name_pool: vec![],
+        is_builtin: false,
+        is_active: true,
+        shared: false,
+        source_team: None,
+        source_team_persona_slug: None,
+        catalog_source: None,
+        team_catalog_source: None,
+        relay_mesh: None,
+        effort_level: None,
+        auto_restart_on_config_change: false,
+        definition_respond_to: None,
+        definition_respond_to_allowlist: vec![],
+        definition_parallelism: None,
+    }
+}

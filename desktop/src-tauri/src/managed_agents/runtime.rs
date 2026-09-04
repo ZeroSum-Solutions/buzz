@@ -74,6 +74,15 @@ pub use lifecycle::{kill_stale_tracked_processes, sync_managed_agent_processes};
 mod spawn_key; // production spawn-key derivation + its regressions
 pub(crate) use spawn_key::bound_runtime_key;
 
+/// The environment variable a spawn hands the harness the effective system
+/// prompt in.
+///
+/// `buzz-acp` reads the same name into `CliArgs::system_prompt`
+/// (`crates/buzz-acp/src/config.rs`), so the two sides of the delivery seam are
+/// pinned to one spelling and a rename on either side fails the end-to-end
+/// prompt-source test rather than silently dropping the prompt.
+pub(crate) const SYSTEM_PROMPT_ENV: &str = "BUZZ_ACP_SYSTEM_PROMPT";
+
 /// Classify an agent's persona against the live catalog for the Agents-menu
 /// drift indicator. Returns `(out_of_date, orphaned)`.
 ///
@@ -660,9 +669,9 @@ pub fn spawn_agent_child(
     let effective_provider = effective_cfg.provider.value;
 
     if let Some(prompt) = &effective_prompt {
-        command.env("BUZZ_ACP_SYSTEM_PROMPT", prompt);
+        command.env(SYSTEM_PROMPT_ENV, prompt);
     } else {
-        command.env_remove("BUZZ_ACP_SYSTEM_PROMPT");
+        command.env_remove(SYSTEM_PROMPT_ENV);
     }
     // Shared compute stores `auto`, but the wire name is MeshLLM's virtual
     // `mesh` model. Translate here too, so the harness and the LLM client are

@@ -279,7 +279,7 @@ pub struct OwnedAgent {
 /// on `session/new` — the feature landed in v0.6.0 (Oct 2025), before the
 /// `@zed-industries/claude-code-acp` → `@agentclientprotocol/claude-agent-acp`
 /// rename, so the new name is a reliable capability gate.
-pub(crate) const CLAUDE_AGENT_ACP_NAME: &str = "@agentclientprotocol/claude-agent-acp";
+pub const CLAUDE_AGENT_ACP_NAME: &str = "@agentclientprotocol/claude-agent-acp";
 
 fn has_system_prompt_support(
     protocol_version: u32,
@@ -297,9 +297,9 @@ fn has_system_prompt_support(
 
 /// The `session/new` system-prompt transport for an adapter.
 ///
-/// `pub(crate)` so the delivery-seam test in [`crate::acp`] can put a prompt
+/// Public within the crate facade so a delivery-seam test can put a prompt
 /// through the same choice production makes, rather than restating it.
-pub(crate) fn session_new_system_prompt<'a>(
+pub fn session_new_system_prompt<'a>(
     is_goose: bool,
     protocol_version: u32,
     agent_name: &str,
@@ -1283,21 +1283,13 @@ async fn create_session_and_apply_model(
     // its own `<core-memory>` boundary, and canvas carries its own
     // `<channel-canvas>` boundary; both are appended with a blank-line separator.
     let is_goose = agent.agent_name == "goose";
-    let combined_system_prompt = with_canvas(
-        with_huddle_instructions(
-            with_core(
-                with_team(
-                    framed_system_prompt(
-                        &ctx.cwd,
-                        ctx.base_prompt.as_deref(),
-                        ctx.system_prompt.as_deref(),
-                    ),
-                    ctx.team_instructions.as_deref(),
-                ),
-                agent_core,
-            ),
-            channel.huddle_instructions,
-        ),
+    let combined_system_prompt = combined_system_prompt(
+        &ctx.cwd,
+        ctx.base_prompt.as_deref(),
+        ctx.system_prompt.as_deref(),
+        ctx.team_instructions.as_deref(),
+        agent_core,
+        channel.huddle_instructions,
         channel.canvas,
     );
 
@@ -1858,6 +1850,40 @@ pub(crate) fn prepend_standing_for_legacy(
 /// agent instructions. A persona-only agent still yields
 /// `<system>…</system>` rather than an unlabeled blob that would be mistaken
 /// for `<base>`.
+/// The standing system prompt one `session/new` carries.
+///
+/// The agent's own instructions are framed with the base prompt and workspace
+/// section, then the team, core-memory, huddle and canvas sections are appended
+/// in that order. Every section body is preserved byte-for-byte, so a prompt
+/// loaded from a file reaches the adapter exactly as written.
+///
+/// This is the whole composition `create_session_and_apply_model` performs; it
+/// is a named function so a caller outside this module can drive the same
+/// composition production does instead of restating the nesting.
+pub fn combined_system_prompt(
+    cwd: &str,
+    base_prompt: Option<&str>,
+    system_prompt: Option<&str>,
+    team_instructions: Option<&str>,
+    agent_core: Option<&str>,
+    huddle_instructions: Option<&str>,
+    canvas: Option<&str>,
+) -> Option<String> {
+    with_canvas(
+        with_huddle_instructions(
+            with_core(
+                with_team(
+                    framed_system_prompt(cwd, base_prompt, system_prompt),
+                    team_instructions,
+                ),
+                agent_core,
+            ),
+            huddle_instructions,
+        ),
+        canvas,
+    )
+}
+
 fn framed_system_prompt(
     cwd: &str,
     base_prompt: Option<&str>,
