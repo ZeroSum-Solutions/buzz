@@ -16,19 +16,28 @@ through. Revision 3 folds in Sol's passes 1 and 2 on this plan (log at the end).
 - Port tickets carry upstream parity only. Fork deviations on a ported feature are their own
   ticket, so an upstream merge can retire the port without losing fork work (range-diff the
   upstream merge against the port, then drop the port commit).
-- Landing is serialized, one ticket at a time:
-  1. `git fetch origin && git rebase --signoff origin/zs/main`; record `BASE=$(git rev-parse origin/zs/main)`.
-  2. Rerun the ticket's gates and the Sol audit on the rebased branch.
-  3. Open the PR ourselves with the full body (`gh pr create --base zs/main --body-file`):
+- Landing goes through GitHub's merge queue on `zs/main` (ruleset "zs/main merge queue",
+  squash, one entry built at a time, CI on the `merge_group` event). The queue tests each pull
+  request against the merged result in order, so the base cannot drift under a tested change and
+  nobody re-merges by hand.
+  1. Before enqueueing, run the ticket's gates and the Sol audit on the branch as it stands.
+  2. Open the PR ourselves with the full body (`gh pr create --base zs/main --body-file`):
      gates run and their results, the tested base OID, the Gemini verdict, the Sol verdict.
-  4. Immediately before `~/bin/zs-land`: `git fetch origin && test "$(git rev-parse origin/zs/main)" = "$BASE"`;
-     if it fails, go back to step 1. `zs-land` reuses the open PR, requires green CI, squash-merges
-     and syncs `zs/main`. It checks the base branch name, not the base SHA, so landings are
-     strictly one at a time from this session and nothing else pushes to `zs/main` meanwhile.
-     After a PR is open, updates from `zs/main` come in by `git merge --signoff origin/zs/main`, never
-     by rebase, because force-push is blocked on this machine.
+  3. Overlap rule instead of blanket re-testing: if `origin/zs/main` moved since the branch's
+     base, compute `git diff --name-only <base>..origin/zs/main` and intersect it with the
+     branch's own file list. Empty intersection: enqueue as is. Non-empty: `git merge --signoff
+     origin/zs/main`, rerun the gates that cover the overlapping files, then enqueue.
+  4. Enqueue with `gh pr merge <n> --squash --auto`. The queue runs CI on the merge group and
+     merges on green; the repository deletes the head branch on merge. `zs-land` is not used in
+     this repository because it expects an immediate merge, which a queue does not give. The
+     enqueue command is on this machine's guarded list, so it runs only with Devin's go-ahead.
   5. If a CI job fails on the fork for a reason outside the diff (missing secret, upstream-only
-     runner), the fix is a fork-only edit to that job on `zs/main`. Never `--allow-no-ci`.
+     runner, a flake on the recorded list), re-run only the failed jobs once; if it fails the same
+     way, fix the job on `zs/main` as a fork-only edit. Never `--allow-no-ci`.
+  6. Direct pushes to `zs/main` are for fork-only CI and docs commits by the repository admin
+     (the ruleset's bypass actor); feature work always goes through the queue.
+- Linux CI jobs run on Blacksmith (`runs-on: blacksmith-4vcpu-ubuntu-2404`, fork-only label swap
+  on `ci.yml`, `_ci-*.yml`, `mesh-lifecycle.yml`); macOS and Windows jobs stay on GitHub's runners.
 - Hooks and differential lanes compare against `origin/main` (`AGENTS.md:128`,
   `scripts/check-file-sizes-core.mjs:44`), so on the fork they see the cumulative fork delta.
   That is stricter, not wrong. If a lane flags an upstream-ported file, the PR notes it and the
@@ -76,7 +85,7 @@ through. Revision 3 folds in Sol's passes 1 and 2 on this plan (log at the end).
    (the `review --base` form cannot take a custom prompt, so the scope lives in the prompt).
    Every BLOCK and WARN is verified against the code by the driver before it is fixed or
    discarded with a written reason. Re-run until nothing above NIT.
-7. **Land** as above.
+7. **Land** through the merge queue as above.
 
 Concurrency: builders and critics are in-process agents (cap 10). Gemini and Sol are external
 processes (cap 4, shared with anything else on the machine); at most two tickets sit in the

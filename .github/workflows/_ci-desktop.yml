@@ -23,7 +23,7 @@ env:
 jobs:
   desktop-core:
     name: Desktop Core
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 45
     if: github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust
     permissions:
@@ -114,7 +114,7 @@ jobs:
 
   desktop-smoke-e2e:
     name: Desktop Smoke E2E (${{ matrix.shard }})
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     if: github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust
     strategy:
@@ -179,7 +179,7 @@ jobs:
 
   desktop:
     name: Desktop
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     needs: [desktop-core, desktop-smoke-e2e, desktop-windows-build]
     if: always() && (github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust)
@@ -235,7 +235,7 @@ jobs:
     name: Results
     if: ${{ always() }}
     needs: [desktop]
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     permissions: {}
     outputs:
