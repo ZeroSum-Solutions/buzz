@@ -12,9 +12,9 @@ This document is the software-forge slice of the broader Buzz platform. [VISION.
 
 The shared room contract is [VISION_ROOMS.md](VISION_ROOMS.md): a project, repo,
 task, branch, or document is a facet of a canonical room, not an exclusive channel
-type. Several facets may share one conversation. The room model and automatic
-lifecycle described here are product direction, not a claim that provisioning,
-comment migration, or inheritance already ships.
+type. Several facets may share one conversation. Projects organize time-bound
+outcomes across repositories; repository rooms support ongoing code and
+maintenance discussion.
 
 A project lives on the relay. `myproject.com` in a browser shows the project home. Click a repo and you're at `repoa.myproject.com` — README rendered, file tree navigable, code syntax-highlighted, clone URL at the top. The same URL serves HTML to a browser and git protocol to `git clone`. Content negotiation. One URL, two audiences.
 
@@ -194,7 +194,7 @@ Every step traced. Every trace a signed event. Change the project CI once and ev
 
 Bug reports and tasks retain their NIP-34 kind:1621 identity. In the target model, task details, forum presentation, and branch work can open the same canonical room; subtasks can have nested rooms. A forum is a view, not a reason to fork the conversation.
 
-NIP-22 kind:1111 is the intended portable threaded-comment representation in this forge vision; current issue/PR clients use separate kind:1 comments. Unifying these with room chat requires the explicit read/write compatibility transition described in [VISION_ROOMS.md](VISION_ROOMS.md#rollout-boundaries). Labels, assignees, and milestones remain object metadata, not channel identity.
+Threaded comments use NIP-22 kind:1111. Labels, assignees, and milestones are nostr tags. Design discussions and RFCs use the forum's long-form async surface.
 
 NIP-34 clients can discover and interact with issues. Buzz's forum gives them a home with threading, search, and agent triage.
 
@@ -241,7 +241,7 @@ Standard kinds as substrate. Custom kinds only where genuinely novel.
 | Layer | Standard NIP Kinds | Buzz Custom | Rationale |
 |-------|-------------------|---------------|-----------|
 | **Git state** | 30617, 30618, 1617, 1618, 1621, 1630-1633 (NIP-34) | — | Interop with ngit, gitworkshop.dev |
-| **Comments (target)** | 1111 (NIP-22) | — | Portable threading; transition from current kind:1 comments remains to be designed |
+| **Comments** | 1111 (NIP-22) | — | Threaded replies everywhere |
 | **Channels** | 9000-9022, 39000-39003 (NIP-29) | — | Project workspaces |
 | **HTTP auth** | 27235 (NIP-98) | — | Git push authentication |
 | **Agent identity** | 0 (NIP-01 profile) | — | Agents are npubs |

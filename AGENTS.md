@@ -26,28 +26,12 @@ and runtime evidence answer different questions.
 ### Room and Object Model
 
 For changes involving projects, tasks, repositories, branches, documents, or
-channel navigation, read [VISION_ROOMS.md](VISION_ROOMS.md) before designing the
-client or protocol. Apply these rules across desktop, web, mobile, CLI, and agents:
+channel navigation, read [VISION_ROOMS.md](VISION_ROOMS.md).
 
-- A room is a stable channel UUID with one conversation and zero or more object
-  facets, not an exclusive task/branch/repo type. One object resolves to one
-  canonical room; several objects may share it. A task and branch can be the
-  **same room**. Do not create a second chat merely to add a view.
-- Resolve by community-scoped object identity, never display names. Preserve
-  task nesting and branch-to-repository links even when navigation shows a tree.
-- Containment, context inheritance, and access control are separate. Nesting or
-  linking must not grant membership, privatize global records, or change Git
-  ACLs. Repo `buzz-channel` is security-sensitive; project binding is not repo
-  authority.
-- Do not invent per-client relationship encodings or conflict winners. Shared
-  metadata must round-trip through relay persistence/discovery and supported
-  writers; handle unsupported fields, conflicts, retries, and partial creation.
-- Preserve one conversation and its history across views. Migrating issue/PR
-  comments needs an explicit compatibility plan, not silent duplicate streams.
-  A branch merge must not archive other active facets sharing its room.
-
-The vision's metadata extension is proposed, not a shipped API. These guardrails
-constrain new work; they do not authorize an implicit data migration.
+A room has one conversation and can have several object views. Each object has
+one canonical room; a task and its branch can share the **same room**. Do not
+create a second conversation merely to add a view. Apply this model consistently
+across desktop, web, mobile, CLI, and agents.
 
 ---
 
