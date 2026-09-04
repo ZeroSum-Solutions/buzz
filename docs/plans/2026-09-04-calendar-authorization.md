@@ -112,7 +112,7 @@ Google's revocation endpoint works on: revoking any token removes every scope th
 to the *project* and invalidates the tokens of every client registered under it. Two token
 responses for the same account are two views of one grant, not two grants, so "revoke the token we
 just issued" and "revoke the credential we already hold" are the same operation. The short-scope
-branch of a re-authorization is therefore decided by `sub` before anything is revoked:
+branch of a re-authorization is therefore decided by `sub`, and neither branch revokes:
 
 - **Same `sub` as the stored binding** — the ordinary case, a user upgrading their own connection.
   The new token is dropped in memory and **never sent to the revocation endpoint**. Buzz
@@ -873,8 +873,9 @@ The reconnect action is never hidden behind the same state it repairs, and no fa
 user out of Buzz, deletes the channel mapping, or shows a raw OAuth error string. Failures are
 logged with the reason and never with a token or an authorization code; T12 asserts that with a
 test. Reconnect reuses the connect flow — including decision 1's full-union request and readback —
-and keeps the binding when `sub` matches, without ever revoking, per decision 1's same-`sub` rule;
-a different `sub` is an account change and takes the explicit confirm from decision 2.
+and keeps the binding when `sub` matches, without ever revoking. A different `sub` is an account
+change and takes decision 2's explicit confirm, which is raised only after the exchange; declining
+it revokes nothing either.
 
 **Reason.** Rule 6 — a guard that hides the only recovery affordance is a functional failure, so
 the reconnect entry lives in two places, one of which does not depend on the broken surface
