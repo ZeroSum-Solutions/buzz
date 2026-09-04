@@ -29,7 +29,7 @@ pub(super) const MAX_DOWNLOAD_BYTES: u64 = 50 * 1024 * 1024;
 /// `size` field and is UX-only (a forged or absent size must not buy a
 /// larger fetch). Keep in sync with
 /// `desktop/src/shared/ui/markdown/markdownDocFile.ts`.
-const MAX_MARKDOWN_DOC_BYTES: u64 = 2 * 1024 * 1024;
+pub(super) const MAX_MARKDOWN_DOC_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Download request timeout.
 const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -284,7 +284,7 @@ async fn fetch_blob_bytes(url: &str, state: &State<'_, AppState>) -> Result<Vec<
 /// for an ordinary relay error — following it would forward the minted media
 /// auth header across origins. Pulled out of `fetch_blob_bytes_with_cap` so
 /// the redirect-refusal message is unit-testable without a Tauri `State`.
-fn redirect_refusal_error(status: reqwest::StatusCode) -> Option<String> {
+pub(super) fn redirect_refusal_error(status: reqwest::StatusCode) -> Option<String> {
     status.is_redirection().then(|| {
         format!(
             "media fetch refused: relay returned a {status} redirect, which is \
@@ -367,7 +367,10 @@ pub(super) async fn fetch_blob_bytes_with_cap(
 /// streamed bytes, so a missing or dishonest length never buys a larger
 /// download. Pulled out of `fetch_blob_bytes_with_cap` so the pre-body
 /// refusal is unit-testable without a Tauri `State`.
-fn declared_length_refusal_error(content_length: Option<u64>, cap: u64) -> Option<String> {
+pub(super) fn declared_length_refusal_error(
+    content_length: Option<u64>,
+    cap: u64,
+) -> Option<String> {
     let content_length = content_length?;
     (content_length > cap).then(|| {
         format!(
@@ -384,7 +387,11 @@ fn declared_length_refusal_error(content_length: Option<u64>, cap: u64) -> Optio
 /// mid-stream instead of buffering past the cap. Pulled out of
 /// `fetch_blob_bytes_with_cap` so the cutoff is unit-testable without a
 /// Tauri `State`.
-fn append_chunk_within_cap(bytes: &mut Vec<u8>, chunk: &[u8], cap: u64) -> Result<(), String> {
+pub(super) fn append_chunk_within_cap(
+    bytes: &mut Vec<u8>,
+    chunk: &[u8],
+    cap: u64,
+) -> Result<(), String> {
     if bytes.len() as u64 + chunk.len() as u64 > cap {
         return Err(format!("file too large (max {} MiB)", cap / (1024 * 1024)));
     }
@@ -407,7 +414,7 @@ pub(crate) enum SnapshotFileKind {
 }
 
 impl SnapshotFileKind {
-    fn cap(self) -> u64 {
+    pub(super) fn cap(self) -> u64 {
         match self {
             SnapshotFileKind::AgentJson => MAX_SNAPSHOT_JSON_BYTES as u64,
             SnapshotFileKind::AgentPng => MAX_SNAPSHOT_PNG_BYTES as u64,
@@ -435,7 +442,7 @@ impl SnapshotFileKind {
 /// PNG magic (`\x89PNG`) is required for `Png` and must be absent for `Json`.
 /// Returns an error with a clear message on mismatch so that `fetch_snapshot_bytes`
 /// fails closed before any bytes reach the frontend.
-fn ensure_bytes_match_kind(bytes: &[u8], kind: SnapshotFileKind) -> Result<(), String> {
+pub(super) fn ensure_bytes_match_kind(bytes: &[u8], kind: SnapshotFileKind) -> Result<(), String> {
     let has_png_magic = bytes.len() >= 4 && bytes[..4] == PNG_MAGIC;
     if kind.is_png() && !has_png_magic {
         Err(format!(
@@ -454,7 +461,7 @@ fn ensure_bytes_match_kind(bytes: &[u8], kind: SnapshotFileKind) -> Result<(), S
 
 /// Determine whether a sanitized filename is a valid agent snapshot candidate.
 /// Returns the `SnapshotFileKind` for the extension, or an error.
-fn snapshot_kind_for_filename(filename: &str) -> Result<SnapshotFileKind, String> {
+pub(super) fn snapshot_kind_for_filename(filename: &str) -> Result<SnapshotFileKind, String> {
     let lower = filename.to_ascii_lowercase();
     if lower.ends_with(".agent.json") {
         Ok(SnapshotFileKind::AgentJson)
@@ -476,7 +483,7 @@ fn snapshot_kind_for_filename(filename: &str) -> Result<SnapshotFileKind, String
 ///
 /// Keeping this as a pure helper makes the per-kind cap a testable production
 /// boundary, rather than relying on a duplicated test-side comparison.
-fn ensure_declared_size_within_cap(
+pub(super) fn ensure_declared_size_within_cap(
     expected_size: usize,
     kind: SnapshotFileKind,
 ) -> Result<(), String> {
@@ -582,7 +589,3 @@ pub async fn fetch_snapshot_bytes(
 
     Ok(tauri::ipc::Response::new(bytes))
 }
-
-#[cfg(test)]
-#[path = "media_download_tests.rs"]
-mod tests;

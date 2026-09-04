@@ -105,6 +105,11 @@ test("markdown attachment opens the in-app viewer with Preview/Code toggle", asy
   ).toBeVisible();
   // GFM table rendered as a real table, not pipes.
   await expect(panel.locator("table")).toContainText("Headings");
+  // GFM fenced code block rendered as a highlighted code block in the
+  // Preview pane, not left as raw ``` fences or plain inline text.
+  await expect(panel.locator("[data-code-block]")).toContainText(
+    'console.log("hi");',
+  );
   const commands = () =>
     page.evaluate(
       () =>
@@ -238,6 +243,90 @@ test("a document over the native 2 MiB cap falls back to download", async ({
   const panel = page.getByTestId("markdown-doc-panel");
   await expect(panel).toBeVisible();
   await expect(panel).toContainText("This file is too large to preview.");
+  await expect(
+    panel.getByRole("button", { name: "Download file" }),
+  ).toBeVisible();
+});
+
+test("a binary payload behind a .md filename falls back to the invalid-text error with a working download", async ({
+  page,
+}) => {
+  // The imeta filename says ".md" (so the card offers the viewer), but the
+  // served bytes are not valid UTF-8 — strict decoding must reject them
+  // rather than render mojibake, and the download escape hatch must still
+  // work from that error state.
+  await page.unroute(`**/media/${DOC_SHA}.bin`);
+  await page.route(`**/media/${DOC_SHA}.bin`, (route) =>
+    route.fulfill({
+      body: Buffer.from([0xff, 0xfe, 0xfd, 0x00, 0x01, 0x02]),
+      contentType: "application/octet-stream",
+    }),
+  );
+  await sendMarkdownAttachment(page);
+
+  const card = page.getByTestId("file-card").last();
+  await expect(card).toHaveAttribute("aria-label", "Open release-notes.md");
+  await card.click();
+
+  const panel = page.getByTestId("markdown-doc-panel");
+  await expect(panel).toBeVisible();
+  await expect(panel).toContainText(
+    "This file isn't valid text, so it can't be previewed.",
+  );
+  const downloadFallback = panel.getByRole("button", {
+    name: "Download file",
+  });
+  await expect(downloadFallback).toBeVisible();
+
+  const commands = () =>
+    page.evaluate(
+      () =>
+        (window as Window & { __BUZZ_E2E_COMMANDS__?: string[] })
+          .__BUZZ_E2E_COMMANDS__ ?? [],
+    );
+  await downloadFallback.click();
+  await expect.poll(commands).toContain("download_file");
+});
+
+test("a relay fetch failure falls back to the couldn't-load error", async ({
+  page,
+}) => {
+  // A 404 (deleted/expired media) or a network failure must not leave the
+  // panel stuck loading — it must name the failure and still offer the
+  // download escape hatch.
+  await page.unroute(`**/media/${DOC_SHA}.bin`);
+  await page.route(`**/media/${DOC_SHA}.bin`, (route) =>
+    route.fulfill({ status: 404, body: "not found" }),
+  );
+  await sendMarkdownAttachment(page);
+
+  const card = page.getByTestId("file-card").last();
+  await expect(card).toHaveAttribute("aria-label", "Open release-notes.md");
+  await card.click();
+
+  const panel = page.getByTestId("markdown-doc-panel");
+  await expect(panel).toBeVisible();
+  await expect(panel).toContainText("Couldn't load this file from the relay.");
+  await expect(
+    panel.getByRole("button", { name: "Download file" }),
+  ).toBeVisible();
+});
+
+test("a network failure fetching the relay media falls back to the couldn't-load error", async ({
+  page,
+}) => {
+  await page.unroute(`**/media/${DOC_SHA}.bin`);
+  await page.route(`**/media/${DOC_SHA}.bin`, (route) =>
+    route.abort("connectionrefused"),
+  );
+  await sendMarkdownAttachment(page);
+
+  const card = page.getByTestId("file-card").last();
+  await card.click();
+
+  const panel = page.getByTestId("markdown-doc-panel");
+  await expect(panel).toBeVisible();
+  await expect(panel).toContainText("Couldn't load this file from the relay.");
   await expect(
     panel.getByRole("button", { name: "Download file" }),
   ).toBeVisible();

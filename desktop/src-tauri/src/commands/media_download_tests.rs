@@ -1,7 +1,12 @@
 // Tests for commands/media_download.rs — split into a sibling file to keep
-// media_download.rs under the per-file line cap.
+// media_download.rs under the per-file line cap, and registered directly in
+// commands/mod.rs (rather than nested inside media_download.rs) so
+// `cargo test commands::media_download_tests` runs this suite on its own,
+// not only as a side effect of a broader `media_download` filter.
 
-use super::*;
+use super::media_download::*;
+use crate::commands::personas::{MAX_SNAPSHOT_JSON_BYTES, MAX_SNAPSHOT_PNG_BYTES};
+use crate::commands::team_snapshot::MAX_TEAM_SNAPSHOT_JSON_BYTES;
 
 #[test]
 fn snapshot_kind_json_returns_json_kind_and_correct_cap() {

@@ -173,6 +173,46 @@ test("ignores a record made for a different document URL", async () => {
   assert.equal(dom.window.document.activeElement, first);
 });
 
+test("a concurrent open does not let the first document's unmount clear the second document's record", async () => {
+  // Switching doc1 -> doc2 before doc1's panel unmounts: React records doc2's
+  // opener first (synchronously, in the click handler), then doc1's panel
+  // cleanup runs restoreFocusToMarkdownDocOpener for doc1's own url. That
+  // mismatched call must not destroy doc2's still-pending record, and must
+  // not steal focus onto anything belonging to doc2's document.
+  const { recordMarkdownDocOpener, restoreFocusToMarkdownDocOpener } =
+    await loadModule();
+  const otherUrl = "http://localhost:3000/media/other-doc.bin";
+  const doc1Opener = addCard(otherUrl, "message-doc1");
+
+  const first = addCard(DOC_URL, "message-first");
+  const doc2Opener = addCard(DOC_URL, "message-second");
+  recordMarkdownDocOpener(DOC_URL, doc2Opener);
+
+  // doc1's panel unmount cleanup fires for doc1's url, not doc2's.
+  restoreFocusToMarkdownDocOpener(otherUrl);
+  await settleFrames();
+  assert.notEqual(
+    dom.window.document.activeElement,
+    doc2Opener,
+    "doc1's mismatched restore must not steal focus onto doc2's card",
+  );
+  assert.notEqual(
+    dom.window.document.activeElement,
+    first,
+    "doc1's mismatched restore must not steal focus onto any doc2 card",
+  );
+
+  // Free the focus doc1's restore claimed, then close doc2: its own
+  // recorded opener must still win over the first same-URL DOM match —
+  // proof the record survived the earlier mismatched call.
+  dom.window.document.activeElement?.blur?.();
+  doc1Opener.blur();
+  restoreFocusToMarkdownDocOpener(DOC_URL);
+  await settleFrames();
+
+  assert.equal(dom.window.document.activeElement, doc2Opener);
+});
+
 test("aborts when another control already claimed focus", async () => {
   const { recordMarkdownDocOpener, restoreFocusToMarkdownDocOpener } =
     await loadModule();

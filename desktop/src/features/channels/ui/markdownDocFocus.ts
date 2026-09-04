@@ -140,7 +140,11 @@ export function focusMarkdownDocPanelClose(): () => void {
  */
 export function restoreFocusToMarkdownDocOpener(url: string): void {
   const record = lastOpenerRecord?.url === url ? lastOpenerRecord : null;
-  lastOpenerRecord = null;
+  // Only clear the record when this call actually consumes it. A mismatched
+  // url means some *other* document's unmount is racing this one (opening a
+  // second document before the first panel's cleanup runs) — that call must
+  // not destroy a newer, not-yet-consumed record it doesn't own.
+  if (record) lastOpenerRecord = null;
   scheduleFocusSearch(
     () =>
       (record ? findCard(record.messageId, url) : null) ??
