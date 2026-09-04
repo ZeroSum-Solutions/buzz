@@ -4,7 +4,10 @@
 # offline mode (remote image pointed at the local sentinel, which logs and
 # refuses every request), then delegates per-PDF structural checks to
 # scripts/zs/pdf-validate.sh <pdf> — the validator contract named in the
-# T8 ticket text. Throwaway spike script — not production code.
+# T8 ticket text. Also asserts the renderer's own `image_state` field
+# (online must be "loaded", offline must not be) — a measured event-based
+# signal, not an inferred one — and that pdftoppm actually succeeds.
+# Throwaway spike script — not production code.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -31,8 +34,19 @@ run_online() {
   local json
   json=$("$BIN" fixtures/approval.html "$pdf")
   echo "  render: $json"
+  local image_state
+  image_state=$(echo "$json" | grep -o '"image_state":"[a-z]*"' | cut -d'"' -f4)
+  if [ "$image_state" = "loaded" ]; then
+    echo "  PASS: online render image_state=loaded (remote <img> confirmed via its load event, not inferred from a sleep)"
+  else
+    echo "  FAIL: online render image_state=$image_state (expected loaded) — the Wikimedia image did not load within the 5s in-page timeout; the memo's size-drop claim would be unsupported"
+    fail=1
+  fi
   "$VALIDATE_PDF" "$pdf" || fail=1
-  pdftoppm -png -r 100 "$pdf" "$pngdir/page"
+  if ! pdftoppm -png -r 100 "$pdf" "$pngdir/page"; then
+    echo "  FAIL: pdftoppm exited non-zero rendering $pdf"
+    fail=1
+  fi
   for p in "$pngdir"/page-*.png; do
     echo "  png: $p sha256=$(shasum -a 256 "$p" | awk '{print $1}') bytes=$(stat -f%z "$p" 2>/dev/null || stat -c%s "$p")"
   done
@@ -65,6 +79,8 @@ run_offline() {
   local json
   json=$("$BIN" fixtures/approval-offline.html "$pdf")
   echo "  render: $json"
+  local image_state
+  image_state=$(echo "$json" | grep -o '"image_state":"[a-z]*"' | cut -d'"' -f4)
 
   kill "$sentinel_pid" 2>/dev/null || true
   wait "$sentinel_pid" 2>/dev/null || true
@@ -80,8 +96,18 @@ run_offline() {
     fail=1
   fi
 
+  if [ "$image_state" = "loaded" ]; then
+    echo "  FAIL: offline render image_state=loaded — the remote image loaded despite the sentinel; offline is not actually offline"
+    fail=1
+  else
+    echo "  PASS: offline render image_state=$image_state (not loaded, consistent with the sentinel's 403 refusal)"
+  fi
+
   "$VALIDATE_PDF" "$pdf" || fail=1
-  pdftoppm -png -r 100 "$pdf" "$pngdir/page"
+  if ! pdftoppm -png -r 100 "$pdf" "$pngdir/page"; then
+    echo "  FAIL: pdftoppm exited non-zero rendering $pdf"
+    fail=1
+  fi
   for p in "$pngdir"/page-*.png; do
     echo "  png: $p sha256=$(shasum -a 256 "$p" | awk '{print $1}') bytes=$(stat -f%z "$p" 2>/dev/null || stat -c%s "$p")"
   done

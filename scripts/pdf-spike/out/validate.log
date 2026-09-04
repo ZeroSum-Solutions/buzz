@@ -1,5 +1,6 @@
 == mode: online ==
-  render: {"bytes":493243,"wall_ms":3518,"sha256":"eb247eafafd51830cb158b80f517ee0db531b5e2b4aa4ae7f5de927129000cd7"}
+  render: {"bytes":493243,"wall_ms":3191,"image_wait_ms":141,"print_ms":163,"image_state":"loaded","sha256":"62ac13828de8025f78e495221403eb69427425506953f438416c8db235c83370"}
+  PASS: online render image_state=loaded (remote <img> confirmed via its load event, not inferred from a sleep)
 == validating out/approval-headless-chrome-online.pdf ==
   PASS: page count == 3 (got 3)
   PASS: heading 1 (Approval Page One) present (got 1)
@@ -9,16 +10,17 @@
   PASS: table cell token (delta-fixture-row) present (got 2)
   PASS: code marker line present (got 2)
   PASS: pdftoppm produced 3 PNGs without error (got 3)
-  pdf: bytes=493243 sha256=eb247eafafd51830cb158b80f517ee0db531b5e2b4aa4ae7f5de927129000cd7
+  pdf: bytes=493243 sha256=62ac13828de8025f78e495221403eb69427425506953f438416c8db235c83370
 VALIDATION PASSED
   png: out/png-online/page-1.png sha256=8c951faf84d6b9775ebfc99bd6508a80a370076184439d1594ed599fb4b1dd42 bytes=193999
   png: out/png-online/page-2.png sha256=ed7231ce9816e8c4424f76c3db1f7ce66e7d41026026c54e30b4602cb2f8e96d bytes=185002
   png: out/png-online/page-3.png sha256=540d3f91b1899821100a252845c8aaf4635d42216bdc1823b700a0776bb68d6c bytes=120294
 == mode: offline ==
-  render: {"bytes":110006,"wall_ms":4025,"sha256":"9d07da525f2dba2c38e73fee77b2ecb188a7984add97a63a2265689bd6fc7523"}
+  render: {"bytes":110006,"wall_ms":3247,"image_wait_ms":22,"print_ms":143,"image_state":"failed","sha256":"23b50ed037238686a476da1b8c7fd807a0c1637c516bc747ac0ffa2f642fd647"}
   PASS: sentinel log shows the remote fetch was attempted (got 1 line(s))
   sentinel log:
-    1788514280113 refused peer=127.0.0.1:56230 request=GET /remote-image.png HTTP/1.1
+    1788515768542 refused peer=127.0.0.1:56425 request=GET /remote-image.png HTTP/1.1
+  PASS: offline render image_state=failed (not loaded, consistent with the sentinel's 403 refusal)
 == validating out/approval-headless-chrome-offline.pdf ==
   PASS: page count == 3 (got 3)
   PASS: heading 1 (Approval Page One) present (got 1)
@@ -28,7 +30,7 @@ VALIDATION PASSED
   PASS: table cell token (delta-fixture-row) present (got 2)
   PASS: code marker line present (got 2)
   PASS: pdftoppm produced 3 PNGs without error (got 3)
-  pdf: bytes=110006 sha256=9d07da525f2dba2c38e73fee77b2ecb188a7984add97a63a2265689bd6fc7523
+  pdf: bytes=110006 sha256=23b50ed037238686a476da1b8c7fd807a0c1637c516bc747ac0ffa2f642fd647
 VALIDATION PASSED
   png: out/png-offline/page-1.png sha256=5a59a1826f58c84710e68bbc0d49b224e17e5bd0fc7edc5afe70bb9d3846dea0 bytes=191651
   png: out/png-offline/page-2.png sha256=26e29263defda67d0328763f563dc0c632a46a43187321f24566d0153c82b705 bytes=205835
