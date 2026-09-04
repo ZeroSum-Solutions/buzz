@@ -1,0 +1,8 @@
+/target/
+/out/*.pdf
+/out/png-*/
+/out/sentinel.log
+/out/sentinel-stdout.log
+/out/sentinel-noinstrument.log
+/out/sentinel-noinstrument-stdout.log
+/out/*-run.html
