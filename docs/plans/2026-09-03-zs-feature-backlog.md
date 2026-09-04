@@ -40,3 +40,10 @@ not on Devin's disk.
 1. Audit each idea against the code and the `VISION_*.md` docs (repo `CLAUDE.md` requires it).
 2. Implementation plan with evals per feature and tickets.
 3. Execute feature by feature on `feat/*` branches off `zs/main`.
+
+## Findings from the first install (2026-09-03, 23:45 PT)
+
+- **Installed build = fork.** `/Applications/Buzz.app` is the fork's 0.5.21 release bundle (ad-hoc signed; one-time Keychain "Always Allow" on first launch). Block's 0.5.20 is at `~/Backups/buzz/Buzz-0.5.20-block-release.app`. Rebuild: `cargo build --release` for the six sidecars, copy into `desktop/src-tauri/binaries/`, then `pnpm tauri build --features mesh-llm --target aarch64-apple-darwin` in `desktop/`; quit Buzz, `ditto` the bundle over `/Applications/Buzz.app`, relaunch from the Dock.
+- **Harness discovery order** (`desktop/src-tauri/src/managed_agents/discovery.rs`, `command_search_dirs`): the app looks in the compile-time workspace's `target/release` before its own bundle, so on this machine the installed app runs whatever `~/projects/buzz/target/release/buzz-acp` is. Candidate fork fix: prefer the bundle dir when `current_exe` is inside an `.app`.
+- **Launch from the Dock, never `open -a Buzz` from an agent shell.** `open` propagates the caller's environment, and every agent child inherits it (seen once: the whole Claude Code shell env, API keys included). A clean relaunch is `env -i HOME=… PATH=/usr/bin:/bin:/usr/sbin:/sbin /usr/bin/open -a /Applications/Buzz.app`.
+- **Agent prompts from files works.** Definitions in `managed-agents.json` are read at boot and re-pinned onto each instance on spawn (`commands/agents.rs`), so editing the store while Buzz is quit applies cleanly. Script: `~/projects/clients/broken-english/buzz/apply-agent-prompts.py`. Backlog item 7 becomes "do this inside the app".
