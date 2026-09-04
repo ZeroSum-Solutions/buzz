@@ -141,3 +141,55 @@ test("whitespace-only about degrades to null (name-only row)", () => {
 
   assert.equal(result.description, null);
 });
+
+test("an unbounded about is capped to 120 graphemes with an ellipsis", () => {
+  // A plausible non-hostile case: an agent whose `about` is its full system
+  // prompt. Also stands in for the relay's 256 KiB kind-0 content ceiling —
+  // this suite doesn't build a string that large, it proves the cap applies
+  // to any input longer than the bound, regardless of size.
+  const hugeAbout = "S".repeat(200_000);
+
+  const result = mapMentionCandidateToSuggestion({
+    agentProvenanceReady: true,
+    candidate: agentCandidate({ description: hugeAbout }),
+    label: "Codex",
+  });
+
+  assert.equal(result.description?.length, 120);
+  assert.ok(result.description?.endsWith("…"));
+  assert.equal(result.description, `${"S".repeat(119)}…`);
+});
+
+test("an about exactly at the cap is left untouched", () => {
+  const exact = "A".repeat(120);
+
+  const result = mapMentionCandidateToSuggestion({
+    agentProvenanceReady: true,
+    candidate: agentCandidate({ description: exact }),
+    label: "Codex",
+  });
+
+  assert.equal(result.description, exact);
+});
+
+test("description length cap counts graphemes, not UTF-16 code units", () => {
+  // Each family emoji is one grapheme cluster spanning multiple UTF-16 code
+  // units (ZWJ sequence) — a code-unit-based cap would truncate mid-cluster.
+  const family = "\u{1F468}‍\u{1F469}‍\u{1F467}‍\u{1F466}";
+  const about = family.repeat(130);
+
+  const result = mapMentionCandidateToSuggestion({
+    agentProvenanceReady: true,
+    candidate: agentCandidate({ description: about }),
+    label: "Codex",
+  });
+
+  assert.ok(result.description);
+  const graphemeCount = Array.from(
+    new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(
+      result.description,
+    ),
+  ).length;
+  assert.equal(graphemeCount, 120);
+  assert.ok(result.description.endsWith("…"));
+});

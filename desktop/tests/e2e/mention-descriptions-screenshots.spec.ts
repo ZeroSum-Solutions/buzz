@@ -6,6 +6,8 @@ import {
   openNewMessagePage,
   TEST_IDENTITIES,
 } from "../helpers/bridge";
+import { MENTION_SUGGESTION_LIMIT } from "../../src/features/messages/lib/mentionFallbackWindow";
+import { MENTION_DESCRIPTION_MAX_GRAPHEMES } from "../../src/features/messages/lib/mentionSuggestionMapping";
 import type { MockManagedAgentSeed } from "../../src/testing/e2eBridge";
 
 const SHOTS = "test-results/mention-descriptions";
@@ -24,6 +26,15 @@ const ATLAS_LONG_ABOUT =
   "Operations copilot for the whole hive: triages incoming requests, " +
   "routes work to the right specialist agent, keeps the runbook current, " +
   "and escalates anything ambiguous to a human before acting on it";
+// mapMentionCandidateToSuggestion caps the role line to
+// MENTION_DESCRIPTION_MAX_GRAPHEMES before it ever reaches the DOM (a
+// documented bound on untrusted kind-0 `about` content — see
+// mentionSuggestionMapping.ts), so this fixture's `about` is deliberately
+// longer than that cap and every DOM assertion below expects the capped
+// text, not ATLAS_LONG_ABOUT itself. The component's own CSS truncation
+// (tested via scrollWidth below) is a second, independent bound on top of
+// this one — pixel clipping only, not a length cap.
+const ATLAS_CAPPED_ABOUT = `${ATLAS_LONG_ABOUT.slice(0, MENTION_DESCRIPTION_MAX_GRAPHEMES - 1)}…`;
 
 /** Locator scoped to the mention autocomplete dropdown inside the composer. */
 function autocomplete(page: import("@playwright/test").Page) {
@@ -118,22 +129,29 @@ test("mention selector shows each agent's kind-0 about as a role line", async ({
       about,
     );
     // The row's aria-label ("Mention Fizz") overrides descendant text as the
-    // accessible name, so the role line must reach screen readers through
-    // aria-describedby instead — assert the accessible description directly
-    // rather than only the visible text, or a regression that renders the
-    // text but drops the wiring would pass silently.
-    await expect(row).toHaveAccessibleDescription(about);
+    // accessible name, so both metadata halves must reach screen readers
+    // through aria-describedby instead — assert the accessible description
+    // directly rather than only the visible text, or a regression that
+    // renders the text but drops the wiring would pass silently. It carries
+    // the agent's own bio AND the verified "managed by you" provenance
+    // (space-joined, description first) — dropping either half is a
+    // regression: the self-authored bio is the disambiguating content this
+    // row exists to announce, and the provenance is what keeps that bio from
+    // reading as a verified ownership claim it isn't.
+    await expect(row).toHaveAccessibleDescription(`${about} managed by you`);
     await expect(row.getByText("managed by you")).toBeVisible();
   }
 
-  // No `about` → today's exact row: bot icon + literal "agent" label.
+  // No `about` → today's exact row: bot icon + literal "agent" label. The
+  // accessible description still carries the verified "managed by you"
+  // provenance even with no bio to announce alongside it.
   const buzzyRow = dropdown.locator("button", { hasText: "Buzzy" });
   await expect(buzzyRow.getByTestId("mention-agent-icon")).toBeVisible();
   await expect(buzzyRow.getByText("agent", { exact: true })).toBeVisible();
   await expect(buzzyRow.getByTestId("mention-agent-description")).toHaveCount(
     0,
   );
-  await expect(buzzyRow).toHaveAccessibleDescription("");
+  await expect(buzzyRow).toHaveAccessibleDescription("managed by you");
 
   // Humans never get a role line, even with an `about` on their profile.
   const bobRow = dropdown.locator("button", { hasText: "bob" });
@@ -175,8 +193,10 @@ test("long about truncates to a single line beside the managed-by label", async 
   const atlasRow = dropdown.locator("button", { hasText: "Atlas" });
   const description = atlasRow.getByTestId("mention-agent-description");
   await expect(description).toBeVisible();
-  await expect(description).toHaveAttribute("title", ATLAS_LONG_ABOUT);
-  await expect(atlasRow).toHaveAccessibleDescription(ATLAS_LONG_ABOUT);
+  await expect(description).toHaveAttribute("title", ATLAS_CAPPED_ABOUT);
+  await expect(atlasRow).toHaveAccessibleDescription(
+    `${ATLAS_CAPPED_ABOUT} managed by you`,
+  );
   await expect(atlasRow.getByText("managed by you")).toBeVisible();
 
   // The full text must overflow its one-line box — proof it truncates
@@ -198,13 +218,17 @@ test("long about truncates to a single line beside the managed-by label", async 
 // passes no `profiles` prop to `MessageComposer` at all, so any agent role
 // line here can only come from useMentions' own fallback batch.
 //
-// The numeric request bound (never more than MENTION_SUGGESTION_LIMIT
-// pubkeys, even with 150+ mentionable agents, and a past-the-window agent
-// still resolving once ranked into view) is covered directly and cheaply at
-// the unit level in mentionFallbackWindow.test.mjs, which exercises the
-// exact functions useMentions.ts calls. This spec proves the other half —
-// that useMentions.ts is actually wired to call them on a real composer
-// with no scoped `profiles` — through observable UI behavior only.
+// mentionFallbackWindow.test.mjs proves the selection helpers themselves are
+// bounded, but it imports them directly and never imports useMentions.ts —
+// it cannot prove useMentions.ts is actually wired to call them with a
+// bounded input on a real composer. This spec binds that seam: it asserts
+// the ACTUAL `get_users_batch` payloads useMentions.ts sends (recorded by
+// the mock bridge) never exceed MENTION_SUGGESTION_LIMIT pubkeys, even with
+// 120 mentionable agents, and that a past-the-window agent still resolves
+// once ranked into view — through observable UI behavior AND the recorded
+// IPC payload, not just the render count (which is capped separately by
+// `matchingSuggestions` and would stay 50 even if the batch request itself
+// regressed to unbounded).
 const MANY_AGENTS_COUNT = 120;
 // Zero-padded to a fixed width so no agent's name is a substring of
 // another's (`Agent001` vs. `Agent010` vs. `Agent100`) — Playwright's
@@ -235,6 +259,30 @@ const manySearchProfiles = manyManagedAgents.map((agent, i) => ({
   about: `Role ${i + 1}`,
 }));
 
+/** Reads every recorded `get_users_batch` call's `pubkeys` payload, narrowed
+ *  to calls made up entirely of this fixture's agent pubkeys (the
+ *  `manyAgentPubkey` `9f…` prefix) — the shape only a mention-picker
+ *  agent-profile request can have. The app shell also mounts an unrelated,
+ *  legitimately unbounded batch call on startup (the agent-observer
+ *  bridge's blanket relay-agent sweep, which pulls in non-agent identities
+ *  like the recipient-picker's search results too); this filter excludes it
+ *  by content rather than by timing, which stays correct across the whole
+ *  test regardless of when that unrelated call happens to settle. */
+async function fixtureAgentUsersBatchCalls(
+  page: import("@playwright/test").Page,
+) {
+  return page.evaluate(() =>
+    (window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? [])
+      .filter((entry) => entry.command === "get_users_batch")
+      .map((entry) => (entry.payload as { pubkeys?: string[] })?.pubkeys ?? [])
+      .filter(
+        (pubkeys) =>
+          pubkeys.length > 0 &&
+          pubkeys.every((pk) => pk.toLowerCase().startsWith("9f")),
+      ),
+  );
+}
+
 test("resolves an agent's about through the fallback batch on a composer with no profiles prop, bounded even past the ranked window", async ({
   page,
 }) => {
@@ -242,6 +290,25 @@ test("resolves an agent's about through the fallback batch on a composer with no
     managedAgents: manyManagedAgents,
     relayAgents: [],
     searchProfiles: manySearchProfiles,
+    // The 120th agent's `about` stays seeded (so `get_users_batch` resolves
+    // it normally) but withheld from `search_users` results. Without this,
+    // typing its exact name below would enable global user search, which
+    // would independently resolve its `about` through the search-result
+    // candidate path (buildMentionCandidates.ts) and let this test pass
+    // even if useMentions.ts's own fallback batch were deleted.
+    usersBatchOnlyPubkeys: [manyAgentPubkey(MANY_AGENTS_COUNT - 1)],
+    // Every `get_users_batch` caller (including the unrelated app-shell
+    // agent-observer sweep — see fixtureAgentUsersBatchCalls) starts
+    // pinned open. Without this, that sweep resolves before the composer
+    // ever mounts and pre-warms useUsersBatchQuery's per-pubkey delta-fetch
+    // cache for every one of these agents; the mention fallback's own call
+    // would then resolve entirely from cache and never reach
+    // `get_users_batch` at all, so a regression to the unbounded upstream
+    // form would leave zero recorded calls to inspect either way — a
+    // request-count assertion with nothing to bind to. Holding first keeps
+    // every caller's request recorded before any of them can resolve and
+    // populate that cache.
+    startWithUsersBatchHeld: true,
   });
   await page.goto("/");
   await openNewMessagePage(page);
@@ -256,7 +323,10 @@ test("resolves an agent's about through the fallback batch on a composer with no
 
   // A bare "@" keeps the mention query empty, which keeps global user
   // search disabled (`canSearchGlobalPeople` requires non-empty text) — the
-  // fallback batch is the ONLY thing that can resolve an about here.
+  // fallback batch is the ONLY thing that can resolve an about here. Row
+  // rendering does not wait on the batch resolving (only the role-line text
+  // inside each row does), so all 50 buttons appear even while every
+  // `get_users_batch` call is still held.
   await page.getByTestId("message-input").fill("@");
   const dropdown = autocomplete(page);
   await expect(dropdown).toBeVisible();
@@ -267,6 +337,26 @@ test("resolves an agent's about through the fallback batch on a composer with no
   await expect(
     dropdown.locator("button", { hasText: LAST_AGENT_NAME }),
   ).toHaveCount(0);
+
+  // The production request bound, captured before anything can resolve
+  // from cache: every `get_users_batch` call made up entirely of this
+  // fixture's agent pubkeys — the mention fallback's own request shape,
+  // isolated from the unrelated observer sweep by content (see
+  // fixtureAgentUsersBatchCalls) — carries at most
+  // MENTION_SUGGESTION_LIMIT pubkeys. A regression to the unbounded
+  // upstream form (requesting every mentionable agent) would still render
+  // 50 buttons (that cap comes from `matchingSuggestions`, not this
+  // request) but would fail this assertion.
+  const boundedWindowCalls = await fixtureAgentUsersBatchCalls(page);
+  expect(boundedWindowCalls.length).toBeGreaterThan(0);
+  for (const pubkeys of boundedWindowCalls) {
+    expect(pubkeys.length).toBeLessThanOrEqual(MENTION_SUGGESTION_LIMIT);
+  }
+
+  // Release every held call — including the observer sweep and the
+  // fallback batch just verified above — so the UI can settle and the rest
+  // of this test exercises normal (unheld) behavior.
+  await page.evaluate(() => window.__BUZZ_E2E_HOLD_USERS_BATCH__?.(false));
 
   // A visible agent's role line resolved through the fallback. A bare "@"
   // keeps global user search disabled (see above), so this text can only
@@ -279,11 +369,21 @@ test("resolves an agent's about through the fallback batch on a composer with no
 
   // Narrowing the query to the 120th agent's exact name ranks it first and
   // brings it into the visible window — proof the bound doesn't strand an
-  // agent past the first page; it resolves once brought into view.
+  // agent past the first page; it resolves once brought into view. Global
+  // people search is enabled by this non-empty query, but `about` still
+  // proves the fallback batch resolved it and not search: this pubkey is
+  // withheld from `search_users` results by `usersBatchOnlyPubkeys` above,
+  // so global search returns nothing for it — deleting useMentions.ts's
+  // fallback block drops this row to the generic "agent" label.
   await page.getByTestId("message-input").fill(`@${LAST_AGENT_NAME}`);
   const lastRow = dropdown.locator("button", { hasText: LAST_AGENT_NAME });
   await expect(lastRow).toBeVisible();
   await expect(lastRow.getByTestId("mention-agent-description")).toHaveText(
     LAST_AGENT_ABOUT,
   );
+
+  // The bound holds for this narrowed, newly-brought-into-view request too.
+  for (const pubkeys of await fixtureAgentUsersBatchCalls(page)) {
+    expect(pubkeys.length).toBeLessThanOrEqual(MENTION_SUGGESTION_LIMIT);
+  }
 });

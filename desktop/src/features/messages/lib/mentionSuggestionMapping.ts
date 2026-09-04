@@ -8,6 +8,35 @@ import type { MentionCandidate, TeamMentionMember } from "./mentionCandidates";
 import { mentionCandidateLabel } from "./mentionCandidates";
 import { pickDefaultAgentCandidate } from "./mentionRanking";
 
+// Grapheme cap on the rendered role line. `about` is untrusted kind-0
+// content with no upstream length bound (the relay allows up to 256 KiB of
+// kind-0 content) — this is what keeps a hostile or merely verbose bio from
+// reaching the DOM (text node, `title` attribute, and the accessible
+// description) at full length. The full bio remains available on the
+// profile surface; this is a quick-picker row, not a profile card.
+export const MENTION_DESCRIPTION_MAX_GRAPHEMES = 120;
+
+const mentionDescriptionSegmenter =
+  typeof Intl.Segmenter === "function"
+    ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
+    : null;
+
+function mentionDescriptionGraphemes(text: string): string[] {
+  return mentionDescriptionSegmenter
+    ? Array.from(
+        mentionDescriptionSegmenter.segment(text),
+        ({ segment }) => segment,
+      )
+    : Array.from(text);
+}
+
+/** Caps a role-line description to {@link MENTION_DESCRIPTION_MAX_GRAPHEMES}. */
+function truncateMentionDescription(text: string): string {
+  const graphemes = mentionDescriptionGraphemes(text);
+  if (graphemes.length <= MENTION_DESCRIPTION_MAX_GRAPHEMES) return text;
+  return `${graphemes.slice(0, MENTION_DESCRIPTION_MAX_GRAPHEMES - 1).join("")}…`;
+}
+
 export type MentionSuggestionCandidate = {
   kind: "identity" | "persona" | "team";
   pubkey?: string;
@@ -55,7 +84,10 @@ export function mapMentionCandidateToSuggestion(opts: {
         ? profiles?.[normalizePubkey(candidate.pubkey)]?.about
         : null))
     : null;
-  const description = rawDescription?.replace(/\s+/g, " ").trim() || null;
+  const collapsedDescription = rawDescription?.replace(/\s+/g, " ").trim();
+  const description = collapsedDescription
+    ? truncateMentionDescription(collapsedDescription)
+    : null;
 
   return {
     pubkey: candidate.pubkey,

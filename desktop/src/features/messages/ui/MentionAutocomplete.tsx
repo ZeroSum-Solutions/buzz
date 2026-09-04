@@ -282,14 +282,25 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
                 lockedAgentPubkeys?.has(suggestion.pubkey.toLowerCase()),
             );
             // The row's `aria-label` overrides all descendant text as the
-            // accessible name, so the role line below is otherwise announced
-            // to no one — the exact disambiguation it exists to provide
-            // (two same-named agents with different roles) is unavailable to
-            // screen-reader users without this.
+            // accessible name, so neither metadata line below is announced
+            // to screen-reader users without `aria-describedby`. Both the
+            // agent's self-authored `about` and the verified
+            // `managed by <owner>` provenance get an id here so the
+            // description carries both — promoting only the untrusted
+            // self-authored half while silently dropping verified
+            // provenance would let an agent's `about` fabricate ownership
+            // unchallenged.
             const descriptionId =
               suggestion.isAgent && suggestion.description
                 ? `mention-agent-description-${index}`
                 : undefined;
+            const provenanceId =
+              ownerLabel || suggestion.notInChannel
+                ? `mention-agent-provenance-${index}`
+                : undefined;
+            const describedBy =
+              [descriptionId, provenanceId].filter(Boolean).join(" ") ||
+              undefined;
 
             return (
               <div
@@ -304,7 +315,7 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
                 key={suggestionKey}
               >
                 <button
-                  aria-describedby={descriptionId}
+                  aria-describedby={describedBy}
                   aria-label={`Mention ${suggestion.displayName}`}
                   className={cn(
                     "flex min-w-0 flex-1 items-center gap-2 rounded-lg px-3 py-1.5 text-left",
@@ -389,6 +400,7 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
                         {ownerLabel || suggestion.notInChannel ? (
                           <span
                             className="min-w-0 truncate"
+                            id={provenanceId}
                             title={
                               ownerLabel && suggestion.notInChannel
                                 ? `managed by ${ownerLabel} · not in channel`

@@ -10,11 +10,17 @@ import {
  * {@link rankVisibleMentionCandidates} — on the agent profile fallback batch
  * in useMentions.ts's `agentProfilePubkeys`. The two must share one bound:
  * on a surface with no scoped `profiles` prop the mentionable set can be a
- * community's whole agent directory, and the relay's `get_users_batch`
- * clamps a limit-less filter to 100 rows. Requesting every unknown agent in
- * the directory risks a truncated page being cached as confirmed-missing.
- * Keeping the fallback to this same 50-row window keeps every request under
- * that clamp.
+ * community's whole agent directory. `get_users_batch` sends a `kind: 0`
+ * filter with no `limit` (desktop/src-tauri/src/commands/profile.rs), and
+ * the relay clamps a limit-less filter to `DEFAULT_MAX_PAGE_LIMIT` — 1,000
+ * rows (crates/buzz-db/src/store/event.rs), also the advertised NIP-11
+ * `max_limit` (crates/buzz-relay/src/nip11.rs). This bound is not sized
+ * against that 1,000-row ceiling; it is sized to match what the picker
+ * renders, so the fallback never fetches an about for an agent the user
+ * can't see. Requesting every unknown agent in the directory instead risks
+ * a truncated page (past 1,000 mentionable agents) being cached as
+ * confirmed-missing. Keeping the fallback to this same 50-row window keeps
+ * every request an order of magnitude under that clamp.
  */
 export const MENTION_SUGGESTION_LIMIT = 50;
 
