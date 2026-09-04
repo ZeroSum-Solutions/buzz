@@ -28,6 +28,8 @@ const NAMESAKE_PUBKEY =
 const MENTION_LABEL = "John Smith";
 const MENTION_SIGIL = `@${MENTION_LABEL}`;
 const MESSAGE_BODY = "@John Smith fixed the bug";
+/** A copied sentence with words either side of its mention, as most have. */
+const SURROUNDED_MENTION_BODY = "Hello @John Smith fixed the bug";
 /** A second copied sentence naming the same person, appended to the first. */
 const SECOND_MENTION_BODY = " and @John Smith agrees";
 const FORUM_REPLY_BODY = "Agreed, @John Smith should confirm";
@@ -390,6 +392,36 @@ async function holdRelayProfileLookups(page: Page, hold: boolean) {
     (next) => window.__BUZZ_E2E_HOLD_USERS_BATCH__?.(next) ?? 0,
     hold,
   );
+}
+
+/**
+ * Select the first occurrence of `wanted` in the composer.
+ *
+ * The DOM range a mouse drag leaves behind, in one shot: ProseMirror adopts it
+ * exactly as it adopts a real drag, and whatever key is pressed next still
+ * goes through the editor's own keymap. A caret walked there with arrow keys
+ * silently lost presses between runs and deleted the wrong words.
+ */
+async function selectComposerRange(page: Page, wanted: string) {
+  const selected = await page
+    .getByTestId("message-input")
+    .evaluate((element, needle) => {
+      const selection = window.getSelection();
+      if (!selection) throw new Error("Selection API unavailable.");
+      const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        const at = node.nodeValue?.indexOf(needle) ?? -1;
+        if (at < 0) continue;
+        const range = document.createRange();
+        range.setStart(node, at);
+        range.setEnd(node, at + needle.length);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        return selection.toString();
+      }
+      throw new Error(`Composer holds no run reading ${needle}`);
+    }, wanted);
+  expect(selected).toBe(wanted);
 }
 
 /** Wait until a lookup naming `pubkey` is provably pinned open. */
@@ -1038,6 +1070,81 @@ test("a slow paste settling last does not take a newer paste's name", async ({
   expect(await readSentMentionPubkeys(page, wholeBody)).not.toContain(
     NAMESAKE_PUBKEY,
   );
+});
+
+test("retyping the pasted mention binds nothing to the typed words", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-bob-tyler").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("bob-tyler");
+
+  await holdRelayProfileLookups(page, true);
+  await pasteIntoComposer(
+    page,
+    mentionFlavors(JOHN_SMITH_PUBKEY, SURROUNDED_MENTION_BODY),
+  );
+  const input = page.getByTestId("message-input");
+  await expect(input).toHaveText(SURROUNDED_MENTION_BODY);
+  await waitForHeldProfileLookup(page, JOHN_SMITH_PUBKEY);
+
+  // Second thoughts about the name specifically: select exactly the mention
+  // and write it out again. The edit is strictly inside the paste, so the
+  // sentence around it is untouched and the composer reads character for
+  // character as it did — but the name is now the user's own words, and their
+  // own candidates are what should decide who it means.
+  await selectComposerRange(page, MENTION_SIGIL);
+  await input.pressSequentially(MENTION_SIGIL);
+  // Hand-typing `@` opens the picker; nothing here selects from it.
+  await input.press("Escape");
+  await expect(input).toHaveText(SURROUNDED_MENTION_BODY);
+
+  expect(await holdRelayProfileLookups(page, false)).toBeGreaterThan(0);
+  await expect(input.locator(".mention-chip")).toHaveCount(0);
+
+  await page.getByTestId("send-message").click();
+  await expect(input).toHaveText("");
+  await expect
+    .poll(() => readSentMentionPubkeys(page, SURROUNDED_MENTION_BODY))
+    .not.toBeNull();
+  expect(
+    await readSentMentionPubkeys(page, SURROUNDED_MENTION_BODY),
+  ).not.toContain(JOHN_SMITH_PUBKEY);
+});
+
+test("editing a word beside a pasted mention keeps its identity", async ({
+  page,
+}) => {
+  // The other side of the same fence. A lookup that crosses the network is
+  // exactly the window a user has time to tidy the sentence in, and tidying it
+  // must not silently cost the mention its pubkey — that is the non-member
+  // case this whole feature exists for.
+  await page.goto("/");
+  await page.getByTestId("channel-bob-tyler").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("bob-tyler");
+
+  await holdRelayProfileLookups(page, true);
+  await pasteIntoComposer(
+    page,
+    mentionFlavors(JOHN_SMITH_PUBKEY, SURROUNDED_MENTION_BODY),
+  );
+  const input = page.getByTestId("message-input");
+  await expect(input).toHaveText(SURROUNDED_MENTION_BODY);
+  await waitForHeldProfileLookup(page, JOHN_SMITH_PUBKEY);
+
+  await selectComposerRange(page, "fixed ");
+  await input.press("Backspace");
+  const edited = SURROUNDED_MENTION_BODY.replace("fixed ", "");
+  await expect(input).toHaveText(edited);
+
+  expect(await holdRelayProfileLookups(page, false)).toBeGreaterThan(0);
+  await expect(input.locator(".mention-chip")).toHaveText("John Smith");
+
+  await page.getByTestId("send-message").click();
+  await expect(input).toHaveText("");
+  await expect
+    .poll(() => readSentMentionPubkeys(page, edited))
+    .toContain(JOHN_SMITH_PUBKEY);
 });
 
 test("a deleted paste binds nothing to the same name typed after it", async ({

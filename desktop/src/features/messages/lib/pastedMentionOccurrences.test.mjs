@@ -7,7 +7,7 @@ import StarterKit from "@tiptap/starter-kit";
 
 import {
   PastedMentionOccurrencesExtension,
-  readPastedMentionOccurrenceText,
+  readPastedMentionOccurrenceRange,
   releasePastedMentionOccurrence,
   trackPastedMentionOccurrence,
 } from "./pastedMentionOccurrences.ts";
@@ -16,9 +16,10 @@ import {
  * Occurrence ownership, driven through the real ProseMirror plugin.
  *
  * A pasted mention's identity check can outlive the paste, so settlement has
- * to ask whether the label is still in the text *that paste* inserted. These
- * cases pin what "still" means: positions follow edits elsewhere, and the
- * range dies rather than drifting onto text the user typed.
+ * to ask whether the text *that paste* inserted is still there. These cases
+ * pin what "still" means: positions follow edits elsewhere, and the range dies
+ * rather than drifting onto text the user typed — including when the user
+ * edits strictly inside it, where both endpoints survive untouched.
  */
 
 const schema = getSchema([
@@ -58,6 +59,13 @@ function trackWholeParagraph(view) {
   return trackPastedMentionOccurrence(view, 1, view.state.doc.content.size - 1);
 }
 
+/** The text an occurrence still owns, or `null` once its range is gone. */
+function ownedText(view, id) {
+  const range = readPastedMentionOccurrenceRange(view, id);
+  if (!range) return null;
+  return view.state.doc.textBetween(range.from, range.to, "\n", "\n");
+}
+
 function replaceRange(view, from, to, replacement) {
   const tr = view.state.tr;
   if (replacement === "") tr.delete(from, to);
@@ -74,7 +82,7 @@ test("an occurrence still reads its own text after an edit elsewhere", () => {
     view.state.tr.insertText(" thanks", view.state.doc.content.size - 1),
   );
 
-  assert.equal(readPastedMentionOccurrenceText(view, id), PASTED);
+  assert.equal(ownedText(view, id), PASTED);
 });
 
 test("an occurrence's positions follow an insertion before it", () => {
@@ -84,7 +92,7 @@ test("an occurrence's positions follow an insertion before it", () => {
   view.dispatch(view.state.tr.insertText("see: ", 1));
 
   assert.equal(view.state.doc.textContent, `see: ${PASTED}`);
-  assert.equal(readPastedMentionOccurrenceText(view, id), PASTED);
+  assert.equal(ownedText(view, id), PASTED);
 });
 
 test("text typed at either edge stays outside the occurrence", () => {
@@ -97,7 +105,7 @@ test("text typed at either edge stays outside the occurrence", () => {
   const afterHead = view.state.doc.content.size - 1;
   view.dispatch(view.state.tr.insertText(" @Fizz", afterHead));
 
-  assert.equal(readPastedMentionOccurrenceText(view, id), PASTED);
+  assert.equal(ownedText(view, id), PASTED);
 });
 
 test("an occurrence dies when its text is deleted", () => {
@@ -106,7 +114,7 @@ test("an occurrence dies when its text is deleted", () => {
 
   replaceRange(view, 1, view.state.doc.content.size - 1, "");
 
-  assert.equal(readPastedMentionOccurrenceText(view, id), null);
+  assert.equal(ownedText(view, id), null);
 });
 
 test("an occurrence dies when the same text is pasted over it", () => {
@@ -118,7 +126,7 @@ test("an occurrence dies when the same text is pasted over it", () => {
   replaceRange(view, 1, view.state.doc.content.size - 1, PASTED);
 
   assert.equal(view.state.doc.textContent, PASTED);
-  assert.equal(readPastedMentionOccurrenceText(view, id), null);
+  assert.equal(ownedText(view, id), null);
 });
 
 test("an occurrence dies when the composer is cleared on send", () => {
@@ -127,20 +135,90 @@ test("an occurrence dies when the composer is cleared on send", () => {
 
   view.dispatch(view.state.tr.delete(0, view.state.doc.content.size));
 
-  assert.equal(readPastedMentionOccurrenceText(view, id), null);
+  assert.equal(ownedText(view, id), null);
 });
 
 test("an occurrence dies when an edit eats into its head or tail", () => {
   const head = viewWith(PASTED);
   const headId = trackWholeParagraph(head);
   replaceRange(head, 1, 2, "");
-  assert.equal(readPastedMentionOccurrenceText(head, headId), null);
+  assert.equal(ownedText(head, headId), null);
 
   const tail = viewWith(PASTED);
   const tailId = trackWholeParagraph(tail);
   const end = tail.state.doc.content.size - 1;
   replaceRange(tail, end - 3, end, "");
-  assert.equal(readPastedMentionOccurrenceText(tail, tailId), null);
+  assert.equal(ownedText(tail, tailId), null);
+});
+
+test("an occurrence dies when an edit replaces text strictly inside it", () => {
+  // Neither endpoint moves, and the document ends up character-for-character
+  // as it was — so endpoint mapping alone left the range alive and owning
+  // words the user had just typed out by hand.
+  const view = viewWith(PASTED);
+  const id = trackWholeParagraph(view);
+
+  const at = 1 + PASTED.indexOf("fixed");
+  replaceRange(view, at, at + "fixed".length, "fixed");
+
+  assert.equal(view.state.doc.textContent, PASTED);
+  assert.equal(ownedText(view, id), null);
+});
+
+test("an occurrence dies when a later step of one transaction overlaps it", () => {
+  // The overlap is only visible per step: the first step shifts the range, so
+  // a check against the transaction's combined mapping would compare the
+  // second step's replaced region to stale coordinates.
+  const view = viewWith(PASTED);
+  const id = trackWholeParagraph(view);
+
+  const tr = view.state.tr;
+  tr.insertText("see: ", 1);
+  const at = tr.mapping.map(1 + PASTED.indexOf("fixed"));
+  tr.replaceWith(at, at + "fixed".length, text("broke"));
+  view.dispatch(tr);
+
+  assert.equal(
+    view.state.doc.textContent,
+    `see: ${PASTED}`.replace("fixed", "broke"),
+  );
+  assert.equal(ownedText(view, id), null);
+});
+
+test("a replacement that only butts an occurrence's boundary spares it", () => {
+  // The replaced text was outside the range on either side, so it was never
+  // the paste's to lose. Killing here would cost a legitimate identity every
+  // time a word beside the paste is edited during verification.
+  const head = viewWith(`see: ${PASTED}`);
+  const headId = trackPastedMentionOccurrence(
+    head,
+    1 + "see: ".length,
+    head.state.doc.content.size - 1,
+  );
+  replaceRange(head, 1, 1 + "see: ".length, "");
+  assert.equal(ownedText(head, headId), PASTED);
+
+  const tail = viewWith(`${PASTED} thanks`);
+  const tailId = trackPastedMentionOccurrence(tail, 1, 1 + PASTED.length);
+  replaceRange(
+    tail,
+    1 + PASTED.length,
+    tail.state.doc.content.size - 1,
+    " cheers",
+  );
+  assert.equal(ownedText(tail, tailId), PASTED);
+});
+
+test("a pure insertion inside an occurrence leaves it holding the new text", () => {
+  // An insertion replaces nothing, so the range legitimately survives — the
+  // caller's own check on the surviving text is what refuses a token the user
+  // has typed into.
+  const view = viewWith(PASTED);
+  const id = trackWholeParagraph(view);
+
+  view.dispatch(view.state.tr.insertText("X", 1 + "@John".length));
+
+  assert.equal(ownedText(view, id), "@JohnX Smith fixed the bug");
 });
 
 test("releasing an occurrence retires it", () => {
@@ -149,7 +227,7 @@ test("releasing an occurrence retires it", () => {
 
   releasePastedMentionOccurrence(view, id);
 
-  assert.equal(readPastedMentionOccurrenceText(view, id), null);
+  assert.equal(ownedText(view, id), null);
   // Idempotent: a second release dispatches nothing and does not throw.
   releasePastedMentionOccurrence(view, id);
 });
@@ -165,11 +243,8 @@ test("occurrences are independent", () => {
 
   replaceRange(view, 1, 1 + PASTED.length, "");
 
-  assert.equal(readPastedMentionOccurrenceText(view, first), null);
-  assert.equal(
-    readPastedMentionOccurrenceText(view, second),
-    " and @Fizz agrees",
-  );
+  assert.equal(ownedText(view, first), null);
+  assert.equal(ownedText(view, second), " and @Fizz agrees");
 });
 
 test("tracks nothing without a plugin, or for an empty insertion", () => {
@@ -180,7 +255,7 @@ test("tracks nothing without a plugin, or for an empty insertion", () => {
 
   const view = viewWith(PASTED);
   assert.equal(trackPastedMentionOccurrence(view, 3, 3), null);
-  assert.equal(readPastedMentionOccurrenceText(view, null), null);
+  assert.equal(ownedText(view, null), null);
 });
 
 test("tracks nothing for a destroyed view", () => {
@@ -188,6 +263,6 @@ test("tracks nothing for a destroyed view", () => {
   const id = trackWholeParagraph(view);
   view.isDestroyed = true;
 
-  assert.equal(readPastedMentionOccurrenceText(view, id), null);
+  assert.equal(ownedText(view, id), null);
   assert.equal(trackWholeParagraph(view), null);
 });

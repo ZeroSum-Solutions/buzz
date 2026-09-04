@@ -16,17 +16,23 @@ import {
  * the one this paste put there, and binding the former hands a stranger's
  * pubkey to text the composer's own candidates should have resolved.
  *
- * The plugin holds one range per in-flight paste and maps it through every
+ * The plugin holds a range per in-flight claim and maps it through every
  * transaction, so settlement can ask the narrower question: does the label
- * still appear in the text *this* paste owns? A range dies when its content is
+ * still occupy the text *this* paste owns? A range dies when its content is
  * deleted or replaced, which is the fail-closed direction — a settlement with
  * no live range binds nothing.
+ *
+ * The ranges callers track are the individual `@Label` tokens rather than the
+ * whole insertion, so an edit elsewhere in a pasted sentence costs nothing
+ * while any edit to the token itself revokes the identity it carried. The
+ * plugin stays granularity-agnostic: it tracks whatever range it is handed.
  */
 export const pastedMentionOccurrencesKey = new PluginKey<PastedMentionRanges>(
   "pastedMentionOccurrences",
 );
 
-type PastedMentionRange = { from: number; to: number };
+/** A half-open document range, in the coordinates the editor state uses. */
+export type PastedMentionRange = { from: number; to: number };
 
 type PastedMentionRanges = ReadonlyMap<number, PastedMentionRange>;
 
@@ -47,33 +53,62 @@ export type PastedMentionOccurrenceView = {
 };
 
 /**
- * Every paste releases its range at settlement, so this cap is a backstop
+ * Every paste releases its ranges at settlement, so this cap is a backstop
  * rather than a working limit: a composer whose settlements somehow stop
- * arriving must not accumulate ranges for the life of the session.
+ * arriving must not accumulate ranges for the life of the session. Callers
+ * also read it as the ceiling on what one paste may track — trimming costs a
+ * pasted identity rather than binding one, which is the safe direction.
  */
-const MAX_TRACKED_OCCURRENCES = 50;
+export const MAX_TRACKED_OCCURRENCES = 50;
 
 let nextOccurrenceId = 1;
 
 /**
- * Map every tracked range through one transaction, dropping the dead ones.
+ * Map one tracked range through a transaction, or `null` once it is dead.
  *
- * `from` maps with assoc 1 and `to` with assoc −1, so text typed at either
- * edge lands *outside* the range: an occurrence owns what the paste inserted
- * and nothing the user added around it. A range whose endpoint was deleted —
- * the select-all-and-retype case, and any edit that eats into the paste's head
- * or tail — is dropped rather than repaired.
+ * Two rules, and endpoint mapping alone is neither of them. `from` maps with
+ * assoc 1 and `to` with assoc −1, so text typed at either edge lands *outside*
+ * the range: an occurrence owns what the paste inserted and nothing the user
+ * added around it. But both endpoints also survive an edit wholly *inside* the
+ * range, so endpoint mapping on its own left a range alive while the user
+ * replaced the very characters it was tracking.
+ *
+ * Each step is therefore checked for a replaced region that strictly overlaps
+ * the range first, and any overlap kills it — the range no longer owns what it
+ * was handed. Touching a boundary is not an overlap, since that text was
+ * always outside; a pure insertion replaces nothing at all, and the caller's
+ * own check on the surviving text is what refuses those.
  */
+function remapPastedMentionRange(
+  range: PastedMentionRange,
+  tr: Transaction,
+): PastedMentionRange | null {
+  let { from, to } = range;
+  for (const map of tr.mapping.maps) {
+    let overlapped = false;
+    map.forEach((oldStart, oldEnd) => {
+      if (oldEnd > oldStart && oldStart < to && oldEnd > from)
+        overlapped = true;
+    });
+    if (overlapped) return null;
+    const mappedFrom = map.mapResult(from, 1);
+    const mappedTo = map.mapResult(to, -1);
+    if (mappedFrom.deleted || mappedTo.deleted) return null;
+    from = mappedFrom.pos;
+    to = mappedTo.pos;
+    if (to <= from) return null;
+  }
+  return { from, to };
+}
+
 function remapPastedMentionRanges(
   current: PastedMentionRanges,
   tr: Transaction,
 ): PastedMentionRanges {
   const next = new Map<number, PastedMentionRange>();
   for (const [id, range] of current) {
-    const from = tr.mapping.mapResult(range.from, 1);
-    const to = tr.mapping.mapResult(range.to, -1);
-    if (from.deleted || to.deleted || to.pos <= from.pos) continue;
-    next.set(id, { from: from.pos, to: to.pos });
+    const mapped = remapPastedMentionRange(range, tr);
+    if (mapped) next.set(id, mapped);
   }
   return next;
 }
@@ -96,7 +131,7 @@ function applyPastedMentionCommand(
 }
 
 /**
- * Tracks the document range each in-flight pasted mention occupies.
+ * Tracks the document range each in-flight pasted mention token occupies.
  *
  * Registered in the shared composer extension list, so every composer that
  * accepts a mention paste — channel, DM, thread, edit, forum — can fence a
@@ -129,7 +164,7 @@ export const PastedMentionOccurrencesExtension = Extension.create({
 });
 
 /**
- * Start tracking `[from, to)` as one paste's own text.
+ * Start tracking `[from, to)` as one mention token a paste inserted.
  *
  * Returns `null` when there is nothing to own (an empty insertion) or when the
  * composer carries no occurrence plugin — callers treat that as "no live
@@ -155,17 +190,15 @@ export function trackPastedMentionOccurrence(
   return id;
 }
 
-/** The text an occurrence still owns, or `null` once its range is gone. */
-export function readPastedMentionOccurrenceText(
+/** Where an occurrence now sits, or `null` once its range is gone. */
+export function readPastedMentionOccurrenceRange(
   view: PastedMentionOccurrenceView,
   id: number | null,
-): string | null {
+): PastedMentionRange | null {
   if (id === null || view.isDestroyed) return null;
   const range = pastedMentionOccurrencesKey.getState(view.state)?.get(id);
   if (!range) return null;
-  const { doc } = view.state;
-  if (range.to > doc.content.size) return null;
-  return doc.textBetween(range.from, range.to, "\n", "\n");
+  return range.to > view.state.doc.content.size ? null : range;
 }
 
 /** Stop tracking an occurrence whose paste has finished settling. */

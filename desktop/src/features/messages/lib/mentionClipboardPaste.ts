@@ -3,7 +3,6 @@ import type { EditorView } from "@tiptap/pm/view";
 import { getBuzzCopyKind } from "./mentionClipboard";
 import type { BindPastedMentionIdentities } from "./mentionPasteBinding";
 import { normalizeMentionClipboardContent } from "./normalizeMentionClipboard";
-import { trackPastedMentionOccurrence } from "./pastedMentionOccurrences";
 
 /**
  * Insert `text` through ProseMirror's plain-text paste pipeline.
@@ -11,8 +10,8 @@ import { trackPastedMentionOccurrence } from "./pastedMentionOccurrences";
  * `view.pasteText` re-enters `handlePaste` with the original event, so the
  * clipboard data is rebuilt with only the plain flavor — otherwise the HTML
  * branch would claim the paste again, forever. That re-entry also means this
- * function's own call carries no identity records, so it cannot double-track
- * the occurrence its caller is about to claim.
+ * function's own call carries no identity records, so it cannot double-bind
+ * the identities its caller is about to hand over.
  */
 function pastePlainText(view: EditorView, text: string): void {
   const clipboardData = new DataTransfer();
@@ -35,10 +34,10 @@ function pastePlainText(view: EditorView, text: string): void {
  * name known to the composer, so its chip re-lights and the send path recovers
  * the original pubkey. Each branch is judged against the content *it* inserts
  * — the plain flavor is not evidence for what the HTML branch shows, and vice
- * versa — and the range it inserted into is tracked, so a verification that
- * lands later can tell this paste's text from whatever the user typed next.
- * `bindPastedMentionIdentities` owns the rest; a composer that passes no
- * binder inserts readable text and binds nothing.
+ * versa — and the range it inserted into is handed over, so a verification
+ * that lands later can tell the mention tokens this paste put on screen from
+ * whatever the user typed next. `bindPastedMentionIdentities` owns the rest; a
+ * composer that passes no binder inserts readable text and binds nothing.
  */
 export function handleMentionClipboardPaste({
   bindMentionIdentities,
@@ -62,11 +61,7 @@ export function handleMentionClipboardPaste({
     bindMentionIdentities({
       html,
       insertedText,
-      occurrenceId: trackPastedMentionOccurrence(
-        view,
-        insertedFrom,
-        view.state.selection.to,
-      ),
+      insertedRange: { from: insertedFrom, to: view.state.selection.to },
       view,
     });
   };
