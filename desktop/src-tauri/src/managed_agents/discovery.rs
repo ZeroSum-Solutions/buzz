@@ -405,11 +405,68 @@ fn command_search_dirs() -> Vec<PathBuf> {
         workspace_dirs.extend(profile_target_dirs(&current_dir));
     }
 
-    let exe_parent = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(Path::to_path_buf));
+    order_search_dirs(exe_parent_for_search(), workspace_dirs)
+}
 
-    order_search_dirs(exe_parent, workspace_dirs)
+/// The exe parent [`command_search_dirs`] searches from: the real
+/// `std::env::current_exe()`'s parent, unless a test has set
+/// [`set_exe_parent_override_for_test`].
+///
+/// The override exists because `std::env::current_exe()` inside a `cargo
+/// test` process is always the test runner's own binary, which is never
+/// itself packaged inside a `.app` bundle — there is no way to make the
+/// *real* exe parent bundle-shaped from inside a test. The override lets
+/// the production entry points (`command_search_dirs`, `resolve_command`,
+/// `resolve_command_cached`, `resolve_workspace_command`) be exercised
+/// end-to-end with a bundle-shaped path instead of only through the
+/// extracted `order_search_dirs`/`resolve_workspace_command_from` helpers.
+fn exe_parent_for_search() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        if let Some(overridden) = exe_parent_override_cell()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            return Some(overridden);
+        }
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+}
+
+/// Process-global cell backing [`set_exe_parent_override_for_test`]. Test-only.
+#[cfg(test)]
+fn exe_parent_override_cell() -> &'static std::sync::Mutex<Option<PathBuf>> {
+    use std::sync::{Mutex, OnceLock};
+    static CELL: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+/// Set (or clear, with `None`) the exe-parent override consulted by
+/// [`exe_parent_for_search`]. The override is process-global: hold
+/// [`exe_parent_override_test_lock`] for the lifetime of the override so a
+/// concurrently-running test's own `command_search_dirs()` call can't
+/// observe it.
+#[cfg(test)]
+fn set_exe_parent_override_for_test(path: Option<PathBuf>) {
+    *exe_parent_override_cell()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = path;
+}
+
+/// Serializes tests that use the exe-parent override. Same pattern as
+/// `custom_harnesses::registry_test_lock` — a process-global `Mutex<()>`
+/// guard, not a data mutex, so callers hold it across their whole
+/// override-set → call → override-clear sequence.
+#[cfg(test)]
+fn exe_parent_override_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 fn is_executable_file(path: &Path) -> bool {
