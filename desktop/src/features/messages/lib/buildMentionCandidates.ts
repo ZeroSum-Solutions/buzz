@@ -117,6 +117,9 @@ export function buildMentionCandidates({
       role: current.role ?? candidate.role ?? null,
       secondaryLabel:
         current.secondaryLabel ?? candidate.secondaryLabel ?? null,
+      // `??` (not `?? null`) so both-undefined stays undefined — that is
+      // the "still unknown, resolve from the profile lookup" signal.
+      description: current.description ?? candidate.description,
       ownerPubkey:
         current.ownerPubkey ??
         candidate.ownerPubkey ??
@@ -219,6 +222,7 @@ export function buildMentionCandidates({
           relayAgentNamesByPubkey.has(pubkey),
         personaName: personaNameByPubkey.get(pubkey) ?? null,
         secondaryLabel: formatSearchUserSecondaryLabel(user),
+        description: user.about ?? null,
         ownerPubkey: user.ownerPubkey ?? null,
         isGlobalSearchResult: true,
         isManagedAgent: managedAgentNamesByPubkey.has(pubkey),

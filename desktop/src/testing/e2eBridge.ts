@@ -460,6 +460,28 @@ type E2eConfig = {
      *  (e.g. `["link-preview-image"]` fails only the thumbnail, favicon survives). */
     linkPreviewUploadErrorFilenames?: string[];
     searchProfiles?: MockSearchProfileSeed[];
+    /** Pubkeys whose profile stays fully seeded (via `searchProfiles` or
+     *  managed/relay agent registration) but is withheld from `search_users`
+     *  results. Lets a spec isolate `get_users_batch` (which still resolves
+     *  these normally) from global user search, so an assertion that
+     *  depends on an `about` reaching the UI can only pass through the
+     *  batch fallback. */
+    usersBatchOnlyPubkeys?: string[];
+    /** Hold every `get_users_batch` call from the first render (equivalent
+     *  to calling `__BUZZ_E2E_HOLD_USERS_BATCH__(true)` before the app
+     *  could issue one). Without this, an app-shell-wide caller that
+     *  resolves before a spec's own interaction (e.g. the agent-observer
+     *  bridge's blanket profile sweep) can pre-warm `useUsersBatchQuery`'s
+     *  per-pubkey delta-fetch cache for the same pubkeys a later, narrower
+     *  caller wants — so the later caller's `useUsersBatchQuery` resolves
+     *  from cache and never issues its own IPC call, making a raw
+     *  `get_users_batch` call count unable to observe it at all. Starting
+     *  held keeps every caller's request recorded (`__BUZZ_E2E_COMMAND_
+     *  PAYLOADS__` still records a held call immediately) before any of
+     *  them can resolve and cache; release with
+     *  `__BUZZ_E2E_HOLD_USERS_BATCH__(false)` once every request of
+     *  interest has been recorded. */
+    startWithUsersBatchHeld?: boolean;
     updateAvailable?: boolean;
     updateChannelDelayMs?: number;
     updateDownloadDelayMs?: number;
@@ -715,6 +737,7 @@ type RawUserProfileSummary = {
   display_name: string | null;
   name?: string | null;
   avatar_url: string | null;
+  about?: string | null;
   nip05_handle: string | null;
   owner_pubkey: string | null;
   is_agent?: boolean;
@@ -2824,6 +2847,12 @@ function seedMockSearchProfiles(config?: E2eConfig) {
   }
 }
 
+function seedMockUsersBatchOnlyPubkeys(config?: E2eConfig) {
+  for (const pubkey of config?.mock?.usersBatchOnlyPubkeys ?? []) {
+    mockUsersBatchOnlyPubkeys.add(pubkey.toLowerCase());
+  }
+}
+
 function getMockProfileByPubkey(pubkey: string): RawProfile | null {
   const normalizedPubkey = pubkey.toLowerCase();
   const existing = mockProfiles.get(normalizedPubkey);
@@ -4211,6 +4240,9 @@ function handleGetWorkflowRuns(args: {
 function handleGetRunApprovals(_args: { workflowId: string; runId: string }) {
   return { approvals: [] };
 }
+
+// Pubkeys withheld from `search_users` results — see `usersBatchOnlyPubkeys`.
+const mockUsersBatchOnlyPubkeys = new Set<string>();
 
 const mockProfiles = new Map<string, RawProfile>([
   [
@@ -7002,6 +7034,7 @@ async function handleGetUsersBatch(
         display_name: profile.display_name,
         name: profile.name ?? null,
         avatar_url: profile.avatar_url,
+        about: profile.about,
         nip05_handle: profile.nip05_handle,
         owner_pubkey: profile.owner_pubkey,
         is_agent: profile.is_agent ?? false,
@@ -7027,6 +7060,7 @@ async function handleGetUsersBatch(
       display_name: content.display_name ?? content.name ?? null,
       name: content.name ?? null,
       avatar_url: content.picture ?? null,
+      about: content.about ?? null,
       nip05_handle: content.nip05 ?? null,
       owner_pubkey:
         ((ev.tags ?? []) as string[][]).find(
@@ -7056,6 +7090,7 @@ async function handleGetUsersBatch(
       display_name: profile.display_name,
       name: profile.name ?? null,
       avatar_url: profile.avatar_url,
+      about: profile.about,
       nip05_handle: profile.nip05_handle,
       owner_pubkey: profile.owner_pubkey,
       is_agent: profile.is_agent ?? false,
@@ -7087,6 +7122,7 @@ async function handleSearchUsers(
     const limit = args.limit ?? 8;
     const page = Math.max(Number(args.cursor ?? 1) || 1, 1);
     const allResults = listMockProfiles()
+      .filter((profile) => !mockUsersBatchOnlyPubkeys.has(profile.pubkey))
       .filter((profile) => {
         if (normalizedQuery.length === 0) {
           return true;
@@ -7113,6 +7149,7 @@ async function handleSearchUsers(
         pubkey: profile.pubkey,
         display_name: profile.display_name,
         avatar_url: profile.avatar_url,
+        about: profile.about,
         nip05_handle: profile.nip05_handle,
         owner_pubkey: profile.owner_pubkey,
         is_agent: profile.is_agent ?? false,
@@ -7139,6 +7176,7 @@ async function handleSearchUsers(
       pubkey: ev.pubkey ?? "",
       display_name: content.display_name ?? content.name ?? null,
       avatar_url: content.picture ?? null,
+      about: content.about ?? null,
       nip05_handle: content.nip05 ?? null,
       owner_pubkey:
         ((ev.tags ?? []) as string[][]).find(
@@ -11373,7 +11411,7 @@ export function maybeInstallE2eTauriMocks() {
   deferredLinkPreviewMetadataQueue = [];
   deferredLinkPreviewUploadQueue = [];
   deferredThreadRepliesQueue = [];
-  holdUsersBatch = false;
+  holdUsersBatch = config.mock?.startWithUsersBatchHeld ?? false;
   heldUsersBatchReleases = [];
   cancelledMediaUploadIds = new Set<string>();
   for (const controller of mockMediaFetchControllers.values()) {
@@ -11418,6 +11456,7 @@ export function maybeInstallE2eTauriMocks() {
   resetMockPersonas(config);
   resetMockTeams(config);
   seedMockSearchProfiles(config);
+  seedMockUsersBatchOnlyPubkeys(config);
   resetMockWorkflows();
   resetMockMesh();
   resetMockUserStatuses();
