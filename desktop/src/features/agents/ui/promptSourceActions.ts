@@ -15,12 +15,12 @@ export function canReloadPromptSource(
 /**
  * Clear removes a stored binding, and is offered whenever the field is usable.
  *
- * The dialog cannot read the sidecar back — the feature has one backend
- * command and no getter — so on every re-open it knows of no binding even when
- * one exists. Gating Clear on what the dialog has seen this session would make
- * a binding whose file has been moved or deleted unclearable, which is exactly
- * when a user needs it. Unbinding what is already unbound is a no-op the
- * backend accepts, so offering the action always is the safe direction.
+ * The field now seeds itself from the stored binding, so Clear is no longer
+ * offered blind — but it is still not *gated* on that seed. The seed can fail
+ * (an unreadable sidecar) or be out of date (another window bound a file since
+ * this dialog opened), and in both cases the operator needs the way out more,
+ * not less. Unbinding what is already unbound is a no-op the backend accepts,
+ * so offering the action always is the safe direction.
  */
 export function canClearPromptSource(isPending: boolean): boolean {
   return !isPending;
@@ -70,3 +70,17 @@ export const DIRTY_EXEMPT_ATTRIBUTE = "data-dirty-exempt";
 
 /** Selector for {@link DIRTY_EXEMPT_ATTRIBUTE}, for ancestor lookups. */
 export const DIRTY_EXEMPT_SELECTOR = `[${DIRTY_EXEMPT_ATTRIBUTE}]`;
+
+/**
+ * Resting sentence under the field, before any action has been taken.
+ *
+ * Naming the bound path is what makes the stored binding visible: the value in
+ * the input alone cannot say whether it is a live binding or something the
+ * operator has just typed and not yet reloaded.
+ */
+export function promptSourceHint(boundPath: string | null): string {
+  if (boundPath === null) {
+    return "Read this agent's instructions from a file in your home folder.";
+  }
+  return `These instructions are loaded from ${boundPath}.`;
+}

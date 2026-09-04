@@ -9,12 +9,15 @@
  *   - a reload replaces the text in the dialog's own "Agent instructions"
  *     textarea — the propagation the feature exists for;
  *   - Clear leaves that textarea alone;
+ *   - re-opening the dialog on a bound definition seeds the path field from
+ *     the sidecar, so the binding survives a close and is not retyped;
  *   - the two directions of the dialog's own dirty flag, which decides whether
  *     a save republishes the community catalog head: a reload must not drop an
  *     unsaved edit to another field out of that publish, and typing the
  *     machine-local path must not arm one.
  *
- * Mutation proofs: dropping `setSystemPrompt` from the dialog's
+ * Mutation proofs: dropping the seed effect from the field → the re-open
+ * assertion fails; dropping `setSystemPrompt` from the dialog's
  * `onPromptReloaded` → the propagation assertion fails; rendering the field
  * unconditionally → the create-mode assertion fails; restoring
  * `setHasUserChanges(false)` to `onPromptReloaded` → the reload-keeps-edits
@@ -76,12 +79,17 @@ globalThis.getComputedStyle = dom.window.getComputedStyle.bind(dom.window);
 
 let promptSourceCalls = [];
 let promptSourceResult = { localUpdated: true };
+/** What `get_prompt_source` answers on open: a stored path, or `null`. */
+let storedPromptSource = null;
 
 globalThis.__TAURI_INTERNALS__ = {
   invoke: (cmd, payload) => {
     if (cmd === "set_prompt_source_and_reload") {
       promptSourceCalls.push(payload);
       return Promise.resolve(promptSourceResult);
+    }
+    if (cmd === "get_prompt_source") {
+      return Promise.resolve(storedPromptSource);
     }
     if (cmd === "get_global_agent_config") {
       return Promise.resolve({
@@ -127,6 +135,7 @@ afterEach(() => {
   }
   promptSourceCalls = [];
   promptSourceResult = { localUpdated: true };
+  storedPromptSource = null;
 });
 
 after(() => dom.window.close());
@@ -180,6 +189,41 @@ test("the instructions-file field is edit-mode only", async () => {
   cleanup();
   await act(async () => mount(editValues));
   assert.ok(promptSourceInput(), "edit mode offers the field");
+});
+
+test("re-opening the dialog shows the file already bound to the agent", async () => {
+  // The binding this dialog wrote in an earlier session. Without the read the
+  // sidecar would be write-only and the operator would retype the whole
+  // absolute path on every reload.
+  storedPromptSource = "/Users/me/agent-prompts/pm.md";
+  const dirtyReports = [];
+  await act(async () =>
+    mount(editValues, {
+      onDirtyChange: (dirty) => dirtyReports.push(dirty),
+      publishCatalogUpdatesOnSave: true,
+    }),
+  );
+
+  assert.deepEqual(
+    dirtyReports.filter(Boolean),
+    [],
+    "seeding the field is not an edit and must not arm a catalog publish",
+  );
+  assert.equal(
+    promptSourceInput().value,
+    "/Users/me/agent-prompts/pm.md",
+    "the stored binding must seed the field when the dialog re-opens",
+  );
+  assert.equal(
+    screen.getByRole("button", { name: "Reload" }).disabled,
+    false,
+    "the seeded path is reloadable with one click",
+  );
+  assert.deepEqual(
+    promptSourceCalls,
+    [],
+    "seeding reads the binding; it does not reload the file",
+  );
 });
 
 test("a reload replaces the dialog's instructions text", async () => {

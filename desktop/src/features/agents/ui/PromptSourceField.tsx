@@ -1,6 +1,9 @@
 import * as React from "react";
 
-import { setPromptSourceAndReload } from "@/shared/api/tauriPersonas";
+import {
+  getPromptSource,
+  setPromptSourceAndReload,
+} from "@/shared/api/tauriPersonas";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
 import { Input } from "@/shared/ui/input";
@@ -13,6 +16,7 @@ import {
   canClearPromptSource,
   canReloadPromptSource,
   DIRTY_EXEMPT_ATTRIBUTE,
+  promptSourceHint,
   promptSourceStatusMessage,
 } from "./promptSourceActions";
 
@@ -30,9 +34,13 @@ type PromptSourceFieldProps = {
  *
  * The path is machine-local: only the prompt text is published, and typing it
  * leaves the parent dialog's unsaved-changes state untouched. Reload is
- * disabled until a path is typed. Clear stays available, because the dialog
- * cannot read the stored binding back and must still be able to unbind a
- * prompt file that has been moved or deleted.
+ * disabled until a path is typed.
+ *
+ * On open the field seeds itself from the stored binding, so re-opening the
+ * dialog shows which file feeds this agent instead of an empty box the
+ * operator has to retype an absolute path into. Clear stays available even
+ * when the seed found nothing — a seed that failed, or a sidecar written by
+ * another window since, must not make an existing binding unclearable.
  */
 export function PromptSourceField({
   definitionId,
@@ -40,20 +48,65 @@ export function PromptSourceField({
   onPromptReloaded,
 }: PromptSourceFieldProps) {
   const [path, setPath] = React.useState("");
+  const [boundPath, setBoundPath] = React.useState<string | null>(null);
   const [isPending, setIsPending] = React.useState(false);
   const [notice, setNotice] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
+  /** Newest seed request. An older answer that arrives late is discarded. */
+  const seedGeneration = React.useRef(0);
+  /** Set once the operator types or acts, so a late seed cannot overwrite. */
+  const interacted = React.useRef(false);
+
+  React.useEffect(() => {
+    const generation = ++seedGeneration.current;
+    interacted.current = false;
+    setBoundPath(null);
+    setPath("");
+    setError(null);
+    setNotice(null);
+    void (async () => {
+      try {
+        const stored = await getPromptSource(definitionId);
+        // Fenced by generation and by the operator: an answer for a definition
+        // the dialog has moved off, or one that lost the race to typing or a
+        // reload, must not land on top of newer state.
+        if (generation !== seedGeneration.current || interacted.current) {
+          return;
+        }
+        setBoundPath(stored);
+        if (stored !== null) {
+          setPath(stored);
+        }
+      } catch (caught) {
+        if (generation !== seedGeneration.current || interacted.current) {
+          return;
+        }
+        // A corrupt sidecar is reported, not read as "nothing is bound": the
+        // operator would otherwise rebind over a mapping that is still there.
+        setError(
+          `Could not read this agent's instructions file setting: ${
+            caught instanceof Error ? caught.message : String(caught)
+          }`,
+        );
+      }
+    })();
+  }, [definitionId]);
 
   const busy = disabled || isPending;
   const reloadEnabled = canReloadPromptSource(path, busy);
   const clearEnabled = canClearPromptSource(busy);
 
   const run = async (nextPath: string | null) => {
+    interacted.current = true;
     setIsPending(true);
     setError(null);
     setNotice(null);
     try {
       const result = await setPromptSourceAndReload(definitionId, nextPath);
+      // `path` is set exactly when a mapping was stored, so it is also the
+      // binding the field now shows: null after a clear, and null after a
+      // reload whose sidecar write failed (`mappingError` says which).
+      setBoundPath(result.path);
       if (result.path !== null) {
         setPath(result.path);
       }
@@ -97,7 +150,10 @@ export function PromptSourceField({
             )}
             disabled={busy}
             id="persona-prompt-source"
-            onChange={(event) => setPath(event.target.value)}
+            onChange={(event) => {
+              interacted.current = true;
+              setPath(event.target.value);
+            }}
             placeholder="/Users/you/agent-prompts/pm.md"
             value={path}
           />
@@ -130,9 +186,7 @@ export function PromptSourceField({
         )}
         id="persona-prompt-source-status"
       >
-        {error ??
-          notice ??
-          "Read this agent's instructions from a file in your home folder."}
+        {error ?? notice ?? promptSourceHint(boundPath)}
       </p>
     </div>
   );

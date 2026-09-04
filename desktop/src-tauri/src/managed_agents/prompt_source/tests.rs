@@ -339,3 +339,49 @@ fn a_corrupt_sidecar_is_reported_not_silently_discarded() {
         "error should name the sidecar, got {error:?}"
     );
 }
+
+#[test]
+fn a_stored_binding_reads_back_and_an_unbound_definition_reads_none() {
+    let f = fixture();
+    let path = f.home.join("pm.md");
+    std::fs::write(&path, "Be the PM.").expect("write prompt");
+
+    assert_eq!(
+        prompt_source_at(&f.store, "pm").expect("a missing sidecar is no binding"),
+        None,
+        "nothing is bound before a commit"
+    );
+
+    prepare_and_commit(&f.store, "pm", Some(path.to_str().expect("utf-8")), &f.home)
+        .expect("bind the prompt file");
+
+    assert_eq!(
+        prompt_source_at(&f.store, "pm").expect("sidecar reads"),
+        Some(path.to_string_lossy().into_owned()),
+        "the stored path must read back, or the dialog has to make the user retype it"
+    );
+    assert_eq!(
+        prompt_source_at(&f.store, "designer").expect("sidecar reads"),
+        None,
+        "a definition with no entry is unbound, not the first entry"
+    );
+
+    prepare_and_commit(&f.store, "pm", None, &f.home).expect("clear the binding");
+    assert_eq!(
+        prompt_source_at(&f.store, "pm").expect("sidecar reads"),
+        None,
+        "a cleared binding must read back as unbound"
+    );
+}
+
+#[test]
+fn reading_a_binding_from_a_corrupt_sidecar_is_an_error_not_unbound() {
+    let f = fixture();
+    std::fs::write(&f.store, "{ not json").expect("write corrupt sidecar");
+    let error =
+        prompt_source_at(&f.store, "pm").expect_err("a corrupt sidecar must not read as unbound");
+    assert!(
+        error.contains("prompt-sources"),
+        "error should name the sidecar, got {error:?}"
+    );
+}

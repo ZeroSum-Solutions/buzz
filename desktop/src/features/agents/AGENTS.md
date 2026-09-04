@@ -356,12 +356,21 @@ reloaded into the definition. Three facts about this feature are load-bearing:
    not, and reporting that as `queued` would claim a retry that was never
    recorded. `publish` is absent on the clear path, where nothing is submitted.
 
+The binding is read back as well as written. `get_prompt_source` answers which
+file is bound to a definition, and the field seeds itself from it on open, so a
+re-opened dialog shows the path instead of making the operator retype an
+absolute path on every reload. The seed is fenced two ways — by a generation
+counter, so a slower answer for a definition the dialog has moved off is
+discarded, and by an interaction flag, so it never overwrites what the operator
+is typing. A sidecar that cannot be read is reported in the status line, never
+answered as "nothing is bound".
+
 The field is edit-mode only (a reload writes to a stored definition, so it
 needs an id). Reload stays disabled until a path is typed. Clear stays offered
-whenever the field is usable: the feature has one backend command and no
-getter, so the dialog cannot read the stored binding back on re-open, and
-gating Clear on what it has seen this session would strand a binding whose file
-has been moved or deleted. Unbinding what is already unbound is a no-op.
+whenever the field is usable, and is deliberately **not** gated on the seed:
+the seed can fail, or be out of date because another window bound a file since
+this dialog opened, and both are exactly when the way out is needed. Unbinding
+what is already unbound is a no-op.
 
 ## The tests that enforce this
 
@@ -411,11 +420,14 @@ has been moved or deleted. Unbinding what is already unbound is a no-op.
   `queued` / `failed:` / mapping-error messages staying distinguishable.
 - `ui/PromptSourceField.test.mjs` — the field mounted in JSDOM: button gating,
   one command per click with the typed path, the resolved path replacing what
-  was typed, a refused path surfaced in the status line, and Clear sending
-  `path: null`.
+  was typed, a refused path surfaced in the status line, Clear sending
+  `path: null`, the stored binding seeding the field on open, both halves of
+  the seed fence, and an unreadable sidecar reported rather than read as
+  unbound.
 - `ui/agentDefinitionDialogPromptSource.test.mjs` — the field inside the real
-  dialog: edit-mode only, and a reload replacing the text in the dialog's own
-  "Agent instructions" textarea.
+  dialog: edit-mode only, a reload replacing the text in the dialog's own
+  "Agent instructions" textarea, and a re-open seeding the bound path without
+  arming a catalog publish.
 - Rust: `managed_agents::prompt_source` tests pin the path rules (missing file,
   symlink out of home, over the 64 KiB cap, non-UTF-8, relative, directory),
   that preparation writes nothing until the mapping is committed, that clearing
@@ -426,7 +438,10 @@ has been moved or deleted. Unbinding what is already unbound is a no-op.
 - Rust: `commands::personas::prompt_source` tests drive the command itself over
   a mock runtime — the result schema, and one injected failure per boundary
   (validate, read, persona save, mapping write) each asserting the stored
-  mapping and the effective prompt still agree — plus the lost-update guard.
+  mapping and the effective prompt still agree — plus the lost-update guard,
+  and the round trip through `get_prompt_source` (a reload's binding reads
+  back, a clear reads back as unbound, and a mapping outlives its deleted
+  definition so it stays clearable).
 - Rust: `buzz-acp`'s `session_new_delivers_reloaded_prompt_source_file_bytes`
   closes the delivery seam: the same bytes reach the ACP `session/new` request
   in both the bare-field and Claude `_meta` framings.

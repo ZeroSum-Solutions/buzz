@@ -21,6 +21,11 @@
 //! therefore captures the definition's `updated_at` and the save refuses if it
 //! moved, so a concurrent edit is reported rather than clobbered by this
 //! request's replace-everything fields.
+//!
+//! [`get_prompt_source`] is the read half. Without it the sidecar would be
+//! write-only: the dialog would open knowing of no binding, so the operator
+//! would retype the whole absolute path on every reload and would be offered
+//! `Clear` with nothing to tell them whether anything is bound.
 
 use tauri::{AppHandle, Manager};
 
@@ -30,7 +35,7 @@ use crate::{
         load_personas,
         prompt_source::{
             commit_prompt_source_at, definition_with_prompt, prepare_prompt_source,
-            update_request_from_definition, PromptSourceChange,
+            prompt_source_at, update_request_from_definition, PromptSourceChange,
         },
         UpdatePersonaRequest,
     },
@@ -182,6 +187,33 @@ fn prompt_sources_path<R: tauri::Runtime>(
     app: &AppHandle<R>,
 ) -> Result<std::path::PathBuf, String> {
     Ok(crate::managed_agents::managed_agents_base_dir(app)?.join("prompt-sources.json"))
+}
+
+/// The prompt file bound to `definition_id` on this machine, or `None`.
+///
+/// The read half of the binding the dialog writes with
+/// [`set_prompt_source_and_reload`]: on open the field seeds itself from this,
+/// so the stored path is shown rather than retyped.
+///
+/// Deliberately independent of the definition itself — no existence or
+/// built-in check — so a mapping whose agent was deleted is still visible and
+/// therefore still clearable, matching the clear path's own behaviour.
+#[tauri::command]
+pub async fn get_prompt_source<R: tauri::Runtime>(
+    definition_id: String,
+    app: AppHandle<R>,
+) -> Result<Option<String>, String> {
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || -> Result<Option<String>, String> {
+        let state = app.state::<AppState>();
+        let _store_guard = state
+            .managed_agents_store_lock
+            .lock()
+            .map_err(|error| error.to_string())?;
+        prompt_source_at(&prompt_sources_path(&app)?, &definition_id)
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking failed: {e}"))?
 }
 
 /// Save the reloaded prompt through the persona update path, store the mapping,

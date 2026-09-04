@@ -729,3 +729,92 @@ fn linked_record(persona_id: &str) -> crate::managed_agents::ManagedAgentRecord 
         definition_parallelism: None,
     }
 }
+
+#[tokio::test]
+async fn a_reloaded_binding_reads_back_through_the_command_until_it_is_cleared() {
+    let home = TempHome::new();
+    let app = mock_app();
+    save_personas(
+        app.handle(),
+        &[definition("pm", "Old instructions.", false)],
+    )
+    .expect("seed the definition");
+    let file = home.prompt_file("pm.md", "Ship the roadmap.\n");
+
+    assert_eq!(
+        get_prompt_source("pm".to_string(), app.handle().clone())
+            .await
+            .expect("an empty sidecar reads"),
+        None,
+        "nothing is bound before the first reload"
+    );
+
+    set_prompt_source_and_reload(
+        "pm".to_string(),
+        Some(file.to_string_lossy().into_owned()),
+        app.handle().clone(),
+    )
+    .await
+    .expect("the reload lands");
+
+    assert_eq!(
+        get_prompt_source("pm".to_string(), app.handle().clone())
+            .await
+            .expect("sidecar reads")
+            .as_deref(),
+        file.to_str(),
+        "the binding a reload stored must be readable, or the sidecar is write-only \
+         and the dialog opens knowing nothing about it"
+    );
+    assert_eq!(
+        get_prompt_source("designer".to_string(), app.handle().clone())
+            .await
+            .expect("sidecar reads"),
+        None,
+        "another definition is unbound"
+    );
+
+    set_prompt_source_and_reload("pm".to_string(), None, app.handle().clone())
+        .await
+        .expect("the clear lands");
+
+    assert_eq!(
+        get_prompt_source("pm".to_string(), app.handle().clone())
+            .await
+            .expect("sidecar reads"),
+        None,
+        "a cleared binding reads back as unbound"
+    );
+}
+
+#[tokio::test]
+async fn a_binding_whose_definition_is_gone_still_reads_back_so_it_can_be_cleared() {
+    let home = TempHome::new();
+    let app = mock_app();
+    save_personas(
+        app.handle(),
+        &[definition("pm", "Old instructions.", false)],
+    )
+    .expect("seed the definition");
+    let file = home.prompt_file("pm.md", "Ship the roadmap.\n");
+    set_prompt_source_and_reload(
+        "pm".to_string(),
+        Some(file.to_string_lossy().into_owned()),
+        app.handle().clone(),
+    )
+    .await
+    .expect("the reload lands");
+
+    // The agent is deleted; its mapping outlives it.
+    save_personas(app.handle(), &[]).expect("drop the definition");
+
+    assert_eq!(
+        get_prompt_source("pm".to_string(), app.handle().clone())
+            .await
+            .expect("sidecar reads")
+            .as_deref(),
+        file.to_str(),
+        "the read half must not depend on the definition, or an orphan mapping \
+         becomes invisible and unclearable"
+    );
+}

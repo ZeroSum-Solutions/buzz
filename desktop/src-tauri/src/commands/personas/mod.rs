@@ -69,6 +69,7 @@ mod sharing;
 pub use sharing::set_persona_shared;
 pub use sharing::update_persona_and_publish;
 mod prompt_source;
+pub use prompt_source::get_prompt_source;
 pub use prompt_source::set_prompt_source_and_reload;
 mod update;
 pub use update::update_persona;

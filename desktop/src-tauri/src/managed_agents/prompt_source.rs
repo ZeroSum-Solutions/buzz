@@ -16,6 +16,10 @@
 //! `validate_agent_definition_text` enforces on `system_prompt`, so a file that
 //! passes here cannot be rejected later by the update path.
 //!
+//! The mapping is read back as well as written: [`prompt_source_at`] answers
+//! "which file feeds this agent?" so the dialog can show the stored path when
+//! it re-opens instead of making the operator retype it.
+//!
 //! Reloading is a desktop convenience, not a harness capability, so
 //! `KnownAcpRuntime` carries nothing for it.
 
@@ -66,6 +70,22 @@ pub(crate) fn load_prompt_sources_at(path: &Path) -> Result<PromptSourceMap, Str
     };
     serde_json::from_str(&contents)
         .map_err(|error| format!("failed to parse prompt-sources.json: {error}"))
+}
+
+/// The prompt file bound to `definition_id` in the sidecar at `store_path`.
+///
+/// `Ok(None)` means no binding is stored, which is what the dialog shows as
+/// "no instructions file". A sidecar that exists but cannot be read or parsed
+/// is an error rather than `None`: reporting a corrupt file as "nothing is
+/// bound" would invite the operator to rebind over a mapping that is still
+/// there, and the next save would drop every other definition's entry.
+pub(crate) fn prompt_source_at(
+    store_path: &Path,
+    definition_id: &str,
+) -> Result<Option<String>, String> {
+    Ok(load_prompt_sources_at(store_path)?
+        .get(definition_id)
+        .cloned())
 }
 
 /// Write the sidecar at `path` atomically.

@@ -261,6 +261,23 @@ export async function setPromptSourceAndReload(
   };
 }
 
+/**
+ * The prompt file bound to `definitionId` on this machine, or `null`.
+ *
+ * The read half of {@link setPromptSourceAndReload}. The dialog seeds its path
+ * field from this on open, so a binding survives a re-open instead of forcing
+ * the operator to retype the absolute path. A corrupt sidecar rejects rather
+ * than answering `null`, so "nothing is bound" is never a disguised failure.
+ */
+export async function getPromptSource(
+  definitionId: string,
+): Promise<string | null> {
+  const stored = await invokeTauri<string | null>("get_prompt_source", {
+    definitionId,
+  });
+  return stored ?? null;
+}
+
 export type SnapshotMemoryLevel = "none" | "core" | "everything";
 export type SnapshotFormat = "json" | "png";
 

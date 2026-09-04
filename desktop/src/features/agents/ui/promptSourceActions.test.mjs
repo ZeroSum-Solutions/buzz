@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   canClearPromptSource,
   canReloadPromptSource,
+  promptSourceHint,
   promptSourceStatusMessage,
 } from "./promptSourceActions.ts";
 
@@ -24,10 +25,23 @@ test("Reload is disabled while a reload is in flight", () => {
 });
 
 test("Clear stays offered so a moved or deleted source can be unbound", () => {
-  // The dialog has no getter for the stored binding, so on re-open it knows of
-  // none. Gating Clear on what it has seen would strand a dead binding.
+  // The field seeds itself from the stored binding, but Clear is not gated on
+  // that seed: a failed or stale seed would otherwise strand a live binding.
   assert.equal(canClearPromptSource(false), true);
   assert.equal(canClearPromptSource(true), false);
+});
+
+test("the resting hint names the bound file, or invites one", () => {
+  assert.match(
+    promptSourceHint("/Users/me/agent-prompts/pm.md"),
+    /\/Users\/me\/agent-prompts\/pm\.md/,
+  );
+  assert.match(promptSourceHint(null), /file in your home folder/i);
+  assert.notEqual(
+    promptSourceHint("/Users/me/agent-prompts/pm.md"),
+    promptSourceHint(null),
+    "a bound agent must not read the same as an unbound one",
+  );
 });
 
 test("a queued head and a failed enqueue read differently", () => {
