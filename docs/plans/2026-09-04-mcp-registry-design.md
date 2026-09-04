@@ -1,7 +1,7 @@
 # MCP registry — design memo (T7)
 
 Date: 2026-09-04. Answers the checklist in `docs/plans/2026-09-04-zs-implementation-plan.md` § T7
-before any code lands. Every `file:line` was read on `zs/main` at `cc6b3ee43`.
+before any code lands. Every `file:line` was read on `zs/main` at `36da9fa6b`.
 
 **1 · Server classes and the environment each receives.**
 Decision: two classes — `stdio` (command, args, `env` block) and `http` (Streamable HTTP URL, no `env`). A stdio server's child environment is platform essentials plus its own approved `env` values and nothing else; an http upstream gets no environment, and its credential travels as a request header injected at call time.
@@ -24,7 +24,7 @@ Decision: extract a workspace crate `crates/buzz-secret-store` carrying the read
 Reason: `secret_store` is a private Tauri module (`desktop/src-tauri/src/lib.rs:43`) that a workspace binary cannot call, and the blob is one keychain entry costing one OS prompt per process (`desktop/src-tauri/src/secret_store.rs:3-6`).
 
 **6 · Launcher crate path and packaging.**
-Decision: `crates/buzz-mcp-launch`, added to `Cargo.toml:2-34`, the stub list (`justfile:167-181`), both release build lists (`justfile:275-289`, `justfile:306-309`), `SIDECARS` in `scripts/bundle-sidecars.sh:4`, and `externalBin` in `desktop/src-tauri/tauri.conf.json:55-62` — the bundler already appends the Windows `.exe` suffix. Generated config names the resolved absolute path of the bundled binary, never a bare name.
+Decision: `crates/buzz-mcp-launch`, added to `Cargo.toml:2-34`, the stub list (`Justfile:167-180`), both release build lists (`Justfile:281-295`, `Justfile:312-315`), `SIDECARS` in `scripts/bundle-sidecars.sh:4`, and `externalBin` in `desktop/src-tauri/tauri.conf.json:55-62` — the bundler already appends the Windows `.exe` suffix. Generated config names the resolved absolute path of the bundled binary, never a bare name.
 Reason: those five lists must agree or the Tauri build fails at compile time on `externalBin` validation, and a bare name would resolve through a `PATH` the launcher's own clear removes.
 
 **7 · Name collisions with built-ins.**
