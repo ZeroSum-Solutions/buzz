@@ -6,10 +6,13 @@
 //! Usage: render_headless_chrome <fixture.html> <out.pdf>
 //!
 //! The online/offline distinction lives entirely in which fixture is
-//! passed in: `fixtures/approval.html` points its remote `<img>` at a live
-//! URL, `fixtures/approval-offline.html` points the same `<img>` at the
-//! local sentinel server (see `src/sentinel.rs`) so the "offline" case is a
-//! deterministic, logged refusal rather than a proxy trick.
+//! passed in: `fixtures/approval.html` points its `<img>` at a local,
+//! hash-pinned copy of the reference image (`fixtures/remote-image.png`,
+//! served same-origin from the `file://` fixture — no live network fetch,
+//! so this harness carries no unverified-TLS or live-remote-content
+//! surface), `fixtures/approval-offline.html` points the same `<img>` at
+//! the local sentinel server (see `src/sentinel.rs`) so the "offline" case
+//! is a deterministic, logged refusal rather than a proxy trick.
 //!
 //! Before printing, the page's remote `<img class="remote">` is awaited via
 //! a `load`/`error`-event promise evaluated in-page (`wait_for_remote_image`)
@@ -74,7 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let launch_options = LaunchOptionsBuilder::default()
         .path(Some(chrome_path))
         .headless(true)
-        .sandbox(false)
+        .ignore_certificate_errors(false)
         .build()?;
 
     let wall_start = Instant::now();

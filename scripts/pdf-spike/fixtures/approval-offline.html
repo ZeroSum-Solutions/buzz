@@ -20,8 +20,9 @@
 <body>
   <h1>Approval Page One — Vendor Onboarding</h1>
   <p>This fixture stands in for the Broken English approval-page generator
-  (<code>brand/render-approval.py</code>), which does not exist in the buzz repository. It is a
-  synthetic document built to exercise the same shapes a real approval page needs validated: a
+  (<code>brand/render-approval.py</code>), which lives in a separate client project not reachable
+  from this worktree. It is a synthetic document built to exercise the same shapes a real
+  approval page needs validated: a
   heading structure, a data table, a code block, a remote image, and enough running text to span
   three printed pages at US Letter with 0.75in margins.</p>
   <p>Filler paragraph 1. The quick brown fox jumps over the lazy dog near the riverbank while the
@@ -54,9 +55,10 @@
       <tr><td>4</td><td>Cubic Zirconia</td><td>A</td><td>$0.40/ea</td><td>delta-fixture-row</td></tr>
     </tbody>
   </table>
-  <p>Filler paragraph 5. Table cells above carry a distinctive lead-time token per row
-  (alpha-fixture-row through delta-fixture-row) specifically so a text-extraction check can
-  confirm the table survived rendering rather than being flattened into an image.</p>
+  <p>Filler paragraph 5. Each row of the materials table above carries its own distinct value in
+  the last column, so an automated text-extraction pass can confirm every individual row survived
+  rendering rather than the whole table having been flattened into a single image during export.
+  The exact per-row values are defined once, in the table itself, and are not restated here.</p>
   <p>Filler paragraph 6. Between the table and the code block sits the section of the brief that
   explains how the approval id is generated: a short deterministic function keyed off the vendor
   code, the collection season, and a monotonic counter, so that two approvals issued the same day
@@ -67,9 +69,10 @@
     # PDF_SPIKE_CODE_MARKER_7f3a
     return f"{vendor_code.upper()}-{season}-{counter:04d}"
 </code></pre>
-  <p>Filler paragraph 7. The marker comment inside the code block above
-  (<code>PDF_SPIKE_CODE_MARKER_7f3a</code>) is the line the extraction check looks for; it is
-  deliberately unlikely to appear anywhere else in the document by accident.</p>
+  <p>Filler paragraph 7. The comment on the second line of the code block above is the line an
+  automated extraction check looks for. Its exact text is defined once, inside the code block
+  itself, and is deliberately not repeated anywhere else on this page, so finding it in extracted
+  text is proof the code block rendered rather than proof the phrase merely occurs somewhere.</p>
   <p>Filler paragraph 8. The remainder of this page is running text whose only job is to push the
   document to a third printed page without changing any of the structural elements already
   covered above. Word count, not meaning, is what matters from here down.</p>

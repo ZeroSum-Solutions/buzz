@@ -45,9 +45,15 @@ text=$(pdftotext -layout "$PDF" -)
 check "heading 1 (Approval Page One) present" 1 "$(echo "$text" | grep -c "Approval Page One")"
 check "heading 2 (Materials Table) present" 1 "$(echo "$text" | grep -c "Materials Table")"
 check "heading 3 (Approval ID Generator) present" 1 "$(echo "$text" | grep -c "Approval ID Generator")"
+# All four row tokens, not just the first and last — a table with only its
+# middle rows dropped would otherwise still pass.
 check "table cell token (alpha-fixture-row) present" 1 "$(echo "$text" | grep -c "alpha-fixture-row")"
+check "table cell token (bravo-fixture-row) present" 1 "$(echo "$text" | grep -c "bravo-fixture-row")"
+check "table cell token (charlie-fixture-row) present" 1 "$(echo "$text" | grep -c "charlie-fixture-row")"
 check "table cell token (delta-fixture-row) present" 1 "$(echo "$text" | grep -c "delta-fixture-row")"
-check "code marker line present" 1 "$(echo "$text" | grep -c "PDF_SPIKE_CODE_MARKER_7f3a")"
+# The full comment line, not the bare marker token, so a comment fragment
+# elsewhere in the document can't accidentally satisfy this check.
+check "code marker line (full text) present" 1 "$(echo "$text" | grep -c "# PDF_SPIKE_CODE_MARKER_7f3a")"
 
 pngdir=$(mktemp -d)
 trap 'rm -rf "$pngdir"' EXIT

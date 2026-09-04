@@ -1,25 +1,27 @@
 == mode: online ==
-  render: {"bytes":493243,"wall_ms":3191,"image_wait_ms":141,"print_ms":163,"image_state":"loaded","sha256":"62ac13828de8025f78e495221403eb69427425506953f438416c8db235c83370"}
-  PASS: online render image_state=loaded (remote <img> confirmed via its load event, not inferred from a sleep)
+  render: {"bytes":491106,"wall_ms":3847,"image_wait_ms":81,"print_ms":182,"image_state":"loaded","sha256":"f91b3493f59a7bfc95203c55b74923234f42f4e1c5aa7345daf453ea85ea5a3f"}
+  PASS: online render image_state=loaded (local hash-pinned <img> confirmed via its load event, not inferred from a sleep)
 == validating out/approval-headless-chrome-online.pdf ==
   PASS: page count == 3 (got 3)
   PASS: heading 1 (Approval Page One) present (got 1)
   PASS: heading 2 (Materials Table) present (got 1)
   PASS: heading 3 (Approval ID Generator) present (got 1)
   PASS: table cell token (alpha-fixture-row) present (got 1)
-  PASS: table cell token (delta-fixture-row) present (got 2)
-  PASS: code marker line present (got 2)
+  PASS: table cell token (bravo-fixture-row) present (got 1)
+  PASS: table cell token (charlie-fixture-row) present (got 1)
+  PASS: table cell token (delta-fixture-row) present (got 1)
+  PASS: code marker line (full text) present (got 1)
   PASS: pdftoppm produced 3 PNGs without error (got 3)
-  pdf: bytes=493243 sha256=62ac13828de8025f78e495221403eb69427425506953f438416c8db235c83370
+  pdf: bytes=491106 sha256=f91b3493f59a7bfc95203c55b74923234f42f4e1c5aa7345daf453ea85ea5a3f
 VALIDATION PASSED
-  png: out/png-online/page-1.png sha256=8c951faf84d6b9775ebfc99bd6508a80a370076184439d1594ed599fb4b1dd42 bytes=193999
-  png: out/png-online/page-2.png sha256=ed7231ce9816e8c4424f76c3db1f7ce66e7d41026026c54e30b4602cb2f8e96d bytes=185002
-  png: out/png-online/page-3.png sha256=540d3f91b1899821100a252845c8aaf4635d42216bdc1823b700a0776bb68d6c bytes=120294
+  png: out/png-online/page-1.png sha256=b2860fd4e19a151f628e4b88271ac43434b9938385a0a61bdab36676125c4360 bytes=196557
+  png: out/png-online/page-2.png sha256=32b3a92be78f36e1f650a2614c73ea62af2b5d29f0ec35cc14347e20cee02a7e bytes=193040
+  png: out/png-online/page-3.png sha256=c915b59398c7536cd434197f5cbe4edb23aa1c67c7b027752a6dfc09c63e21c7 bytes=132766
 == mode: offline ==
-  render: {"bytes":110006,"wall_ms":3247,"image_wait_ms":22,"print_ms":143,"image_state":"failed","sha256":"23b50ed037238686a476da1b8c7fd807a0c1637c516bc747ac0ffa2f642fd647"}
+  render: {"bytes":107811,"wall_ms":3663,"image_wait_ms":20,"print_ms":165,"image_state":"failed","sha256":"80ac6953a7d217e9aad4a9601a206d2331a5b0ba99f5f518cc79b3465249d17b"}
   PASS: sentinel log shows the remote fetch was attempted (got 1 line(s))
   sentinel log:
-    1788515768542 refused peer=127.0.0.1:56425 request=GET /remote-image.png HTTP/1.1
+    1788521072933 refused peer=127.0.0.1:62810 request=GET /remote-image.png HTTP/1.1
   PASS: offline render image_state=failed (not loaded, consistent with the sentinel's 403 refusal)
 == validating out/approval-headless-chrome-offline.pdf ==
   PASS: page count == 3 (got 3)
@@ -27,14 +29,43 @@ VALIDATION PASSED
   PASS: heading 2 (Materials Table) present (got 1)
   PASS: heading 3 (Approval ID Generator) present (got 1)
   PASS: table cell token (alpha-fixture-row) present (got 1)
-  PASS: table cell token (delta-fixture-row) present (got 2)
-  PASS: code marker line present (got 2)
+  PASS: table cell token (bravo-fixture-row) present (got 1)
+  PASS: table cell token (charlie-fixture-row) present (got 1)
+  PASS: table cell token (delta-fixture-row) present (got 1)
+  PASS: code marker line (full text) present (got 1)
   PASS: pdftoppm produced 3 PNGs without error (got 3)
-  pdf: bytes=110006 sha256=23b50ed037238686a476da1b8c7fd807a0c1637c516bc747ac0ffa2f642fd647
+  pdf: bytes=107811 sha256=80ac6953a7d217e9aad4a9601a206d2331a5b0ba99f5f518cc79b3465249d17b
 VALIDATION PASSED
-  png: out/png-offline/page-1.png sha256=5a59a1826f58c84710e68bbc0d49b224e17e5bd0fc7edc5afe70bb9d3846dea0 bytes=191651
-  png: out/png-offline/page-2.png sha256=26e29263defda67d0328763f563dc0c632a46a43187321f24566d0153c82b705 bytes=205835
-  png: out/png-offline/page-3.png sha256=4d2db96fa9eeb9d20da666b4747a0f8164816adca52389647226b4b0e2498041 bytes=79808
-fixture sha256 (online)=394fb8ce8a8178e758b9dbae162bd0fc425594e8e05de4653bac74d7cde867de
-fixture sha256 (offline)=9c0aed4284fa9a5cc9c1b7657e38a9bed42acde4a242ca8cd9c9b7a93d1a9457
+  png: out/png-offline/page-1.png sha256=cd6ccde512ac530e69ec4e2c108d17213234ea150785960e32067894d8ade7e3 bytes=194736
+  png: out/png-offline/page-2.png sha256=87760dfb778cff2b607524cef3dd3a1694db7dc0017fe1a5d40f4e2f1f8fb18d bytes=201408
+  png: out/png-offline/page-3.png sha256=23952bd61cff2eccf6da0c1cc2a9e3f566d2d2957c4e809bfe7577e378f2d199 bytes=103855
+== mode: negative fixture (row tokens + code marker removed, page count preserved) ==
+  render: {"bytes":488722,"wall_ms":3528,"image_wait_ms":71,"print_ms":185,"image_state":"loaded","sha256":"7fbf0e9ab7809b1cfd2f4d85ab938051f876caeab88dd596bf6098844ddb40d0"}
+  PASS: negative fixture still renders to 3 pages
+    == validating out/approval-negative.pdf ==
+      PASS: page count == 3 (got 3)
+      PASS: heading 1 (Approval Page One) present (got 1)
+      PASS: heading 2 (Materials Table) present (got 1)
+      PASS: heading 3 (Approval ID Generator) present (got 1)
+      FAIL: table cell token (alpha-fixture-row) present (got 0, want >= 1)
+      FAIL: table cell token (bravo-fixture-row) present (got 0, want >= 1)
+      FAIL: table cell token (charlie-fixture-row) present (got 0, want >= 1)
+      FAIL: table cell token (delta-fixture-row) present (got 0, want >= 1)
+      FAIL: code marker line (full text) present (got 0, want >= 1)
+      PASS: pdftoppm produced 3 PNGs without error (got 3)
+      pdf: bytes=488722 sha256=7fbf0e9ab7809b1cfd2f4d85ab938051f876caeab88dd596bf6098844ddb40d0
+    VALIDATION FAILED
+  PASS: scripts/zs/pdf-validate.sh FAILED against the negative fixture (nonzero exit), as required
+  PASS: 'table cell token (alpha-fixture-row) present' correctly reports FAIL when its structure is removed
+  PASS: 'table cell token (bravo-fixture-row) present' correctly reports FAIL when its structure is removed
+  PASS: 'table cell token (charlie-fixture-row) present' correctly reports FAIL when its structure is removed
+  PASS: 'table cell token (delta-fixture-row) present' correctly reports FAIL when its structure is removed
+  PASS: 'code marker line (full text) present' correctly reports FAIL when its structure is removed
+  PASS: 'page count == 3' still reports PASS (structure was not touched by the negative fixture)
+  PASS: 'heading 1 (Approval Page One) present' still reports PASS (structure was not touched by the negative fixture)
+  PASS: 'heading 2 (Materials Table) present' still reports PASS (structure was not touched by the negative fixture)
+  PASS: 'heading 3 (Approval ID Generator) present' still reports PASS (structure was not touched by the negative fixture)
+fixture sha256 (online)=668773332a295ba28dc9fb6694c89203782ec4c3a1b9dd22ebcee895ef7c6318
+fixture sha256 (offline)=6eb69bb7078a4b22f8d6ab393ec4bcfb74bbe66ee4941b3f6826b00b478479f4
+fixture sha256 (negative)=da863212176141d05ca9d05b1f4a30f3276dd061271787478395f31d9af6069f
 VALIDATION PASSED

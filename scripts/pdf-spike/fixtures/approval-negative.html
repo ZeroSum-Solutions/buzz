@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>Broken English — Vendor Approval (spike fixture)</title>
+<title>Broken English — Vendor Approval (negative fixture — no fixture tokens)</title>
 <style>
   @page { size: 8.5in 11in; margin: 0.75in; }
   body { font-family: Georgia, "Times New Roman", serif; font-size: 12pt; line-height: 1.5; color: #111; }
@@ -49,10 +49,10 @@
       <tr><th>Line</th><th>Material</th><th>Grade</th><th>Unit Cost</th><th>Lead Time</th></tr>
     </thead>
     <tbody>
-      <tr><td>1</td><td>Sterling Silver</td><td>925</td><td>$4.12/g</td><td>alpha-fixture-row</td></tr>
-      <tr><td>2</td><td>Yellow Gold</td><td>14k</td><td>$61.30/g</td><td>bravo-fixture-row</td></tr>
-      <tr><td>3</td><td>Freshwater Pearl</td><td>AAA</td><td>$2.75/ea</td><td>charlie-fixture-row</td></tr>
-      <tr><td>4</td><td>Cubic Zirconia</td><td>A</td><td>$0.40/ea</td><td>delta-fixture-row</td></tr>
+      <tr><td>1</td><td>Sterling Silver</td><td>925</td><td>$4.12/g</td><td>2 weeks</td></tr>
+      <tr><td>2</td><td>Yellow Gold</td><td>14k</td><td>$61.30/g</td><td>3 weeks</td></tr>
+      <tr><td>3</td><td>Freshwater Pearl</td><td>AAA</td><td>$2.75/ea</td><td>1 week</td></tr>
+      <tr><td>4</td><td>Cubic Zirconia</td><td>A</td><td>$0.40/ea</td><td>4 weeks</td></tr>
     </tbody>
   </table>
   <p>Filler paragraph 5. Each row of the materials table above carries its own distinct value in
@@ -66,7 +66,7 @@
 
   <h2>Approval ID Generator</h2>
   <pre><code>def approval_id(vendor_code: str, season: str, counter: int) -> str:
-    # PDF_SPIKE_CODE_MARKER_7f3a
+    # deterministic id, no external state
     return f"{vendor_code.upper()}-{season}-{counter:04d}"
 </code></pre>
   <p>Filler paragraph 7. The comment on the second line of the code block above is the line an
