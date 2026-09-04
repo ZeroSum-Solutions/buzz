@@ -10,6 +10,10 @@ publish = false
 name = "render_headless_chrome"
 path = "src/render_headless_chrome.rs"
 
+[[bin]]
+name = "sentinel"
+path = "src/sentinel.rs"
+
 [dependencies]
 headless_chrome = "1.0.22"
 sha2 = "0.10"

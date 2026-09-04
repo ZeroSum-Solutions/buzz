@@ -3,49 +3,41 @@
 //! `Page.printToPDF` DevTools method. Not production code — thrown away with
 //! the `spike/pdf` branch. See docs/plans/2026-09-04-pdf-route.md.
 //!
-//! Usage: render_headless_chrome <fixture.html> <out.pdf> [--offline]
+//! Usage: render_headless_chrome <fixture.html> <out.pdf>
 //!
-//! `--offline` launches Chrome with a proxy pointed at a closed local port,
-//! so every outbound request (including the fixture's remote <img>) fails
-//! deterministically without needing an OS-level firewall rule or sudo.
+//! The online/offline distinction lives entirely in which fixture is
+//! passed in: `fixtures/approval.html` points its remote `<img>` at a live
+//! URL, `fixtures/approval-offline.html` points the same `<img>` at the
+//! local sentinel server (see `src/sentinel.rs`) so the "offline" case is a
+//! deterministic, logged refusal rather than a proxy trick.
 
 use headless_chrome::browser::default_executable;
 use headless_chrome::types::PrintToPdfOptions;
 use headless_chrome::{Browser, LaunchOptionsBuilder};
 use sha2::{Digest, Sha256};
 use std::env;
-use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 3 {
-        eprintln!("usage: render_headless_chrome <fixture.html> <out.pdf> [--offline]");
+    if args.len() != 3 {
+        eprintln!("usage: render_headless_chrome <fixture.html> <out.pdf>");
         std::process::exit(2);
     }
     let fixture_path = Path::new(&args[1]);
     let out_path = Path::new(&args[2]);
-    let offline = args.iter().any(|a| a == "--offline");
 
     let fixture_abs = fs::canonicalize(fixture_path)?;
     let fixture_url = format!("file://{}", fixture_abs.display());
 
     let chrome_path = default_executable().map_err(|e| format!("no Chrome found: {e}"))?;
 
-    let mut launch_args: Vec<&OsStr> = Vec::new();
-    if offline {
-        // Route everything at an unreachable local port so remote fetches
-        // fail fast and deterministically, without a system firewall rule.
-        launch_args.push(OsStr::new("--proxy-server=127.0.0.1:1"));
-    }
-
     let launch_options = LaunchOptionsBuilder::default()
         .path(Some(chrome_path))
         .headless(true)
         .sandbox(false)
-        .args(launch_args)
         .build()?;
 
     let wall_start = Instant::now();
@@ -53,8 +45,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tab = browser.new_tab()?;
     tab.navigate_to(&fixture_url)?;
     tab.wait_until_navigated()?;
-    // Give the fixture's remote <img> a bounded window to resolve (or fail,
-    // in --offline mode) before the page is captured.
+    // Give the fixture's remote <img> a bounded window to resolve (or be
+    // refused by the sentinel) before the page is captured.
     std::thread::sleep(std::time::Duration::from_millis(800));
 
     let pdf_data = tab.print_to_pdf(Some(PrintToPdfOptions {
@@ -86,8 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hash = hasher.finalize();
 
     println!(
-        "{{\"mode\":\"{}\",\"bytes\":{},\"wall_ms\":{},\"sha256\":\"{}\"}}",
-        if offline { "offline" } else { "online" },
+        "{{\"bytes\":{},\"wall_ms\":{},\"sha256\":\"{}\"}}",
         pdf_data.len(),
         wall_elapsed.as_millis(),
         hex::encode(hash)

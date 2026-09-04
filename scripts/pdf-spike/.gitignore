@@ -1,3 +1,5 @@
 /target/
 /out/*.pdf
 /out/png-*/
+/out/sentinel.log
+/out/sentinel-stdout.log
