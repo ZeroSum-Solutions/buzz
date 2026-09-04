@@ -1,7 +1,7 @@
 name: CI
 on:
   push:
-    branches: [main, release]
+    branches: [main, release, zs/main]  # zs fork: warm caches on the integration branch
   pull_request:
 
 concurrency:
