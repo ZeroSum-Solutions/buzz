@@ -64,12 +64,40 @@ Never requested: `https://www.googleapis.com/auth/calendar` (full calendar manag
 the surface trusts.** Google's granular consent lets a user grant part of what was asked, so the
 read-only surface is produced by the readback, not by a smaller request:
 
-- the read surface needs `calendar.calendarlist.readonly` **and** at least one of
-  `calendar.events.readonly` / `calendar.events`;
+- the read surface needs **at least one of `calendar.events.readonly` / `calendar.events`**, and
+  nothing else. That is what `events.list` requires, and `events.list` is the only probe this
+  contract reads a calendar with (decisions 3 and 6);
+- `calendar.calendarlist.readonly` is still requested, and is still verified before a credential
+  *replacement*, but it is **not** part of the read set: it feeds the deferred picker and the "this
+  calendar is not in your list" diagnostic, neither of which v1 ships or depends on. A user who
+  unchecks it at the consent screen connects, and the surface is whole, because decision 4's
+  mapping arrives through decision 2's proposal command and not through a list;
 - edit affordances need `calendar.events` **and** decision 3's `accessRole` test;
 - anything short of the read set is a *connect failure*, not a degraded surface: the credential is
   not persisted, the new grant is discarded by the single operation "When connect fails" defines,
-  and the user is told which permission the calendar view requires.
+  and the user is told which permission the calendar view requires;
+- the scope set written to the binding record is **exactly** the readback string, parsed and stored
+  verbatim. It is never widened locally to the set that was *requested*, and no code path adds a
+  scope to a stored binding without a token response that justifies it.
+
+**Why the union at connect, and what the read-only-first alternative costs.** The alternative was
+considered: ask at Connect for only `openid`, `userinfo.email`, `calendar.calendarlist.readonly`
+and `calendar.events.readonly`, and route write authority through a later authorization. It is the
+smaller default privilege, and its cost is stated here rather than waved off. Because incremental
+authorization is unavailable to installed apps (below), the upgrade is a **complete second
+consent** for the whole union, so every teacher who schedules pays a full re-authorization the
+first time she drags a class, on a client that cannot merge the two grants. It lost on three
+counts. The teacher who schedules is the ordinary user of this surface, not the exception. Granular
+consent already hands the read-only user the smaller grant without a second request — the read set
+does not contain `calendar.events`, so unchecking write at the consent screen still connects. And a
+second full consent is the event decision 8 works hardest to keep rare: a user who is asked for
+Google permissions twice reads the second prompt as a defect, not as a privilege boundary. What the
+union costs is real and is not hidden: `calendar.events` authorizes editing events on every
+calendar the account can write, personal calendars this contract never discusses included, which is
+exactly why decision 2's command constraints are load-bearing rather than decorative. T12 asserts
+the half that holds either way: the persisted scope set equals the readback string exactly, for a
+full grant and for a partial one, and no test may observe a stored scope that no token response
+returned.
 
 **No incremental authorization.** Google's OAuth 2.0 for Mobile & Desktop Apps guide states that
 incremental authorization is not supported for installed apps or devices, and this decision pins
@@ -88,20 +116,26 @@ branch of a re-authorization is therefore decided by `sub` before anything is re
 
 - **Same `sub` as the stored binding** — the ordinary case, a user upgrading their own connection.
   The new token is dropped in memory and **never sent to the revocation endpoint**. Buzz
-  re-validates the existing credential with one `calendarList` call, reports the scopes that
-  credential actually holds, and says the extra permission was not granted. Google's grants are
-  additive, so a consent screen on which the user granted less does not withdraw what the account
-  already granted; if the stored credential has stopped working anyway, that is decision 8's
-  terminal path and nothing here special-cases it.
+  re-validates the existing credential with one `events.list` call on the mapped calendar
+  (decision 3's authoritative probe), reports the scopes that credential actually holds, and says
+  the extra permission was not granted. Google's grants are additive, so a consent screen on which
+  the user granted less does not withdraw what the account already granted; if the stored
+  credential has stopped working anyway, that is decision 8's terminal path and nothing here
+  special-cases it.
 - **Different `sub`** — not a re-authorization at all but decision 2's account change. It takes the
-  explicit confirm, and a decline or a short scope set runs "discard the new grant" below, which
-  may revoke, because that token belongs to a different account's grant.
+  explicit confirm, and a decline or a short scope set runs "discard the new grant" below. That
+  operation does not revoke either, and for the same reason one level out: the account whose token
+  we are holding may hold a live Buzz grant on a device this installation knows nothing about, and
+  revoking at project granularity would end it there.
 
-We never revoke on a same-`sub` re-authorization. That is the guarantee, and it is narrower than
-the one an earlier draft of this memo made — "a re-authorization can never leave an account holding
-less than it held before" — which was false: honoring it by revoking the short token would have
-taken the stored refresh token with it and stripped the read surface the teacher already had, on
-every device she uses.
+**We never revoke a grant except on an action the user took against that account** — Disconnect, or
+the confirmed half of an account change. That is the guarantee. It is wider than the same-`sub`
+rule an earlier draft settled for, because the same-`sub` test asks the wrong question: it looks at
+whether *this installation* holds a record, when what decides the blast radius is whether *that
+Google account* holds a grant anywhere. It is also narrower than the guarantee the first draft
+made — "a re-authorization can never leave an account holding less than it held before" — which was
+false: honoring it by revoking the short token would have taken the stored refresh token with it
+and stripped the read surface the teacher already had, on every device she uses.
 
 T12 names a test with two token responses for one grant: a stored binding for `sub` S holding the
 full union, a re-authorization for S returning only `calendar.events`, and the assertions that no
@@ -160,9 +194,53 @@ Without step 3 the credential for pubkey A's Google account would be written und
 surface would render A's calendar, and decision 2's "connecting a different Google account requires
 an explicit confirm" would never fire, because from B's side that write is a first connect.
 
+**Connect is single-flight per identity.** At most one transaction record exists for an identity at
+a time. Pressing Connect again — a double press, or a second channel's Connect button — supersedes
+the live record rather than adding one: the old record is dropped, its listener is closed and its
+port released, and only then is the new record created and the new browser tab opened. A callback
+for a superseded transaction therefore arrives carrying a `state` the app no longer knows, and
+step 1 drops it. Newest wins by construction, enforced by the check that is already there rather
+than by a second mechanism. Without this, two flows for one identity each hold a valid distinct
+`state` and each pass the pubkey check, so the *older* one, completing second, would overwrite the
+account the user just chose — or, if the two flows chose different accounts, drive decision 2's
+account-change path against the binding the user made seconds earlier. That is `AGENTS.md`
+Review-Proven Rule 2 applied to connect, which this memo already applies to refreshes (decision 5)
+and to late list responses (decision 4).
+
 T12 names a test for each: a wrong `state`, a missing `state`, a second concurrent callback
-replaying a valid `state`, a callback after the deadline, and an identity switch between the
-browser opening and the callback.
+replaying a valid `state`, a callback after the deadline, an identity switch between the browser
+opening and the callback, and two Connect flows for one identity completing in reverse order —
+where only the newest persists and the older's callback is dropped without a token exchange.
+
+**Every Google request is bounded, and so is every page loop.** The five-minute deadline above
+bounds waiting for the *browser*. It bounds no HTTP call, and a token endpoint that accepts the
+connection and then never finishes its response would otherwise leave Connect in no state at all —
+past its listener deadline, short of stage 2, with nothing to report. One shared client carries
+every Google request this contract makes — token exchange, refresh, revocation, `events.list`,
+`calendarList` — and its limits are stated once here instead of per call site:
+
+- **Deadlines.** Ten seconds to establish the connection, thirty seconds without a received byte,
+  and sixty seconds total for one request including redirects and body read; whichever expires
+  first aborts it. An operation built from several requests — a connect, a window refresh — carries
+  its own total of ninety seconds. Decision 5's sign-out budget is tighter and wins where it
+  applies.
+- **A response byte cap** of eight mebibytes. A body still arriving at the cap aborts the request
+  rather than buffering on; no legitimate response on this surface comes near it.
+- **Page bounds.** A paged read stops at twenty pages, or at the item cap for that resource — 2,500
+  events for one window, 500 `calendarList` entries — whichever comes first, and treats a
+  `nextPageToken` it has already seen in the same operation as a protocol error rather than a page.
+  Reaching a bound is not silent: it is logged with the resource and the page count, and the window
+  renders from what arrived, marked stale.
+- **Cancellation.** Every request is cancellable, and is cancelled on identity change, on
+  `resetCommunityState()` (decision 4), on Disconnect, and at shutdown. A cancelled request writes
+  nothing and delivers nothing — the same fence decision 4 states for a late response.
+
+An aborted, capped or page-bounded request is a **transient** failure everywhere in decision 6's
+table. It is never access loss and never terminal auth: a stall proves nothing about the ACL or the
+grant, and Rule 4 asks for a bound, not for a verdict. T12 binds this to a test server that accepts
+a connection and then sends nothing, one that sends a body past the cap, and one that answers every
+page with the same `nextPageToken`. Each must produce a transient failure inside the stated
+deadline, with no purge, no state change and no unbounded loop.
 
 **When connect fails.** Connect-time failure is its own axis, not one of decision 6's post-connect
 states. Connect is a pipeline, and every stage has a failure; the list runs to the success
@@ -186,9 +264,8 @@ Google grant exists and we hold nothing:
      "Couldn't finish connecting" state that lists those three causes in that order, names the
      Workspace domain this client accepts, and offers Try again.
 2. **Exchanged / exchange failed.** A `state`-matched callback whose code exchange fails (network,
-   5xx, an expired or replayed code). No token was issued, so there is nothing to revoke, but the
-   user's consent already created a grant record on their account. The state is "Couldn't finish
-   connecting", with Try again, and one sentence saying Buzz may appear in their Google account's
+   5xx, an expired or replayed code). No token was issued, but the user's consent already created a
+   grant record on their account. The state is "Couldn't finish connecting", with Try again, and one sentence saying Buzz may appear in their Google account's
    third-party access list until they retry or remove it there. Retry is a fresh transaction, never
    a reuse of the spent one.
 3. **Scope-verified / insufficient.** The readback rule above. An insufficient grant persists
@@ -197,8 +274,9 @@ Google grant exists and we hold nothing:
    account and we hold its refresh token. `SecretStore::store` returns `Result<(), String>`
    (`desktop/src-tauri/src/secret_store.rs:729`), and a locked or unavailable keychain is a real
    return value even after the preflight passed. On `Err` the app does not fall back to plaintext
-   and does not report a bare failure: it runs "discard the new grant" and reports "Couldn't finish
-   connecting" together with whatever that operation resolved to.
+   and does not report a bare failure: it runs "discard the new grant" and reports "Couldn't
+   finish connecting" together with that operation's disclosure sentence, which is the same
+   sentence stage 2 shows.
 5. **Connected.** The binding is written and, in the *same* blob mutation, any revocation job this
    installation still has pending for the same (project, `sub`) is discarded (decision 5).
 
@@ -207,41 +285,64 @@ abort above and a declined account-change confirm (decision 2) all end holding a
 just issued and no right to keep it. They run the same ordered steps, stated here rather than
 re-derived at four call sites that can drift apart:
 
-1. **The same-`sub` exception.** If the new token's `sub` matches a binding this installation
-   already holds for this Cloud project, nothing is revoked: the token is dropped in memory and the
-   operation is done. Revoking it would revoke that binding too — one grant per (project, account).
-2. Otherwise post the refresh token to Google's revocation endpoint. HTTP 200, or a terminal
-   `invalid_token` meaning the grant is already gone, finishes the operation.
-3. On any other outcome, write a decision 5 revocation job for that (project, `sub`). Its retry
-   schedule finishes what the network could not, and the user is told a revocation is pending.
-4. If the journal write also fails, the failure message says in words that a Google grant for Buzz
-   may still exist, and links to the user's Google account permissions page.
+1. **The token is dropped in memory.** Nothing is persisted: no binding record, no partial record,
+   no revocation job, no cache row.
+2. **Nothing is posted to the revocation endpoint** — not for a `sub` this installation already
+   holds, and not for one it has never seen.
+3. **The grant is disclosed in words**, inside the same failure message: Buzz may appear in that
+   Google account's third-party access list until the user retries or removes it there, with a link
+   to the Google account permissions page. That is stage 2's sentence, reused rather than
+   paraphrased per stage.
 
-A grant with no local record and no durable instruction to remove it is exactly Review-Proven Rule
-1's catch-with-no-durable-record, so it is the one outcome this list refuses to leave silent — and
-it is refused in one place instead of once per stage.
+**Why this operation does not revoke.** Revocation is project-granular (decision 5): posting the
+token we have just received removes every scope that Google account granted this Cloud project and
+invalidates every token issued under it, on every device that account uses. The only local thing
+about that token is that we are holding it. Device A already runs a working Buzz connection for
+account B; on device C, bound to account A, the user picks B and then declines the account-change
+confirm — and a revoking discard would disconnect device A with a dialog the user just refused. The
+identical harm reaches device A through the insufficient-scope stage, the persist-failure stage and
+the identity-mismatch abort, none of which is a statement by the user about that account's other
+devices. This is the harm decision 1 already refuses one section up for the same-`sub` case; the
+only change is that the guard no longer asks whether *this installation* holds a record, which was
+never the question that decided the blast radius.
 
-T12 names a test per path into that operation: an exchange failure (no credential, no partial
-record, no revocation job); an insufficient scope set with the revocation endpoint reachable (the
-token is revoked, nothing persists); an insufficient scope set with the network down (a revocation
-job survives and the next launch retries it); a persist failure after a successful exchange (the
-issued token is revoked and the failure is reported); a persist failure whose revocation also fails
-(a job survives and the next launch retries it); an identity switch between the exchange and the
-persist (the token is revoked and nothing is written under either identity); and a declined
-account-change confirm (the token is revoked and the previous binding is untouched).
+What we accept instead is a grant with no local token. It is not silent, which is what `AGENTS.md`
+Review-Proven Rule 1 asks of a caught failure: the failure message names the live grant, names
+where to remove it, and the retry that replaces it is one button away. The earlier draft's
+alternative — a durable revocation job for a grant the user never asked to end — satisfied the
+letter of Rule 1 by scheduling the damage instead of reporting it.
+
+The **confirmed** half of an account change is the one place a token issued by this flow still
+leads to a revocation, and it is the previous binding's token that goes, not the new one
+(decision 2). Disconnect and sign-out (decision 5) are the others. No other path in this contract
+reaches the revocation endpoint.
+
+T12 names a test per path into that operation: an exchange failure, an insufficient scope set, a
+persist failure after a successful exchange, an identity switch between the exchange and the
+persist, and a declined account-change confirm. Each asserts the same three things — **no request
+reaches the revocation endpoint**, no journal entry is written, and no credential is persisted. The
+decisive case is the two-installation test this rule exists for: installation 1 holds a live
+binding for account B; on installation 2, bound to account A, the user completes consent for B and
+declines the confirm; installation 1's binding must still work afterwards, and its next refresh must
+not return `invalid_grant`.
 
 None of these
 states is "not shared with your account" (decisions 4 and 6): that message means a connected
 account the calendar's ACL does not list, and showing it to someone who never reached the consent
 screen sends them to an admin to fix an ACL that is not the problem.
 
-**Reason.** `calendarlist.readonly` is the only way to resolve the business calendar's id and the
-caller's `accessRole` without asking for calendar management. Asking for the whole union at connect
-and deriving the surface from the readback is what keeps "read-only member" a real state without a
-second authorization: Google will not give an installed app an incremental upgrade, so a design
-that depends on one would hand a teacher who drags a class a token carrying only `calendar.events`,
-and the same readback rule that protects the read-only surface would then correctly record that
-`calendarlist.readonly` and `events.readonly` are gone — trying to edit would break reading.
+**Reason.** The events scopes are the smallest pair that answers every question this surface asks:
+one `events.list` on the mapped calendar returns the window, the calendar's `summary` and time
+zone, and the caller's `accessRole`, without asking for calendar management and without depending
+on a `CalendarList` entry Google no longer creates when a calendar is shared (decision 3).
+`calendarlist.readonly` is asked for because a picker is the obvious next entry point and a second
+consent to add it later is exactly what this decision refuses; it is kept out of the read set
+because nothing in v1 breaks without it. Asking for the whole union at connect and deriving the
+surface from the readback is what keeps "read-only member" a real state without a second
+authorization: Google will not give an installed app an incremental upgrade, so a design that
+depends on one would hand a teacher who drags a class a token carrying only `calendar.events`, and
+the same readback rule that protects the read-only surface would then correctly record that
+`events.readonly` is gone — trying to edit would break reading.
 Verifying the full union before replacing a credential is the same rule applied to the
 re-authorization path. Naming the publishing status is not paperwork: it is the single setting that
 decides whether decision 8's terminal branch is rare or weekly. Requiring a Buzz-only Cloud project
@@ -258,7 +359,8 @@ merely closed the browser window to a Workspace admin.
 **Decision.** One Google account per Buzz identity per installation. The Buzz side of the binding
 is the active identity's pubkey hex (`get_identity`, `desktop/src-tauri/src/commands/identity.rs`);
 the Google side is the OIDC `sub`, not the email. The record — refresh token, access token,
-expiry, granted scopes, `sub`, email for display — is stored in the OS keychain through
+expiry, granted scopes, `sub`, email for display, and the `binding_generation` defined below — is
+stored in the OS keychain through
 `SecretStore` under a key namespaced by pubkey hex. `SecretStore` keeps all secrets as one JSON
 blob (the `BLOB_KEY` username `secrets`, `desktop/src-tauri/src/secret_store.rs:42-44`; the
 service name is not a constant in that file but comes from `keyring_service()`,
@@ -267,18 +369,51 @@ and a `buzz-desktop-dev*` service otherwise), so this costs no extra keychain pr
 revocation journal is a *second, separate key* in that same blob; it is deliberately not a field
 of this record, because it has to outlive it. Token exchange, refresh and every Google API call
 happen in Rust. The webview receives a redacted status struct only: connected, email, granted
-scopes, expiry, state. Connecting a different Google account requires an explicit confirm and
-revokes the previous grant first (decision 5). The pubkey → Google-account mapping is never
-published to the relay.
+scopes, expiry, state. Connecting a different Google account takes an explicit confirm, and the
+confirm can only be raised *after* the token exchange, because `sub` is the thing that tells us the
+account differs. On confirm, the **previous** binding's grant is revoked exactly as decision 5's
+Disconnect revokes it, and the confirm carries decision 5's sentence for it: this ends the previous
+Google account's Buzz access on every device. On decline, the new token runs decision 1's "discard
+the new grant" — no revocation of either account — and the previous binding is untouched. The
+pubkey → Google-account mapping is never published to the relay.
+
+**`binding_generation` — what it is, when it changes, and what it survives.** It is a field of the
+binding record, not a process-local counter: 128 bits from the OS CSPRNG, drawn fresh whenever a
+binding record is written, never derived from a clock, a sequence or a hash of the credential.
+
+- **Minted** on first connect, and again on every *credential replacement* — a re-authorization
+  that stores a new refresh token, and an account change. Every mint is a new CSPRNG draw and never
+  an increment, so no caller can predict or reconstruct one.
+- **Unchanged** by an ordinary access-token refresh, by an app restart, by a community switch and
+  by every read. A refresh writes a new access token and expiry into the record and leaves the
+  generation alone, which is what lets a cache row stay valid across an ordinary week.
+- **Carried** by everything that outlives the process: decision 5's journal entries copy it,
+  decision 6's cache rows key on it, and this decision's command handles are minted against it.
+  Each compares against the value read back from the persisted record, never against one still held
+  in memory from before a restart.
+- **Gone** with the record. A binding deleted by Disconnect takes its generation with it and the
+  next connect mints a new one, so nothing written before a Disconnect can match anything after it.
+
+A process-local counter is the defect this field exists to prevent, and it fails in exactly the
+place the fence matters: it resets to its initial value on relaunch, so a cache row written under a
+replaced credential matches the record that replaced it, and decision 6's tuple stops fencing at
+the moment a restart makes it load-bearing. T12 binds this to a **real store reopen** rather than
+an in-memory double — replace the credential, close and reopen both the `SecretStore` and the cache
+DB, then present a refresh response and a cache row from before the replacement. Both must be
+rejected at the production persist and delivery seam, and the generation read back after the reopen
+must equal the one written before it and differ from the one before the replacement.
 
 **Where `sub` comes from.** The `sub` is read from the `id_token` in the token-endpoint response
 Buzz receives directly from Google over TLS, and from nowhere else: never from a UserInfo call,
 never from a value that passed through the webview, never from the loopback callback's query
 string. Because that channel is direct and intermediary-free, Google's own OpenID Connect guidance
-lets an app use the claims of a token received that way without full signature validation. Buzz
-still checks that the `aud` claim equals this client id, and that check is not ceremony: it is what
-stops a token minted for some other client from driving the account-change comparison and being
-persisted as the binding identity. If a later ticket ever sources `sub` from anywhere but that
+lets an app use the claims of a token received that way without full signature validation. That
+guidance leans partly on the client secret authenticating the app to Google, which an installed app
+does not have (decision 1 calls its secret an identifier, not a credential); here it is PKCE that
+binds this response to this app, and the `aud` check below that binds the token to this client.
+Buzz still checks that the `aud` claim equals this client id, and that check is not ceremony: it
+is what stops a token minted for some other client from driving the account-change comparison and
+being persisted as the binding identity. If a later ticket ever sources `sub` from anywhere but that
 direct response, full ID-token validation — signature against the published JWKS, `iss`, `aud`,
 `exp` — becomes required at that point, and the ticket that moves it owns that work.
 
@@ -287,20 +422,51 @@ leaving the process; on its own it does not stop the token's *authority* from le
 renderer can still invoke the commands. So the calendar commands are constrained here:
 
 - Every command takes an **opaque binding handle** minted in Rust — a random id valid only for the
-  current active identity, the current community and the current binding generation. No command
-  takes a caller-supplied calendar id, and no command enumerates calendars.
+  current active identity, the current community and the current binding generation. With the one
+  exception named below, no command takes a caller-supplied calendar id and no command enumerates
+  calendars.
 - An event is addressed by an event handle drawn from the rows Rust itself delivered for the
   current window, never by a raw Google event id supplied by the caller.
 - On every call Rust re-derives from its own state, not from arguments: the active identity pubkey,
-  the current community, the channel-to-calendar mapping (decision 4), and the `accessRole` from
-  the last `calendarList` answer (decision 3). Any mismatch rejects the call.
-- Adding a calendar to the mapping goes through a native confirmation outside the webview, showing
-  the calendar summary and the Google account, so a renderer cannot widen the surface silently.
+  the current community, the channel-to-calendar mapping (decision 4), and the `accessRole` carried
+  by the last `events.list` answer for that calendar (decision 3). Any mismatch rejects the call.
+
+**The one exception, because decision 4 needs one.** The admin conveys the calendar id out of band
+and each user sets the mapping locally, so *some* entry point has to accept an id the app has never
+seen; the alternatives are a picker over the account's calendars, which the bullets above forbid,
+or a decision 4 nobody can carry out. Leaving that unnamed is what would make an implementer either
+ship the mapping unusable or quietly widen a list command, so it is named here and bounded:
+
+- **`propose_calendar_mapping(channel_handle, raw_calendar_id)`** is the only command that accepts
+  a raw calendar id. It returns **no calendar data of any kind** — not a summary, not a role, not
+  an existence bit — and it mints no handle.
+- Rust alone resolves the id: one `events.list` against it under decision 1's client limits, whose
+  response carries the summary, the time zone and the `accessRole` that the confirmation and
+  decision 3 need.
+- Any of that is shown **only** in the OS-native confirmation outside the webview, which names the
+  calendar summary and the Google account. The mapping is written, and a binding handle first
+  minted for it, only after the user confirms there.
+- The value returned to the renderer is one of exactly two: `confirmed` or `not_confirmed`. A
+  calendar id that does not exist, one this account cannot read, a request that hit a client limit
+  and a user who pressed Cancel are **indistinguishable** from the renderer's side, so a
+  compromised renderer cannot turn the command into an existence oracle over the account's
+  calendars.
+- Proposals are rate-limited per identity, and the limit is a Rule 4 bound rather than a warning: a
+  renderer that spends it receives `not_confirmed` and a logged line, never a faster answer.
+- Nothing else moves. Raw calendar ids stay rejected by every list, read and edit command.
+
+A Rust-owned picker over `calendarList` may be added later as a second entry point; it would end in
+the same native confirmation and mint the same handles, and Rust, not the renderer, would
+enumerate. It is not in v1 because decision 4's out-of-band convention does not need it, and
+because `calendarList` is picker metadata and nothing else (decisions 3 and 6).
 
 T12 names handler-level tests: a handle whose calendar is no longer in the current mapping is
-rejected, and so is a request that carries a raw calendar id at all; a handle minted under a
-previous binding generation is rejected; a handle minted under another identity is rejected; and a
-handle minted in community A is rejected after a switch to B.
+rejected, and so is a request that carries a raw calendar id to any command but the proposal one; a
+handle minted under a previous binding generation is rejected; a handle minted under another
+identity is rejected; a handle minted in community A is rejected after a switch to B; a proposal
+for a calendar id that does not exist and a proposal for one this account cannot read return the
+identical `not_confirmed` value and nothing else; and a proposal whose native confirmation is
+declined, or never resolves, writes no mapping and mints no handle.
 
 **Reason.** `sub` is stable; a Workspace email can be renamed or reassigned to a different human,
 and a binding keyed on email would silently follow the address to the new person. Keeping tokens
@@ -324,21 +490,37 @@ failure — never as a local "saved" state. Google's ACL also accepts addresses 
 Workspace, and we do not restrict that: such a grant is real read access in Google, it simply
 produces no Buzz surface, because the OAuth client is Internal (decision 1).
 
-Edit affordances derive from the `accessRole` that `calendarList` returns for that user, and the
-table is closed:
+Edit affordances derive from the `accessRole` carried by the **`events.list` response for the
+mapped calendar** — the same call that fetches the window — and the table is closed:
 
 | `accessRole` | Edit affordances |
 |---|---|
 | `owner`, `writer` | enabled for every event on the calendar |
 | `writerWithoutPrivateAccess` | enabled for the events the API returns in full; disabled for events returned as free/busy only, which render as busy blocks with no edit affordance |
-| `reader`, `freeBusyReader` | disabled |
+| `reader`, `freeBusyReader`, `none` | disabled |
 | **any other value, present or future** | **disabled — treated as read-only** |
 
 The last row is the rule, not a placeholder. Google adds roles; an unrecognized role must never
 default to allow, because the resulting edit fails at Google with a raw error, which this decision
 forbids, and it must not be an implementation choice, because "hide edit" and "default allow" are
-both defensible in isolation and only one of them is safe. T12 tests one case per row, including
-an invented unknown role.
+both defensible in isolation and only one of them is safe.
+
+**Why the role comes from `events.list` and not from `calendarList`.** Google documents that
+sharing a calendar with a user no longer inserts it into that user's `CalendarList`. A correctly
+shared teacher can therefore be absent from her own `calendarList` while her reads of the calendar
+are fully authorized — and a role derived from `calendarList` would be *missing* for exactly that
+user: no role, so no affordances, and, under an earlier draft of decision 6's matrix, a purge and
+an ACL support call for an ACL that is correct. The `events.list` response carries `accessRole`
+with all six values Google defines for it — `none`, `freeBusyReader`, `reader`,
+`writerWithoutPrivateAccess`, `writer`, `owner` — beside the `summary` and `timeZone` the surface
+needs, and it is authorized by the scopes decision 1 actually requests. One call answers "may I
+read this calendar", "what may I do here" and "what is in the window", which is why decision 6 also
+makes it the authoritative probe. `calendarList` keeps one job — offering calendars in a picker —
+and decides nothing.
+
+T12 tests one case per row, including an invented unknown role, and one case the rows alone would
+not force: a `writer` teacher whose calendar is absent from her `calendarList`, who must still get
+her events and her edit affordances.
 
 **Reason.** Two access-control systems that can disagree is the failure mode the feature audit
 named (`2026-09-04-zs-feature-audit.md:57`). Buzz's only gate is channel membership
@@ -556,10 +738,13 @@ produced it:
 |---|---|---|
 | 403 `userRateLimitExceeded`, `rateLimitExceeded`, `quotaExceeded` | transient (decision 8) | keep the cache, back off; identical handling to 429 |
 | 403 `forbiddenForNonOrganizer` | write-authorization | fails that write only; the read path and the cache are untouched |
-| 403 `insufficientPermissions` on a write | write-authorization | edit affordances drop to read-only; if the scope readback shows `calendar.events` absent, decision 1's re-authorization is offered |
+| 403 `insufficientPermissions` on a **write** | write-authorization | edit affordances drop to read-only; if the scope readback shows `calendar.events` absent, decision 1's re-authorization is offered |
+| 403 `insufficientPermissions` on a **read** | terminal auth (decision 8) | a scope the read surface depends on is no longer granted: `needs_reconnect`, events dropped as decision 8 states. Never access loss, and never the "no longer shared" message — the ACL is not what changed |
 | 404 on an **event-level** request (get, patch or delete of one event id) | missing event | drop that one cached row and refresh the window; never access loss, never a message about sharing |
-| 403 with an access reason, or 404, on a **calendar-level** read (`calendars.get`, `calendarList.get`, or a list of that calendar's events), still failing after one backed-off retry | access loss | purge that calendar's cached rows; surface "no longer shared with your account" |
+| 403 with an access reason, or 404, on the mapped calendar's **`events.list`**, still failing after one backed-off retry | access loss | purge that calendar's cached rows; surface "no longer shared with your account" |
+| 404, or plain absence, from `calendarList.get` / `calendarList.list` | picker metadata only | the calendar is not offered in a picker. No purge, no message, no state change — see "Absence from `calendarList`" below |
 | 401 on a resource call | expiry until proven otherwise | one generation-fenced forced refresh and one replay of that call; the refresh response classifies, never the 401 |
+| an aborted, capped or page-bounded request (decision 1's client limits) | transient (decision 8) | keep the cache, back off; a stall proves nothing about the ACL or the grant |
 | refresh returning `invalid_grant`, or a 401 on the replay after a refresh that succeeded | terminal auth (decision 8) | `needs_reconnect` |
 | refresh returning `invalid_client` | app error (decision 8) | `app_error`; no reconnect affordance, because a reconnect cannot repair it |
 | network failure, 5xx, 429 | transient (decision 8) | keep the cache, back off |
@@ -570,8 +755,27 @@ someone deleted in Google answers 404 to a read of its cached id, and answers 40
 backed-off retry, because a deleted event stays deleted. Classified on status alone that satisfies
 the access-loss condition, purges the whole calendar, and sends a teacher to an administrator to
 hunt an ACL that is correct — the support call decision 6 already removed from the rate-limit row,
-one row further down. So only a **calendar-level** request can establish access loss; an
+one row further down. So only the mapped calendar's **`events.list`** can establish access loss; an
 event-level 404 removes that event and nothing else.
+
+**One probe, and it is the one the scopes authorize.** `calendars.get` appears nowhere in this
+contract. Google documents it as requiring one of `calendar.readonly`, `calendar`,
+`calendar.app.created`, `calendar.calendars` or `calendar.calendars.readonly`, and decision 1
+requests none of them — so every call would answer 403 `insufficientPermissions`, for every user,
+forever, and land in whichever row caught it. An earlier draft named it as a calendar-level probe;
+the row is deleted rather than repaired, because adding `calendar.calendars.readonly` would widen
+the grant for a question `events.list` already answers. `calendarList.get` is out of the access-loss
+condition for the reason decision 3 gives: absence from a `CalendarList` is an ordinary state for a
+correctly shared calendar, so a 404 there is evidence about a picker and about nothing else. What
+remains is one probe — `events.list` on the mapped calendar — which is authorized by
+`calendar.events.readonly` and by `calendar.events`, both in decision 1's request, and which
+returns the `accessRole` decision 3 reads and the window the view draws in the same response.
+
+A read `insufficientPermissions` is therefore never an unclassified reason. It is the granted set
+changing under a live binding — a scope withdrawn at the user's Google account page, or a
+re-authorization that stored less than the surface depends on — which is a terminal auth condition
+in decision 8's sense and not an ACL event. It drops the events the way decision 8 drops them and
+it never says "no longer shared with your account", because sharing is not what moved.
 
 **A 401 is an expiry until a refresh says otherwise.** Access tokens last about an hour and
 decision 7's poll runs every five minutes, so a token expiring mid-call is ordinary operation, not
@@ -588,19 +792,27 @@ cannot classify. Erring toward transient is deliberate and asymmetric: a wrong t
 one stale poll interval, while a wrong access-loss call purges a cache and sends a teacher to an
 administrator to hunt an ACL that was never wrong.
 
-T12 names a test per row, and three more that the rows alone would not force: a deleted event that
-answers 404 twice (only that row disappears, no purge and no sharing message), an unknown 403
-reason that repeats until the staleness ceiling (`unreachable`, never "no longer shared"), and the
+T12 names a test per row, and five more that the rows alone would not force: a deleted event that
+answers 404 twice (only that row disappears, no purge and no sharing message); an unknown 403
+reason that repeats until the staleness ceiling (`unreachable`, never "no longer shared"); the
 expiry-mid-call race — one 401, one refresh, one successful replay, no state change and no
-Reconnect prompt — plus an assertion that five concurrent 401s produce exactly one refresh.
+Reconnect prompt — plus an assertion that five concurrent 401s produce exactly one refresh; a
+calendar whose ACL is valid and which `calendarList` does not list, where `events.list` succeeds
+and nothing purges; and a read answering 403 `insufficientPermissions`, which must reach
+`needs_reconnect` without ever rendering the "no longer shared" message.
 
-**Absence from `calendarList` is not evidence of anything.** The list call hides calendars for two
-ordinary reasons: `showHidden` defaults to false, and `maxResults` defaults to 100 entries with
-`nextPageToken` paging. T12's list call therefore sets `showHidden=true` and pages to exhaustion
-before drawing any conclusion — and even then, absence only means "do not offer this calendar in
-the picker". It never purges and never produces the "no longer shared" message; only a direct,
-classified failure on the calendar resource does. T12 tests a calendar the user hid in Google's own
-UI and a calendar sorted past entry 100: both resolve, and neither purges.
+**Absence from `calendarList` is not evidence of anything.** The list call hides calendars for
+three ordinary reasons: `showHidden` defaults to false, `maxResults` defaults to 100 entries with
+`nextPageToken` paging, and — the one that matters most here — Google no longer inserts a shared
+calendar into the recipient's `CalendarList` at all, so a calendar a teacher can fully read may
+simply never have been listed for her. T12's list call therefore sets `showHidden=true` and pages
+to exhaustion, or to decision 1's page and item bounds, rejecting a `nextPageToken` it has already
+seen — and even then, absence only means "do not offer this calendar in the picker". It never
+purges, never produces the "no longer shared" message, and never withholds the events: the mapping
+of decision 4 and the `events.list` probe do not consult it. Only a classified failure on
+`events.list` for the mapped calendar can establish access loss. T12 tests a calendar the user hid
+in Google's own UI, a calendar sorted past entry 100, and a calendar that was shared correctly and
+never inserted into the list at all: all three resolve, and none of them purges.
 
 **Reason.** Purging on Buzz membership loss would mean Buzz is enforcing Google's ACL, which
 decision 3 refuses; the user still has the calendar in Google, and their local copy is theirs. The
@@ -717,6 +929,56 @@ scope it, and remove it in the same place they manage everyone else.
   not scheduled.
 - Agent calendar access through a separate Google principal — blocked on RFC #3227 landing
   upstream.
+
+## Deviations
+
+Named here so T12's PR body carries them forward instead of rediscovering them. A deviation is
+something this memo does that the plan's T11 or T12 text does not say, or says differently.
+
+Carried from earlier rounds, unchanged:
+
+- **Filename.** The plan writes `docs/plans/2026-09-xx-calendar-authorization.md`; this file uses
+  the resolved date, `2026-09-04-calendar-authorization.md`. The plan file itself was not edited to
+  point at the resolved name, because other wave-1 tickets share that file and the edit would
+  collide.
+- **Two decisions beyond the literal checklist.** The flow shape — PKCE loopback, every token and
+  every Google call in Rust, forced by the desktop CSP allowing `connect-src https:` — and the
+  24-hour staleness ceiling. Checklist items 6 and 7 cannot be answered without them.
+- **Two corrected citations.** The feature audit cites `VISION.md:35` and `ingest.rs:434`; in this
+  tree they are `VISION.md:37` and `ingest.rs:437`, and this memo cites the latter.
+- **v1 mapping authority.** The checklist asks who chooses which channels show the calendar.
+  Decision 4 answers "the channel admin decides, out of band; each user sets it locally", because
+  an enforced answer needs a relay-allow-listed kind this fork cannot add. The gap is stated in
+  decision 4 and the ticket that closes it is in the Deferred list.
+
+New in this round. Each widens what T12 must build or must test:
+
+- **T12's mock Google server grows from one behavior to six.** The plan names "two principals, one
+  calendar shared to both, and an ACL-loss case". This contract additionally requires the mock to
+  serve: a connection that is accepted and then stalls, a response body past the byte cap, a cyclic
+  `nextPageToken`, a calendar whose ACL is valid but which is absent from the user's `CalendarList`,
+  and a read answering 403 `insufficientPermissions`.
+- **`accessRole` comes from `events.list`, not from `calendarList`.** T12's named frontend test
+  "disable edit when write ACL is absent" binds to the `accessRole` in the `events.list` response.
+  `calendarList` gates nothing and can be absent for a correctly shared user.
+- **One desktop command the plan does not name.** `propose_calendar_mapping` (decision 2) is the
+  only way a calendar id reaches Rust under decision 4's out-of-band convention. It is outside what
+  "per-user OAuth through desktop commands" describes in T12, and it carries its own tests —
+  including the one asserting that a non-existent calendar and an unreadable one are
+  indistinguishable to the caller.
+- **The keychain record gains a persisted field.** `binding_generation` (decision 2) lives inside
+  the `SecretStore` blob and must survive a store reopen. That is more than "tokens in the keychain
+  (`secret_store` pattern)" implies in T12, and it is the value T12's cache and journal fences are
+  checked against, so its test uses a real store reopen rather than an in-memory double.
+- **No revocation on a failed or declined connect.** T12's traceability table cannot list a
+  revocation test for a declined confirm, an insufficient scope set, a persist failure or an
+  identity switch; the assertion for all four is the opposite one — no request reaches the
+  revocation endpoint. Revocation appears only under Disconnect, the confirmed half of an account
+  change, and sign-out. The plan's "revocation propagation within the bounded window" test is
+  unaffected: it exercises decision 7, which is a poll bound, not a discard path.
+- **A shared HTTP client with stated limits.** Decision 1's deadlines, byte cap, page and item
+  bounds, repeated-page-token rejection and cancellation points are a T12 component the plan does
+  not name, and three of its tests need a server that misbehaves rather than one that answers.
 
 ## Relates to
 
