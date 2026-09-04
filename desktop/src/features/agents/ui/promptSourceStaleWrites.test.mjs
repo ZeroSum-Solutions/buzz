@@ -20,10 +20,26 @@
  *      reload now runs through a mutation that invalidates the same keys a
  *      typed edit does.
  *
+ *   3. **An edit typed into the dialog while the reload was in flight.** The
+ *      field disabled only its own controls, so the instructions textarea and
+ *      Save stayed live through the round trip. The late answer overwrote what
+ *      was typed, and a Save in the same window submitted the pre-reload draft
+ *      through `update_persona`, which carries no precondition — the reload's
+ *      write lost with no error anywhere. The field now reports its pending
+ *      state up and the dialog fences both controls.
+ *
+ *   4. **The community catalog caches.** A reload is a save-and-publish: it
+ *      awaits the relay and refreshes the affected team catalog heads. Live
+ *      delivery normally covers the catalog views, but `subscribeLive`'s
+ *      failure path only logs, so a device whose subscription never
+ *      established showed the pre-reload prompt until the 20-minute poll.
+ *
  * Mutation proofs: removing either fence check from the field's `run` → test 1
  * fails with A's text in B's textarea; removing the `onSettled` invalidation
  * from `useSetPromptSourceMutation` → test 2 fails with the stale prompt in the
- * submitted payload.
+ * submitted payload; dropping `isPromptSourcePending` from the dialog's
+ * `Textarea`/`canSubmit` → test 3 fails with both controls live; dropping the
+ * catalog keys from `onSettled` → test 4 fails with both caches still fresh.
  */
 
 import assert from "node:assert/strict";
@@ -171,9 +187,9 @@ async function settle() {
   }
 }
 
-function newClient() {
+function newClient(queryOverrides = {}) {
   const client = new QueryClient({
-    defaultOptions: { queries: { retry: false, gcTime: 0 } },
+    defaultOptions: { queries: { retry: false, gcTime: 0, ...queryOverrides } },
   });
   clients.push(client);
   return client;
@@ -351,4 +367,132 @@ test("a reload refreshes the cache the next open seeds the dialog from", async (
     assert.ok(found, `the cache must hold ${id}`);
     return found;
   }
+});
+
+test("the instructions and Save are fenced while a reload is in flight", async () => {
+  const client = newClient();
+  holdReload = true;
+
+  await act(async () => {
+    render(
+      createElement(
+        QueryClientProvider,
+        { client },
+        createElement(
+          AgentDefinitionDialog,
+          dialogProps({
+            id: "pm",
+            displayName: "PM",
+            systemPrompt: "Old instructions.",
+          }),
+        ),
+      ),
+    );
+  });
+
+  const submit = () => screen.getByTestId("persona-dialog-submit");
+  assert.equal(
+    instructions().disabled,
+    false,
+    "the instructions are editable before a reload starts",
+  );
+  assert.equal(submit().disabled, false, "and so is Save");
+
+  await act(async () => {
+    fireEvent.change(screen.getByLabelText(/Instructions file/i), {
+      target: { value: "/Users/me/agent-prompts/pm.md" },
+    });
+  });
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Reload" }));
+  });
+  assert.ok(releaseReload, "the reload must still be in flight");
+
+  // The window the fence exists for: the answer will replace the instructions
+  // outright, so anything typed here is discarded, and a Save here submits the
+  // pre-reload draft through a command with no precondition — last writer wins.
+  assert.equal(
+    instructions().disabled,
+    true,
+    "typing during the round trip would be silently discarded by the answer",
+  );
+  assert.equal(
+    submit().disabled,
+    true,
+    "saving during the round trip would overwrite the reload with the old draft",
+  );
+
+  await act(async () => {
+    releaseReload({
+      localUpdated: true,
+      publish: "published",
+      binding: { path: "/Users/me/agent-prompts/pm.md", inSync: true },
+      prompt: "Reloaded from the file.",
+    });
+    await Promise.resolve();
+  });
+  await settle();
+
+  assert.equal(
+    instructions().value,
+    "Reloaded from the file.",
+    "the file's text lands once the answer arrives",
+  );
+  assert.equal(
+    instructions().disabled,
+    false,
+    "and the fence lifts, or the dialog is stuck read-only",
+  );
+  assert.equal(submit().disabled, false, "Save is usable again");
+});
+
+test("a reload refreshes the community catalog caches it just changed", async () => {
+  // A retained cache: the default `gcTime: 0` would evict an observer-less
+  // entry the instant it is seeded, and there would be nothing left to
+  // invalidate.
+  const client = newClient({ gcTime: 5 * 60_000 });
+  // Two catalog caches with data and no mounted reader — the state of a device
+  // whose live subscription never established. Nothing else will refresh them.
+  const personaCatalogKey = ["persona-catalog", "community-1"];
+  const teamCatalogKey = ["team-catalog", "community-1"];
+  client.setQueryData(personaCatalogKey, []);
+  client.setQueryData(teamCatalogKey, []);
+
+  await act(async () => {
+    render(
+      createElement(
+        QueryClientProvider,
+        { client },
+        createElement(
+          AgentDefinitionDialog,
+          dialogProps({
+            id: "pm",
+            displayName: "PM",
+            systemPrompt: "Old instructions.",
+          }),
+        ),
+      ),
+    );
+  });
+
+  await act(async () => {
+    fireEvent.change(screen.getByLabelText(/Instructions file/i), {
+      target: { value: "/Users/me/agent-prompts/pm.md" },
+    });
+  });
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Reload" }));
+  });
+  await settle();
+
+  assert.equal(
+    client.getQueryState(personaCatalogKey)?.isInvalidated,
+    true,
+    "the reload publishes a new persona head, so the community catalog is stale",
+  );
+  assert.equal(
+    client.getQueryState(teamCatalogKey)?.isInvalidated,
+    true,
+    "and the backend refreshed every team catalog head that lists this agent",
+  );
 });

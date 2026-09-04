@@ -261,25 +261,10 @@ pub async fn delete_persona<R: tauri::Runtime>(
             //   persona save fails → cascade agents gone, persona survives; a retry
             //                        finds an empty cascade and proceeds cleanly
             // Keys and tombstones are enqueued only after their records leave disk.
-            // Drop the machine-local prompt-file binding first. It is a claim
-            // that a file's text is this definition's instructions, and the
-            // definition is about to stop existing; nothing else in the app can
-            // reach the entry afterwards, so leaving it would orphan a claim
-            // with no UI able to retract it (Review-Proven Rule 2: clear
-            // derived metadata on every removal path).
-            //
-            // First, not last, because removing a claim is always safe while
-            // adding one is not: if a later phase fails and the delete is
-            // retried, the worst case is a lost convenience binding on a
-            // definition whose prompt bytes are unchanged. A failure here is
-            // propagated before anything is destroyed, so the command stays
-            // retryable.
-            crate::managed_agents::prompt_source::commit_prompt_source_at(
-                &crate::managed_agents::managed_agents_base_dir(&app)?
-                    .join("prompt-sources.json"),
-                &id,
-                None,
-            )?;
+            // Drop the machine-local prompt-file binding before anything is
+            // destroyed — see `forget_prompt_source` for why every removal path
+            // must, and why it goes first.
+            crate::managed_agents::prompt_source::forget_prompt_source(&app, &id)?;
 
             if !cascade.is_empty() {
                 commit_cascade_agents(&mut agents, &cascade, |recs| {

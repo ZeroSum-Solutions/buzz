@@ -28,6 +28,11 @@ type PromptSourceFieldProps = {
   /** The definition being edited. The field is edit-mode only. */
   definitionId: string;
   disabled: boolean;
+  /**
+   * Reports whether a reload, clear or reset is in flight, so the parent
+   * dialog can fence the controls this field cannot reach.
+   */
+  onPendingChange: (pending: boolean) => void;
   /** Applies the reloaded text to the open dialog's instructions field. */
   onPromptReloaded: (prompt: string) => void;
 };
@@ -45,6 +50,14 @@ type PromptSourceFieldProps = {
  * operator has to retype an absolute path into — and says so only while the
  * binding still matches the agent's instructions.
  *
+ * **The whole edit is fenced while a request is in flight**, not just this
+ * field. A reload replaces the instructions outright, so anything typed into
+ * the dialog's own textarea during the round trip is discarded when the answer
+ * lands, and a Save pressed in the same window submits the pre-reload draft
+ * through `update_persona`, which carries no precondition — last writer wins.
+ * The field cannot disable controls it does not own, so it reports its pending
+ * state up through `onPendingChange` and the dialog disables them.
+ *
  * **Every answer that arrives late is fenced.** The dialog is persistent: it
  * keeps this component mounted across agents and re-mounts it on the next open,
  * while a reload started on one agent is still in flight. An answer is applied
@@ -56,6 +69,7 @@ type PromptSourceFieldProps = {
 export function PromptSourceField({
   definitionId,
   disabled,
+  onPendingChange,
   onPromptReloaded,
 }: PromptSourceFieldProps) {
   const [path, setPath] = React.useState("");
@@ -140,6 +154,22 @@ export function PromptSourceField({
 
   const isPending = reload.isPending || isResetting;
   const busy = disabled || isPending;
+
+  // Held in a ref so the report below depends only on `isPending`: a parent
+  // that passes a fresh callback each render must not re-report on every
+  // render, and an unmount mid-flight must still lift the parent's fence.
+  const onPendingChangeRef = React.useRef(onPendingChange);
+  React.useEffect(() => {
+    onPendingChangeRef.current = onPendingChange;
+  }, [onPendingChange]);
+  React.useEffect(() => {
+    onPendingChangeRef.current(isPending);
+    return () => {
+      if (isPending) {
+        onPendingChangeRef.current(false);
+      }
+    };
+  }, [isPending]);
   const reloadEnabled = canReloadPromptSource(path, busy);
   const clearEnabled = canClearPromptSource(busy);
   const resetEnabled = canResetPromptSources(seedFailed, busy);

@@ -244,7 +244,10 @@ fn agents_referencing_team<'a>(
 /// vec is empty. For catalog-adopted teams (`catalog_source` present), member
 /// copies matching this publication's provenance are deactivated (re-activatable
 /// on re-add), not deleted.
-pub fn delete_team_with_cascade(app: &AppHandle, team_id: &str) -> Result<Vec<String>, String> {
+pub fn delete_team_with_cascade<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    team_id: &str,
+) -> Result<Vec<String>, String> {
     let mut teams = load_teams(app)?;
     let team = teams
         .iter()
@@ -281,6 +284,18 @@ pub fn delete_team_with_cascade(app: &AppHandle, team_id: &str) -> Result<Vec<St
             .filter(|p| p.source_team.as_deref() == Some(persona_key.as_str()))
             .map(super::persona_events::persona_d_tag)
             .collect();
+        // Each cascaded definition is about to stop existing, so retract its
+        // machine-local prompt-file binding before the destructive save — see
+        // `forget_prompt_source`. Propagated, not swallowed: a failure here
+        // leaves every record on disk and the delete retryable.
+        for id in personas
+            .iter()
+            .filter(|p| p.source_team.as_deref() == Some(persona_key.as_str()))
+            .map(|p| p.id.clone())
+            .collect::<Vec<_>>()
+        {
+            super::prompt_source::forget_prompt_source(app, &id)?;
+        }
         personas.retain(|p| p.source_team.as_deref() != Some(persona_key.as_str()));
         super::save_personas(app, &personas)?;
 

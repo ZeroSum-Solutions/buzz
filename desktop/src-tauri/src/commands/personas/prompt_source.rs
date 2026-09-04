@@ -20,7 +20,11 @@
 //! cannot be held across both (the update path takes it itself). The read pass
 //! therefore captures the definition's `updated_at` and the save refuses if it
 //! moved, so a concurrent edit is reported rather than clobbered by this
-//! request's replace-everything fields.
+//! request's replace-everything fields. The mapping write is a third hold, and
+//! the precondition cannot cover it — this reload's save has already
+//! committed — so the binding it reports is resolved against the store's
+//! *current* prompt rather than asserted, which is what keeps this response and
+//! the next [`get_prompt_source`] from disagreeing.
 //!
 //! [`get_prompt_source`] is the read half. Without it the sidecar would be
 //! write-only: the dialog would open knowing of no binding, so the operator
@@ -42,8 +46,8 @@ use crate::{
         load_personas,
         prompt_source::{
             commit_prompt_source_at, definition_with_prompt, prepare_prompt_source,
-            prompt_source_binding_at, quarantine_prompt_sources_at, update_request_from_definition,
-            PromptSourceBinding, PromptSourceChange,
+            prompt_source_binding_at, prompt_sources_store_path, quarantine_prompt_sources_at,
+            update_request_from_definition, PromptSourceBinding, PromptSourceChange,
         },
         UpdatePersonaRequest,
     },
@@ -214,7 +218,7 @@ async fn read_update_request<R: tauri::Runtime>(
 fn prompt_sources_path<R: tauri::Runtime>(
     app: &AppHandle<R>,
 ) -> Result<std::path::PathBuf, String> {
-    Ok(crate::managed_agents::managed_agents_base_dir(app)?.join("prompt-sources.json"))
+    prompt_sources_store_path(app)
 }
 
 /// The prompt file bound to `definition_id` on this machine, or `None`.
@@ -316,6 +320,15 @@ async fn submit_reloaded_prompt<R: tauri::Runtime>(
         )
         .await?;
 
+    // The second window this command cannot lock across. The persona save above
+    // released the store lock before `commit_mapping` retakes it, so another
+    // writer — a second dialog, an inbound kind:30175 replacement — can land in
+    // between and make the effective prompt something this reload never read.
+    // Tests put a writer in exactly this window; in production the hook is not
+    // compiled.
+    #[cfg(test)]
+    tests::run_save_mapping_barrier(&definition_id);
+
     // Boundary 4 — the mapping. The prompt is durable now, so this write can
     // only add a claim that is already true. A failure here is reported rather
     // than swallowed, together with whatever binding survived on disk: the
@@ -330,13 +343,7 @@ async fn submit_reloaded_prompt<R: tauri::Runtime>(
     )
     .await
     {
-        Ok(()) => (
-            Some(PromptSourceBinding {
-                path: source_path.to_string_lossy().into_owned(),
-                in_sync: true,
-            }),
-            None,
-        ),
+        Ok(binding) => (binding, None),
         Err(error) => {
             eprintln!("buzz-desktop: prompt-source mapping write failed: {error}");
             let surviving = surviving_binding(&app, &definition_id, &persona.system_prompt).await;
@@ -406,26 +413,42 @@ async fn surviving_binding<R: tauri::Runtime>(
     .flatten()
 }
 
-/// Store the definition → path mapping under the store lock.
+/// Store the definition → path mapping under the store lock, and report the
+/// binding that write produced.
+///
+/// The binding is resolved inside the same lock hold, against the prompt the
+/// persona store holds **now** — not against the prompt this reload submitted.
+/// The two differ whenever another writer landed between the persona save and
+/// this write, and the sidecar records the digest of the text that was read
+/// from the file, so a hard-coded `in_sync: true` would tell the dialog the
+/// file feeds the agent while the effective prompt is somebody else's. Reading
+/// the store here is the same check `get_prompt_source` makes on the next open,
+/// so the answer this call returns and the answer the next open returns agree.
 async fn commit_mapping<R: tauri::Runtime>(
     app: &AppHandle<R>,
     definition_id: String,
     source_path: std::path::PathBuf,
     prompt: &str,
-) -> Result<(), String> {
+) -> Result<Option<PromptSourceBinding>, String> {
     let app = app.clone();
     let prompt = prompt.to_string();
-    tokio::task::spawn_blocking(move || -> Result<(), String> {
+    tokio::task::spawn_blocking(move || -> Result<Option<PromptSourceBinding>, String> {
         let state = app.state::<AppState>();
         let _store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|error| error.to_string())?;
+        let store_path = prompt_sources_path(&app)?;
         commit_prompt_source_at(
-            &prompt_sources_path(&app)?,
+            &store_path,
             &definition_id,
             Some((source_path.as_path(), prompt.as_str())),
-        )
+        )?;
+        let current_prompt = load_personas(&app)?
+            .into_iter()
+            .find(|record| record.id == definition_id)
+            .map(|record| record.system_prompt);
+        prompt_source_binding_at(&store_path, &definition_id, current_prompt.as_deref())
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))?

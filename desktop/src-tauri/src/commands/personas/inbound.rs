@@ -21,6 +21,9 @@ mod inbound_tests;
 // runner (same constraint as `persona_events::tests::flush_barrier`).
 #[cfg(all(test, not(target_os = "windows")))]
 mod catalog_reconcile_tests;
+// Same constraint: builds a real `AppState` via `build_app_state()`.
+#[cfg(all(test, not(target_os = "windows")))]
+mod tombstone_prompt_source_tests;
 
 #[derive(Debug)]
 enum InboundRuntimeRefresh {
@@ -601,6 +604,15 @@ fn reconcile_inbound_tombstone<R: tauri::Runtime>(
         &target_d_tag,
         || match target_kind {
             KIND_PERSONA => {
+                // The definition is about to stop existing and its id is
+                // reusable (`persona_from_event` sets `id = d_tag`), so retract
+                // its machine-local prompt-file binding before the destructive
+                // save — see `forget_prompt_source`. Propagated, not swallowed:
+                // a failure here leaves the tombstone uncommitted and the whole
+                // reconcile retryable.
+                if let Some(persona_id) = &deleted_persona_id {
+                    crate::managed_agents::prompt_source::forget_prompt_source(app, persona_id)?;
+                }
                 let mut personas = load_personas(app)?;
                 personas.retain(|record| persona_d_tag(record) != target_d_tag);
                 save_personas(app, &personas)

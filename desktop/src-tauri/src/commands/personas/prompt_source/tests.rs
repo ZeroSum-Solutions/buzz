@@ -160,32 +160,65 @@ fn stored_mapping(app: &tauri::AppHandle<tauri::test::MockRuntime>, id: &str) ->
 /// — which is how the guard came to be removable without failing anything.
 /// Keyed by id so tests running in parallel cannot arm each other's barrier.
 fn arm_read_save_barrier(definition_id: &str, barrier: impl FnOnce() + Send + 'static) {
-    read_save_barriers()
+    arm_barrier(read_save_barriers(), definition_id, barrier);
+}
+
+/// Register a one-shot hook to run in the window between the command's persona
+/// save and its sidecar write, keyed by definition id.
+///
+/// The second window the store lock cannot cover: the update path releases the
+/// lock when it returns, and `commit_mapping` retakes it. A writer landing here
+/// makes the effective prompt something this reload never read, which is the
+/// only thing that can make the returned binding's `in_sync` disagree with the
+/// sidecar's digest.
+fn arm_save_mapping_barrier(definition_id: &str, barrier: impl FnOnce() + Send + 'static) {
+    arm_barrier(save_mapping_barriers(), definition_id, barrier);
+}
+
+type Barrier = Box<dyn FnOnce() + Send>;
+type BarrierRegistry = std::sync::Mutex<std::collections::HashMap<String, Barrier>>;
+
+fn read_save_barriers() -> &'static BarrierRegistry {
+    static BARRIERS: std::sync::OnceLock<BarrierRegistry> = std::sync::OnceLock::new();
+    BARRIERS.get_or_init(Default::default)
+}
+
+fn save_mapping_barriers() -> &'static BarrierRegistry {
+    static BARRIERS: std::sync::OnceLock<BarrierRegistry> = std::sync::OnceLock::new();
+    BARRIERS.get_or_init(Default::default)
+}
+
+fn arm_barrier(
+    registry: &'static BarrierRegistry,
+    definition_id: &str,
+    barrier: impl FnOnce() + Send + 'static,
+) {
+    registry
         .lock()
         .expect("barrier registry")
         .insert(definition_id.to_string(), Box::new(barrier));
 }
 
-type ReadSaveBarrier = Box<dyn FnOnce() + Send>;
-
-fn read_save_barriers(
-) -> &'static std::sync::Mutex<std::collections::HashMap<String, ReadSaveBarrier>> {
-    static BARRIERS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, ReadSaveBarrier>>,
-    > = std::sync::OnceLock::new();
-    BARRIERS.get_or_init(Default::default)
-}
-
-/// Called by the command itself, between its two passes. A no-op unless a test
-/// armed a barrier for this definition.
-pub(super) fn run_read_save_barrier(definition_id: &str) {
-    let barrier = read_save_barriers()
+fn run_barrier(registry: &'static BarrierRegistry, definition_id: &str) {
+    let barrier = registry
         .lock()
         .expect("barrier registry")
         .remove(definition_id);
     if let Some(barrier) = barrier {
         barrier();
     }
+}
+
+/// Called by the command itself, between its read and save passes. A no-op
+/// unless a test armed a barrier for this definition.
+pub(super) fn run_read_save_barrier(definition_id: &str) {
+    run_barrier(read_save_barriers(), definition_id);
+}
+
+/// Called by the command itself, between its persona save and its sidecar
+/// write. A no-op unless a test armed a barrier for this definition.
+pub(super) fn run_save_mapping_barrier(definition_id: &str) {
+    run_barrier(save_mapping_barriers(), definition_id);
 }
 
 #[tokio::test]
@@ -1131,6 +1164,160 @@ async fn a_concurrent_save_inside_the_command_window_is_refused() {
         stored_mapping(app.handle(), "barrier-pm"),
         None,
         "and stores no mapping, so the sidecar cannot claim a prompt that was never applied"
+    );
+}
+
+/// The second unlockable window: a writer that lands **after** the persona save
+/// and before the sidecar write.
+///
+/// The precondition cannot help here — the reload's own save has already
+/// committed — so the only honest answer is the one the sidecar's digest gives:
+/// the binding this call reports must say the file no longer matches the
+/// agent's instructions, exactly as the next `get_prompt_source` will. Reporting
+/// `in_sync: true` here would render "These instructions are loaded from
+/// pm.md" over a prompt that came from somewhere else, and the claim would
+/// silently flip on the next open with nothing to explain it.
+///
+/// Mutation proof: restoring the hard-coded `PromptSourceBinding { in_sync:
+/// true }` in `submit_reloaded_prompt` fails this test while every other
+/// prompt-source test stays green.
+#[tokio::test]
+async fn a_writer_between_the_save_and_the_mapping_reports_the_binding_out_of_sync() {
+    let home = TempHome::new();
+    let app = mock_app();
+    save_personas(
+        app.handle(),
+        &[definition("late-writer-pm", "Old instructions.", false)],
+    )
+    .expect("seed the definition");
+    let file = home.prompt_file("pm.md", "Instructions from the file.\n");
+
+    // The concurrent writer: a save that lands after the reload's own persona
+    // save and before the sidecar write, so the effective prompt is neither the
+    // pre-reload text nor the file's.
+    let writer_app = app.handle().clone();
+    arm_save_mapping_barrier("late-writer-pm", move || {
+        let mut personas = load_personas(&writer_app).expect("the writer loads");
+        let record = personas
+            .iter_mut()
+            .find(|record| record.id == "late-writer-pm")
+            .expect("definition exists");
+        record.system_prompt = "Typed in another window.".to_string();
+        record.updated_at = crate::util::now_iso();
+        save_personas(&writer_app, &personas).expect("the concurrent edit lands");
+    });
+
+    let result = set_prompt_source_and_reload(
+        "late-writer-pm".to_string(),
+        Some(file.to_string_lossy().into_owned()),
+        app.handle().clone(),
+    )
+    .await
+    .expect("the reload itself succeeded; only the claim it can make is narrower");
+
+    let binding = result
+        .binding
+        .clone()
+        .expect("the mapping was stored, so a binding is reported");
+    assert_eq!(Some(binding.path.as_str()), file.to_str());
+    assert!(
+        !binding.in_sync,
+        "the agent's instructions came from the other writer, not from this file"
+    );
+    assert_eq!(
+        result.mapping_error, None,
+        "the sidecar write itself worked"
+    );
+
+    assert_eq!(
+        stored_prompt(app.handle(), "late-writer-pm"),
+        "Typed in another window.",
+        "the last writer's prompt is what the agent will actually use"
+    );
+
+    // The same question asked again on the next open must give the same answer:
+    // one response and the durable state cannot disagree.
+    let reopened = get_prompt_source("late-writer-pm".to_string(), app.handle().clone())
+        .await
+        .expect("the sidecar reads")
+        .expect("the binding is still stored");
+    assert_eq!(
+        reopened, binding,
+        "the reload's answer must match what the next open reports"
+    );
+}
+
+/// Deleting a directory-backed team cascades its member definitions away, and
+/// each one's prompt-file binding must go with it.
+///
+/// The same reusable-id hazard as the inbound tombstone: a team re-adopted from
+/// the same directory recreates its members under the same ids, and an orphaned
+/// entry would rebind one to a file its owner never chose for it. This drives
+/// the production `delete_team_with_cascade`, not a seam — removing the
+/// `forget_prompt_source` loop from its cascade turns this test RED.
+#[test]
+fn deleting_a_team_retracts_its_cascaded_members_prompt_bindings() {
+    let _home = TempHome::new();
+    let app = mock_app();
+    let handle = app.handle().clone();
+
+    let mut member = definition("pack-pm", "Instructions from the file.\n", false);
+    member.source_team = Some("pack".to_string());
+    save_personas(&handle, &[member]).expect("seed the member definition");
+    crate::managed_agents::save_teams(
+        &handle,
+        &[crate::managed_agents::TeamRecord {
+            id: "pack-team".to_string(),
+            name: "Pack".to_string(),
+            description: None,
+            instructions: None,
+            persona_ids: vec!["pack-pm".to_string()],
+            is_builtin: false,
+            shared: false,
+            catalog_source: None,
+            // Never created on disk: the cascade removes the directory only
+            // when it exists, and this test is about the sidecar.
+            source_dir: Some(
+                managed_agents_base_dir(&handle)
+                    .expect("base dir")
+                    .join("pack"),
+            ),
+            is_symlink: false,
+            symlink_target: None,
+            version: None,
+            created_at: "2026-09-04T00:00:00Z".to_string(),
+            updated_at: "2026-09-04T00:00:00Z".to_string(),
+        }],
+    )
+    .expect("seed the team");
+
+    let sidecar = managed_agents_base_dir(&handle)
+        .expect("base dir")
+        .join("prompt-sources.json");
+    crate::managed_agents::prompt_source::commit_prompt_source_at(
+        &sidecar,
+        "pack-pm",
+        Some((
+            std::path::Path::new("/home/me/agent-prompts/pack-pm.md"),
+            "Instructions from the file.\n",
+        )),
+    )
+    .expect("seed the binding this device made");
+
+    crate::managed_agents::delete_team_with_cascade(&handle, "pack-team")
+        .expect("a non-built-in team with no referencing agents deletes");
+
+    assert!(
+        load_personas(&handle)
+            .expect("load personas")
+            .iter()
+            .all(|record| record.id != "pack-pm"),
+        "the cascade must remove the member definition"
+    );
+    assert_eq!(
+        stored_mapping(&handle, "pack-pm"),
+        None,
+        "the binding must not outlive the definition the cascade destroyed"
     );
 }
 

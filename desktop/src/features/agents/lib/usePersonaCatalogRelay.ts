@@ -5,6 +5,7 @@ import {
   fetchPersonaCatalogPublications,
   type PersonaCatalogPublication,
 } from "@/features/agents/lib/personaCatalogRelay";
+import { PERSONA_CATALOG_QUERY_KEY_ROOT } from "@/features/agents/lib/catalogQueryKeys";
 import { invalidatePersonaEditCaches } from "@/features/agents/lib/personaEditCaches";
 import { relayClient } from "@/shared/api/relayClient";
 import { useFocusedRefetchInterval } from "@/shared/lib/useDocumentVisible";
@@ -32,7 +33,7 @@ export const personaCatalogFocusRefetchPolicy = {
 } as const;
 
 export function personaCatalogQueryKey(communityId: string | null) {
-  return ["persona-catalog", communityId] as const;
+  return [PERSONA_CATALOG_QUERY_KEY_ROOT, communityId] as const;
 }
 
 export function usePersonaCatalogQuery(communityId: string | null) {

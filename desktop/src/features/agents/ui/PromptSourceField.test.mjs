@@ -133,9 +133,11 @@ after(() => dom.window.close());
  */
 async function mount(overrides = {}) {
   const reloaded = [];
+  const pendingReports = [];
   const props = () => ({
     definitionId: "pm",
     disabled: false,
+    onPendingChange: (pending) => pendingReports.push(pending),
     onPromptReloaded: (prompt) => reloaded.push(prompt),
     ...overrides,
   });
@@ -156,6 +158,7 @@ async function mount(overrides = {}) {
     ({ rerender } = render(tree()));
   });
   return {
+    pendingReports,
     reloaded,
     /** Re-render with a different definition id, as switching agents does. */
     async switchTo(definitionId) {

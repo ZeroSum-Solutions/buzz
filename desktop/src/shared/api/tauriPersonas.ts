@@ -167,6 +167,7 @@ type RawPersonaSharePublicationResult = {
   persona: RawPersona;
   publicationStatus: "published" | "queued";
   relayMessage?: string;
+  bookkeepingError?: string;
 };
 
 function fromRawPublicationResult(
@@ -176,6 +177,7 @@ function fromRawPublicationResult(
     persona: fromRawPersona(raw.persona),
     publicationStatus: raw.publicationStatus,
     relayMessage: raw.relayMessage ?? null,
+    bookkeepingError: raw.bookkeepingError ?? null,
   };
 }
 
@@ -208,6 +210,17 @@ export type PersonaSharePublicationResult = {
   persona: AgentPersona;
   publicationStatus: "published" | "queued";
   relayMessage: string | null;
+  /**
+   * Why the local "this head is synced" record did not update after the relay
+   * accepted the event, or `null`.
+   *
+   * The backend stopped raising this as an error, because the publish and the
+   * local save both landed and reporting `Err` would tell the user nothing was
+   * applied. Dropping it here instead would make it invisible: the retained row
+   * stays `pending_sync` and the flush loop republishes the head, which the
+   * user sees as a change that publishes itself twice with no explanation.
+   */
+  bookkeepingError: string | null;
 };
 
 /**

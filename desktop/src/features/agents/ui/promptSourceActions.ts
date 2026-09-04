@@ -1,3 +1,4 @@
+import { catalogBookkeepingSentence } from "@/features/agents/lib/personaSaveNotice";
 import type {
   PromptSourceBinding,
   PromptSourceResult,
@@ -53,9 +54,7 @@ export function promptSourceStatusMessage(
           : ""
       }`
     : "";
-  const bookkeeping = result.bookkeepingError
-    ? ` The local sync record did not update (${result.bookkeepingError}), so the catalog head will be sent again.`
-    : "";
+  const bookkeeping = catalogBookkeepingSentence(result.bookkeepingError);
   const publish = result.publish ?? "";
   if (publish === "published") {
     return `Instructions reloaded from the file and published.${mapping}${bookkeeping}`;

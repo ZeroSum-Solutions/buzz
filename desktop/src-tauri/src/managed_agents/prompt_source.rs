@@ -315,6 +315,37 @@ pub(crate) fn commit_prompt_source_at(
     save_prompt_sources_at(store_path, &sources)
 }
 
+/// Path of the machine-local prompt-source sidecar for this app.
+///
+/// One definition of the file's location, shared by the command layer and by
+/// every path that destroys a definition, so a retraction can never write to a
+/// different file than the reload wrote to.
+pub(crate) fn prompt_sources_store_path<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<PathBuf, String> {
+    Ok(crate::managed_agents::managed_agents_base_dir(app)?.join("prompt-sources.json"))
+}
+
+/// Retract the binding of a definition that is about to stop existing.
+///
+/// Every path that destroys a definition must call this **before** the
+/// destructive save (Review-Proven Rule 2: clear derived metadata on every
+/// removal path). Persona ids are reusable — an inbound `persona_from_event`
+/// sets `id = d_tag` — so an entry left behind by a tombstone rebinds the next
+/// definition that takes the id to a file its owner never chose, and `Reload`
+/// would then read that file into it.
+///
+/// Retracting first, not last, keeps the caller retryable: removing a claim is
+/// always safe, so a later failure costs at most a convenience binding on a
+/// definition whose prompt bytes never changed, while a failure here propagates
+/// before anything is destroyed.
+pub(crate) fn forget_prompt_source<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    definition_id: &str,
+) -> Result<(), String> {
+    commit_prompt_source_at(&prompt_sources_store_path(app)?, definition_id, None)
+}
+
 /// The definition a reloaded prompt produces.
 ///
 /// The single projection point for a reload: the command builds the next
