@@ -200,6 +200,9 @@ pub struct McpRegistry {
     init_timeout: Duration,
     /// Consecutive hook timeout count per server. Kill on second consecutive.
     hook_timeouts: std::sync::Mutex<HashMap<String, u32>>,
+    /// Servers already reported as allowlisted-but-untrusted, so the warning
+    /// is emitted once rather than on every turn.
+    hook_trust_warned: std::sync::Mutex<HashSet<String>>,
 }
 
 impl McpRegistry {
@@ -224,6 +227,7 @@ impl McpRegistry {
             backoff_max: Duration::from_millis(cfg.mcp_restart_max_ms.max(1)),
             init_timeout: cfg.mcp_init_timeout,
             hook_timeouts: std::sync::Mutex::new(HashMap::new()),
+            hook_trust_warned: std::sync::Mutex::new(HashSet::new()),
         };
 
         let mut seen_names = HashSet::new();
@@ -275,6 +279,23 @@ impl McpRegistry {
                 }
                 let qname = format!("{}{SEP}{}", s.name, bare);
                 if qname.len() > MAX_QNAME_LEN {
+                    // A trusted server is the harness's own: an over-long
+                    // qualified name there is a packaging bug and stays fatal.
+                    // An untrusted server is operator-supplied and its tool
+                    // names are outside this repo's control — `valid_name`
+                    // allows 128 bytes, while a name generated for the server
+                    // can only reserve about 30. One long third-party tool
+                    // name must cost that tool, not the session, which would
+                    // take the built-in server's tools down with it.
+                    if !s.trusted {
+                        tracing::warn!(
+                            "MCP server '{}': tool '{bare}' not registered — qualified name \
+                             is {} bytes, over the {MAX_QNAME_LEN}-byte limit",
+                            s.name,
+                            qname.len()
+                        );
+                        continue;
+                    }
                     return Err(AgentError::Mcp(format!(
                         "qualified tool name too long: {} ({} > {MAX_QNAME_LEN})",
                         qname,
@@ -347,6 +368,23 @@ impl McpRegistry {
     /// `(server_name, text)` pairs in **config order** (deterministic),
     /// dropping empty/whitespace-only responses, errors and timeouts.
     /// Hooks are fail-open and must never block the agent.
+    /// Report an allowlisted server that cannot run hooks because it was not
+    /// declared `trusted`, at most once per server per registry.
+    fn warn_hook_untrusted_once(&self, name: &str) {
+        let first = match self.hook_trust_warned.lock() {
+            Ok(mut warned) => warned.insert(name.to_owned()),
+            // A poisoned lock must not cost the log line; at worst it repeats.
+            Err(poisoned) => poisoned.into_inner().insert(name.to_owned()),
+        };
+        if first {
+            tracing::warn!(
+                "MCP server '{name}' is named by MCP_HOOK_SERVERS but was not declared \
+                 `trusted`; its hooks will not run. An ACP client that does not send the \
+                 `trusted` marker declares every server untrusted."
+            );
+        }
+    }
+
     pub async fn call_hooks(
         self: &Arc<Self>,
         hook_name: &str,
@@ -369,6 +407,15 @@ impl McpRegistry {
             // are never hook targets, whatever the allowlist says — including
             // the wildcard hook-capable runtimes are launched with.
             if !server.spec.trusted {
+                // An ACP client that predates the `trusted` marker declares
+                // every server untrusted by omission, which silently turns
+                // hooks off for a server the operator explicitly allowlisted.
+                // Say so — once per server, since call_hooks runs on every
+                // turn — so the cause is in the log rather than inferred from
+                // a hook that never fires.
+                if allowed.allows(&server.name) {
+                    self.warn_hook_untrusted_once(&server.name);
+                }
                 continue;
             }
             if !allowed.allows(&server.name) {
@@ -749,11 +796,29 @@ async fn spawn_one(
     let mut cmd = Command::new(&spec.command);
     cmd.args(&spec.args);
     cmd.env_clear();
+    if !spec.trusted {
+        // Say it once per spawn, so an operator can see the boundary was
+        // applied — and, when a server misbehaves for want of a variable,
+        // why.
+        tracing::info!(
+            "MCP server '{}' is untrusted: withholding the Buzz identity variables",
+            spec.name
+        );
+    }
     for k in PASSTHROUGH_ENV {
-        // Withhold Buzz identity credentials from untrusted MCP servers so
-        // third-party tooling cannot exfiltrate the agent's signing key,
-        // relay URL, or owner attestation. Only the built-in buzz-dev-mcp
-        // server (marked `trusted`) receives these.
+        // Withhold the four Buzz identity variables (BUZZ_PRIVATE_KEY,
+        // NOSTR_PRIVATE_KEY, BUZZ_RELAY_URL, BUZZ_AUTH_TAG) from an untrusted
+        // MCP server. That is the whole of what this filter buys: those four
+        // names are absent from the child's environment. It is not process
+        // isolation — the child runs under this process's UID and keeps HOME
+        // and SSH_AUTH_SOCK from PASSTHROUGH_ENV, so it can read whatever the
+        // agent's user can, including a plaintext key in `managed-agents.json`
+        // when the OS keyring is unreachable. It also only covers servers this
+        // registry spawns: a third-party ACP adapter that spawns its own MCP
+        // children inherits the harness's full environment, which is why
+        // `buzz-acp` refuses `BUZZ_ACP_EXTRA_MCP_COMMANDS` unless it is
+        // driving buzz-agent (see `crates/buzz-acp/README.md`). Real
+        // per-server isolation belongs to the MCP-registry trust model.
         if !spec.trusted && is_buzz_identity_env(k) {
             continue;
         }

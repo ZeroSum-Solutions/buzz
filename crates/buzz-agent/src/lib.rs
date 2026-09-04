@@ -17,6 +17,12 @@ pub use catalog::{
     discover_databricks_models, discover_databricks_models_with_cache_dir, ModelEntry,
 };
 pub use config::Provider;
+/// The registry's cap on how many MCP servers one `session/new` may carry.
+///
+/// Re-exported so `buzz-acp`, which has to refuse an over-long configuration
+/// at startup, can pin its mirror of this bound in a test rather than in a
+/// comment.
+pub use mcp::MAX_MCP_SERVERS;
 pub use types::AgentError;
 
 /// Environment keys the Windows Git Bash resolver may inspect. `spawn_one()`

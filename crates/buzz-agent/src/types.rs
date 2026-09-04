@@ -541,12 +541,23 @@ pub struct McpServerStdio {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: Vec<EnvVar>,
-    /// When `false`, the spawn boundary withholds Buzz identity credentials
-    /// (`BUZZ_PRIVATE_KEY`, `NOSTR_PRIVATE_KEY`, `BUZZ_RELAY_URL`,
-    /// `BUZZ_AUTH_TAG`) from the child
-    /// process so third-party MCP servers cannot exfiltrate the agent's
-    /// signing key or owner attestation. Only the built-in `buzz-dev-mcp`
-    /// server sets this to `true`.
+    /// Trust marker for this server, set by the ACP client that declared it.
+    ///
+    /// When `false`, two things follow. The spawn boundary keeps the four Buzz
+    /// identity variables (`BUZZ_PRIVATE_KEY`, `NOSTR_PRIVATE_KEY`,
+    /// `BUZZ_RELAY_URL`, `BUZZ_AUTH_TAG`) out of the child's environment — no
+    /// more and no less than that: the child still runs under this process's
+    /// UID and can read what the agent's user can. And `call_hooks` never runs
+    /// `_Stop` or `_PostCompact` on the server, whatever `MCP_HOOK_SERVERS`
+    /// says. Only the built-in `buzz-dev-mcp` server is declared `true`.
+    ///
+    /// The field is `#[serde(default)]`, so an ACP client that predates this
+    /// extension — Zed, JetBrains, anything but `buzz-acp` — declares every
+    /// server untrusted by omission. For credentials that is fail-safe; for
+    /// hooks it is a **behavior change**: such a client's own `buzz-dev-mcp`
+    /// declaration silently stops running hooks (logged once per server, see
+    /// `mcp::McpRegistry::call_hooks`). Those clients must send
+    /// `"trusted": true` for the servers they own.
     #[serde(default)]
     pub trusted: bool,
 }

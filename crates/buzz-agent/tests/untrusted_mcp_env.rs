@@ -42,8 +42,10 @@ fn identity_env() -> Vec<(&'static str, &'static str)> {
 }
 
 /// Declare one fake MCP server on the wire. `trusted` is emitted only when
-/// true so the untrusted case exercises the serde default, exactly as
-/// `buzz-acp` writes it.
+/// true, so every untrusted case below is also the *marker-absent* case: the
+/// field is missing from the JSON entirely, which is both how `buzz-acp`
+/// writes an extra server and how any ACP client that predates the extension
+/// declares every server. The serde default carries the whole boundary.
 fn server_decl(name: &str, trusted: bool) -> Value {
     let mut decl = json!({
         "name": name,
@@ -272,6 +274,71 @@ async fn untrusted_mcp_env_keeps_non_identity_passthrough() {
     assert!(
         names.contains(&"FAKE_MCP_ENV_REPORT"),
         "wire-declared env did not reach the server: {report}"
+    );
+
+    h.shutdown().await;
+}
+
+/// A server name at the generated ceiling plus a tool name longer than the
+/// reserve overflows `<server>__<tool>` — and must cost that one tool, not the
+/// session.
+///
+/// `buzz-acp` caps a generated name at 32 bytes, reserving 32 for the
+/// separator and the bare tool name, but `buzz-agent` accepts bare tool names
+/// up to 128 bytes and the fork does not control what a third-party server
+/// advertises. Failing the whole array would let one operator-supplied server
+/// take the built-in one down with it, leaving the agent with no tools at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn untrusted_mcp_env_over_long_tool_name_costs_only_that_tool() {
+    // 32 bytes: exactly what buzz-acp's MAX_MCP_NAME_LEN produces.
+    let long_server = "a".repeat(32);
+    // 32 bytes, a real tool name from a shipped MCP server. 32 + 2 + 32 = 66,
+    // over the registry's 64-byte qualified-name limit.
+    let long_tool = "get_google_search_console_report";
+    let mut extra = server_decl(&long_server, false);
+    extra["env"]
+        .as_array_mut()
+        .expect("declaration has an env array")
+        .push(json!({ "name": "FAKE_MCP_NAMED_TOOLS", "value": long_tool }));
+
+    let llm = spawn_capturing_llm(vec![openai_text("done")]).await;
+    let mut h = Harness::spawn(&llm.url).await;
+    // `new_session` asserts session/new succeeded: before this guard the whole
+    // array was rejected and this line failed.
+    let sid = new_session(&mut h, vec![server_decl("devmcp", true), extra]).await;
+
+    let p = h
+        .send(
+            "session/prompt",
+            json!({"sessionId": sid, "prompt": [{"type":"text","text":"go"}]}),
+        )
+        .await;
+    let r = h.recv_until_approving(|v| v["id"] == json!(p)).await;
+    assert!(r.get("error").is_none(), "prompt errored: {r}");
+
+    let captured = llm.captured.lock().await;
+    let offered: Vec<String> = captured[0]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no tools array: {}", captured[0]))
+        .iter()
+        .filter_map(|t| {
+            t.get("name")
+                .or_else(|| t.get("function").and_then(|f| f.get("name")))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect();
+    assert!(
+        offered.contains(&"devmcp__tool_0".to_owned()),
+        "the trusted server lost its tools to the other server's long name: {offered:?}"
+    );
+    assert!(
+        offered.contains(&format!("{long_server}__tool_0")),
+        "the untrusted server's fitting tool was dropped too: {offered:?}"
+    );
+    assert!(
+        !offered.iter().any(|name| name.contains(long_tool)),
+        "the over-long qualified name was registered: {offered:?}"
     );
 
     h.shutdown().await;

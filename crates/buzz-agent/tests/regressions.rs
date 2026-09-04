@@ -558,36 +558,40 @@ async fn init_session_with_fake_mcp(h: &mut Harness, extra_mcp_env: &[(&str, &st
 }
 
 /// As [`init_session_with_fake_mcp`], with the server's `trusted` flag under
-/// the caller's control. `trusted: false` is exactly how `buzz-acp` declares an
-/// operator-supplied `BUZZ_ACP_EXTRA_MCP_COMMANDS` server.
+/// the caller's control. `Some(false)` is how `buzz-acp` declares an
+/// operator-supplied `BUZZ_ACP_EXTRA_MCP_COMMANDS` server; `None` omits the
+/// field entirely, which is how every ACP client that predates the extension
+/// declares every server.
 async fn init_session_with_fake_mcp_trust(
     h: &mut Harness,
     extra_mcp_env: &[(&str, &str)],
-    trusted: bool,
+    trusted: impl Into<Option<bool>>,
 ) -> String {
+    let trusted = trusted.into();
     let fake_mcp = env!("CARGO_BIN_EXE_fake-mcp");
     let env: Vec<Value> = extra_mcp_env
         .iter()
         .map(|(k, v)| json!({ "name": k, "value": v }))
         .collect();
+    let marker = trusted.map(Value::from);
     h.send(
         "initialize",
         json!({"protocolVersion":1,"clientCapabilities":{}}),
     )
     .await;
     let _ = h.recv().await;
+    let mut decl = json!({
+        "name": "fake",
+        "command": fake_mcp,
+        "args": [],
+        "env": env,
+    });
+    if let Some(marker) = marker {
+        decl["trusted"] = marker;
+    }
     h.send(
         "session/new",
-        json!({
-            "cwd": "/tmp",
-            "mcpServers": [{
-                "name": "fake",
-                "command": fake_mcp,
-                "args": [],
-                "env": env,
-                "trusted": trusted,
-            }],
-        }),
+        json!({ "cwd": "/tmp", "mcpServers": [decl] }),
     )
     .await;
     let r = h
@@ -752,6 +756,58 @@ async fn hook_never_invoked_on_untrusted_server() {
         !objection_present,
         "an untrusted server's hook output reached the model: {:?}",
         *captured
+    );
+    h.shutdown().await;
+}
+
+/// A server declared with **no** `trusted` field runs no hooks either.
+///
+/// `trusted` is `#[serde(default)]`, so an ACP client that predates the
+/// extension — Zed, JetBrains, anything but `buzz-acp` — declares every server
+/// untrusted by omission, including the built-in `buzz-dev-mcp` it spawned
+/// itself. That is a real compatibility break for hooks, documented on
+/// `McpServerStdio::trusted` and in `crates/buzz-acp/README.md`; this test
+/// pins the behavior so it cannot change silently in either direction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hook_never_invoked_when_trusted_marker_absent() {
+    let llm = spawn_capturing_llm(vec![openai_text("done"), openai_text("looped")]).await;
+    let mut h = Harness::spawn_with_env(
+        &llm.url,
+        &[
+            ("MCP_HOOK_SERVERS", "fake"),
+            ("BUZZ_AGENT_STOP_MAX_REJECTIONS", "10"),
+        ],
+    )
+    .await;
+    // `None`: the declaration carries no `trusted` key at all.
+    let sid = init_session_with_fake_mcp_trust(
+        &mut h,
+        &[
+            ("FAKE_MCP_TOOL_COUNT", "1"),
+            ("FAKE_MCP_STOP_HOOK", "1"),
+            ("FAKE_MCP_STOP_TEXT", "you have open work"),
+            ("FAKE_MCP_STOP_COUNT", "1"),
+        ],
+        None,
+    )
+    .await;
+
+    let p = h
+        .send(
+            "session/prompt",
+            json!({"sessionId": sid, "prompt": [{"type":"text","text":"go"}]}),
+        )
+        .await;
+    let r = h.recv_until_approving(|v| v["id"] == json!(p)).await;
+    assert!(r.get("result").is_some(), "errored: {r}");
+    assert_eq!(r["result"]["stopReason"], "end_turn");
+
+    let captured = llm.captured.lock().await;
+    assert_eq!(
+        captured.len(),
+        1,
+        "a marker-absent server's _Stop hook ran and made the agent loop: {} LLM calls",
+        captured.len()
     );
     h.shutdown().await;
 }
