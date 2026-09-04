@@ -120,9 +120,18 @@ test("markdown attachment opens the in-app viewer with Preview/Code toggle", asy
 
   // Code view shows the raw source.
   await page.getByTestId("markdown-doc-view-code").click();
-  await expect(page.getByTestId("markdown-doc-code")).toContainText(
-    "# Release Notes",
-  );
+  const smallDocCodeView = page.getByTestId("markdown-doc-code");
+  await expect(smallDocCodeView).toContainText("# Release Notes");
+  // Positive control for the highlight-byte-bound test below (Sol audit
+  // finding 2): a small document is well under CodeBlock's highlight caps,
+  // so Shiki tokenization succeeds — each rendered line nests a `<span
+  // style="color:...">` per token, distinct from the plain-text fallback's
+  // bare `<span data-line="">` with no element children. Shiki's
+  // language/theme assets load asynchronously after first mount, so poll
+  // rather than taking one immediate count.
+  await expect(
+    smallDocCodeView.locator("[data-line] > span").first(),
+  ).toBeAttached({ timeout: 5000 });
   await page.getByTestId("markdown-doc-view-preview").click();
   await expect(
     panel.getByRole("heading", { name: "Release Notes" }),
@@ -657,6 +666,87 @@ test("an adversarially list-dense document shows a bounded Preview fallback and 
   expect(renderedLineCount).toBeLessThan(2100);
 });
 
+// ── Adversarial complexity on a single line (Sol audit finding 1, round 2)
+//
+// The line-count gate above only bounds block-level node count, so a
+// single-line document densely packed with inline link syntax passes it
+// outright (1 line) while still driving the inline tokenizer into the same
+// superlinear cost — the audit's own reproduction shape.
+//
+// Fixture, recompute with `shasum -a 256
+// desktop/tests/fixtures/link-dense-line.md`:
+//   SHA-256: d1f165cd61afa3898297ebba6777b83b6501504aec1315ef9989e7f91f9834fb
+//   Bytes:   340000
+//   Lines:   1
+
+const LINK_DENSE_LINE_CONTENT = readFileSync(
+  new URL("../fixtures/link-dense-line.md", import.meta.url),
+  "utf-8",
+);
+const LINK_DENSE_LINE_SHA = "e".repeat(64);
+const LINK_DENSE_LINE_URL = `${RELAY_HTTP_URL}/media/${LINK_DENSE_LINE_SHA}.bin`;
+
+test("a one-line link-dense document shows a bounded Preview fallback, not a freeze", async ({
+  page,
+}) => {
+  test.setTimeout(30_000);
+
+  await installMockBridge(page, {
+    deferredComposerUploads: true,
+    uploadDescriptors: [
+      {
+        url: LINK_DENSE_LINE_URL,
+        sha256: LINK_DENSE_LINE_SHA,
+        size: Buffer.byteLength(LINK_DENSE_LINE_CONTENT),
+        type: "application/octet-stream",
+        uploaded: Math.floor(Date.now() / 1000),
+        filename: "link-dense-line.md",
+      },
+    ],
+  });
+  await page.route(`**/media/${LINK_DENSE_LINE_SHA}.bin`, (route) =>
+    route.fulfill({
+      body: LINK_DENSE_LINE_CONTENT,
+      contentType: "application/octet-stream",
+    }),
+  );
+
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+
+  const [chooser] = await Promise.all([
+    page.waitForEvent("filechooser"),
+    page.getByRole("button", { name: "Attach file" }).click(),
+  ]);
+  await chooser.setFiles({
+    buffer: Buffer.from(LINK_DENSE_LINE_CONTENT),
+    mimeType: "text/markdown",
+    name: "link-dense-line.md",
+  });
+  await expect(page.getByTestId("message-composer")).toContainText(
+    "link-dense-line.md",
+  );
+  await page.getByTestId("send-message").click();
+  await expect(page.getByText("Sending")).toHaveCount(0);
+
+  const card = page.getByTestId("file-card").last();
+  await expect(card).toContainText("link-dense-line.md");
+
+  const openedAt = Date.now();
+  await card.click();
+
+  const panel = page.getByTestId("markdown-doc-panel");
+  await expect(panel).toBeVisible();
+
+  // A single line passes the line-count gate outright; the link-marker
+  // density gate must still refuse the full mdast parse.
+  await expect(
+    page.getByTestId("markdown-doc-preview-too-complex"),
+  ).toBeVisible({ timeout: 5000 });
+  expect(Date.now() - openedAt).toBeLessThan(5000);
+});
+
 test("Code view for a large-but-few-lines document skips synchronous tokenization (highlight byte bound)", async ({
   page,
 }) => {
@@ -714,9 +804,26 @@ test("Code view for a large-but-few-lines document skips synchronous tokenizatio
   await expect(codeView).toBeVisible({ timeout: 5000 });
   await expect(codeView).toContainText("Long Document Fixture");
   // Well under the 2,000-line plain-text bound, so no truncation notice —
-  // proves the byte gate routed this to the (fast, bounded) plain-text
-  // path rather than hanging in synchronous tokenization.
+  // true regardless of which rendering path produced the text, so on its
+  // own this does not prove synchronous tokenization was actually skipped
+  // (Sol audit finding 2, round 2).
   await expect(page.getByTestId("code-block-truncated-notice")).toHaveCount(0);
+  // Bind the actual production decision instead: the plain-text fallback
+  // (CodeBlock.tsx) emits `<span data-line="">{line}</span>` with the line
+  // text as a bare text node, while the highlighted path emits nested
+  // `<span style="color:...">` children per token. Zero element children
+  // under `[data-line]` here proves the byte gate routed this document to
+  // the fallback rather than tokenizing it — this fails if the byte check
+  // is removed, since the surviving line-count cap (150) does not catch a
+  // 122-line document.
+  //
+  // Shiki's language/theme assets load asynchronously after mount, and the
+  // pre-load render is the same plain-text fallback either way, so an
+  // immediate read can't distinguish "byte-guarded" from "not yet loaded" —
+  // give the async load time to settle before asserting the negative.
+  await page.waitForTimeout(3000);
+  const nestedTokenSpans = await codeView.locator("[data-line] > span").count();
+  expect(nestedTokenSpans).toBe(0);
 });
 
 // ── Held-request cancellation (Sol audit finding 3) ────────────────────────

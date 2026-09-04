@@ -46,17 +46,40 @@ export const MAX_MARKDOWN_DOC_BYTES = 2 * 1024 * 1024;
 export const MAX_MARKDOWN_DOC_PREVIEW_LINES = 3000;
 
 /**
+ * Above this many `[` characters (the opener shared by links, images,
+ * footnotes, and reference-style links), a full Preview render is refused
+ * even when the line-count gate above passes.
+ *
+ * The line-count gate only bounds *block*-level node count — it does
+ * nothing for a single line densely packed with inline constructs.
+ * Reproduced on this project's pinned parser (mdast-util-from-markdown +
+ * micromark-extension-gfm@3.0.0 + mdast-util-gfm@3.1.0) with
+ * `"[a](http://e.co) "` repeated on ONE line: 12,336 links (209,712 bytes,
+ * 1 line — passes the line-count gate outright) parses in 351ms, already
+ * over this app's 200ms main-thread budget, climbing to 9,379ms/1,105MB at
+ * 111,025 links. 2,000 `[` markers extrapolates (by the same superlinear
+ * curve measured across those points) to well under 100ms — the same
+ * safety margin the line-count gate above uses — while a prose document
+ * with occasional literal brackets stays nowhere near this count.
+ */
+export const MAX_MARKDOWN_DOC_PREVIEW_LINK_MARKERS = 2000;
+
+/**
  * Whether decoded markdown text is safe to run through the full Preview
- * parse. A single `charCodeAt` scan is linear and cheap — nothing like the
- * parse it is gating — so it is safe to run unconditionally before the
- * expensive path.
+ * parse. A single scan is linear and cheap — nothing like the parse it is
+ * gating — so it is safe to run unconditionally before the expensive path.
  */
 export function isMarkdownDocTooComplexForPreview(text: string): boolean {
   let lines = 1;
+  let linkMarkers = 0;
   for (let i = 0; i < text.length; i++) {
-    if (text.charCodeAt(i) === 10 /* "\n" */) {
+    const code = text.charCodeAt(i);
+    if (code === 10 /* "\n" */) {
       lines++;
       if (lines > MAX_MARKDOWN_DOC_PREVIEW_LINES) return true;
+    } else if (code === 91 /* "[" */) {
+      linkMarkers++;
+      if (linkMarkers > MAX_MARKDOWN_DOC_PREVIEW_LINK_MARKERS) return true;
     }
   }
   return false;

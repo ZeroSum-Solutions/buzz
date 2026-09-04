@@ -7,6 +7,7 @@ import {
   isMarkdownDocTooComplexForPreview,
   MAX_MARKDOWN_DOC_BYTES,
   MAX_MARKDOWN_DOC_PREVIEW_LINES,
+  MAX_MARKDOWN_DOC_PREVIEW_LINK_MARKERS,
 } from "./markdownDocFile.ts";
 
 // ── isMarkdownDocFilename ─────────────────────────────────────────────────
@@ -108,4 +109,35 @@ test("isMarkdownDocTooComplexForPreview: a legitimate long-but-simple document (
   const text = `# Heading\n\n${"word ".repeat(120_000)}\n`;
   assert.ok(text.length > 500_000);
   assert.equal(isMarkdownDocTooComplexForPreview(text), false);
+});
+
+// ── inline-construct (link marker) density (Sol audit finding 1, round 2,
+// port/6731) ─────────────────────────────────────────────────────────────
+//
+// The line-count gate above only bounds block count. A single line densely
+// packed with inline link syntax passes it outright (1 line) while still
+// driving the mdast/micromark *inline* tokenizer into superlinear cost — the
+// audit's own reproduction: "[a](http://e.co) " repeated on one line.
+
+test("isMarkdownDocTooComplexForPreview: false at exactly the link-marker cap", () => {
+  const text = `[a](http://e.co) `.repeat(
+    MAX_MARKDOWN_DOC_PREVIEW_LINK_MARKERS,
+  );
+  assert.equal(isMarkdownDocTooComplexForPreview(text), false);
+});
+
+test("isMarkdownDocTooComplexForPreview: true one link marker past the cap", () => {
+  const text = `[a](http://e.co) `.repeat(
+    MAX_MARKDOWN_DOC_PREVIEW_LINK_MARKERS + 1,
+  );
+  assert.equal(isMarkdownDocTooComplexForPreview(text), true);
+});
+
+test("isMarkdownDocTooComplexForPreview: true for a one-line link-dense document (audit reproduction shape)", () => {
+  // Mirrors the audit's own reproduction exactly: a single line, no
+  // newlines at all, so the line-count gate alone would admit it.
+  const text = "[a](http://e.co) ".repeat(12_336);
+  assert.ok(!text.includes("\n"));
+  assert.ok(text.length < MAX_MARKDOWN_DOC_BYTES);
+  assert.equal(isMarkdownDocTooComplexForPreview(text), true);
 });
