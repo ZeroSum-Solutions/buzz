@@ -299,9 +299,56 @@ fn codex_toml_parses_back_to_the_declared_structure() {
         entry["args"].as_array().expect("args")[0].as_str(),
         Some("--stdio")
     );
-    let env = entry["env"].as_table().expect("env table");
-    assert_eq!(env.keys().collect::<Vec<_>>(), vec!["OPENSEO_TOKEN"]);
-    assert_eq!(env["OPENSEO_TOKEN"].as_str(), Some("${OPENSEO_TOKEN}"));
+    assert_eq!(
+        entry["env_vars"]
+            .as_array()
+            .expect("env_vars array")
+            .iter()
+            .map(|v| v.as_str().expect("a name"))
+            .collect::<Vec<_>>(),
+        vec!["OPENSEO_TOKEN"]
+    );
+}
+
+/// Codex reads `env` values as literal strings and interpolates nothing
+/// (`codex-rs/config/src/mcp_types.rs`, `RawMcpServerConfig::env:
+/// Option<HashMap<String, String>>`), so the `${NAME}` placeholder Claude
+/// expands would reach the server as those characters. Forwarding is `env_vars`
+/// — a list of NAMES Codex takes from its own environment. Reinstating the env
+/// table, or writing a placeholder into it, fails here.
+#[test]
+fn codex_forwards_environment_by_name_rather_than_by_placeholder() {
+    let spec = spec_with(
+        vec![McpServerSpec::stdio(
+            "probe",
+            "/bin/true",
+            &[],
+            &["ALPHA_TOKEN".to_string(), "BETA_TOKEN".to_string()],
+        )
+        .expect("stdio")],
+        Vec::new(),
+    );
+    let rendered = render_codex_config_toml(&spec).expect("render");
+    let table: toml::Table = rendered.parse().expect("valid TOML");
+    let entry = &table["mcp_servers"]["probe"];
+    assert_eq!(
+        entry["env_vars"]
+            .as_array()
+            .expect("env_vars array")
+            .iter()
+            .map(|v| v.as_str().expect("a name"))
+            .collect::<Vec<_>>(),
+        vec!["ALPHA_TOKEN", "BETA_TOKEN"],
+        "the exact names, in the order the spec declared them"
+    );
+    assert!(
+        entry.get("env").is_none(),
+        "no env table: Codex would pass its values through verbatim"
+    );
+    assert!(
+        !rendered.contains("${"),
+        "no placeholder anywhere in the Codex document: {rendered}"
+    );
 }
 
 /// The generated Claude document is one Buzz's own Claude reader understands.
@@ -331,6 +378,12 @@ fn generated_claude_document_round_trips_through_the_production_reader() {
 }
 
 /// The generated Codex document is one Buzz's own Codex parser understands.
+///
+/// The names are all this can assert: `config_bridge::codex::parse_mcp_servers`
+/// discards each server's table and returns an `ExtensionEntry` of name, kind
+/// and enabled, so no reader-side seam exists to bind `env_vars` through. The
+/// value assertion lives in
+/// [`codex_forwards_environment_by_name_rather_than_by_placeholder`].
 #[test]
 fn generated_codex_document_round_trips_through_the_production_reader() {
     let spec = spec_with(
@@ -358,16 +411,20 @@ fn no_generated_file_carries_an_environment_value() {
         ],
         Vec::new(),
     );
-    for rendered in [
-        render_claude_mcp_json(&spec).expect("json"),
-        render_codex_config_toml(&spec).expect("toml"),
-    ] {
-        assert!(rendered.contains("SECRET_TOKEN"), "the name is declared");
-        assert!(
-            rendered.contains("${SECRET_TOKEN}"),
-            "and only as a placeholder: {rendered}"
-        );
-    }
+    let claude = render_claude_mcp_json(&spec).expect("json");
+    assert!(
+        claude.contains("\"${SECRET_TOKEN}\""),
+        "Claude gets the placeholder it expands, never a value: {claude}"
+    );
+    let codex = render_codex_config_toml(&spec).expect("toml");
+    assert!(
+        codex.contains("env_vars = [\"SECRET_TOKEN\"]"),
+        "Codex gets the name to forward, never a value: {codex}"
+    );
+    assert!(
+        !codex.contains(".env]"),
+        "and no env table, whose values Codex reads literally: {codex}"
+    );
 }
 
 // ------------------------------------------------------- placement and paths
@@ -832,22 +889,47 @@ fn a_symlink_where_the_config_file_belongs_is_refused() {
 
 /// The staging name must not be derivable from the process id: another writer
 /// in the shared root could compute it and pre-plant a symlink there.
+///
+/// Asserted on the name function itself. A staging file exists only between
+/// `create_new` and `rename`, so walking the tree after a successful write sees
+/// only renamed-away files and would stay green if a `<pid>.<counter>` name
+/// came back — that check proves the writes finished, not that the name is
+/// unpredictable. Restoring a pid-derived name fails this test.
 #[test]
 fn the_staging_name_is_not_derived_from_the_process_id() {
+    let pid = std::process::id().to_string();
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..8 {
+        let name = super::write::temp_name();
+        assert!(
+            !name.contains(&pid),
+            "the staging name carries this process's id: {name}"
+        );
+        assert!(
+            seen.insert(name.clone()),
+            "two staging names collided, so the name is predictable: {name}"
+        );
+    }
+}
+
+/// And no staging file survives a run, anywhere under the root: each is renamed
+/// into place or cleaned up. The recursive counterpart of
+/// [`no_temporary_file_survives_a_successful_write`], which reads the root
+/// directory only and so cannot see one left in a skill directory.
+#[test]
+fn no_staging_file_survives_anywhere_under_the_root() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
     for i in 0..4 {
         let spec = spec_with(Vec::new(), vec![skill(&format!("probe{i}"))]);
         write_claude_project_config(root, &spec).expect("write");
     }
-    let pid_fragment = format!(".{}.", std::process::id());
     for path in walk(root) {
         let name = path.to_string_lossy().into_owned();
         assert!(
             !name.contains("buzz-config-gen"),
             "staging file left: {name}"
         );
-        assert!(!name.contains(&pid_fragment), "pid-derived name: {name}");
     }
 }
 

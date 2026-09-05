@@ -275,10 +275,18 @@ fn read_codex(path: &Path) -> Res<BTreeMap<String, String>> {
                     .collect()
             })
             .unwrap_or_default();
+        // Codex forwards by name through `env_vars`, not through the `env`
+        // table, whose values it reads literally. Reading the names back from
+        // `env_vars` is what makes the caller's env-name assertion bind the
+        // shape Codex actually honours.
         let env: Vec<String> = entry
-            .get("env")
-            .and_then(toml::Value::as_table)
-            .map(|t| t.keys().cloned().collect())
+            .get("env_vars")
+            .and_then(toml::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
             .unwrap_or_default();
         let (kind, target) = match entry.get("url").and_then(toml::Value::as_str) {
             Some(url) => ("http", url.to_string()),

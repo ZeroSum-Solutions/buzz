@@ -290,7 +290,12 @@ fn write_file_atomic(base: &Path, path: &Path, contents: &str) -> Result<(), Con
 ///
 /// The previous name was `<pid>.<counter>`, which another process sharing the
 /// root could compute and pre-plant. The random half comes from the OS.
-fn temp_name() -> String {
+///
+/// Visible to the module's tests: a staging file exists only between
+/// `create_new` and `rename`, so a test that walks the tree after a successful
+/// write sees nothing and would stay green if a pid-derived name came back.
+/// The name function is the seam that can actually be falsified.
+pub(super) fn temp_name() -> String {
     let mut bytes = [0u8; 12];
     if getrandom::getrandom(&mut bytes).is_err() {
         // The OS source is unavailable. Fall back to a clock-derived value

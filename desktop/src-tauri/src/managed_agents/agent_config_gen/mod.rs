@@ -33,10 +33,14 @@
 //!   the "Symlinks and permissions" section of [`mod@write`].
 //! * It never writes a literal environment value. A server that needs a
 //!   credential names the variable it wants in
-//!   [`McpTransport::Stdio::env_passthrough`]; the generator emits a
-//!   `"${NAME}"` placeholder, so no secret can reach the file. Every value in a
+//!   [`McpTransport::Stdio::env_passthrough`], and each runtime is given the
+//!   form *it* forwards by: Claude gets a `"${NAME}"` placeholder it expands at
+//!   spawn time, Codex gets `env_vars = ["NAME"]`, its list of names to forward
+//!   from its own environment. Codex reads `env` values literally and
+//!   interpolates nothing, so a placeholder written there would reach the
+//!   server verbatim. Either way no secret reaches the file: every value in a
 //!   generated file is either operator-chosen structure (a command, an
-//!   argument, a URL) or a placeholder. The agent's own identity variables are
+//!   argument, a URL), a placeholder, or a variable name. The agent's own identity variables are
 //!   refused outright ([`DENIED_ENV_NAMES`]): forwarding one would hand an
 //!   arbitrary MCP child the key the agent signs relay events with.
 //! * A custom `CLAUDE_CONFIG_DIR` / `CODEX_HOME` starts a fresh keychain
@@ -224,7 +228,8 @@ pub enum McpTransport {
         /// Its arguments, in order.
         args: Vec<String>,
         /// Environment variable names to forward. Emitted as `"${NAME}"`
-        /// placeholders; the generator never writes a value.
+        /// placeholders for Claude and as `env_vars` names for Codex; the
+        /// generator never writes a value.
         env_passthrough: Vec<String>,
     },
     /// A remote server reached over HTTP, the shape OpenSEO's published
