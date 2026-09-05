@@ -144,6 +144,69 @@ async fn the_credential_comes_from_the_store_and_never_from_a_file() {
     assert_eq!(headers.as_slice(), ["Bearer S3CRET-VALUE"]);
 }
 
+/// A listener that counts the connections made to it and answers nothing,
+/// standing in for the proxy an ambient `HTTP_PROXY` would name.
+async fn start_proxy_sentinel() -> (Arc<AtomicUsize>, SocketAddr) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let address = listener.local_addr().expect("local address");
+    let connections = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&connections);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            // Drop it immediately: a proxied request should fail fast rather
+            // than sit on the request timeout.
+            drop(stream);
+        }
+    });
+    (connections, address)
+}
+
+#[tokio::test]
+async fn an_ambient_proxy_never_sees_the_credential() {
+    // reqwest discovers a system proxy from the environment by default, and
+    // this client is the one in the process that carries a resolved keychain
+    // secret to an upstream `validate_upstream` allows to be plain `http://`
+    // on loopback. `Proxy::new`'s `.no_proxy()` is what keeps the request on
+    // the origin the registry named.
+    let (connections, sentinel) = start_proxy_sentinel().await;
+    let (state, address) = start_upstream().await;
+
+    // Set process-wide and never unset: unsetting would race the other tests
+    // in this binary, and with `.no_proxy()` in place no client here reads
+    // these at all. Every spelling reqwest consults is covered.
+    std::env::set_var("HTTP_PROXY", format!("http://{sentinel}"));
+    std::env::set_var("HTTPS_PROXY", format!("http://{sentinel}"));
+    std::env::set_var("ALL_PROXY", format!("http://{sentinel}"));
+    std::env::remove_var("NO_PROXY");
+    std::env::remove_var("no_proxy");
+
+    let proxy = proxy_with(address, ProxyLimits::default());
+    let result = proxy
+        .forward(br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
+        .await;
+
+    // Checked before the reply, so a client that honours the ambient proxy
+    // reports that rather than the connection error the sentinel produces by
+    // hanging up.
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        0,
+        "the credential-carrying request was routed through the ambient proxy"
+    );
+    assert_eq!(
+        state.requests.load(Ordering::SeqCst),
+        1,
+        "the named upstream did not receive the request"
+    );
+    let reply = result
+        .expect("the call goes straight to the named upstream")
+        .expect("a reply");
+    assert!(String::from_utf8_lossy(&reply).contains("\"ping\""));
+}
+
 #[tokio::test]
 async fn a_redirect_is_an_error_and_issues_no_second_request() {
     let (state, address) = start_upstream().await;

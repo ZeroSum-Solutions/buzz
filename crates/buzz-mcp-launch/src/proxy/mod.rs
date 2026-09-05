@@ -105,6 +105,15 @@ impl<S: SecretBlobSource> Proxy<S> {
             // Redirects are never followed: a 30x is an error, so no origin
             // change can carry the credential.
             .redirect(reqwest::redirect::Policy::none())
+            // Nor can an ambient one. reqwest discovers a system proxy from
+            // `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` by default, which would
+            // send this request — the only one in the process that carries a
+            // resolved keychain secret — to a host the registry never named,
+            // in cleartext for the `http://` loopback upstreams
+            // `validate_upstream` permits. Matches the pairing in
+            // `buzz-workflow` and `buzz-auth`, which refuse a system proxy for
+            // the same reason.
+            .no_proxy()
             .connect_timeout(config.limits.connect_timeout)
             .timeout(config.limits.request_timeout)
             .pool_max_idle_per_host(config.limits.max_connections)
