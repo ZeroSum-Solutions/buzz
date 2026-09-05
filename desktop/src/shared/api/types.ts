@@ -545,7 +545,35 @@ export type AcpRuntimeCatalogEntry = {
   definitionEnv?: Record<string, string>;
   /** Spawn-time parallelism cap; absent for uncapped harnesses. */
   maxParallelism?: number;
+  /**
+   * Where this runtime's generated MCP configuration must be written.
+   * Projected from the Rust runtime catalog; the panel and the config writer
+   * read this one value so they cannot drift.
+   */
+  mcpConfigPlacement: McpConfigPlacement;
+  /** Transports the MCP registry may offer this runtime. */
+  mcpTransports: McpTransport[];
+  /**
+   * Transports this runtime's own config file accepts. Deliberately separate
+   * from `mcpTransports`: buzz-agent is offered stdio through a handed-over
+   * registry file while its own config accepts no MCP transport at all.
+   */
+  mcpNativeTransports: McpTransport[];
 };
+
+/** A transport an MCP server can speak. */
+export type McpTransport = "stdio" | "http";
+
+/**
+ * Where a runtime's generated MCP configuration has to be written. An env-var
+ * name alone cannot express this: Claude reads a cwd-relative project file with
+ * `CLAUDE_CONFIG_DIR` deliberately unset, Codex a file under a directory named
+ * by an env var, and some runtimes have no native MCP config at all.
+ */
+export type McpConfigPlacement =
+  | { kind: "project_file_in_workdir"; file: string }
+  | { kind: "env_rooted_dir"; var: string; file: string }
+  | { kind: "unsupported" };
 
 /** An AcpRuntimeCatalogEntry that is confirmed available — command and binaryPath are non-null. */
 export type AcpRuntime = AcpRuntimeCatalogEntry & {

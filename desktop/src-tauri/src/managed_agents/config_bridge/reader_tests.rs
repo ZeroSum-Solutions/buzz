@@ -5,7 +5,7 @@
 use std::{collections::BTreeMap, path::Path, sync::Mutex};
 
 use super::*;
-use crate::managed_agents::discovery::KnownAcpRuntime;
+use crate::managed_agents::discovery::{KnownAcpRuntime, McpConfigPlacement};
 use crate::managed_agents::types::ManagedAgentRecord;
 
 static GOOSE_PATH_ROOT_LOCK: Mutex<()> = Mutex::new(());
@@ -62,6 +62,9 @@ fn test_runtime() -> &'static KnownAcpRuntime {
         required_normalized_fields: &["model", "provider"],
         login_hint: None,
         auth_probe_args: None,
+        mcp_config_placement: McpConfigPlacement::Unsupported,
+        mcp_transports: &[],
+        mcp_native_transports: &[],
     };
     &RUNTIME
 }
@@ -658,6 +661,9 @@ fn buzz_agent_runtime() -> &'static KnownAcpRuntime {
         required_normalized_fields: &["model", "provider"],
         login_hint: None,
         auth_probe_args: None,
+        mcp_config_placement: McpConfigPlacement::Unsupported,
+        mcp_transports: &[],
+        mcp_native_transports: &[],
     }
 }
 

@@ -4,6 +4,7 @@
       "binaries/buzz-acp",
       "binaries/buzz-agent",
       "binaries/buzz-dev-mcp",
+      "binaries/buzz-mcp-launch",
       "binaries/git-credential-nostr",
       "binaries/buzz"
     ]

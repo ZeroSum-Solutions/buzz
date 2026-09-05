@@ -125,6 +125,16 @@ run_unit_tests() {
   # step with `just test-unit`; ignored lifecycle tests run elsewhere.
   run_test_step "buzz-acp unit tests" \
     cargo test -p buzz-acp --lib -- --nocapture
+
+  # MCP registry launcher and secret store. Every target, not --lib: the
+  # end-to-end guards live in tests/launcher.rs and tests/proxy.rs. Both crates
+  # are infra-free. Mirrors the nextest path in `just test-unit` — the two
+  # lists must stay in step.
+  run_test_step "buzz-secret-store tests" \
+    cargo test -p buzz-secret-store -- --nocapture
+
+  run_test_step "buzz-mcp-launch tests" \
+    cargo test -p buzz-mcp-launch -- --nocapture
 }
 
 # ---- DB / integration tests (infra required) --------------------------------

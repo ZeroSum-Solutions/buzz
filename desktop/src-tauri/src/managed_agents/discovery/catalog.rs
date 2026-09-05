@@ -5,7 +5,8 @@
 //! in the parent.
 
 use super::runtime_metadata::{
-    KnownAcpRuntime, BUZZ_AGENT_EFFORT_VALUES, GOOSE_EFFORT_NORMALIZATION,
+    KnownAcpRuntime, McpConfigPlacement, McpTransport, BUZZ_AGENT_EFFORT_VALUES,
+    GOOSE_EFFORT_NORMALIZATION,
 };
 use super::{BUZZ_AGENT_AVATAR_URL, CLAUDE_CODE_AVATAR_URL, CODEX_AVATAR_URL, GOOSE_AVATAR_URL};
 
@@ -46,6 +47,10 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         required_normalized_fields: &["model", "provider"],
         login_hint: None,
         auth_probe_args: None,
+        // Goose has its own extension config; the registry does not write it.
+        mcp_config_placement: McpConfigPlacement::Unsupported,
+        mcp_transports: &[],
+        mcp_native_transports: &[],
     },
     KnownAcpRuntime {
         id: "claude",
@@ -81,6 +86,11 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         required_normalized_fields: &[],
         login_hint: Some("Run the Claude CLI to complete authentication."),
         auth_probe_args: Some(&["claude", "auth", "status"]),
+        // A project `.mcp.json` in the agent's working directory, with
+        // `CLAUDE_CONFIG_DIR` deliberately unset (memo decisions 9 and 11).
+        mcp_config_placement: McpConfigPlacement::ProjectFileInWorkdir { file: ".mcp.json" },
+        mcp_transports: &[McpTransport::Stdio, McpTransport::Http],
+        mcp_native_transports: &[McpTransport::Stdio, McpTransport::Http],
     },
     KnownAcpRuntime {
         id: "codex",
@@ -117,6 +127,12 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         login_hint: Some("Run `codex login` to authenticate."),
         // Verified: `codex login status` exits 0 when logged in, non-zero otherwise.
         auth_probe_args: Some(&["codex", "login", "status"]),
+        mcp_config_placement: McpConfigPlacement::EnvRootedDir {
+            var: "CODEX_HOME",
+            file: "config.toml",
+        },
+        mcp_transports: &[McpTransport::Stdio, McpTransport::Http],
+        mcp_native_transports: &[McpTransport::Stdio, McpTransport::Http],
     },
     KnownAcpRuntime {
         id: "buzz-agent",
@@ -152,5 +168,11 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         required_normalized_fields: &["model", "provider"],
         login_hint: None,
         auth_probe_args: None,
+        // buzz-agent has no native MCP config: the registry hands it a file
+        // through `BUZZ_ACP_MCP_REGISTRY`, and it deserializes only the stdio
+        // server shape (`crates/buzz-agent/src/types.rs:537`).
+        mcp_config_placement: McpConfigPlacement::Unsupported,
+        mcp_transports: &[McpTransport::Stdio],
+        mcp_native_transports: &[],
     },
 ];

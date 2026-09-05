@@ -1,0 +1,31 @@
+[package]
+name = "buzz-secret-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Read side of the Buzz desktop keychain blob, with the MCP-only namespace and per-agent capability binding"
+
+[features]
+# OS keyring backend. Off by default so the root workspace (and every crate
+# that only needs the namespace/capability types) never builds the keyring
+# stack. `buzz-mcp-launch` turns it on; the desktop crate turns it on through
+# its own `system-keyring` feature.
+default = []
+system-keyring = ["dep:keyring"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["sync-secret-service", "vendored"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "vendored"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["windows-native", "vendored"], optional = true }

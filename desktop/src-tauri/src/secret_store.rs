@@ -41,7 +41,11 @@ pub enum KeyringProbe {
 
 /// Username used for the single blob keychain entry. All secrets are stored
 /// as a JSON map under this name within the service.
-const BLOB_KEY: &str = "secrets";
+///
+/// Re-exported from `buzz-secret-store`, which owns the blob format so the
+/// desktop (write side) and the `buzz-mcp-launch` sidecar (read side) can never
+/// drift on the key, the encoding, or the bounds.
+use buzz_secret_store_pkg::BLOB_KEY;
 
 // ── Interprocess advisory lock ─────────────────────────────────────────────
 //
@@ -246,6 +250,38 @@ impl SecretStore {
     }
 }
 
+/// Build the candidate blob for a checked read-modify-write.
+///
+/// `Ok(None)` means the mutation was a no-op and no durable write is needed.
+/// An `Err` means the mutation *refused*: the caller must write nothing, which
+/// is what makes a compare-and-set possible — the predicate runs on the
+/// freshly-read durable state inside the lock and its verdict is the only thing
+/// that decides whether a write happens.
+///
+/// Separate from the keychain I/O so that contract is testable on every
+/// platform, with no OS keyring in the loop.
+///
+/// # Errors
+/// Returns `f`'s error verbatim when the mutation refuses.
+#[cfg_attr(not(feature = "system-keyring"), allow(dead_code))]
+fn checked_candidate<F>(
+    current: &HashMap<String, String>,
+    f: F,
+) -> Result<Option<HashMap<String, String>>, String>
+where
+    F: FnOnce(&mut HashMap<String, String>) -> Result<(), String>,
+{
+    let mut next = current.clone();
+    // `?`, not a discarded result: a refusal must abandon the candidate rather
+    // than write it.
+    f(&mut next)?;
+    if &next == current {
+        Ok(None)
+    } else {
+        Ok(Some(next))
+    }
+}
+
 /// Whether a keyring error string indicates the backend itself is unavailable
 /// (vs. a per-entry error like "not found"). Mirrors goose's discriminator
 /// (`crates/goose/src/config/base.rs`): treat dbus / Secret Service / platform
@@ -318,11 +354,7 @@ impl SecretStore {
         let raw = self.read_blob_raw()?;
         let map = match raw {
             None => return Ok(None),
-            Some(bytes) => {
-                let json = String::from_utf8(bytes).map_err(|e| format!("blob utf8: {e}"))?;
-                serde_json::from_str::<HashMap<String, String>>(&json)
-                    .map_err(|e| format!("blob json: {e}"))?
-            }
+            Some(bytes) => buzz_secret_store_pkg::parse_blob(&bytes).map_err(|e| e.to_string())?,
         };
 
         // Only populate the cache if it is still empty — a concurrent
@@ -353,16 +385,16 @@ impl SecretStore {
     /// builds that lack hardened-runtime entitlements).
     #[cfg(feature = "system-keyring")]
     fn read_blob_raw_keyring(&self) -> Result<Option<Vec<u8>>, String> {
-        let entry =
-            keyring_entry(&self.service, BLOB_KEY).map_err(|e| format!("keyring entry: {e}"))?;
-        match entry.get_password() {
-            Ok(s) => Ok(Some(s.into_bytes())),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) if is_keyring_availability_error(&e.to_string()) => {
-                Err(format!("keyring unavailable: {e}"))
+        // The read itself lives in `buzz-secret-store` so the sidecar reads the
+        // exact entry this process writes. The availability discriminator stays
+        // here: it feeds the desktop-only file-fallback decision.
+        buzz_secret_store_pkg::keyring_source::read_blob_raw(&self.service).map_err(|e| {
+            if is_keyring_availability_error(&e) {
+                format!("keyring unavailable: {e}")
+            } else {
+                e
             }
-            Err(e) => Err(format!("keyring read: {e}")),
-        }
+        })
     }
 
     /// Atomically load the blob, apply `f` to a candidate map, write back if
@@ -396,6 +428,44 @@ impl SecretStore {
     where
         F: FnOnce(&mut HashMap<String, String>),
     {
+        self.mutate_blob_checked(|map| {
+            f(map);
+            Ok(())
+        })
+    }
+
+    /// Store-wide read-modify-write whose mutation may refuse.
+    ///
+    /// Identical to `mutate_blob` except that `f` returns a `Result`: an `Err`
+    /// leaves the durable blob and the cache exactly as they were and is
+    /// returned to the caller. This is what makes a compare-and-set possible —
+    /// the predicate runs on the freshly-read durable state *inside* the
+    /// interprocess lock, so no concurrent writer can slip between a check and
+    /// its write.
+    ///
+    /// # Errors
+    /// Returns `f`'s error when the mutation refuses, or the backend's error
+    /// when the keyring is unavailable or the write fails.
+    pub fn mutate_checked<F>(&self, f: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut HashMap<String, String>) -> Result<(), String>,
+    {
+        #[cfg(feature = "system-keyring")]
+        {
+            self.mutate_blob_checked(f)
+        }
+        #[cfg(not(feature = "system-keyring"))]
+        {
+            let _ = f;
+            Err("system-keyring feature disabled".to_string())
+        }
+    }
+
+    #[cfg(feature = "system-keyring")]
+    fn mutate_blob_checked<F>(&self, f: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut HashMap<String, String>) -> Result<(), String>,
+    {
         // Acquire the interprocess advisory lock first. All Buzz processes
         // using the same service name contend on the same lockfile at
         // /tmp/buzz-keychain-<uid>-<service>.lock (a deterministic per-user
@@ -410,30 +480,28 @@ impl SecretStore {
         let raw = self.read_blob_raw()?;
         let current: HashMap<String, String> = match raw {
             None => HashMap::new(),
-            Some(bytes) => {
-                let json = String::from_utf8(bytes).map_err(|e| format!("blob utf8: {e}"))?;
-                serde_json::from_str::<HashMap<String, String>>(&json)
-                    .map_err(|e| format!("blob json: {e}"))?
-            }
+            Some(bytes) => buzz_secret_store_pkg::parse_blob(&bytes).map_err(|e| e.to_string())?,
         };
 
         // Build the candidate state in a separate allocation so that a write
-        // failure below cannot leave the cache ahead of durable storage.
-        let mut next = current.clone();
-        f(&mut next);
-
-        // Skip the keychain write when the candidate equals the freshly-read
-        // durable state — no I/O needed and no keychain ACL prompt on macOS.
-        if next == current {
+        // failure below cannot leave the cache ahead of durable storage, and
+        // so that a refusing mutation writes nothing at all.
+        let Some(next) = checked_candidate(&current, f)? else {
+            // Skip the keychain write when the candidate equals the
+            // freshly-read durable state — no I/O needed and no keychain ACL
+            // prompt on macOS.
             // Update the cache to the fresh read even on no-op so subsequent
             // reads in this process see any keys another process may have added.
             let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
             *guard = Some(current);
             return Ok(());
-        }
+        };
 
         // Write to keyring while still holding the file lock.
-        let json = serde_json::to_string(&next).map_err(|e| format!("blob serialize: {e}"))?;
+        // `serialize_blob` re-checks the `mcp:` record-count, value-size and
+        // whole-blob bounds, so an overflowing mutation is refused here rather
+        // than written as a blob no later read could accept.
+        let json = buzz_secret_store_pkg::serialize_blob(&next).map_err(|e| e.to_string())?;
         match self.write_blob_raw(json.as_bytes()) {
             Ok(()) => {
                 // Advance the cache to `next` only after the durable write succeeds.
@@ -1302,5 +1370,55 @@ mod tests {
         );
         // Agent key should also be gone.
         assert_eq!(store3.load("agent:abc123").unwrap(), None);
+    }
+
+    // ── The compare-and-set seam (`mutate_checked`) ───────────────────────
+    //
+    // These drive the shipped candidate builder every `mutate_checked` call
+    // goes through. They need no OS keychain, so they run on every platform
+    // and in CI — unlike the keychain-backed tests above, which are ignored.
+
+    #[test]
+    fn checked_candidate_refusal_abandons_the_candidate() {
+        // The guard: `f(&mut next)?`. Turn it into `let _ = f(&mut next);` and
+        // a refused predicate writes anyway, destroying the compare-and-set
+        // every calendar transition depends on.
+        let current = HashMap::from([("a".to_string(), "1".to_string())]);
+        let refused = checked_candidate(&current, |map| {
+            map.insert("a".to_string(), "2".to_string());
+            Err("the predicate refuses".to_string())
+        });
+        assert_eq!(refused, Err("the predicate refuses".to_string()));
+        assert_eq!(
+            current.get("a").map(String::as_str),
+            Some("1"),
+            "the freshly-read state is never mutated in place"
+        );
+    }
+
+    #[test]
+    fn checked_candidate_writes_only_a_real_change() {
+        let current = HashMap::from([("a".to_string(), "1".to_string())]);
+        assert_eq!(
+            checked_candidate(&current, |_| Ok(())),
+            Ok(None),
+            "a no-op mutation must not reach the keychain"
+        );
+        assert_eq!(
+            checked_candidate(&current, |map| {
+                map.insert("a".to_string(), "1".to_string());
+                Ok(())
+            }),
+            Ok(None),
+            "writing back the same value is still a no-op"
+        );
+        let changed = checked_candidate(&current, |map| {
+            map.insert("b".to_string(), "2".to_string());
+            Ok(())
+        })
+        .expect("an accepted mutation produces a candidate")
+        .expect("a real change is written");
+        assert_eq!(changed.get("b").map(String::as_str), Some("2"));
+        assert_eq!(changed.get("a").map(String::as_str), Some("1"));
     }
 }
