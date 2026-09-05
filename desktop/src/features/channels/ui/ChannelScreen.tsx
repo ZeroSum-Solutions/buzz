@@ -94,7 +94,7 @@ import { GuardedChannelPane } from "./GuardedChannelPane";
 import { useNavigationGuard } from "./useNavigationGuard";
 import * as searchForwarding from "./searchTargetForwarding";
 import { ChannelFilesTab } from "@/features/channel-files/ChannelFilesTab";
-import { useChannelFiles } from "@/features/channel-files/useChannelFiles";
+import { useChannelFilesIndex } from "@/features/channel-files/useChannelFilesIndex";
 import { useFileFolders } from "@/features/channel-files/useFileFolders";
 import {
   CHANNEL_TAB_CHAT,
@@ -237,7 +237,7 @@ export function ChannelScreen({
   React.useEffect(() => {
     if (activeTab === CHANNEL_TAB_FILES) setFilesTabOpened(true);
   }, [activeTab]);
-  const channelFiles = useChannelFiles(activeChannel, filesTabOpened);
+  const channelFiles = useChannelFilesIndex(activeChannel, filesTabOpened);
   const fileFoldersHook = useFileFolders(activeChannelId, currentPubkey);
   // Reset to chat tab when switching channels
   // biome-ignore lint/correctness/useExhaustiveDependencies: activeChannelId is the intentional reset trigger
@@ -1115,9 +1115,11 @@ export function ChannelScreen({
                       )}
                     >
                   <ChannelFilesTab
+                    canLoadOlder={channelFiles.canLoadOlder}
                     canMutateFolders={fileFoldersHook.canMutate}
                     fileFolderMap={fileFoldersHook.fileFolderMap}
                     files={channelFiles.files}
+                    filesError={channelFiles.error}
                     foldersError={fileFoldersHook.isError}
                     foldersInvalidReason={fileFoldersHook.invalidReason}
                     foldersLoading={fileFoldersHook.isLoading}
@@ -1127,6 +1129,7 @@ export function ChannelScreen({
                     onCreateFolder={fileFoldersHook.createFolder}
                     onDeleteFolder={fileFoldersHook.deleteFolder}
                     onJumpToMessage={handleJumpToMessage}
+                    onLoadOlder={channelFiles.refetch}
                     onMoveFolder={fileFoldersHook.moveFolder}
                     onRetryFiles={channelFiles.refetch}
                     onRetryFolders={() => void fileFoldersHook.refetch()}
