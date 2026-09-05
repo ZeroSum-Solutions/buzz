@@ -63,6 +63,12 @@ BOOTSTRAP_WAIT="${BUZZ_CI_BOOTSTRAP_WAIT:-3600}"
 SSH_WAIT="${BUZZ_CI_SSH_WAIT:-300}"
 MARKER=/var/lib/buzz-ci-bootstrap-done
 
+# Everything from here on can expand a credential: the admin key below, and the
+# runner secret on its way to ZS Vault. `bash -x` would print both to stderr,
+# and a redirected provisioning log would then hold them, so tracing is turned
+# off here and never turned back on. Trace the lines above this one if you need
+# it; below it, --dry-run and the ==> log lines already narrate every aws call.
+set +x
 AWS_REGION_NAME="${AWS_REGION:-us-east-1}"
 if [ -n "${AWS_ADMIN_ACCESS_KEY_ID-}" ] && [ -n "${AWS_ADMIN_SECRET_ACCESS_KEY-}" ]; then
   VAULT_ADMIN=1
@@ -83,6 +89,9 @@ LAUNCH_ATTEMPTED=0
 RUNNING_INSTANCE=""
 STOP_FAILED=0
 STOP_BACKOFF="${BUZZ_CI_STOP_BACKOFF:-5}"
+# An access key that exists but is not yet in the vault is an obligation, not a
+# result: the trap revokes it unless both vault writes finished.
+PENDING_KEY_ID=""
 CLIENT_TOKEN=""
 TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
 
@@ -285,8 +294,29 @@ rediscover_box() {
   return 1
 }
 
+revoke_pending_key() {
+  [ -n "$PENDING_KEY_ID" ] || return 0
+  local id="$PENDING_KEY_ID"
+  PENDING_KEY_ID=""
+  log "revoking the runner access key ${id}: it never reached ZS Vault"
+  run_aws iam delete-access-key --user-name "$RUNNER_USER" --access-key-id "$id" \
+    >/dev/null 2>&1 && return 0
+  cat >&2 <<EOF
+
+provision: AN ACTIVE IAM ACCESS KEY WAS LEFT BEHIND.
+${id} for ${RUNNER_USER} was created but never stored, and deleting it failed.
+Delete it by hand NOW:
+
+  aws iam delete-access-key --user-name ${RUNNER_USER} --access-key-id ${id}
+
+EOF
+  STOP_FAILED=1
+  return 1
+}
+
 provision_trap() {
   local rc=$?
+  revoke_pending_key || true
   if [ -z "$RUNNING_INSTANCE" ] && [ "$LAUNCH_ATTEMPTED" = 1 ] && [ "$DRY_RUN" = 0 ]; then
     if RUNNING_INSTANCE="$(rediscover_box)"; then
       log "recovered the launched instance id: ${RUNNING_INSTANCE}"
@@ -299,7 +329,11 @@ provision_trap() {
   if [ "$STOP_FAILED" = 1 ] && [ "$rc" -eq 0 ]; then rc=1; fi
   exit "$rc"
 }
-trap provision_trap EXIT INT TERM
+# A signal must not look like success: exit with a failing status so the EXIT
+# trap below discharges its obligations and the caller sees the interruption.
+on_signal() { exit 130; }
+trap on_signal INT TERM
+trap provision_trap EXIT
 
 caller_cidr() {
   if [ -n "$ALLOW_IP_CIDR" ]; then printf '%s\n' "$ALLOW_IP_CIDR"; return 0; fi
@@ -540,7 +574,27 @@ if [ -z "$INSTANCE_ID" ]; then
       "ResourceType=volume,Tags=[{Key=Name,Value=${BOX_NAME}},{Key=${OWNER_TAG_KEY},Value=${OWNER_TAG_VALUE}}]" \
     --user-data "file://${BOOTSTRAP}" \
     --query 'Instances[0].InstanceId')"
-  INSTANCE_ID="${INSTANCE_ID:-i-0dryrun0000000000}"
+  if [ "$DRY_RUN" = 1 ]; then
+    INSTANCE_ID="i-0dryrun0000000000"
+  else
+    # EC2 can accept run-instances and still return nothing useful. Recording a
+    # placeholder here would make the trap "stop" an id that does not exist
+    # while the real instance keeps billing with no alarm and no cron, so ask
+    # EC2 what it actually launched instead of inventing an id.
+    case "$INSTANCE_ID" in
+      i-[0-9a-f]*) : ;;
+      *)
+        log "run-instances returned '${INSTANCE_ID:-<empty>}'; asking EC2 what it launched"
+        INSTANCE_ID="$(rediscover_box)" \
+          || lost_box "run-instances was issued but no instance could be found by
+its client token ${CLIENT_TOKEN} and owner tag."
+        case "$INSTANCE_ID" in
+          i-[0-9a-f]*) log "recovered the launched instance id: ${INSTANCE_ID}" ;;
+          *) die "could not determine the launched instance id" ;;
+        esac
+        ;;
+    esac
+  fi
   RUNNING_INSTANCE="$INSTANCE_ID"
   CREATED=1
 else
@@ -688,6 +742,10 @@ zsvault, then re-run: everything else is already in place."
       --query 'AccessKey.[AccessKeyId,SecretAccessKey]')"
     key_id="$(printf '%s' "$key_line" | awk '{print $1}')"
     [ -n "$key_id" ] || die "create-access-key returned no key id"
+    # From here until both vault writes land, this key is an obligation the
+    # EXIT/INT/TERM trap must discharge: a Ctrl-C in between would otherwise
+    # leave an active long-lived credential whose secret nobody holds.
+    PENDING_KEY_ID="$key_id"
     vault_ok=1
     printf '%s' "$key_line" | awk '{printf "%s", $1}' \
       | zsvault add aws_ci_runner_access_key_id --type api_key \
@@ -699,15 +757,12 @@ zsvault, then re-run: everything else is already in place."
     fi
     key_line=""
     if [ "$vault_ok" = 0 ]; then
-      log "a zsvault write failed; deleting the IAM access key again"
-      run_aws iam delete-access-key --user-name "$RUNNER_USER" --access-key-id "$key_id" \
-        >/dev/null 2>&1 \
-        || die "could not store the runner key in ZS Vault AND could not delete it.
-Delete it by hand NOW:
-  aws iam delete-access-key --user-name ${RUNNER_USER} --access-key-id ${key_id}"
-      die "could not store the runner key in ZS Vault; the IAM key was deleted again.
+      log "a zsvault write failed; the IAM access key is being revoked again"
+      revoke_pending_key || true
+      die "could not store the runner key in ZS Vault.
 Fix zsvault, then re-run this script."
     fi
+    PENDING_KEY_ID=""   # both halves are in the vault; the obligation is met
     log "runner key ${key_id} stored as aws_ci_runner_access_key_id and aws_ci_runner_secret_access_key"
   fi
 fi

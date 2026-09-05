@@ -108,6 +108,17 @@ EOF
 die() { printf 'remote-ci: %s\n' "$*" >&2; exit 2; }
 log() { printf '==> %s\n' "$*" >&2; }
 
+# A containment limit that can be set to 0 is not a limit: GNU timeout treats 0
+# as "no timeout", and a 0-byte log cap keeps the whole log. Every numeric
+# override is checked before the first AWS call.
+require_int() { # require_int <name> <value> <min> <max>
+  case "$2" in
+    ''|*[!0-9]*) die "${1} must be a whole number, not '${2}'" ;;
+  esac
+  [ "$2" -ge "$3" ] && [ "$2" -le "$4" ] \
+    || die "${1}=${2} is outside ${3}..${4}; refusing to weaken the limit it sets"
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --keep) KEEP=1; shift ;;
@@ -126,6 +137,13 @@ if [ $# -gt 0 ]; then
   TARGETS=("$@")
 fi
 [ "${#TARGETS[@]}" -gt 0 ] || TARGETS=(ci)
+
+require_int REMOTE_CI_GATE_TIMEOUT "$GATE_TIMEOUT" 60 86400
+require_int REMOTE_CI_LOG_CAP "$LOG_CAP_BYTES" 1048576 10737418240
+require_int REMOTE_CI_REPORT_CAP_KB "$REPORT_CAP_KB" 1024 10485760
+require_int REMOTE_CI_SSH_WAIT "$SSH_WAIT_SECONDS" 1 3600
+require_int REMOTE_CI_STOPPING_WAIT "$STOPPING_WAIT_SECONDS" 1 3600
+require_int REMOTE_CI_STOP_BACKOFF "$STOP_BACKOFF" 0 300
 
 # ── the script this run executes on the box ──────────────────────────────────
 # Written here and copied over, so no quoting of the just targets survives a
@@ -523,24 +541,43 @@ esac
 [ "$GATE_RC" = 124 ] && log "the gate hit its ${GATE_TIMEOUT}s timeout"
 
 # ── bring the report home ────────────────────────────────────────────────────
-report_kb="$(ssh "${SSH_OPTS[@]}" "$REMOTE" \
-  "du -sk ${REMOTE_REPO}/desktop/playwright-report 2>/dev/null | cut -f1" 2>/dev/null || true)"
-case "$report_kb" in
-  ''|*[!0-9]*) : ;;
-  *)
-    if [ "$report_kb" -gt "$REPORT_CAP_KB" ]; then
-      log "the playwright report is ${report_kb} KB, over the ${REPORT_CAP_KB} KB cap; not copying it"
-      log "read it on the box: ssh -i ${KEY_PATH} ${REMOTE}"
+# An absent report and a broken probe are different facts. The probe prints
+# "absent" or "present" on stdout; anything else is a failure we name.
+REPORT_NOTE=""
+probe_err="${WORKDIR}/probe.err"
+report_state="$(ssh "${SSH_OPTS[@]}" "$REMOTE" \
+  "test -d ${REMOTE_REPO}/desktop/playwright-report && echo present || echo absent" \
+  2>"$probe_err")" || report_state="probe-failed"
+case "$report_state" in
+  absent)
+    :
+    ;;
+  present)
+    mkdir -p "$REPORT_DIR"
+    # Bounded transfer, not a preflight size check: a gate that is still
+    # writing could pass a `du` check and then overrun the cap during the copy.
+    # tar streams a snapshot, `head -c` cuts it at the cap, and the whole thing
+    # has a deadline. A truncated stream makes tar fail, which is reported.
+    cap_bytes=$(( REPORT_CAP_KB * 1024 ))
+    if ssh "${SSH_OPTS[@]}" "$REMOTE" \
+         "timeout 600 tar -C ${REMOTE_REPO}/desktop -cf - playwright-report" \
+         2>"${WORKDIR}/tar.err" \
+       | head -c "$cap_bytes" \
+       | tar -C "$REPORT_DIR" -xf - 2>"${WORKDIR}/untar.err"; then
+      log "playwright report: ${REPORT_DIR}"
     else
-      mkdir -p "$REPORT_DIR"
-      if scp -r "${SSH_OPTS[@]}" "${REMOTE}:${REMOTE_REPO}/desktop/playwright-report" "$REPORT_DIR/" >/dev/null; then
-        log "playwright report: ${REPORT_DIR}"
-      else
-        log "WARNING: could not copy the playwright report back"
-      fi
+      REPORT_NOTE="the playwright report did not copy back in full (over the ${REPORT_CAP_KB} KB cap, or the transfer failed)"
+      log "WARNING: ${REPORT_NOTE}"
+      log "read it on the box: ssh -i ${KEY_PATH} ${REMOTE}"
+      [ -s "${WORKDIR}/tar.err" ] && log "remote tar said: $(head -3 "${WORKDIR}/tar.err")"
     fi
+    ;;
+  *)
+    REPORT_NOTE="could not tell whether a playwright report exists: $(head -3 "$probe_err" | tr '\n' ' ')"
+    log "WARNING: ${REPORT_NOTE}"
     ;;
 esac
 
 log "gate exit code: ${GATE_RC}"
+[ -n "$REPORT_NOTE" ] && log "report note: ${REPORT_NOTE}"
 exit "$GATE_RC"

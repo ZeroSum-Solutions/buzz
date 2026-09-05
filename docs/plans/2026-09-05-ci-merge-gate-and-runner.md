@@ -171,6 +171,16 @@ the target and removes untracked files while keeping ignored ones (`node_modules
 - An adopted role must carry the exact EC2-only trust policy (one statement, `ec2.amazonaws.com`,
   `sts:AssumeRole`, no other principal and no condition) and belong to our instance profile and
   no other. Policy names alone do not say who may assume a role.
+- `provision.sh` turns `xtrace` off before the first credential-bearing expansion and never
+  turns it back on, so `bash -x` cannot put the admin key or the runner secret into a redirected
+  log. An access key that exists but is not yet in the vault is a cleanup obligation the
+  EXIT/INT/TERM trap discharges, so a Ctrl-C mid-handoff revokes the key rather than leaving an
+  active credential nobody holds the secret for. A signal exits non-zero, never 0.
+- A launch that returns no instance id is resolved by asking EC2 for the instance carrying the
+  client token and owner tag; a placeholder id is never recorded.
+- The Playwright report comes back through a bounded stream (`tar` over ssh with a deadline, cut
+  at the cap) rather than a preflight size check a still-writing gate could beat, and a probe
+  that fails is reported as a probe failure, not as "no report".
 - A stop that fails is retried five times with backoff and then reported loudly, naming the
   instance id and the exact `aws ec2 stop-instances` command. It is never a warning, and it
   makes the run exit non-zero even when the gate itself was green. If `run-instances` succeeded
@@ -208,7 +218,7 @@ the target and removes untracked files while keeping ignored ones (`node_modules
 5. **After a network change**, refresh the SSH allow-list: `scripts/zs/remote-ci/provision.sh
    --allow-ip`. The security group opens port 22 to the caller's public IP only.
 
-Verification available now, with no AWS account: `scripts/zs/remote-ci/test-remote-ci.sh` (98
+Verification available now, with no AWS account: `scripts/zs/remote-ci/test-remote-ci.sh` (119
 checks). It shellchecks all four scripts, runs `provision.sh --dry-run` against a stub `aws` and
 asserts the whole plan (instance type, 200 GB volume, client token, owner tag, alarm, both IAM
 policies, the final stop) while asserting the real `aws` was never called. Each guard is driven

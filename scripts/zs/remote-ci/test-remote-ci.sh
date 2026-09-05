@@ -50,6 +50,10 @@ done
 owner="${AWS_STUB_OWNER:-buzz-remote-ci}"
 case "$*" in
   *"sts get-caller-identity"*) echo "111122223333" ;;
+  *"describe-instances"*"client-token"*)
+    echo "${AWS_STUB_REDISCOVERED:-i-0recovered00000000}"
+    ;;
+  *"run-instances"*) echo "${AWS_STUB_RUN_ID-i-0launched000000000}" ;;
   *"describe-instances"*)
     case "$query" in
       *State.Name*) echo "${AWS_STUB_STATE:-stopped}" ;;
@@ -243,6 +247,12 @@ cat > "${WORK}/bin/zsvault" <<'VAULT'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${ZSVAULT_STUB_LOG:?}"
 cat >/dev/null
+# ZSVAULT_STUB_KILL simulates an interrupt arriving between create-access-key
+# and the vault write landing: the caller is signalled, not returned to.
+if [ -n "${ZSVAULT_STUB_KILL:-}" ]; then
+  kill -TERM "$PPID" 2>/dev/null
+  sleep 5
+fi
 exit "${ZSVAULT_STUB_RC:-0}"
 VAULT
 chmod +x "${WORK}/bin/zsvault"
@@ -287,6 +297,63 @@ if [ -z "$(find "$WORK" -name '*buzz-ci-runner*' 2>/dev/null)" ]; then
   pass "the runner secret is never written to a file"
 else
   fail "the runner secret is never written to a file" "$(find "$WORK" -name '*buzz-ci-runner*')"
+fi
+
+# An interrupt between create-access-key and the vault write must still revoke
+# the key: the stub signals provision.sh instead of returning.
+: > "${WORK}/kill-aws.log"
+kill_rc=0
+kill_out="$(export ZSVAULT_STUB_KILL=1 EXTRA_PATH="${WORK}/sshbin:"
+  adopt_provision "${WORK}/kill-aws.log" 2>&1)" || kill_rc=$?
+unset ZSVAULT_STUB_KILL EXTRA_PATH
+if [ "$kill_rc" -ne 0 ]; then
+  pass "an interrupt during the vault handoff fails provisioning"
+else
+  fail "an interrupt during the vault handoff fails provisioning" "exited 0: ${kill_out}"
+fi
+if grep -q 'iam delete-access-key' "${WORK}/kill-aws.log"; then
+  pass "an interrupt during the vault handoff revokes the pending key"
+else
+  fail "an interrupt during the vault handoff revokes the pending key" "$(cat "${WORK}/kill-aws.log")"
+fi
+
+# `bash -x` must never print either credential.
+: > "${WORK}/xtrace-aws.log"
+xtrace_err="${WORK}/xtrace.err"
+AWS_STUB_LOG="${WORK}/xtrace-aws.log" \
+AWS_ADMIN_ACCESS_KEY_ID=AKIAFAKEADMINKEYID \
+AWS_ADMIN_SECRET_ACCESS_KEY=s3cr3t-admin-value-never-print \
+PATH="${WORK}/bin:$PATH" AWS_REGION=us-east-1 \
+BUZZ_CI_KEY_PATH="${WORK}/xtrace.pem" \
+  bash -x "$PROVISION" --dry-run >/dev/null 2>"$xtrace_err" || true
+if grep -q 's3cr3t-admin-value-never-print' "$xtrace_err"; then
+  fail "bash -x never prints the admin secret" "the secret is in the trace"
+else
+  pass "bash -x never prints the admin secret"
+fi
+if grep -q 'stub-secret-value' "$xtrace_err"; then
+  fail "bash -x never prints the runner secret" "the secret is in the trace"
+else
+  pass "bash -x never prints the runner secret"
+fi
+
+# A launch that returns no id is rediscovered, never recorded as a placeholder.
+: > "${WORK}/relaunch-aws.log"
+relaunch_rc=0
+relaunch_out="$(export AWS_STUB_RUN_ID='None'
+  AWS_STUB_LOG="${WORK}/relaunch-aws.log" AWS_STUB_INSTANCES="" \
+  PATH="${WORK}/bin:$PATH" AWS_PROFILE=stub-admin AWS_REGION=us-east-1 \
+  BUZZ_CI_KEY_PATH="${WORK}/relaunch.pem" BUZZ_CI_STOP_BACKOFF=0 \
+    "$PROVISION" --no-wait-bootstrap 2>&1)" || relaunch_rc=$?
+case "$relaunch_out" in
+  *"recovered the launched instance id: i-0recovered00000000"*)
+    pass "an id-less launch is rediscovered by client token" ;;
+  *) fail "an id-less launch is rediscovered by client token" "$relaunch_out (rc=${relaunch_rc})" ;;
+esac
+if grep -q 'i-0dryrun' "${WORK}/relaunch-aws.log"; then
+  fail "no placeholder instance id is ever used" "$(cat "${WORK}/relaunch-aws.log")"
+else
+  pass "no placeholder instance id is ever used"
 fi
 
 # ── 5. remote-ci.sh --help ───────────────────────────────────────────────────
@@ -369,6 +436,31 @@ else
     *) fail "box.env with a bad instance id is rejected" "$bi_out" ;;
   esac
 fi
+
+# A limit that can be set to 0 is not a limit.
+for pair in "REMOTE_CI_GATE_TIMEOUT=0" "REMOTE_CI_LOG_CAP=0" "REMOTE_CI_REPORT_CAP_KB=0"; do
+  name="${pair%%=*}"
+  lim_rc=0
+  lim_out="$(export "${pair?}"; run_remote_ci zs/main 2>&1)" || lim_rc=$?
+  unset "$name"
+  if [ "$lim_rc" -ne 0 ]; then
+    pass "${name}=0 is rejected"
+  else
+    fail "${name}=0 is rejected" "exited 0"
+  fi
+  case "$lim_out" in
+    *"outside"*) pass "${name}=0 says why it is rejected" ;;
+    *) fail "${name}=0 says why it is rejected" "$lim_out" ;;
+  esac
+done
+bad_rc=0
+bad_out="$(export REMOTE_CI_GATE_TIMEOUT=abc; run_remote_ci zs/main 2>&1)" || bad_rc=$?
+unset REMOTE_CI_GATE_TIMEOUT
+if [ "$bad_rc" -ne 0 ]; then pass "a non-numeric override is rejected"; else fail "a non-numeric override is rejected" "exited 0"; fi
+case "$bad_out" in
+  *"must be a whole number"*) pass "a non-numeric override says why" ;;
+  *) fail "a non-numeric override says why" "$bad_out" ;;
+esac
 
 miss_rc=0
 miss_out="$(REMOTE_CI_BOX_ENV="${WORK}/absent.env" "$REMOTE_CI" zs/main 2>&1)" || miss_rc=$?
@@ -518,7 +610,9 @@ check_absent "bootstrap grants the ci user no blanket root" "$BOOTSTRAP" \
 check_contains "bootstrap writes its marker only at the end" "$BOOTSTRAP" \
   'date -u +%FT%TZ > "$MARKER"'
 check_contains "provision arms the stop trap before launching" "$PROVISION" \
-  "trap provision_trap EXIT INT TERM"
+  "trap provision_trap EXIT"
+check_contains "provision treats a signal as a failure" "$PROVISION" \
+  "trap on_signal INT TERM"
 check_contains "provision rediscovers a lost instance by client token" "$PROVISION" \
   "Name=client-token,Values="
 check_contains "provision keeps the instance recorded until EC2 confirms" "$PROVISION" \
@@ -551,6 +645,18 @@ check_contains "remote-ci refuses an oversized report" "$REMOTE_CI" \
   "over the \${REPORT_CAP_KB} KB cap"
 check_contains "remote-ci fails a green gate whose box did not stop" "$REMOTE_CI" \
   'if [ "$STOP_FAILED" = 1 ] && [ "$rc" -eq 0 ]; then rc=1; fi'
+check_contains "remote-ci copies the report through a bounded stream" "$REMOTE_CI" \
+  'head -c "$cap_bytes"'
+check_contains "remote-ci bounds the report transfer in time" "$REMOTE_CI" \
+  "timeout 600 tar -C"
+check_contains "remote-ci tells a missing report from a failed probe" "$REMOTE_CI" \
+  "could not tell whether a playwright report exists"
+check_contains "provision turns xtrace off before touching a credential" "$PROVISION" \
+  "set +x"
+check_contains "provision records the new key as a cleanup obligation" "$PROVISION" \
+  'PENDING_KEY_ID="$key_id"'
+check_contains "provision revokes a pending key from its trap" "$PROVISION" \
+  "revoke_pending_key || true"
 
 printf '\n%s\n' "-----"
 if [ "$FAILURES" -eq 0 ]; then
