@@ -425,6 +425,17 @@ Created on the fork only when Devin asks. Titles:
   `just desktop-tauri-test`, `just desktop-tauri-test-compiled-flags` and every `cargo test`
   or `cargo nextest run`. Three worktrees running those at once is what made `buzz-agent`'s
   cancellation test flake locally. Fast gates (fmt, clippy, checks) do not take the lock.
+- Once `scripts/zs/remote-ci/box.env` exists, a builder may run the heavy gates on the
+  on-demand AWS Linux box instead of taking the machine-wide gate lock:
+  `scripts/zs/remote-ci.sh <branch> [just targets...]` (default target `ci`). It starts the
+  stopped instance, checks the branch out there, streams the log to the terminal and to
+  `~/Inbox/notes/`, copies any Playwright report to `~/Inbox/misc/`, stops the instance again
+  and exits with the gate's own exit code — so a green run there means the same thing a green
+  local gate means, without holding the lock or heating the Mac. Use `--push-local <branch>`
+  for a branch that is not pushed yet (it sends the committed tree, never uncommitted work) and
+  `--status` to check the box. If `box.env` is absent the script says so and does nothing; fall
+  back to `with-gate-lock.sh`. Blacksmith stays the merge gate either way. Setup and cost
+  guardrails: `docs/plans/2026-09-05-ci-merge-gate-and-runner.md`, Step 3.
 - A header-box change moved `chromeWrapperRef` and shifted the channel column by 42 px without
   failing any existing test, until the file-drop overlay no longer lined up with the drop zone.
   The geometry test in `channel-files-tab.spec.ts` now binds the measured chrome height to the
