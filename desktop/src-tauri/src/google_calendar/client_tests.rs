@@ -337,6 +337,27 @@ impl ProxySentinel {
     fn connections(&self) -> usize {
         self.seen.load(Ordering::Relaxed)
     }
+
+    /// Waits until the accept counter has not moved for 300 ms and returns it.
+    /// The accept loop polls with a 5 ms sleep and `reqwest` retries an
+    /// idempotent request whose connection closed early, so accepts from a
+    /// request that already returned can still be landing when the caller
+    /// reads the counter.
+    fn quiesced_connections(&self) -> usize {
+        let mut last = self.connections();
+        let mut stable_reads = 0;
+        while stable_reads < 3 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let now = self.connections();
+            if now == last {
+                stable_reads += 1;
+            } else {
+                last = now;
+                stable_reads = 0;
+            }
+        }
+        last
+    }
 }
 
 impl Drop for ProxySentinel {
@@ -417,7 +438,11 @@ fn google_calendar_transport_never_routes_a_bearer_token_through_an_environment_
         sentinel.connections() > 0,
         "the negative control must actually reach the sentinel, or this test proves nothing"
     );
-    let routed = sentinel.connections();
+    // Close the leaky client's pool and let every accept it caused land before
+    // the baseline is read; a late accept must not be charged to the pinned
+    // transport below.
+    drop(leaky);
+    let routed = sentinel.quiesced_connections();
     server.with_state(|state| state.requests.clear());
 
     // The shipped configuration, with the same environment set at build time,
