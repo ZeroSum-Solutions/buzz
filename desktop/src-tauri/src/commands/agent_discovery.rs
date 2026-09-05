@@ -164,6 +164,10 @@ pub async fn save_custom_harness(
         source: HarnessSource::Custom,
         definition_env: definition.env,
         max_parallelism: crate::managed_agents::harness_max_parallelism(&definition.command),
+        // A custom harness definition carries no MCP capability facts.
+        mcp_config_placement: crate::managed_agents::McpConfigPlacement::Unsupported,
+        mcp_transports: Vec::new(),
+        mcp_native_transports: Vec::new(),
     })
 }
 

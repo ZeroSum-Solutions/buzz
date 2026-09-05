@@ -87,6 +87,10 @@ pub(super) fn preset_catalog_entry(
         // unavailable entries (command: null in JSON, None here) still carry
         // the cap — the harness cap is command-keyed, not availability-gated.
         max_parallelism: crate::managed_agents::harness_max_parallelism(def.command),
+        // Presets are plain ACP entries; the registry writes no config for them.
+        mcp_config_placement: crate::managed_agents::McpConfigPlacement::Unsupported,
+        mcp_transports: Vec::new(),
+        mcp_native_transports: Vec::new(),
     }
 }
 

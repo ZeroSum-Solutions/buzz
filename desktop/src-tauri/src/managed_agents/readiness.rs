@@ -1071,6 +1071,9 @@ mod tests {
             required_normalized_fields: &[],
             login_hint: None,
             auth_probe_args: None,
+            mcp_config_placement: crate::managed_agents::McpConfigPlacement::Unsupported,
+            mcp_transports: &[],
+            mcp_native_transports: &[],
         }
     }
 
@@ -1265,6 +1268,9 @@ mod tests {
             required_normalized_fields: &[],
             login_hint: None,
             auth_probe_args: None,
+            mcp_config_placement: crate::managed_agents::McpConfigPlacement::Unsupported,
+            mcp_transports: &[],
+            mcp_native_transports: &[],
         }
     }
 

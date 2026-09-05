@@ -36,6 +36,22 @@ X" flag): add it to `KnownAcpRuntime` first, expose it on
 `AcpRuntimeCatalogEntry`, then project it through the core. Do not shortcut
 with a TypeScript lookup table or an id comparison in a component.
 
+**MCP registry capability facts.** Three fields on `KnownAcpRuntime` describe
+how the MCP registry may configure a harness, and they follow the rule above:
+`mcp_config_placement` (`ProjectFileInWorkdir` for Claude's cwd-relative
+`.mcp.json` with `CLAUDE_CONFIG_DIR` deliberately unset, `EnvRootedDir` for
+Codex's `CODEX_HOME/config.toml`, `Unsupported` for a runtime with no native
+MCP config), `mcp_transports` (what the registry may offer a runtime) and
+`mcp_native_transports` (what that runtime's own config file accepts). The last
+two are separate on purpose: buzz-agent is offered stdio through a registry
+file handed over in `BUZZ_ACP_MCP_REGISTRY`, while its own config accepts no
+MCP transport at all, so one field could not express both. All three are
+projected onto `AcpRuntimeCatalogEntry` and reach TypeScript as
+`mcpConfigPlacement`, `mcpTransports` and `mcpNativeTransports`. An env-var
+*name* cannot stand in for the placement, which is why the earlier
+`mcp_config_root_env` shape was dropped. Design memo:
+`docs/plans/2026-09-04-mcp-registry-design.md` decision 11.
+
 ## Rules
 
 1. **No hardcoded harness-ID checks in render code.** `runtime.id === "claude"`

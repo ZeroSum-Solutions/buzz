@@ -64,6 +64,46 @@ impl EffortNormalization {
     }
 }
 
+/// A transport an MCP server can speak.
+///
+/// Kept as two separate facts on [`KnownAcpRuntime`]: what the registry may
+/// offer a runtime (`mcp_transports`) is not the same question as what that
+/// runtime's own config file accepts (`mcp_native_transports`). buzz-agent is
+/// the case that forces the split — the registry offers it stdio through a
+/// handed-over file, and its own config accepts no MCP transport at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTransport {
+    /// A child process speaking MCP over stdio.
+    Stdio,
+    /// A Streamable HTTP endpoint.
+    Http,
+}
+
+/// Where a runtime's generated MCP configuration has to be written.
+///
+/// An env-var *name* alone cannot express this: Claude reads a cwd-relative
+/// project file with `CLAUDE_CONFIG_DIR` deliberately unset, and Codex reads a
+/// file under a directory named by an env var.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum McpConfigPlacement {
+    /// A project file inside the agent's working directory, e.g. `.mcp.json`.
+    ProjectFileInWorkdir {
+        /// File name, relative to the agent's working directory.
+        file: &'static str,
+    },
+    /// A file inside a directory named by an environment variable.
+    EnvRootedDir {
+        /// The variable naming the directory.
+        var: &'static str,
+        /// File name inside it.
+        file: &'static str,
+    },
+    /// This runtime has no native MCP config file to generate.
+    Unsupported,
+}
+
 /// Static capabilities and installation metadata for a known ACP runtime.
 pub(crate) struct KnownAcpRuntime {
     pub id: &'static str,
@@ -159,6 +199,12 @@ pub(crate) struct KnownAcpRuntime {
     /// CLI args for probing authentication status. `args[0]` is the binary name;
     /// the remainder are the subcommand. `None` for runtimes with no login step.
     pub auth_probe_args: Option<&'static [&'static str]>,
+    /// Where this runtime's generated MCP configuration must be written.
+    pub mcp_config_placement: McpConfigPlacement,
+    /// Transports the MCP registry may offer this runtime.
+    pub mcp_transports: &'static [McpTransport],
+    /// Transports this runtime's own config file accepts.
+    pub mcp_native_transports: &'static [McpTransport],
 }
 
 impl KnownAcpRuntime {
@@ -181,6 +227,52 @@ impl KnownAcpRuntime {
 #[cfg(test)]
 mod tests {
     use super::super::known_acp_runtime_exact;
+    use super::{McpConfigPlacement, McpTransport};
+
+    /// Memo decision 11: every `KnownAcpRuntime` fills all three MCP capability
+    /// facts, and `mcp_transports` is kept apart from `mcp_native_transports`.
+    /// Deleting either distinction fails here.
+    #[test]
+    fn mcp_capability_facts_are_declared_per_runtime() {
+        let claude = known_acp_runtime_exact("claude").expect("claude is in the catalog");
+        assert_eq!(
+            claude.mcp_config_placement,
+            McpConfigPlacement::ProjectFileInWorkdir { file: ".mcp.json" },
+            "Claude reads a cwd-relative project file with CLAUDE_CONFIG_DIR unset"
+        );
+        assert_eq!(
+            claude.mcp_transports,
+            &[McpTransport::Stdio, McpTransport::Http]
+        );
+
+        let codex = known_acp_runtime_exact("codex").expect("codex is in the catalog");
+        assert_eq!(
+            codex.mcp_config_placement,
+            McpConfigPlacement::EnvRootedDir {
+                var: "CODEX_HOME",
+                file: "config.toml",
+            }
+        );
+
+        let goose = known_acp_runtime_exact("goose").expect("goose is in the catalog");
+        assert_eq!(goose.mcp_config_placement, McpConfigPlacement::Unsupported);
+        assert!(goose.mcp_transports.is_empty());
+
+        // buzz-agent is why the two transport facts are separate: the registry
+        // offers it stdio through a handed-over file, and its own config
+        // accepts no MCP transport at all.
+        let buzz_agent =
+            known_acp_runtime_exact("buzz-agent").expect("buzz-agent is in the catalog");
+        assert_eq!(
+            buzz_agent.mcp_config_placement,
+            McpConfigPlacement::Unsupported
+        );
+        assert_eq!(buzz_agent.mcp_transports, &[McpTransport::Stdio]);
+        assert!(
+            buzz_agent.mcp_native_transports.is_empty(),
+            "collapsing the two facts into one would let the registry write a native config buzz-agent cannot read"
+        );
+    }
 
     #[test]
     fn vendor_metadata_distinguishes_cli_and_adapter_guidance() {

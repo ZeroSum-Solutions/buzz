@@ -29,9 +29,9 @@ pub(crate) use presets::{
 };
 use presets::{preset_catalog_entry, PRESET_HARNESSES};
 pub(crate) use runtime_metadata::EffortNormalization;
-pub(crate) use runtime_metadata::KnownAcpRuntime;
 #[cfg(test)]
 pub(crate) use runtime_metadata::GOOSE_EFFORT_NORMALIZATION;
+pub(crate) use runtime_metadata::{KnownAcpRuntime, McpConfigPlacement, McpTransport};
 
 const GOOSE_AVATAR_URL: &str = "https://goose-docs.ai/img/logo_dark.png";
 const CLAUDE_CODE_AVATAR_URL: &str = "https://anthropic.gallerycdn.vsassets.io/extensions/anthropic/claude-code/2.1.77/1773707456892/Microsoft.VisualStudio.Services.Icons.Default";
@@ -1154,6 +1154,11 @@ fn discover_acp_runtime_phase1(runtime: &'static KnownAcpRuntime, force: bool) -
             source: HarnessSource::Builtin,
             definition_env: Default::default(),
             max_parallelism: super::parallelism::harness_max_parallelism(runtime.id),
+            // One source for every harness capability fact: projected from the
+            // Rust catalog, never rebuilt on the TypeScript side.
+            mcp_config_placement: runtime.mcp_config_placement,
+            mcp_transports: runtime.mcp_transports.to_vec(),
+            mcp_native_transports: runtime.mcp_native_transports.to_vec(),
         },
     }
 }
@@ -1296,6 +1301,10 @@ pub fn discover_acp_runtimes_from(
                 source: HarnessSource::Custom,
                 definition_env: def.env.clone(), // preserve for edit round-trip
                 max_parallelism: super::parallelism::harness_max_parallelism(&def.command),
+                // The registry never writes config for a custom harness.
+                mcp_config_placement: McpConfigPlacement::Unsupported,
+                mcp_transports: Vec::new(),
+                mcp_native_transports: Vec::new(),
             });
         }
     }

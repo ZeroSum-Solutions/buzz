@@ -703,6 +703,18 @@ pub struct AcpRuntimeCatalogEntry {
     /// Spawn-time parallelism cap; absent for uncapped harnesses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_parallelism: Option<u32>,
+    /// Where this runtime's generated MCP configuration must be written.
+    ///
+    /// Projected from `KnownAcpRuntime` so the Settings panel and the config
+    /// writer read one value and cannot drift. `Unsupported` for preset and
+    /// custom harnesses, which the registry never generates config for.
+    pub mcp_config_placement: super::discovery::McpConfigPlacement,
+    /// Transports the MCP registry may offer this runtime.
+    pub mcp_transports: Vec<super::discovery::McpTransport>,
+    /// Transports this runtime's own config file accepts. Deliberately separate
+    /// from `mcp_transports`: buzz-agent is offered stdio through a handed-over
+    /// registry file while its own config accepts no MCP transport at all.
+    pub mcp_native_transports: Vec<super::discovery::McpTransport>,
 }
 
 /// Result of a single install step (CLI or adapter).
