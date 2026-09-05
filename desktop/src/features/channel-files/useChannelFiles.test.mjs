@@ -8,6 +8,7 @@ import {
   projectChannelFiles,
   sortFiles,
 } from "./useChannelFiles.ts";
+import { MAX_IMETA_TAGS_SCANNED } from "./boundedImeta.ts";
 
 const SHA = "d".repeat(64);
 
@@ -335,4 +336,34 @@ test("categorizeFile maps mime types to categories", () => {
   assert.equal(categorizeFile("application/pdf"), "document");
   assert.equal(categorizeFile("text/markdown"), "document");
   assert.equal(categorizeFile("application/octet-stream"), "other");
+});
+
+test("parseChannelFiles bounds the tag scan by every tag, not only imeta tags", () => {
+  const tags = [];
+  for (let i = 0; i < 5_000; i++) tags.push(["p", `pubkey-${i}`]);
+  tags.push(
+    imetaTag({ url: "https://relay.example/media/late.png", m: "image/png" }),
+  );
+
+  let indexReads = 0;
+  const counted = new Proxy(tags, {
+    get(target, property, receiver) {
+      if (typeof property === "string" && /^\d+$/.test(property)) {
+        indexReads += 1;
+      }
+      return Reflect.get(target, property, receiver);
+    },
+  });
+
+  const files = parse([relayEvent({ id: "tag-flood", tags: counted })]);
+
+  assert.equal(
+    files.length,
+    0,
+    "an imeta tag past the scan budget is never reached",
+  );
+  assert.ok(
+    indexReads <= MAX_IMETA_TAGS_SCANNED,
+    `the scan must stop at the budget; it read ${indexReads} tags`,
+  );
 });

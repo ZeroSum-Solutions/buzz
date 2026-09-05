@@ -5,14 +5,22 @@
  * walks every tag and every part of a relay event and materialises the whole
  * map before any caller-side cap runs. The Files tab projects *every* loaded
  * message, so that scan is the hot path: the bounds below stop the scan
- * itself, validate each field before it is stored, and keep nothing but the
+ * itself — every tag the loop touches spends the budget, not only the imeta
+ * ones — validate each field before it is stored, and keep nothing but the
  * capped copies — a hostile event costs a bounded amount of work, memory and
  * DOM, not a bounded-looking render over unbounded strings.
  */
 
 /** A real message carries a handful of attachments; generous headroom. */
 export const MAX_ATTACHMENTS_PER_EVENT = 20;
-/** Tags scanned before giving up on an event, however many it declares. */
+/**
+ * Tags examined per event before the scan gives up, imeta or not.
+ *
+ * The budget bounds the loop itself, so an event padded with cheap non-imeta
+ * tags costs the same as an event with 64 tags. A 512 KiB relay frame
+ * (`crates/buzz-relay/src/config.rs:14`) holds tens of thousands of minimal
+ * tags; counting only the imeta ones would leave the walk unbounded.
+ */
 export const MAX_IMETA_TAGS_SCANNED = 64;
 /** Parts scanned inside one imeta tag. */
 export const MAX_IMETA_PARTS_PER_TAG = 32;
@@ -69,13 +77,12 @@ function acceptSize(value: string): number | undefined {
 export function parseBoundedImeta(tags: string[][]): BoundedAttachment[] {
   const result: BoundedAttachment[] = [];
   const seen = new Set<string>();
-  let tagsScanned = 0;
+  const scanLimit = Math.min(tags.length, MAX_IMETA_TAGS_SCANNED);
 
-  for (const tag of tags) {
+  for (let tagIndex = 0; tagIndex < scanLimit; tagIndex += 1) {
     if (result.length >= MAX_ATTACHMENTS_PER_EVENT) break;
-    if (tagsScanned >= MAX_IMETA_TAGS_SCANNED) break;
-    if (tag[0] !== "imeta") continue;
-    tagsScanned += 1;
+    const tag = tags[tagIndex];
+    if (!Array.isArray(tag) || tag[0] !== "imeta") continue;
 
     let url: string | undefined;
     let mimeType: string | undefined;
