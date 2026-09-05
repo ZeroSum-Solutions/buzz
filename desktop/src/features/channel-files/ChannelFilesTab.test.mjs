@@ -529,9 +529,13 @@ test("a truncated index tells the user the list is partial", async () => {
     truncated: true,
   });
   try {
-    assert.ok(
-      partial.screen.getByText(/Showing the most recent attachments only/),
+    const banner = partial.screen.getByText(
+      /Showing the most recent attachments only/,
     );
+    // It must name what is missing, not just that something is: the index
+    // drops the OLDEST attachments, and a reader who is not told that reads a
+    // partial list as the whole channel.
+    assert.match(banner.textContent, /older ones are not listed/);
   } finally {
     partial.cleanup();
   }

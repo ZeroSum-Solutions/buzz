@@ -17,6 +17,10 @@
  * index is long-lived and re-projected on every arrival, so an unbounded event
  * kept here would cost unbounded work and memory for as long as the tab is
  * open, not just for one render.
+ *
+ * The retention caps evict rather than refuse ({@link admitNewest}): a channel
+ * past a cap keeps the newest entries and drops the oldest, so live arrivals
+ * keep landing in a tab whose banner promises the most recent attachments.
  */
 
 import { applyEditTagOverlay } from "@/features/messages/lib/applyEditTagOverlay.mjs";
@@ -39,11 +43,21 @@ import { type ChannelFile, parseChannelFiles } from "./useChannelFiles";
  * Attachment-bearing events retained for one channel. At the backfill's page
  * bound (50 pages of 100) the index sees at most this many events, so the cap
  * is the memory ceiling for a channel whose whole history is attachments.
+ *
+ * The cap keeps the newest entries: past it a newer event evicts the oldest
+ * retained one (see {@link admitNewest}), so a channel with more attachments
+ * than this still shows the recent ones the tab claims to show.
  */
 export const MAX_INDEXED_ATTACHMENT_EVENTS = 5_000;
-/** Deletion targets retained. Deletions are ids only, but still unbounded input. */
+/**
+ * Deletion targets retained. Deletions are ids only, but still unbounded input.
+ * Retained newest-first on the deletion event's own timestamp.
+ */
 export const MAX_INDEXED_DELETIONS = 5_000;
-/** Edited messages tracked. One entry per edited message, newest edit wins. */
+/**
+ * Edited messages tracked. One entry per edited message, newest edit wins, and
+ * the cap retains the newest edits.
+ */
 export const MAX_INDEXED_EDITS = 5_000;
 /** Pubkeys are 64 hex characters; the cap is headroom, not a format check. */
 export const MAX_INDEXED_PUBKEY_LENGTH = 128;
@@ -74,17 +88,23 @@ export type IndexedEdit = {
 export type FilesIndex = {
   /** Attachment-bearing events by event id. */
   readonly sources: ReadonlyMap<string, IndexedSource>;
-  /** Ids of messages a deletion marker removed. */
-  readonly deletions: ReadonlySet<string>;
+  /**
+   * Ids of messages a deletion marker removed, each mapped to the timestamp of
+   * the deletion that removed it — the recency the retention cap orders by.
+   */
+  readonly deletions: ReadonlyMap<string, number>;
   /** Newest edit per edited message id. */
   readonly edits: ReadonlyMap<string, IndexedEdit>;
-  /** True once any cap above refused an entry: the list is partial. */
+  /**
+   * True once any cap above refused or evicted an entry: older attachments are
+   * missing from the list, so the tab must say the list is partial.
+   */
   readonly truncated: boolean;
 };
 
 const EMPTY_INDEX: FilesIndex = {
   sources: new Map(),
-  deletions: new Set(),
+  deletions: new Map(),
   edits: new Map(),
   truncated: false,
 };
@@ -207,23 +227,125 @@ function isAuthorizedFileEdit(source: IndexedSource, edit: IndexedEdit) {
 
 type IndexDraft = {
   sources: Map<string, IndexedSource>;
-  deletions: Set<string>;
+  deletions: Map<string, number>;
   edits: Map<string, IndexedEdit>;
   truncated: boolean;
   changed: boolean;
 };
 
+/** One retained entry reduced to what the retention order compares. */
+type RetentionKey = { key: string; created_at: number };
+
+/**
+ * The total order the caps retain by: oldest first, map key breaking ties.
+ *
+ * It is the same order {@link selectIndexedFiles} sorts rows into, so the entry
+ * a cap evicts is always the one that sorts off the old end of the list, and
+ * the page a caller is looking at cannot shuffle because of an eviction.
+ */
+function isOlderRetained(left: RetentionKey, right: RetentionKey): boolean {
+  if (left.created_at !== right.created_at) {
+    return left.created_at < right.created_at;
+  }
+  return left.key < right.key;
+}
+
+/**
+ * The oldest retained entry of a capped map — the retention floor — or `null`
+ * when the map is empty.
+ *
+ * Linear in the map, and only ever walked when a cap is already full and the
+ * arriving entry is not a duplicate. A backfill runs newest-first, so it fills
+ * a cap once and then has every older page refused by the floor without a
+ * scan; the scan is the live path's cost, one arrival at a time.
+ */
+function oldestRetained<V>(
+  map: ReadonlyMap<string, V>,
+  createdAtOf: (value: V) => number,
+): RetentionKey | null {
+  let oldest: RetentionKey | null = null;
+  for (const [key, value] of map) {
+    const candidate = { key, created_at: createdAtOf(value) };
+    if (oldest === null || isOlderRetained(candidate, oldest)) {
+      oldest = candidate;
+    }
+  }
+  return oldest;
+}
+
+function markTruncated(draft: IndexDraft): void {
+  if (draft.truncated) return;
+  draft.truncated = true;
+  draft.changed = true;
+}
+
+/**
+ * Make room for one entry in a capped retention map, keeping the newest.
+ *
+ * A cap that only refused arrivals would freeze the index on whichever entries
+ * it happened to see first: a channel past the cap would stop showing new
+ * files entirely while the tab said it was showing the most recent ones. So
+ * the cap evicts by recency instead — an entry newer than the floor takes the
+ * floor's place, and only an entry older than the floor is refused, which is
+ * exactly the entry a "keep the newest N" cap exists to leave out. `onEvict`
+ * removes whatever else the evicted key owned.
+ *
+ * Either outcome means something is missing from the list, so both set
+ * `truncated`; the caps still bound the entries retained, which is the memory
+ * the index actually costs.
+ *
+ * Returns true when the caller may store the entry.
+ */
+function admitNewest<V>(
+  map: Map<string, V>,
+  createdAtOf: (value: V) => number,
+  candidate: RetentionKey,
+  cap: number,
+  draft: IndexDraft,
+  onEvict?: (evictedKey: string) => void,
+): boolean {
+  if (map.size < cap) return true;
+  const floor = oldestRetained(map, createdAtOf);
+  markTruncated(draft);
+  if (floor === null || !isOlderRetained(floor, candidate)) return false;
+  map.delete(floor.key);
+  onEvict?.(floor.key);
+  return true;
+}
+
+const editCreatedAt = (edit: IndexedEdit) => edit.created_at;
+const sourceCreatedAt = (source: IndexedSource) => source.created_at;
+const deletionCreatedAt = (createdAt: number) => createdAt;
+
+/**
+ * A relay-supplied timestamp, or `0` when it is unusable.
+ *
+ * Deletions order by this. A deletion the relay did not timestamp readably
+ * sorts oldest, so it is the first evicted and the one refused at a full cap,
+ * and it can never displace a deletion that carries a real timestamp.
+ */
+function boundEventTimestamp(value: unknown): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : 0;
+}
+
 function ingestDeletion(event: RelayEvent, draft: IndexDraft): void {
+  const createdAt = boundEventTimestamp(event.created_at);
   for (const targetId of referencedEventIds(event.tags)) {
     if (draft.deletions.has(targetId)) continue;
-    if (draft.deletions.size >= MAX_INDEXED_DELETIONS) {
-      if (!draft.truncated) {
-        draft.truncated = true;
-        draft.changed = true;
-      }
-      return;
+    if (
+      !admitNewest(
+        draft.deletions,
+        deletionCreatedAt,
+        { key: targetId, created_at: createdAt },
+        MAX_INDEXED_DELETIONS,
+        draft,
+      )
+    ) {
+      continue;
     }
-    draft.deletions.add(targetId);
+    draft.deletions.set(targetId, createdAt);
     draft.changed = true;
   }
 }
@@ -240,11 +362,16 @@ function ingestEdit(event: RelayEvent, draft: IndexDraft): void {
   if (target && !isAuthorizedFileEdit(target, edit)) return;
   const existing = draft.edits.get(targetId);
   if (existing && existing.created_at >= edit.created_at) return;
-  if (!existing && draft.edits.size >= MAX_INDEXED_EDITS) {
-    if (!draft.truncated) {
-      draft.truncated = true;
-      draft.changed = true;
-    }
+  if (
+    !existing &&
+    !admitNewest(
+      draft.edits,
+      editCreatedAt,
+      { key: targetId, created_at: edit.created_at },
+      MAX_INDEXED_EDITS,
+      draft,
+    )
+  ) {
     return;
   }
   draft.edits.set(targetId, edit);
@@ -254,11 +381,22 @@ function ingestEdit(event: RelayEvent, draft: IndexDraft): void {
 function ingestSource(event: RelayEvent, draft: IndexDraft): void {
   const source = boundIndexSource(event);
   if (!source || draft.sources.has(source.id)) return;
-  if (draft.sources.size >= MAX_INDEXED_ATTACHMENT_EVENTS) {
-    if (!draft.truncated) {
-      draft.truncated = true;
-      draft.changed = true;
-    }
+  if (
+    !admitNewest(
+      draft.sources,
+      sourceCreatedAt,
+      { key: source.id, created_at: source.created_at },
+      MAX_INDEXED_ATTACHMENT_EVENTS,
+      draft,
+      (evictedId) => {
+        // The evicted message's overlay entries describe a row that is gone.
+        // Left behind they would be retention the caps no longer bound, and a
+        // later message reusing the id would inherit a stranger's deletion.
+        draft.edits.delete(evictedId);
+        draft.deletions.delete(evictedId);
+      },
+    )
+  ) {
     return;
   }
   draft.sources.set(source.id, source);
@@ -286,7 +424,7 @@ export function ingestIndexEvents(
   if (events.length === 0) return index;
   const draft: IndexDraft = {
     sources: new Map(index.sources),
-    deletions: new Set(index.deletions),
+    deletions: new Map(index.deletions),
     edits: new Map(index.edits),
     truncated: index.truncated,
     changed: false,

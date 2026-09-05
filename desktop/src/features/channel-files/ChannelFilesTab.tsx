@@ -54,7 +54,10 @@ const SORT_OPTIONS: { value: FileSort; label: string }[] = [
 
 export type ChannelFilesTabProps = {
   files: ChannelFile[];
-  /** True when the file projection hit its row cap and is not the whole set. */
+  /**
+   * True when a row cap or an index retention cap dropped older attachments,
+   * so the list is the newest ones rather than the whole set.
+   */
   truncated?: boolean;
   isLoading: boolean;
   /** True when the file list could not be loaded at all. */
@@ -743,8 +746,9 @@ export function ChannelFilesTab({
 
       {truncated ? (
         <p className="shrink-0 border-b border-border px-4 py-1.5 text-xs text-muted-foreground">
-          Showing the most recent attachments only — this channel has more than
-          the Files tab loads at once.
+          Showing the most recent attachments only — this channel has more
+          attachments than the Files tab keeps, and the older ones are not
+          listed here.
         </p>
       ) : null}
 

@@ -485,6 +485,354 @@ test("the index bounds the events, deletions and edits it retains", () => {
   assert.equal(edits.truncated, true);
 });
 
+// ---------------------------------------------------------------------------
+// Retention caps: keep the newest, evict the oldest.
+//
+// A cap that only refused arrivals would freeze a busy channel's index on the
+// first N events it saw and drop every later file, while the tab kept saying it
+// showed the most recent attachments. These bind the eviction rule instead —
+// newer in, oldest out, and only an entry older than the retained floor is
+// refused. Every assertion here fails if its guard is taken out.
+// ---------------------------------------------------------------------------
+
+/** `MAX_INDEXED_ATTACHMENT_EVENTS` sources, created_at 1001 ascending. */
+let filledSources = null;
+function sourcesAtCap() {
+  filledSources ??= ingestIndexEvents(
+    emptyFilesIndex(),
+    Array.from({ length: MAX_INDEXED_ATTACHMENT_EVENTS }, (_unused, i) =>
+      fileEvent({ index: i + 1 }),
+    ),
+  );
+  return filledSources;
+}
+
+test("a newer attachment evicts the oldest instead of being refused", () => {
+  const full = sourcesAtCap();
+  assert.equal(full.sources.size, MAX_INDEXED_ATTACHMENT_EVENTS);
+  assert.equal(
+    full.truncated,
+    false,
+    "a cap that is merely full has dropped nothing yet",
+  );
+
+  const arrival = fileEvent({ index: MAX_INDEXED_ATTACHMENT_EVENTS + 1 });
+  const after = ingestIndexEvents(full, [arrival]);
+
+  assert.equal(after.sources.size, MAX_INDEXED_ATTACHMENT_EVENTS);
+  assert.ok(after.sources.has(arrival.id), "the live arrival is indexed");
+  assert.equal(
+    after.sources.has(hexId(1)),
+    false,
+    "the oldest retained attachment made way for it",
+  );
+  assert.equal(
+    after.truncated,
+    true,
+    "and the tab is told older attachments are missing",
+  );
+});
+
+test("an attachment older than the retained floor is refused", () => {
+  const full = sourcesAtCap();
+  // created_at 1000, one second below the floor at 1001.
+  const older = fileEvent({ index: 0 });
+  const after = ingestIndexEvents(full, [older]);
+
+  assert.equal(after.sources.size, MAX_INDEXED_ATTACHMENT_EVENTS);
+  assert.equal(
+    after.sources.has(older.id),
+    false,
+    "an entry older than the floor is what the cap exists to leave out",
+  );
+  assert.ok(after.sources.has(hexId(1)), "so the floor itself is still held");
+  assert.equal(after.truncated, true);
+});
+
+test("evicting an attachment drops the edit and deletion it owned", () => {
+  const full = ingestIndexEvents(sourcesAtCap(), [
+    editEvent(hexId(1)),
+    deletionEvent(hexId(1)),
+  ]);
+  assert.ok(full.edits.has(hexId(1)));
+  assert.ok(full.deletions.has(hexId(1)));
+
+  const after = ingestIndexEvents(full, [
+    fileEvent({ index: MAX_INDEXED_ATTACHMENT_EVENTS + 1 }),
+  ]);
+
+  assert.equal(after.sources.has(hexId(1)), false);
+  assert.equal(
+    after.edits.has(hexId(1)),
+    false,
+    "the evicted message's edit goes with it",
+  );
+  assert.equal(
+    after.deletions.has(hexId(1)),
+    false,
+    "and so does its deletion",
+  );
+});
+
+test("a newer edit evicts the oldest edit, an older one is refused", () => {
+  const target = (n) => hexId(200_000 + n);
+  const atCap = ingestIndexEvents(
+    emptyFilesIndex(),
+    Array.from({ length: MAX_INDEXED_EDITS }, (_unused, i) =>
+      editEvent(target(i + 1), {
+        id: hexId(600_000 + i),
+        created_at: 8_000 + i + 1,
+      }),
+    ),
+  );
+  assert.equal(atCap.edits.size, MAX_INDEXED_EDITS);
+  assert.equal(atCap.truncated, false);
+
+  const newerTarget = target(MAX_INDEXED_EDITS + 1);
+  const evicted = ingestIndexEvents(atCap, [
+    editEvent(newerTarget, {
+      id: hexId(700_001),
+      created_at: 8_000 + MAX_INDEXED_EDITS + 1,
+    }),
+  ]);
+  assert.equal(evicted.edits.size, MAX_INDEXED_EDITS);
+  assert.ok(evicted.edits.has(newerTarget), "the newer edit is tracked");
+  assert.equal(
+    evicted.edits.has(target(1)),
+    false,
+    "the oldest edit made way for it",
+  );
+  assert.equal(evicted.truncated, true);
+
+  const refused = ingestIndexEvents(atCap, [
+    editEvent(target(0), { id: hexId(700_002), created_at: 8_000 }),
+  ]);
+  assert.equal(
+    refused.edits.has(target(0)),
+    false,
+    "an edit older than the floor is refused",
+  );
+  assert.ok(refused.edits.has(target(1)), "and the floor is kept");
+  assert.equal(refused.truncated, true);
+});
+
+test("a newer deletion evicts the oldest deletion, an older one is refused", () => {
+  const target = (n) => hexId(300_000 + n);
+  const atCap = ingestIndexEvents(
+    emptyFilesIndex(),
+    Array.from({ length: MAX_INDEXED_DELETIONS }, (_unused, i) =>
+      deletionEvent(target(i + 1), {
+        id: hexId(500_000 + i),
+        created_at: 9_000 + i + 1,
+      }),
+    ),
+  );
+  assert.equal(atCap.deletions.size, MAX_INDEXED_DELETIONS);
+  assert.equal(atCap.truncated, false);
+
+  const newerTarget = target(MAX_INDEXED_DELETIONS + 1);
+  const evicted = ingestIndexEvents(atCap, [
+    deletionEvent(newerTarget, {
+      id: hexId(510_001),
+      created_at: 9_000 + MAX_INDEXED_DELETIONS + 1,
+    }),
+  ]);
+  assert.equal(evicted.deletions.size, MAX_INDEXED_DELETIONS);
+  assert.ok(evicted.deletions.has(newerTarget), "the newer deletion applies");
+  assert.equal(
+    evicted.deletions.has(target(1)),
+    false,
+    "the oldest deletion made way for it",
+  );
+  assert.equal(evicted.truncated, true);
+
+  const refused = ingestIndexEvents(atCap, [
+    deletionEvent(target(0), { id: hexId(510_002), created_at: 9_000 }),
+  ]);
+  assert.equal(
+    refused.deletions.has(target(0)),
+    false,
+    "a deletion older than the floor is refused",
+  );
+  assert.ok(refused.deletions.has(target(1)), "and the floor is kept");
+  assert.equal(refused.truncated, true);
+});
+
+test("a deletion with an unusable timestamp sorts oldest and never displaces one", () => {
+  const target = (n) => hexId(310_000 + n);
+  const atCap = ingestIndexEvents(
+    emptyFilesIndex(),
+    Array.from({ length: MAX_INDEXED_DELETIONS }, (_unused, i) =>
+      deletionEvent(target(i + 1), {
+        id: hexId(530_000 + i),
+        created_at: 9_000 + i + 1,
+      }),
+    ),
+  );
+
+  const after = ingestIndexEvents(atCap, [
+    deletionEvent(target(0), { id: hexId(540_000), created_at: Number.NaN }),
+  ]);
+  assert.equal(
+    after.deletions.has(target(0)),
+    false,
+    "an untimestamped deletion cannot evict a timestamped one",
+  );
+  assert.ok(after.deletions.has(target(1)));
+
+  // Under the cap the missing timestamp costs nothing: the file still goes.
+  const small = ingestIndexEvents(emptyFilesIndex(), [
+    fileEvent({ index: 1 }),
+    deletionEvent(hexId(1), { created_at: Number.NaN }),
+  ]);
+  assert.equal(selectIndexedFiles(small).files.length, 0);
+
+  // And it must not jam the cap. An unnormalised timestamp compares false
+  // against every other, so a retained one would be an entry nothing can ever
+  // displace and no later deletion would land again.
+  const jammed = ingestIndexEvents(emptyFilesIndex(), [
+    deletionEvent(target(0), { id: hexId(540_001), created_at: Number.NaN }),
+    ...Array.from({ length: MAX_INDEXED_DELETIONS - 1 }, (_unused, i) =>
+      deletionEvent(target(i + 1), {
+        id: hexId(530_000 + i),
+        created_at: 9_000 + i + 1,
+      }),
+    ),
+  ]);
+  assert.equal(jammed.deletions.size, MAX_INDEXED_DELETIONS);
+  const newerTarget = target(MAX_INDEXED_DELETIONS + 1);
+  const unjammed = ingestIndexEvents(jammed, [
+    deletionEvent(newerTarget, {
+      id: hexId(540_002),
+      created_at: 9_000 + MAX_INDEXED_DELETIONS + 1,
+    }),
+  ]);
+  assert.ok(
+    unjammed.deletions.has(newerTarget),
+    "a newer deletion still lands",
+  );
+  assert.equal(
+    unjammed.deletions.has(target(0)),
+    false,
+    "the untimestamped deletion is the oldest, so the first evicted",
+  );
+});
+
+test("at equal timestamps the retention order breaks ties on the entry id", () => {
+  // Ties resolve the way the projection sorts them. Without that, two entries
+  // sharing one timestamp make eviction, refusal and page order disagree, and
+  // a relay that stamps a whole batch alike could not evict at all.
+  const target = (n) => hexId(330_000 + n);
+  const atCap = ingestIndexEvents(
+    emptyFilesIndex(),
+    Array.from({ length: MAX_INDEXED_DELETIONS }, (_unused, i) =>
+      deletionEvent(target(i + 1), {
+        id: hexId(570_000 + i),
+        created_at: 9_000,
+      }),
+    ),
+  );
+  assert.equal(atCap.deletions.size, MAX_INDEXED_DELETIONS);
+
+  const higher = target(MAX_INDEXED_DELETIONS + 1);
+  const evicted = ingestIndexEvents(atCap, [
+    deletionEvent(higher, { id: hexId(580_000), created_at: 9_000 }),
+  ]);
+  assert.ok(evicted.deletions.has(higher), "the higher id wins the tie");
+  assert.equal(
+    evicted.deletions.has(target(1)),
+    false,
+    "and the lowest id was the floor",
+  );
+
+  const lower = target(0);
+  const refused = ingestIndexEvents(atCap, [
+    deletionEvent(lower, { id: hexId(580_001), created_at: 9_000 }),
+  ]);
+  assert.equal(
+    refused.deletions.has(lower),
+    false,
+    "a lower id at the same timestamp sits below the floor",
+  );
+  assert.ok(refused.deletions.has(target(1)));
+});
+
+test("at a full deletion cap a newer deletion still hides its file, and the tab is told", () => {
+  // Deletions, so the retained ROWS stay far under the projection's own row
+  // cap: what reaches the banner here is the index's eviction and nothing else.
+  const kept = fileEvent({ index: 1 });
+  const removed = fileEvent({ index: 2 });
+  const full = ingestIndexEvents(emptyFilesIndex(), [
+    kept,
+    removed,
+    ...Array.from({ length: MAX_INDEXED_DELETIONS }, (_unused, i) =>
+      deletionEvent(hexId(320_000 + i + 1), {
+        id: hexId(550_000 + i),
+        created_at: 9_000 + i + 1,
+      }),
+    ),
+  ]);
+  assert.equal(full.deletions.size, MAX_INDEXED_DELETIONS);
+  assert.equal(selectIndexedFiles(full).files.length, 2);
+  assert.equal(selectIndexedFiles(full).truncated, false);
+
+  const after = ingestIndexEvents(full, [
+    deletionEvent(removed.id, {
+      id: hexId(560_000),
+      created_at: 9_000 + MAX_INDEXED_DELETIONS + 1,
+    }),
+  ]);
+  const projection = selectIndexedFiles(after);
+
+  assert.deepEqual(
+    projection.files.map((file) => file.eventId),
+    [kept.id],
+    "the newer deletion took effect over a full cap",
+  );
+  assert.equal(
+    projection.truncated,
+    true,
+    "and the banner state reports that older entries were dropped",
+  );
+});
+
+test("eviction and refusal leave the same page, whichever order events arrive in", () => {
+  // Deterministic pagination: the live path arrives oldest-first and evicts,
+  // the backfill arrives newest-first and is refused at the floor. Both must
+  // retain the same newest entries in the same total order, or the page a
+  // caller is reading would shuffle under it.
+  const events = Array.from(
+    { length: MAX_INDEXED_ATTACHMENT_EVENTS + 25 },
+    (_unused, i) => fileEvent({ index: i + 1 }),
+  );
+  const evicting = ingestIndexEvents(emptyFilesIndex(), events);
+  const refusing = ingestIndexEvents(emptyFilesIndex(), [...events].reverse());
+
+  assert.equal(evicting.sources.size, MAX_INDEXED_ATTACHMENT_EVENTS);
+  assert.equal(refusing.sources.size, MAX_INDEXED_ATTACHMENT_EVENTS);
+  assert.equal(evicting.truncated, true);
+  assert.equal(refusing.truncated, true);
+
+  const evictedOrder = selectIndexedFiles(evicting).files.map(
+    (file) => file.eventId,
+  );
+  const refusedOrder = selectIndexedFiles(refusing).files.map(
+    (file) => file.eventId,
+  );
+  assert.deepEqual(evictedOrder, refusedOrder);
+  assert.equal(
+    evictedOrder[0],
+    events.at(-1).id,
+    "the newest attachment heads the first page",
+  );
+  assert.equal(
+    evicting.sources.has(hexId(25)),
+    false,
+    "the 25 oldest were evicted",
+  );
+  assert.ok(evicting.sources.has(hexId(26)), "and the 26th is the new floor");
+});
+
 test("ingesting nothing new returns the same index object", () => {
   const event = fileEvent({ index: 1 });
   const index = ingestIndexEvents(emptyFilesIndex(), [event]);
@@ -1040,7 +1388,7 @@ test("the projection refuses an edit signed by anyone but the author", () => {
 
   const projection = selectIndexedFiles({
     sources: new Map([[source.id, source]]),
-    deletions: new Set(),
+    deletions: new Map(),
     edits: new Map([[source.id, forged]]),
     truncated: false,
   });
