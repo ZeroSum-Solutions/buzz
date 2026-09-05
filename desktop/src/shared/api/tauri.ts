@@ -34,6 +34,8 @@ import type {
   UpdateManagedAgentInput,
   AcpAvailabilityStatus,
   AcpRuntimeCatalogEntry,
+  McpConfigPlacement,
+  McpTransport,
   AuthStatus,
   CommandAvailability,
   InstallRuntimeResult,
@@ -197,6 +199,9 @@ export type RawAcpRuntimeCatalogEntry = {
   definition_env?: Record<string, string>;
   max_parallelism?: number;
   effort_canonical_values?: string[] | null;
+  mcp_config_placement?: McpConfigPlacement;
+  mcp_transports?: McpTransport[];
+  mcp_native_transports?: McpTransport[];
 };
 
 export type {
@@ -700,6 +705,9 @@ export function fromRawAcpRuntimeCatalogEntry(
     source: entry.source,
     definitionEnv: entry.definition_env ?? {},
     effortCanonicalValues: entry.effort_canonical_values ?? null,
+    mcpConfigPlacement: entry.mcp_config_placement ?? { kind: "unsupported" },
+    mcpTransports: entry.mcp_transports ?? [],
+    mcpNativeTransports: entry.mcp_native_transports ?? [],
     ...(entry.max_parallelism !== undefined && {
       maxParallelism: entry.max_parallelism,
     }),

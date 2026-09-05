@@ -18,11 +18,17 @@ pub(crate) mod config_bridge;
 pub(crate) mod custom_harnesses;
 mod definition_validation;
 mod discovery;
+pub(crate) use discovery::McpConfigPlacement;
 pub(crate) mod effective_config;
 mod env_vars;
 pub(crate) mod git_bash;
 pub(crate) mod global_config;
+// Slice one of the MCP registry: the backend core. Nothing here is wired to
+// the spawn path yet — that is slice two — so the items below have no in-tree
+// caller and would read as dead code until they do.
 mod managed_node_paths;
+#[allow(dead_code)]
+pub(crate) mod mcp_registry;
 mod nest;
 pub(crate) mod parallelism;
 mod persona_avatars;

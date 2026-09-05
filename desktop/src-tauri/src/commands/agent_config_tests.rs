@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::managed_agents::config_bridge::types::ConfigOrigin;
+use crate::managed_agents::McpConfigPlacement;
 use crate::managed_agents::{BackendKind, RespondTo};
 
 use std::sync::Mutex;
@@ -63,6 +64,9 @@ fn goose_runtime() -> &'static KnownAcpRuntime {
         required_normalized_fields: &["model", "provider"],
         login_hint: None,
         auth_probe_args: None,
+        mcp_config_placement: McpConfigPlacement::Unsupported,
+        mcp_transports: &[],
+        mcp_native_transports: &[],
     };
     &RUNTIME
 }

@@ -1,0 +1,48 @@
+[package]
+name = "buzz-mcp-launch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bundled launcher and credential-resolving proxy for registry MCP servers"
+
+[[bin]]
+name = "buzz-mcp-launch"
+path = "src/main.rs"
+
+[lib]
+name = "buzz_mcp_launch"
+path = "src/lib.rs"
+
+[features]
+default = ["system-keyring"]
+# Resolve `mcp:` references through the OS keyring. On by default because the
+# bundled sidecar must be able to; a build with it off refuses a reference with
+# a named error rather than starting a server without its credential.
+system-keyring = ["buzz-secret-store/system-keyring"]
+
+[dependencies]
+buzz-secret-store = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-std"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# Safe wrappers for killpg and PR_SET_PDEATHSIG. The launcher takes no `unsafe`
+# on Unix: the process group itself comes from tokio's `process_group(0)`.
+nix = { version = "0.31", default-features = false, features = ["signal", "process"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+[dev-dependencies]
+axum = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util", "io-std"] }

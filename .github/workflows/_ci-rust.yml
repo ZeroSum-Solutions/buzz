@@ -138,7 +138,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p desktop/src-tauri/binaries
-          for bin in buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz; do
+          for bin in buzz-acp buzz-agent buzz-dev-mcp buzz-mcp-launch git-credential-nostr buzz; do
             touch "desktop/src-tauri/binaries/${bin}-${TARGET}.exe"
           done
       - name: Clippy (workspace)
@@ -165,6 +165,16 @@ jobs:
         # cross-process cache success/race (on-disk token handoff, also
         # #[cfg(unix)]).
         run: cargo test -p buzz-agent --target $env:TARGET --test databricks_auth_coordinator
+      - name: Test (buzz-mcp-launch Windows containment)
+        # launch/windows.rs puts the launcher in a kill-on-close Job Object
+        # before it spawns a server, and checks the return value of every
+        # Win32 call. tests/launcher_windows.rs drives the shipped binary
+        # through each BUZZ_MCP_LAUNCH_FAULT value and asserts the abort leaves
+        # no server process, plus that a clean exit still reports the server's
+        # own exit code. Every other lane compiles that module and runs none of
+        # it: tests/launcher.rs is #![cfg(unix)]. All targets, so the
+        # cfg(windows) integration test actually runs.
+        run: cargo test -p buzz-mcp-launch --target $env:TARGET
       # Smoke-test the new host-prereq contract: Git for Windows (which provides
       # bash) is available on the runner, a shell command round-trips, and bash
       # does NOT resolve from System32 (so WSL's launcher is never picked up).

@@ -171,7 +171,7 @@ _ensure-sidecar-stubs:
     set -euo pipefail
     TARGET=$(rustc -vV | sed -n 's|host: ||p')
     mkdir -p desktop/src-tauri/binaries
-    SIDECARS=(buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz)
+    SIDECARS=(buzz-acp buzz-agent buzz-dev-mcp buzz-mcp-launch git-credential-nostr buzz)
     if [[ "$TARGET" != *windows* ]]; then
         SIDECARS+=(buzz-backend-kubernetes)
     fi
@@ -289,6 +289,7 @@ desktop-release-build target="aarch64-apple-darwin":
         touch "desktop/src-tauri/binaries/buzz-backend-kubernetes-$TARGET"
     fi
     touch "desktop/src-tauri/binaries/buzz-dev-mcp-$TARGET"
+    touch "desktop/src-tauri/binaries/buzz-mcp-launch-$TARGET"
     touch "desktop/src-tauri/binaries/git-credential-nostr-$TARGET"
     touch "desktop/src-tauri/binaries/buzz-$TARGET"
     pnpm install
@@ -311,7 +312,7 @@ desktop-demo-build demo_name target="aarch64-apple-darwin":
     DEMO_SLUG="$(read_config slug)"
     cargo build --release --target "$TARGET" \
       -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes -p buzz-dev-mcp \
-      -p git-credential-nostr -p buzz-cli
+      -p buzz-mcp-launch -p git-credential-nostr -p buzz-cli
     ./scripts/bundle-sidecars.sh "$TARGET"
     pnpm install
     cd {{desktop_dir}}
@@ -441,6 +442,17 @@ test-unit:
         # relay events and agent prompts. They are infra-free; ignored lifecycle
         # tests remain excluded and run in their dedicated integration lanes.
         cargo nextest run -p buzz-acp --lib
+        # MCP registry launcher and secret store. All targets, not --lib: the
+        # guards these crates exist for — the child environment built from
+        # empty, the capability strip and its nonce binding, the stdio frame
+        # cap, the redirect refusal, the upstream scheme check, containment
+        # teardown — are asserted in tests/launcher.rs and tests/proxy.rs
+        # through the shipped binary and the shipped transport, and a --lib
+        # run would execute none of them. Both crates are infra-free: the
+        # proxy fixtures bind loopback and the secret store's tests use the
+        # in-memory blob source, never the system keyring. Without this step
+        # nothing in CI runs a single test from either crate.
+        cargo nextest run -p buzz-secret-store -p buzz-mcp-launch
     else
         ./scripts/run-tests.sh unit
     fi
