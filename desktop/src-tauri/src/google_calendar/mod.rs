@@ -27,9 +27,11 @@
 //!   state (T11 decision 5).
 //! * [`failure`] — the three error matrices and their four states
 //!   (T11 decision 8).
+//! * [`dto`] — the bounded event DTO and the only parser API-sourced text
+//!   enters through (T12a decisions 1 and 2).
 //! * [`interval`] — the interval a batch proves (T12a decision 13).
-//!
-//! The event DTO and the bounded `events.list` walk land in the next commit.
+//! * [`client`] — the bounded `events.list` walk and the three mutations
+//!   (T11 decision 6, T12a decisions 5, 11 and 13).
 //!
 //! **What an agent may reach: nothing** (T11 decision 9). The credential lives
 //! under a key outside the `mcp:` namespace the launcher sidecar resolves, and
@@ -37,6 +39,8 @@
 //! denial seam.
 
 pub mod binding;
+pub mod client;
+pub mod dto;
 pub mod failure;
 pub mod interval;
 pub mod loopback;
@@ -47,7 +51,13 @@ pub mod revocation;
 #[cfg(test)]
 mod binding_tests;
 #[cfg(test)]
+mod client_tests;
+#[cfg(test)]
+mod mock_server;
+#[cfg(test)]
 mod testing;
+#[cfg(test)]
+mod tests;
 
 use interval::Window;
 
