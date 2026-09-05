@@ -47,6 +47,7 @@ for arg in "$@"; do
   [ "$prev" = "--query" ] && query="$arg"
   prev="$arg"
 done
+owner="${AWS_STUB_OWNER:-buzz-remote-ci}"
 case "$*" in
   *"sts get-caller-identity"*) echo "111122223333" ;;
   *"describe-instances"*)
@@ -59,6 +60,35 @@ case "$*" in
     esac
     ;;
   *"describe-vpcs"*) echo "vpc-0abc" ;;
+  *"describe-security-groups"*)
+    case "$query" in
+      *Tags*) echo "$owner" ;;
+      *GroupId*) echo "${AWS_STUB_SG:-sg-0abc}" ;;
+      *) echo "None" ;;
+    esac
+    ;;
+  *"describe-security-group-rules"*) echo "" ;;
+  *"describe-key-pairs"*) echo "None" ;;
+  *"list-role-tags"*|*"list-user-tags"*|*"list-instance-profile-tags"*) echo "$owner" ;;
+  *"list-attached-role-policies"*|*"list-attached-user-policies"*) echo "" ;;
+  *"list-groups-for-user"*) echo "" ;;
+  *"list-role-policies"*) echo "self-stop" ;;
+  *"list-user-policies"*) echo "buzz-ci-box-control" ;;
+  *"list-instance-profiles-for-role"*) echo "buzz-ci-box" ;;
+  *"list-access-keys"*) echo "${AWS_STUB_ACCESS_KEYS-}" ;;
+  *"create-access-key"*) echo "AKIASTUBKEYID	stub-secret-value" ;;
+  *"iam get-role"*)
+    case "$query" in
+      *"length("*) echo "1" ;;
+      *Principal.Service*) echo "ec2.amazonaws.com" ;;
+      *Statement\[0\].Action*) echo "sts:AssumeRole" ;;
+      *Statement\[0\].Effect*) echo "Allow" ;;
+      *Principal.AWS*) printf 'None\tNone\tNone\n' ;;
+      *) echo "arn:aws:iam::111122223333:role/buzz-ci-box-self-stop" ;;
+    esac
+    ;;
+  *"iam get-instance-profile"*) echo "buzz-ci-box-self-stop" ;;
+  *"iam get-user"*) echo "arn:aws:iam::111122223333:user/buzz-ci-runner" ;;
   *"start-instances"*|*"stop-instances"*|*" wait "*) : ;;
   *) echo "None" ;;
 esac
@@ -66,11 +96,11 @@ exit 0
 STUB
 chmod +x "${WORK}/bin/aws"
 
-run_provision() { # run_provision <extra env assignments handled by caller> -- args...
+run_provision() {
   PATH="${WORK}/bin:$PATH" \
   AWS_PROFILE=stub-admin AWS_REGION=us-east-1 \
   BUZZ_CI_KEY_PATH="${WORK}/should-not-exist.pem" \
-  BUZZ_CI_BACKUP_DIR="${WORK}/backups" \
+  BUZZ_CI_STOP_BACKOFF=0 \
     "$PROVISION" "$@"
 }
 
@@ -111,7 +141,8 @@ for expect in \
   "cloudwatch put-metric-alarm" \
   "iam put-user-policy" \
   "iam create-access-key" \
-  "ec2 stop-instances"
+  "ec2 stop-instances" \
+  "zsvault add aws_ci_runner_secret_access_key"
 do
   case "$dry_out" in
     *"$expect"*) pass "dry-run plans: ${expect}" ;;
@@ -165,17 +196,110 @@ else
   pass "a denied describe launches nothing"
 fi
 
-# ── 4. remote-ci.sh --help ───────────────────────────────────────────────────
+# Adopting an existing, owner-tagged instance: no launch, no ssh, so this run
+# reaches the security-group and IAM ownership checks and the runner key.
+adopt_provision() { # adopt_provision <log> [args...]
+  local log="$1"; shift
+  # The stub reports no key pair in AWS, so provision.sh refuses to overwrite a
+  # PEM left by a previous check. Each run starts without one.
+  rm -f "${WORK}/adopt.pem"
+  AWS_STUB_LOG="$log" AWS_STUB_INSTANCES="i-0123456789abcdef0" \
+  PATH="${EXTRA_PATH:-}${WORK}/bin:$PATH" AWS_PROFILE=stub-admin AWS_REGION=us-east-1 \
+  BUZZ_CI_KEY_PATH="${WORK}/adopt.pem" BUZZ_CI_STOP_BACKOFF=0 \
+    "$PROVISION" "$@"
+}
+
+# ssh/scp stubs that report a healthy, already-bootstrapped box. They let the
+# real verify_bootstrap path run offline instead of a test-only shortcut.
+mkdir -p "${WORK}/sshbin"
+printf '#!/usr/bin/env bash\nexit 0\n' > "${WORK}/sshbin/ssh"
+printf '#!/usr/bin/env bash\nexit 0\n' > "${WORK}/sshbin/scp"
+chmod +x "${WORK}/sshbin/ssh" "${WORK}/sshbin/scp"
+
+adopt_rc=0
+adopt_out="$(adopt_provision "${WORK}/adopt-aws.log" --no-verify 2>&1)" || adopt_rc=$?
+case "$adopt_out" in
+  *"security group buzz-ci-box exists"*) pass "an owner-tagged security group is adopted" ;;
+  *) fail "an owner-tagged security group is adopted" "$adopt_out (rc=${adopt_rc})" ;;
+esac
+
+# The same group without our owner tag belongs to someone else.
+sg_rc=0
+sg_out="$(export AWS_STUB_OWNER='not-ours'; adopt_provision "${WORK}/sg-aws.log" --no-verify 2>&1)" || sg_rc=$?
+unset AWS_STUB_OWNER   # a prefix assignment on a function call would persist
+if [ "$sg_rc" -ne 0 ]; then
+  pass "an untagged security group aborts provisioning"
+else
+  fail "an untagged security group aborts provisioning" "exited 0"
+fi
+case "$sg_out" in
+  *"security group buzz-ci-box (sg-0abc) exists but is not tagged"*)
+    pass "the abort names the untagged group" ;;
+  *) fail "the abort names the untagged group" "$sg_out" ;;
+esac
+
+# ── 4. the runner key goes to the vault, or it is deleted again ─────────────
+cat > "${WORK}/bin/zsvault" <<'VAULT'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${ZSVAULT_STUB_LOG:?}"
+cat >/dev/null
+exit "${ZSVAULT_STUB_RC:-0}"
+VAULT
+chmod +x "${WORK}/bin/zsvault"
+export ZSVAULT_STUB_LOG="${WORK}/zsvault.log"
+: > "$ZSVAULT_STUB_LOG"
+
+# --no-verify leaves the box unverified, so no key may be created at all.
+if grep -q 'create-access-key' "${WORK}/adopt-aws.log"; then
+  fail "no runner key is created for an unverified box" "$(cat "${WORK}/adopt-aws.log")"
+else
+  pass "no runner key is created for an unverified box"
+fi
+case "$adopt_out" in
+  *"the box was not verified, so no runner key was created"*)
+    pass "an unverified box says why it has no runner key" ;;
+  *) fail "an unverified box says why it has no runner key" "$adopt_out" ;;
+esac
+
+# A verified box creates the key; a failing vault write must delete it again.
+: > "${WORK}/vault-aws.log"
+vault_rc=0
+vault_out="$(export ZSVAULT_STUB_RC=1 EXTRA_PATH="${WORK}/sshbin:"
+  adopt_provision "${WORK}/vault-aws.log" 2>&1)" || vault_rc=$?
+unset ZSVAULT_STUB_RC EXTRA_PATH
+if [ "$vault_rc" -ne 0 ]; then
+  pass "a failed vault write fails provisioning"
+else
+  fail "a failed vault write fails provisioning" "exited 0: ${vault_out}"
+fi
+if grep -q 'iam delete-access-key' "${WORK}/vault-aws.log"; then
+  pass "a failed vault write deletes the IAM access key again"
+else
+  fail "a failed vault write deletes the IAM access key again" "$(cat "${WORK}/vault-aws.log")"
+fi
+if grep -q 'aws_ci_runner_secret_access_key' "$ZSVAULT_STUB_LOG" \
+   || grep -q 'aws_ci_runner_access_key_id' "$ZSVAULT_STUB_LOG"; then
+  pass "the runner key is handed to zsvault"
+else
+  fail "the runner key is handed to zsvault" "$(cat "$ZSVAULT_STUB_LOG")"
+fi
+if [ -z "$(find "$WORK" -name '*buzz-ci-runner*' 2>/dev/null)" ]; then
+  pass "the runner secret is never written to a file"
+else
+  fail "the runner secret is never written to a file" "$(find "$WORK" -name '*buzz-ci-runner*')"
+fi
+
+# ── 5. remote-ci.sh --help ───────────────────────────────────────────────────
 help_out="$("$REMOTE_CI" --help 2>&1)"; help_rc=$?
 if [ "$help_rc" -eq 0 ]; then pass "remote-ci.sh --help exits 0"; else fail "remote-ci.sh --help exits 0" "rc=${help_rc}"; fi
-for flag in --push-local --keep --join --status AWS_PROFILE REMOTE_CI_BOX_ENV; do
+for flag in --push-local --keep --join --status REMOTE_CI_LEASE REMOTE_CI_GATE_TIMEOUT REMOTE_CI_LOG_CAP; do
   case "$help_out" in
     *"$flag"*) pass "--help documents ${flag}" ;;
     *) fail "--help documents ${flag}" "missing" ;;
   esac
 done
 
-# ── 5. box.env parsing ───────────────────────────────────────────────────────
+# ── 6. box.env parsing ───────────────────────────────────────────────────────
 export AWS_STUB_LOG="${WORK}/status-aws.log"
 : > "$AWS_STUB_LOG"
 good="${WORK}/box.env"
@@ -187,19 +311,21 @@ BUZZ_CI_KEY_PATH=${WORK}/fake-key.pem
 BUZZ_CI_SSH_USER=ci
 EOF
 touch "${WORK}/fake-key.pem"
+LEASE="${WORK}/lease.lock"
+run_remote_ci() {
+  PATH="${WORK}/bin:$PATH" AWS_PROFILE=stub-runner REMOTE_CI_BOX_ENV="$good" \
+  REMOTE_CI_LEASE="$LEASE" REMOTE_CI_NOTES_DIR="${WORK}/notes" \
+  REMOTE_CI_MISC_DIR="${WORK}/misc" REMOTE_CI_STOP_BACKOFF=0 \
+  REMOTE_CI_SSH_WAIT="${REMOTE_CI_SSH_WAIT:-1}" \
+    "$REMOTE_CI" "$@"
+}
 status_rc=0
-status_out="$(PATH="${WORK}/bin:$PATH" AWS_PROFILE=stub-runner REMOTE_CI_BOX_ENV="$good" \
-  "$REMOTE_CI" --status 2>&1)" || status_rc=$?
+status_out="$(run_remote_ci --status 2>&1)" || status_rc=$?
 if [ "$status_rc" -eq 0 ]; then pass "--status with a valid box.env exits 0"; else fail "--status with a valid box.env exits 0" "rc=${status_rc}: ${status_out}"; fi
 case "$status_out" in
   *"i-0123456789abcdef0"*stopped*) pass "--status reports the instance and state" ;;
   *) fail "--status reports the instance and state" "$status_out" ;;
 esac
-if grep -q 'describe-instances' "$AWS_STUB_LOG"; then
-  pass "--status calls describe-instances"
-else
-  fail "--status calls describe-instances" "$(cat "$AWS_STUB_LOG")"
-fi
 if grep -qE 'start-instances|stop-instances' "$AWS_STUB_LOG"; then
   fail "--status starts or stops nothing" "$(cat "$AWS_STUB_LOG")"
 else
@@ -209,7 +335,8 @@ fi
 bad_key="${WORK}/box.env.badkey"
 printf 'BUZZ_CI_INSTANCE_ID=i-0123456789abcdef0\nEVIL=$(touch %s/pwned)\n' "$WORK" > "$bad_key"
 bk_rc=0
-bk_out="$(PATH="${WORK}/bin:$PATH" REMOTE_CI_BOX_ENV="$bad_key" "$REMOTE_CI" --status 2>&1)" || bk_rc=$?
+bk_out="$(PATH="${WORK}/bin:$PATH" REMOTE_CI_BOX_ENV="$bad_key" REMOTE_CI_LEASE="$LEASE" \
+  "$REMOTE_CI" --status 2>&1)" || bk_rc=$?
 if [ "$bk_rc" -eq 0 ]; then
   fail "box.env with an unknown key is rejected" "exited 0: ${bk_out}"
 else
@@ -232,7 +359,8 @@ BUZZ_CI_KEY_PATH=${WORK}/fake-key.pem
 BUZZ_CI_SSH_USER=ci
 EOF
 bi_rc=0
-bi_out="$(PATH="${WORK}/bin:$PATH" REMOTE_CI_BOX_ENV="$bad_id" "$REMOTE_CI" --status 2>&1)" || bi_rc=$?
+bi_out="$(PATH="${WORK}/bin:$PATH" REMOTE_CI_BOX_ENV="$bad_id" REMOTE_CI_LEASE="$LEASE" \
+  "$REMOTE_CI" --status 2>&1)" || bi_rc=$?
 if [ "$bi_rc" -eq 0 ]; then
   fail "box.env with a bad instance id is rejected" "exited 0"
 else
@@ -253,14 +381,45 @@ else
   esac
 fi
 
-# ── 6. concurrency guard ─────────────────────────────────────────────────────
+# ── 7. the local lease ───────────────────────────────────────────────────────
+# Hold the lease from another process, exactly as a concurrent run would.
+printf 'pid=99999\nbranch=other-branch\nstarted=2026-09-05T00:00:00Z\n' > "${LEASE}.holder"
+python3 - "$LEASE" "${WORK}/held" <<'HOLD' &
+import fcntl, os, sys, time
+path, flag = sys.argv[1], sys.argv[2]
+fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)
+open(flag, "w").close()
+time.sleep(120)
+HOLD
+HOLD_PID=$!
+tries=0
+until [ -f "${WORK}/held" ] || [ "$tries" -ge 100 ]; do sleep 0.1; tries=$((tries + 1)); done
+export AWS_STUB_LOG="${WORK}/lease-aws.log"
+: > "$AWS_STUB_LOG"
+lease_rc=0
+lease_out="$(run_remote_ci zs/main 2>&1)" || lease_rc=$?
+kill "$HOLD_PID" 2>/dev/null || true
+wait "$HOLD_PID" 2>/dev/null || true
+rm -f "${LEASE}.holder"
+if [ "$lease_rc" -ne 0 ]; then pass "a held lease refuses the run"; else fail "a held lease refuses the run" "exited 0"; fi
+case "$lease_out" in
+  *"another remote-ci run on this machine holds the box"*"other-branch"*)
+    pass "the refusal names the lease holder" ;;
+  *) fail "the refusal names the lease holder" "$lease_out" ;;
+esac
+if [ -s "$AWS_STUB_LOG" ]; then
+  fail "a refused run makes no aws call" "$(cat "$AWS_STUB_LOG")"
+else
+  pass "a refused run makes no aws call"
+fi
+
+# ── 8. a box that is running without our lease ───────────────────────────────
 export AWS_STUB_LOG="${WORK}/busy-aws.log"
 : > "$AWS_STUB_LOG"
 busy_rc=0
-busy_out="$(PATH="${WORK}/bin:$PATH" AWS_PROFILE=stub-runner REMOTE_CI_BOX_ENV="$good" \
-  AWS_STUB_STATE=running REMOTE_CI_NOTES_DIR="${WORK}/notes" \
-  REMOTE_CI_MISC_DIR="${WORK}/misc" "$REMOTE_CI" zs/main 2>&1)" || busy_rc=$?
-if [ "$busy_rc" -ne 0 ]; then pass "a running box refuses a second run"; else fail "a running box refuses a second run" "exited 0"; fi
+busy_out="$(AWS_STUB_STATE=running REMOTE_CI_SSH_WAIT=1 run_remote_ci zs/main 2>&1)" || busy_rc=$?
+if [ "$busy_rc" -ne 0 ]; then pass "a running box refuses a run without --join"; else fail "a running box refuses a run without --join" "exited 0"; fi
 case "$busy_out" in
   *"already running"*"--join"*) pass "the refusal names --join" ;;
   *) fail "the refusal names --join" "$busy_out" ;;
@@ -271,7 +430,77 @@ else
   pass "the refusal starts or stops nothing"
 fi
 
-# ── 7. the guards that live in the scripts' text ─────────────────────────────
+# ── 9. a failed stop is loud and fails the run ───────────────────────────────
+# The box starts, ssh never comes up, and every stop attempt is refused.
+export AWS_STUB_LOG="${WORK}/stopfail-aws.log"
+: > "$AWS_STUB_LOG"
+stop_rc=0
+stop_out="$(AWS_STUB_FAIL="stop-instances" REMOTE_CI_SSH_WAIT=1 \
+  run_remote_ci zs/main 2>&1)" || stop_rc=$?
+if [ "$stop_rc" -ne 0 ]; then pass "a failed stop fails the run"; else fail "a failed stop fails the run" "exited 0"; fi
+case "$stop_out" in
+  *"COULD NOT STOP i-0123456789abcdef0"*)
+    pass "the failed stop names the instance loudly" ;;
+  *) fail "the failed stop names the instance loudly" "$stop_out" ;;
+esac
+attempts="$(grep -c 'stop-instances' "$AWS_STUB_LOG" || true)"
+if [ "${attempts:-0}" -ge 5 ]; then
+  pass "the stop is retried 5 times"
+else
+  fail "the stop is retried 5 times" "saw ${attempts} attempts"
+fi
+
+# ── 10. the runner script resets the shared checkout ─────────────────────────
+runner="${WORK}/runner.sh"
+"$REMOTE_CI" --print-runner zs/main desktop-test > "$runner" 2>/dev/null \
+  || fail "--print-runner emits the remote script" "non-zero exit"
+for needle in 'git reset --hard' 'git clean -f -d' 'git status --porcelain' \
+              'just desktop-install-ci' 'playwright install chromium' \
+              'flock -n 9' 'timeout '; do
+  if grep -qF -- "$needle" "$runner"; then
+    pass "the remote runner contains: ${needle}"
+  else
+    fail "the remote runner contains: ${needle}" "missing"
+  fi
+done
+
+# And it aborts rather than gating a tree that is still dirty. Everything the
+# runner calls is stubbed, and `git status --porcelain` reports a modification.
+FAKE="${WORK}/fake-box"
+mkdir -p "${FAKE}/bin" "${FAKE}/repo/bin" "${FAKE}/repo/desktop"
+cat > "${FAKE}/bin/git" <<'GITSTUB'
+#!/usr/bin/env bash
+[ "$1" = "status" ] && { printf ' M desktop/src/App.tsx\n'; exit 0; }
+exit 0
+GITSTUB
+cat > "${FAKE}/bin/flock" <<'FLOCKSTUB'
+#!/usr/bin/env bash
+exit 0
+FLOCKSTUB
+for tool in just pnpm timeout hostname; do
+  printf '#!/usr/bin/env bash\nexit 0\n' > "${FAKE}/bin/${tool}"
+done
+chmod +x "${FAKE}"/bin/*
+printf 'true\n' > "${FAKE}/repo/bin/activate-hermit"
+dirty_rc=0
+dirty_out="$(cd "${FAKE}/repo" && PATH="${FAKE}/bin:/usr/bin:/bin" \
+  REMOTE_CI_REPO_DIR="${FAKE}/repo" REMOTE_CI_LOCK_FILE="${FAKE}/lock" \
+  bash "$runner" 2>&1)" || dirty_rc=$?
+if [ "$dirty_rc" -ne 0 ]; then
+  pass "the remote runner aborts on a dirty tree"
+else
+  fail "the remote runner aborts on a dirty tree" "exited 0: ${dirty_out}"
+fi
+case "$dirty_out" in
+  *"still dirty after reset"*) pass "the dirty-tree abort says why" ;;
+  *) fail "the dirty-tree abort says why" "$dirty_out" ;;
+esac
+case "$dirty_out" in
+  *"__REMOTE_CI_EXIT__=97"*) pass "the dirty-tree abort reports its exit code" ;;
+  *) fail "the dirty-tree abort reports its exit code" "$dirty_out" ;;
+esac
+
+# ── 11. the guards that live in the scripts' text ────────────────────────────
 check_contains() { # check_contains <label> <file> <needle>
   if grep -qF -- "$3" "$2"; then pass "$1"; else fail "$1" "missing: $3"; fi
 }
@@ -284,32 +513,44 @@ check_contains "bootstrap fails when cron is not active" "$BOOTSTRAP" \
   "systemctl is-active --quiet cron"
 check_contains "bootstrap logs to /var/log/buzz-bootstrap.log" "$BOOTSTRAP" \
   "buzz-bootstrap.log"
-check_absent "bootstrap grants the ci user no blanket sudo" "$BOOTSTRAP" \
+check_absent "bootstrap grants the ci user no blanket root" "$BOOTSTRAP" \
   "NOPASSWD: ALL"
-check_contains "bootstrap removes any earlier sudo grant" "$BOOTSTRAP" \
-  "rm -f /etc/sudoers.d/buzz-ci"
 check_contains "bootstrap writes its marker only at the end" "$BOOTSTRAP" \
   'date -u +%FT%TZ > "$MARKER"'
 check_contains "provision arms the stop trap before launching" "$PROVISION" \
   "trap provision_trap EXIT INT TERM"
+check_contains "provision rediscovers a lost instance by client token" "$PROVISION" \
+  "Name=client-token,Values="
+check_contains "provision keeps the instance recorded until EC2 confirms" "$PROVISION" \
+  "RUNNING_INSTANCE=\"\"   # cleared only once EC2 agrees it is stopped"
 check_contains "provision fails when cloud-init never finishes" "$PROVISION" \
   "cloud-init did not finish within"
 check_contains "provision repairs an instance with no marker" "$PROVISION" \
   "re-running bootstrap.sh over ssh"
-check_contains "provision reads the admin key from the vault env" "$PROVISION" \
-  "AWS_ADMIN_ACCESS_KEY_ID"
-check_contains "provision prints the two zsvault add commands" "$PROVISION" \
-  "zsvault add aws_ci_runner_secret_access_key"
-check_contains "remote-ci installs dependencies after checkout" "$REMOTE_CI" \
-  "just desktop-install-ci"
-check_contains "remote-ci installs the branch's Playwright browser" "$REMOTE_CI" \
-  "playwright install chromium"
-check_contains "remote-ci takes an exclusive lock on the box" "$REMOTE_CI" \
-  "flock -n 9"
+check_contains "provision checks the adopted role's trust policy" "$PROVISION" \
+  "Role.AssumeRolePolicyDocument.Statement[0].Principal.Service"
+check_contains "provision checks the role's instance-profile membership" "$PROVISION" \
+  "list-instance-profiles-for-role"
+check_contains "provision requires the owner tag on the security group" "$PROVISION" \
+  "assert_owner_tag \"security group"
+check_contains "provision revokes every unexpected ingress rule" "$PROVISION" \
+  "revoking every existing ingress rule"
+check_contains "provision deletes the IAM key when the vault write fails" "$PROVISION" \
+  "iam delete-access-key"
+check_absent "provision writes no credential file" "$PROVISION" \
+  "BACKUP_DIR"
+check_contains "remote-ci takes a local lease before any EC2 call" "$REMOTE_CI" \
+  "fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)"
 check_contains "remote-ci waits out a stopping box" "$REMOTE_CI" \
   "waiting up to \${STOPPING_WAIT_SECONDS}s"
 check_contains "remote-ci quotes the Linux script(1) command" "$REMOTE_CI" \
   'linux_cmd="$(printf'
+check_contains "remote-ci caps the local log" "$REMOTE_CI" \
+  "the head was trimmed"
+check_contains "remote-ci refuses an oversized report" "$REMOTE_CI" \
+  "over the \${REPORT_CAP_KB} KB cap"
+check_contains "remote-ci fails a green gate whose box did not stop" "$REMOTE_CI" \
+  'if [ "$STOP_FAILED" = 1 ] && [ "$rc" -eq 0 ]; then rc=1; fi'
 
 printf '\n%s\n' "-----"
 if [ "$FAILURES" -eq 0 ]; then

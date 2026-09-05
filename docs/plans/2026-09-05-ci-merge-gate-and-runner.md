@@ -96,15 +96,27 @@ back through a sentinel line because `script` does not pass a remote status thro
 stop. `--status` prints the state, uptime and current lock holder and touches nothing.
 `--help` documents all of it.
 
-**One box, one run.** The box is a single mutable working tree, so two runs would check out
-different commits into it and one EXIT trap would stop the box under the other. Every run takes
-`flock -n` on `/home/ci/.remote-ci.lock` for its whole duration and records the caller's
-hostname, pid, branch and start time there. A run that finds the box already `running` or
-`pending` refuses and prints that lock holder, unless `--join` is passed; a run that cannot take
-the lock does nothing and leaves the box alone. Only the run that owned the lock (or that
-started the box itself) stops it. A box in `stopping` is waited out, bounded at 5 minutes,
-before `StartInstances` — AWS rejects a start during `stopping`, and that state is the normal
-one right after the previous run.
+**One box, one run.** The box is a single mutable working tree and a single billable instance,
+so two runs would check out different commits into it and one EXIT trap would stop the box under
+the other. Ownership is a **local lease**, taken before the first EC2 call and held for the
+whole run: an exclusive `flock` on `~/.cache/zs/buzz-remote-ci.lock`, the same mechanism
+`scripts/zs/with-gate-lock.sh` uses for the local gates, with the holder's pid, branch and start
+time in a sidecar file for the refusal message. Only the lease holder starts or stops the box.
+A second `flock -n` on `/home/ci/.remote-ci.lock` guards the box itself. Every caller runs on
+this Mac, so a local lease is the whole population — **the box belongs to one machine**; a
+second machine would not see this lease and needs its own box.
+
+A run that finds the box already `running` or `pending` while holding the lease refuses, prints
+the on-box lock holder, and points at `--join`: that state means someone started it by hand,
+used `--keep`, or a stop failed. A box in `stopping` is waited out, bounded at 5 minutes, before
+`StartInstances` — AWS rejects a start during `stopping`, and that state is the normal one right
+after the previous run.
+
+**The checkout is reset, not merely updated.** A previous gate can modify a tracked file or drop
+untracked sources into the shared tree, and `git checkout` keeps both. Each run resets hard to
+the target and removes untracked files while keeping ignored ones (`node_modules`, the cargo
+`target` dirs and the Playwright browsers are the point of the persistent volume), then asserts
+`git status --porcelain` is empty and aborts rather than gate a mixed tree.
 
 ### Cost guardrails as implemented
 
@@ -129,6 +141,10 @@ one right after the previous run.
 - The `ci` user has **no sudo**. Branch code runs as `ci`, and root on that box could disable
   the uptime guard, poison the persistent caches, or read instance metadata. The one privileged
   step, `playwright install-deps`, runs as root during bootstrap only.
+- The gate itself is bounded: it runs under `timeout 5400` on the box, the same 90 minutes as
+  the uptime guard, so a hung target cannot ride the instance to the shutdown. The local log is
+  capped at 200 MB (the head is trimmed, the tail kept) and a Playwright report over 500 MB is
+  left on the box rather than copied, so a runaway gate cannot fill this Mac's disk either.
 - Expected cost unchanged from the estimate: about $1.20 per hour running, about $16 per month
   for the stopped volume, so about $1 per full gate run.
 
@@ -149,6 +165,17 @@ one right after the previous run.
   appear. `--no-verify` skips that check when you only want to refresh metadata.
 - `bootstrap.sh` removes any old marker first and writes the new one only after every step has
   succeeded, so a failed repair cannot leave a stale "this box is fine" marker behind.
+- The security group is adopted only if it carries the owner tag, and every ingress rule that is
+  not the one SSH rule is revoked. A colliding group permitting a test port from `0.0.0.0/0`
+  would otherwise survive a refresh that only touches port 22.
+- An adopted role must carry the exact EC2-only trust policy (one statement, `ec2.amazonaws.com`,
+  `sts:AssumeRole`, no other principal and no condition) and belong to our instance profile and
+  no other. Policy names alone do not say who may assume a role.
+- A stop that fails is retried five times with backoff and then reported loudly, naming the
+  instance id and the exact `aws ec2 stop-instances` command. It is never a warning, and it
+  makes the run exit non-zero even when the gate itself was green. If `run-instances` succeeded
+  but the id was lost, the instance is looked up again by its client token and owner tag before
+  the script gives up — and if it still cannot be found, that too is a loud non-zero exit.
 
 ### Runbook
 
@@ -166,36 +193,34 @@ one right after the previous run.
    scripts/zs/remote-ci/provision.sh --dry-run    # prints every aws call, changes nothing
    scripts/zs/remote-ci/provision.sh              # ~30 min: it waits for cloud-init, then stops the box
    ```
-   It writes `~/.ssh/buzz-ci-box.pem` (0600), `scripts/zs/remote-ci/box.env`, and one access-key
-   file under `~/Backups/aws/` (0600). The secret is written to that file once and never printed.
-3. **Store the runner key**, using the two commands the script prints (it fills in the real file
-   path), then delete the file:
-   ```
-   sed -n 's/^AWS_ACCESS_KEY_ID=//p' <file> \
-     | zsvault add aws_ci_runner_access_key_id --type api_key \
-         --env-name AWS_ACCESS_KEY_ID --yes --value-stdin
-   sed -n 's/^AWS_SECRET_ACCESS_KEY=//p' <file> \
-     | zsvault add aws_ci_runner_secret_access_key --type api_key \
-         --env-name AWS_SECRET_ACCESS_KEY --yes --value-stdin
-   rm -f <file>
-   ```
-   The env names must be exactly `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`; a named
-   profile `buzz-ci-runner` with the same credentials works too — `remote-ci.sh` accepts either.
-4. **Deactivate the admin access key in IAM.** Only `provision.sh` ever needs it, and the
+   It writes `~/.ssh/buzz-ci-box.pem` (0600) and `scripts/zs/remote-ci/box.env`. Once the box
+   has proved it bootstrapped, it creates the scoped runner access key and hands both halves
+   straight to ZS Vault as `aws_ci_runner_access_key_id` (env `AWS_ACCESS_KEY_ID`) and
+   `aws_ci_runner_secret_access_key` (env `AWS_SECRET_ACCESS_KEY`). **The runner secret never
+   touches the disk and is never printed**; if either vault write fails, the IAM key is deleted
+   again and provisioning exits non-zero. `zsvault` must therefore be on `PATH` — the script
+   checks before it creates the key. A named profile `buzz-ci-runner` with the same credentials
+   works too; `remote-ci.sh` accepts either.
+3. **Deactivate the admin access key in IAM.** Only `provision.sh` ever needs it, and the
    day-to-day lane uses the scoped runner key. Reactivate it if you re-provision.
-5. **First run.** `scripts/zs/remote-ci.sh zs/main` (or a branch, or named targets:
+4. **First run.** `scripts/zs/remote-ci.sh zs/main` (or a branch, or named targets:
    `scripts/zs/remote-ci.sh my-branch desktop-test desktop-tauri-test`).
-6. **After a network change**, refresh the SSH allow-list: `scripts/zs/remote-ci/provision.sh
+5. **After a network change**, refresh the SSH allow-list: `scripts/zs/remote-ci/provision.sh
    --allow-ip`. The security group opens port 22 to the caller's public IP only.
 
-Verification available now, with no AWS account: `scripts/zs/remote-ci/test-remote-ci.sh` (66
+Verification available now, with no AWS account: `scripts/zs/remote-ci/test-remote-ci.sh` (98
 checks). It shellchecks all four scripts, runs `provision.sh --dry-run` against a stub `aws` and
 asserts the whole plan (instance type, 200 GB volume, client token, owner tag, alarm, both IAM
-policies, the final stop) while asserting the real `aws` was never called, and drives each new
-guard to its failure: two owner-tagged instances abort with no launch, a denied
-`describe-instances` aborts with no launch, and a `running` box refuses a second run without
-starting or stopping anything. It also exercises `--help` and `box.env` parsing, including that
-a hostile line in `box.env` is rejected rather than executed.
+policies, the final stop) while asserting the real `aws` was never called. Each guard is driven
+to its failure: two owner-tagged instances abort with no launch; a denied `describe-instances`
+aborts with no launch; a security group without the owner tag aborts; a failing `zsvault` write
+makes the script delete the IAM access key again and exit non-zero; a held lease refuses the run
+before any EC2 call; a `running` box refuses a run without `--join`; a stop that keeps failing
+is retried five times and then names the instance loudly; and the generated remote runner,
+executed against stubbed tools, aborts rather than gate a tree that is still dirty after its
+reset. It also exercises `--help` and `box.env` parsing, including that a hostile line in
+`box.env` is rejected rather than executed. Each of those guards was verified falsifiable by
+removing it and watching the matching check fail.
 
 ### What Devin still has to do
 
@@ -203,11 +228,16 @@ Three things, all credential work no agent may do:
 
 1. Put the AWS admin key in ZS Vault as `aws_admin_access_key_id` and
    `aws_admin_secret_access_key` (billing lane: AWS, approved 2026-09-05).
-2. Run `provision.sh`, then store the runner key it creates as the two vault entries above.
+2. Run `provision.sh`. It stores the runner key in ZS Vault itself; no manual key handling.
 3. Deactivate the admin access key in IAM once provisioning has succeeded.
 
 Until the first two are done, `box.env` does not exist and `remote-ci.sh` refuses with a message
 that says so. Nothing else in the repo depends on it.
+
+One more thing to know rather than do: **this box belongs to this Mac.** The lease that keeps
+two runs from fighting over it is a local `flock`, so a second machine pointed at the same
+`box.env` would not see it and could stop the box under a running gate. A second machine needs
+its own box.
 
 Hetzner (AX or CCX line) does the same job for a flat $40 to $60 per month with no start/stop
 logic, but it is a second new vendor and Devin approved AWS specifically; revisit if the

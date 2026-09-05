@@ -33,6 +33,11 @@
 # Deactivate the admin access key in IAM once provisioning has succeeded; the
 # day-to-day lane uses the scoped buzz-ci-runner key instead.
 #
+# The scoped runner key this script creates goes straight into ZS Vault as
+# aws_ci_runner_access_key_id and aws_ci_runner_secret_access_key. It is created
+# only after the box has proved it bootstrapped, it never touches the disk, and
+# a failed vault write deletes it again.
+#
 # Usage:
 #   scripts/zs/remote-ci/provision.sh [--dry-run] [--allow-ip [CIDR]]
 #                                     [--no-verify] [--no-wait-bootstrap]
@@ -51,7 +56,6 @@ SSH_USER="ci"
 AMI_SSM_PARAM="/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id"
 KEY_PATH="${BUZZ_CI_KEY_PATH:-$HOME/.ssh/${BOX_NAME}.pem}"
 KNOWN_HOSTS="${BUZZ_CI_KNOWN_HOSTS:-$HOME/.ssh/known_hosts.${BOX_NAME}}"
-BACKUP_DIR="${BUZZ_CI_BACKUP_DIR:-$HOME/Backups/aws}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BOX_ENV="${SCRIPT_DIR}/box.env"
 BOOTSTRAP="${SCRIPT_DIR}/bootstrap.sh"
@@ -77,6 +81,10 @@ WAIT_BOOTSTRAP=1
 VERIFY_EXISTING=1
 LAUNCH_ATTEMPTED=0
 RUNNING_INSTANCE=""
+STOP_FAILED=0
+STOP_BACKOFF="${BUZZ_CI_STOP_BACKOFF:-5}"
+CLIENT_TOKEN=""
+TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
 
 usage() {
   sed -n '2,44p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -183,12 +191,18 @@ Refusing to adopt it. Rename or remove the colliding resource, then re-run." ;;
   done
 }
 
-assert_owner_tag() { # assert_owner_tag <label> <tag-list-text>
-  case "$2" in
-    *"$OWNER_TAG_VALUE"*) ;;
-    *) die "$1 exists but is not tagged ${OWNER_TAG_KEY}=${OWNER_TAG_VALUE}.
-Something else owns that name. Refusing to adopt it." ;;
-  esac
+# The caller queries Tags[?Key=='<owner key>'].Value, so the value must equal
+# the owner value exactly: a resource tagged purpose=buzz-remote-ci is not ours.
+assert_owner_tag() { # assert_owner_tag <label> <value-of-the-owner-tag-key>
+  [ "$2" = "$OWNER_TAG_VALUE" ] || die "$1 exists but is not tagged
+${OWNER_TAG_KEY}=${OWNER_TAG_VALUE} (that tag key reads '${2:-<absent>}').
+Something else owns that name. Refusing to adopt it."
+}
+
+# assert_equals <label> <expected> <actual>
+assert_equals() {
+  [ "$2" = "$3" ] || die "${1}: expected '${2}', found '${3}'.
+Refusing to adopt a resource this script did not create."
 }
 
 while [ $# -gt 0 ]; do
@@ -209,28 +223,80 @@ command -v aws >/dev/null 2>&1 || die "aws CLI not on PATH (brew install awscli)
 [ -f "$BOOTSTRAP" ] || die "missing $BOOTSTRAP"
 
 # ── cleanup trap, armed before anything can leave an instance running ────────
-stop_and_forget() {
-  local id="$1"
+lost_box() { # lost_box <what-we-know>
+  cat >&2 <<EOF
+
+provision: THE BOX MAY STILL BE RUNNING AND BILLING, at about \$1.20 per hour.
+${1}
+Open the EC2 console for ${AWS_REGION_NAME} and look for an instance tagged
+Name=${BOX_NAME} / ${OWNER_TAG_KEY}=${OWNER_TAG_VALUE}, or with client token
+${CLIENT_TOKEN}. Stop it:
+
+  aws --region ${AWS_REGION_NAME} ec2 stop-instances --instance-ids <id>
+
+The instance was launched before the idle alarm existed and its own uptime
+cron only exists once cloud-init finished, so neither backstop is guaranteed.
+
+EOF
+  STOP_FAILED=1
+}
+
+# Stop the box and keep it recorded until EC2 confirms it stopped. A failed stop
+# is never a warning: it costs money, so it is surfaced and it fails the run.
+stop_box() {
+  local id="$1" attempt
   [ -n "$id" ] || return 0
+  if [ "$DRY_RUN" = 1 ]; then
+    aws_do ec2 stop-instances --instance-ids "$id" >/dev/null
+    RUNNING_INSTANCE=""
+    return 0
+  fi
   log "stopping ${id}"
-  aws_do ec2 stop-instances --instance-ids "$id" >/dev/null \
-    || log "WARNING: stop-instances failed for ${id}. Stop it by hand."
-  [ "$DRY_RUN" = 1 ] || run_aws ec2 wait instance-stopped --instance-ids "$id" \
-    || log "WARNING: the instance did not report stopped."
-  RUNNING_INSTANCE=""
+  for attempt in 1 2 3 4 5; do
+    if run_aws ec2 stop-instances --instance-ids "$id" >/dev/null 2>&1 \
+       && run_aws ec2 wait instance-stopped --instance-ids "$id" >/dev/null 2>&1; then
+      log "stopped ${id}"
+      RUNNING_INSTANCE=""   # cleared only once EC2 agrees it is stopped
+      return 0
+    fi
+    log "stop attempt ${attempt} of 5 failed for ${id}"
+    [ "$attempt" = 5 ] || sleep $(( STOP_BACKOFF * attempt ))
+  done
+  lost_box "Five stop-instances attempts failed for ${id}."
+  return 1
+}
+
+# run-instances can succeed while the CLI returns nothing useful. Look the
+# instance up by its client token and owner tag before giving up on it.
+rediscover_box() {
+  local attempt found
+  for attempt in 1 2 3; do
+    found="$(run_aws ec2 describe-instances \
+      --filters "Name=client-token,Values=${CLIENT_TOKEN}" \
+        "Name=tag:${OWNER_TAG_KEY},Values=${OWNER_TAG_VALUE}" \
+        'Name=instance-state-name,Values=pending,running,stopping,stopped' \
+      --query 'Reservations[].Instances[].InstanceId' 2>/dev/null)" && {
+        found="${found%%[[:space:]]*}"
+        [ "$found" = None ] && found=""
+        if [ -n "$found" ]; then printf '%s\n' "$found"; return 0; fi
+      }
+    sleep $(( STOP_BACKOFF * attempt ))
+  done
+  return 1
 }
 
 provision_trap() {
   local rc=$?
   if [ -z "$RUNNING_INSTANCE" ] && [ "$LAUNCH_ATTEMPTED" = 1 ] && [ "$DRY_RUN" = 0 ]; then
-    # run-instances may have succeeded without us recording the id.
-    RUNNING_INSTANCE="$(run_aws ec2 describe-instances \
-      --filters "Name=tag:Name,Values=${BOX_NAME}" \
-        "Name=tag:${OWNER_TAG_KEY},Values=${OWNER_TAG_VALUE}" \
-        'Name=instance-state-name,Values=pending,running' \
-      --query 'Reservations[].Instances[].InstanceId' 2>/dev/null || true)"
+    if RUNNING_INSTANCE="$(rediscover_box)"; then
+      log "recovered the launched instance id: ${RUNNING_INSTANCE}"
+    else
+      RUNNING_INSTANCE=""
+      lost_box "run-instances was issued but the instance id could not be recovered."
+    fi
   fi
-  [ -n "$RUNNING_INSTANCE" ] && stop_and_forget "$RUNNING_INSTANCE"
+  [ -n "$RUNNING_INSTANCE" ] && { stop_box "$RUNNING_INSTANCE" || true; }
+  if [ "$STOP_FAILED" = 1 ] && [ "$rc" -eq 0 ]; then rc=1; fi
   exit "$rc"
 }
 trap provision_trap EXIT INT TERM
@@ -266,6 +332,7 @@ wait_for_ssh() { # wait_for_ssh <ip>
 # ── account ──────────────────────────────────────────────────────────────────
 ACCOUNT_ID="$(aws_query sts get-caller-identity --query Account)"
 ACCOUNT_ID="${ACCOUNT_ID:-000000000000}"
+CLIENT_TOKEN="${BOX_NAME}-${AWS_REGION_NAME}-${ACCOUNT_ID}"
 log "account ${ACCOUNT_ID}, region ${AWS_REGION_NAME}, admin from ${ADMIN_SOURCE}"
 
 # ── instance discovery first: fail before creating anything ─────────────────
@@ -304,15 +371,25 @@ if [ -z "$SG_ID" ]; then
   SG_ID="${SG_ID:-sg-0dryrun}"
 else
   log "security group ${BOX_NAME} exists (${SG_ID})"
+  # A group with this name that we did not create could already permit anything
+  # from anywhere, and the box would launch into it.
+  sg_owner="$(aws_query ec2 describe-security-groups --group-ids "$SG_ID" \
+    --query "SecurityGroups[0].Tags[?Key=='${OWNER_TAG_KEY}']|[0].Value")"
+  [ "$sg_owner" = None ] && sg_owner=""
+  assert_owner_tag "security group ${BOX_NAME} (${SG_ID})" "$sg_owner"
 fi
 
+# One ingress rule, ours. Every other ingress rule is revoked rather than left
+# in place: a stray "test port from 0.0.0.0/0" would otherwise survive, because
+# a rule refresh that only touches port 22 never sees it.
 refresh_ssh_rule() {
   local cidr rule_ids
   cidr="$(caller_cidr)"
   rule_ids="$(aws_query ec2 describe-security-group-rules \
     --filters "Name=group-id,Values=${SG_ID}" \
-    --query 'SecurityGroupRules[?IsEgress==`false` && FromPort==`22`].SecurityGroupRuleId')"
+    --query 'SecurityGroupRules[?IsEgress==`false`].SecurityGroupRuleId')"
   if [ -n "$rule_ids" ] && [ "$rule_ids" != "None" ]; then
+    log "revoking every existing ingress rule on ${SG_ID}"
     # shellcheck disable=SC2086 # rule ids are a space-separated list by design
     aws_do ec2 revoke-security-group-rules --group-id "$SG_ID" \
       --security-group-rule-ids $rule_ids >/dev/null
@@ -377,17 +454,44 @@ fi
 # ── IAM role: the box may stop only itself ───────────────────────────────────
 if iam_lookup iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn'; then
   log "IAM role ${ROLE_NAME} exists (${IAM_VALUE})"
-  role_tags="$(aws_query iam list-role-tags --role-name "$ROLE_NAME" --query "Tags[].Value")"
+  role_tags="$(aws_query iam list-role-tags --role-name "$ROLE_NAME" --query "Tags[?Key=='${OWNER_TAG_KEY}']|[0].Value")"
+  [ "$role_tags" = None ] && role_tags=""
   assert_owner_tag "IAM role ${ROLE_NAME}" "$role_tags"
   role_managed="$(aws_query iam list-attached-role-policies --role-name "$ROLE_NAME" --query "AttachedPolicies[].PolicyName")"
   assert_only "IAM role ${ROLE_NAME}" "" "$role_managed"
   role_inline="$(aws_query iam list-role-policies --role-name "$ROLE_NAME" --query "PolicyNames")"
   assert_only "IAM role ${ROLE_NAME}" "$ROLE_POLICY_NAME" "$role_inline"
+  # Policy names alone do not say who may assume the role. A role that also
+  # trusts an arbitrary AWS principal would let that principal stop this box,
+  # so require the exact EC2-only trust document, statement by statement.
+  trust_count="$(aws_query iam get-role --role-name "$ROLE_NAME" \
+    --query 'length(Role.AssumeRolePolicyDocument.Statement)')"
+  assert_equals "IAM role ${ROLE_NAME} trust policy statement count" 1 "$trust_count"
+  trust_service="$(aws_query iam get-role --role-name "$ROLE_NAME" \
+    --query 'Role.AssumeRolePolicyDocument.Statement[0].Principal.Service')"
+  assert_equals "IAM role ${ROLE_NAME} trusted service" ec2.amazonaws.com "$trust_service"
+  trust_action="$(aws_query iam get-role --role-name "$ROLE_NAME" \
+    --query 'Role.AssumeRolePolicyDocument.Statement[0].Action')"
+  assert_equals "IAM role ${ROLE_NAME} trusted action" sts:AssumeRole "$trust_action"
+  trust_effect="$(aws_query iam get-role --role-name "$ROLE_NAME" \
+    --query 'Role.AssumeRolePolicyDocument.Statement[0].Effect')"
+  assert_equals "IAM role ${ROLE_NAME} trust effect" Allow "$trust_effect"
+  trust_other="$(aws_query iam get-role --role-name "$ROLE_NAME" \
+    --query 'Role.AssumeRolePolicyDocument.Statement[0].[Principal.AWS,Principal.Federated,Condition]')"
+  case "$(printf '%s' "$trust_other" | tr -d '[:space:]')" in
+    NoneNoneNone|None|'') ;;
+    *) die "IAM role ${ROLE_NAME} trusts more than the EC2 service (${trust_other}).
+Refusing to adopt it." ;;
+  esac
+  # And it must belong to our instance profile, and only to ours.
+  role_profiles="$(aws_query iam list-instance-profiles-for-role --role-name "$ROLE_NAME" \
+    --query 'InstanceProfiles[].InstanceProfileName')"
+  assert_only "IAM role ${ROLE_NAME} instance-profile membership" "$BOX_NAME" "$role_profiles"
 else
   log "creating IAM role ${ROLE_NAME}"
   aws_do iam create-role --role-name "$ROLE_NAME" \
     --tags "Key=${OWNER_TAG_KEY},Value=${OWNER_TAG_VALUE}" \
-    --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}' \
+    --assume-role-policy-document "$TRUST_POLICY" \
     >/dev/null
 fi
 # Scoped by tag so the policy is valid before the instance exists; tightened to
@@ -400,7 +504,8 @@ if iam_lookup iam get-instance-profile --instance-profile-name "$BOX_NAME" \
     --query 'InstanceProfile.Roles[].RoleName'; then
   log "instance profile ${BOX_NAME} exists"
   profile_roles="$IAM_VALUE"
-  profile_tags="$(aws_query iam list-instance-profile-tags --instance-profile-name "$BOX_NAME" --query "Tags[].Value")"
+  profile_tags="$(aws_query iam list-instance-profile-tags --instance-profile-name "$BOX_NAME" --query "Tags[?Key=='${OWNER_TAG_KEY}']|[0].Value")"
+  [ "$profile_tags" = None ] && profile_tags=""
   assert_owner_tag "instance profile ${BOX_NAME}" "$profile_tags"
   assert_only "instance profile ${BOX_NAME}" "$ROLE_NAME" "$profile_roles"
 else
@@ -422,7 +527,7 @@ if [ -z "$INSTANCE_ID" ]; then
   # that already launched adopts that instance instead of launching a second.
   LAUNCH_ATTEMPTED=1
   INSTANCE_ID="$(aws_do ec2 run-instances \
-    --client-token "${BOX_NAME}-${AWS_REGION_NAME}-${ACCOUNT_ID}" \
+    --client-token "$CLIENT_TOKEN" \
     --image-id "$AMI_ID" \
     --instance-type "$INSTANCE_TYPE" \
     --key-name "$BOX_NAME" \
@@ -463,7 +568,8 @@ aws_do cloudwatch put-metric-alarm \
 # ── scoped runner user ───────────────────────────────────────────────────────
 if iam_lookup iam get-user --user-name "$RUNNER_USER" --query 'User.Arn'; then
   log "IAM user ${RUNNER_USER} exists (${IAM_VALUE})"
-  user_tags="$(aws_query iam list-user-tags --user-name "$RUNNER_USER" --query "Tags[].Value")"
+  user_tags="$(aws_query iam list-user-tags --user-name "$RUNNER_USER" --query "Tags[?Key=='${OWNER_TAG_KEY}']|[0].Value")"
+  [ "$user_tags" = None ] && user_tags=""
   assert_owner_tag "IAM user ${RUNNER_USER}" "$user_tags"
   user_managed="$(aws_query iam list-attached-user-policies --user-name "$RUNNER_USER" --query "AttachedPolicies[].PolicyName")"
   assert_only "IAM user ${RUNNER_USER}" "" "$user_managed"
@@ -482,49 +588,9 @@ aws_do iam put-user-policy --user-name "$RUNNER_USER" --policy-name "$USER_POLIC
   --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"ControlThisBox\",\"Effect\":\"Allow\",\"Action\":[\"ec2:StartInstances\",\"ec2:StopInstances\"],\"Resource\":\"${INSTANCE_ARN}\"},{\"Sid\":\"DescribeIsNotResourceScopable\",\"Effect\":\"Allow\",\"Action\":[\"ec2:DescribeInstances\",\"ec2:DescribeInstanceStatus\"],\"Resource\":\"*\"}]}" \
   >/dev/null
 
-EXISTING_KEYS="$(aws_query iam list-access-keys --user-name "$RUNNER_USER" \
-  --query 'AccessKeyMetadata[?Status==`Active`].AccessKeyId')"
-[ "$EXISTING_KEYS" = "None" ] && EXISTING_KEYS=""
-if [ -n "$EXISTING_KEYS" ]; then
-  log "${RUNNER_USER} already has an active access key (${EXISTING_KEYS}); not creating another"
-  log "if you no longer hold its secret, delete the key and re-run this script"
-else
-  CRED_FILE="${BACKUP_DIR}/${RUNNER_USER}-$(date -u +%Y%m%dT%H%M%SZ).env"
-  log "creating one access key for ${RUNNER_USER}"
-  if [ "$DRY_RUN" = 1 ]; then
-    aws_do iam create-access-key --user-name "$RUNNER_USER" \
-      --query 'AccessKey.[AccessKeyId,SecretAccessKey]'
-    printf 'DRY-RUN: write %s (0600)\n' "${BACKUP_DIR}/${RUNNER_USER}-<ts>.env" >&3
-  else
-    mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
-    key_line="$(run_aws iam create-access-key --user-name "$RUNNER_USER" \
-      --query 'AccessKey.[AccessKeyId,SecretAccessKey]')"
-    key_id="$(printf '%s' "$key_line" | awk '{print $1}')"
-    ( umask 077 && printf 'AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\n' \
-        "$key_id" "$(printf '%s' "$key_line" | awk '{print $2}')" > "$CRED_FILE" )
-    chmod 600 "$CRED_FILE"
-    cat >&2 <<EOF
-
-  The secret is written once, to ${CRED_FILE} (0600). It is NOT printed here.
-  Put both halves in ZS Vault with these two commands, then delete the file:
-
-    sed -n 's/^AWS_ACCESS_KEY_ID=//p' '${CRED_FILE}' \\
-      | zsvault add aws_ci_runner_access_key_id --type api_key \\
-          --env-name AWS_ACCESS_KEY_ID --yes --value-stdin
-
-    sed -n 's/^AWS_SECRET_ACCESS_KEY=//p' '${CRED_FILE}' \\
-      | zsvault add aws_ci_runner_secret_access_key --type api_key \\
-          --env-name AWS_SECRET_ACCESS_KEY --yes --value-stdin
-
-    rm -f '${CRED_FILE}'
-
-  remote-ci.sh reads AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, so the
-  env-name of each entry must be exactly as above.
-  Access key id (not the secret): ${key_id}
-
-EOF
-  fi
-fi
+# The runner access key is created LAST, after the box has proved it works.
+# See "runner key" below: a key created here and then abandoned by a failing
+# bootstrap would be an active long-lived credential outside the vault.
 
 # ── bootstrap must have completed, or this box is not usable ────────────────
 verify_bootstrap() { # verify_bootstrap <instance-id> <created:0|1>
@@ -575,19 +641,75 @@ cause, then re-run this script: it repairs an instance with no marker."
   log "bootstrap repaired"
 }
 
+BOX_VERIFIED=0
 if [ "$DRY_RUN" = 1 ]; then
   log "dry run: skipping the bootstrap check"
-  stop_and_forget "$INSTANCE_ID"
+  BOX_VERIFIED=1
+  stop_box "$INSTANCE_ID" || true
 elif [ "$CREATED" = 1 ] && [ "$WAIT_BOOTSTRAP" = 0 ]; then
   log "--no-wait-bootstrap: the box is left RUNNING and unverified."
   log "check ${MARKER} yourself, then stop it: aws ec2 stop-instances --instance-ids ${INSTANCE_ID}"
   RUNNING_INSTANCE=""
 elif [ "$CREATED" = 0 ] && [ "$VERIFY_EXISTING" = 0 ]; then
   log "--no-verify: not starting ${INSTANCE_ID} to check its bootstrap marker"
-  stop_and_forget "$INSTANCE_ID"
+  stop_box "$INSTANCE_ID" || true
 else
   verify_bootstrap "$INSTANCE_ID" "$CREATED"
-  stop_and_forget "$INSTANCE_ID"
+  BOX_VERIFIED=1
+  stop_box "$INSTANCE_ID" || true
+fi
+
+# ── runner key: created last, stored straight into ZS Vault ─────────────────
+# The secret never touches the disk. It is created only once the box has proved
+# it bootstrapped, and if either vault write fails the IAM key is deleted again,
+# so an active long-lived credential can never be left outside the vault.
+EXISTING_KEYS="$(aws_query iam list-access-keys --user-name "$RUNNER_USER" \
+  --query 'AccessKeyMetadata[?Status==`Active`].AccessKeyId')"
+[ "$EXISTING_KEYS" = "None" ] && EXISTING_KEYS=""
+if [ -n "$EXISTING_KEYS" ]; then
+  log "${RUNNER_USER} already has an active access key (${EXISTING_KEYS}); not creating another"
+  log "if you no longer hold its secret, delete that key and re-run this script"
+elif [ "$BOX_VERIFIED" = 0 ]; then
+  log "the box was not verified, so no runner key was created."
+  log "re-run this script once the box bootstraps; it will create the key then."
+else
+  command -v zsvault >/dev/null 2>&1 || [ "$DRY_RUN" = 1 ] \
+    || die "zsvault is not on PATH. The runner secret is only ever handed to
+ZS Vault, never written to disk, so provisioning stops here. Install or fix
+zsvault, then re-run: everything else is already in place."
+  log "creating one access key for ${RUNNER_USER} and storing it in ZS Vault"
+  if [ "$DRY_RUN" = 1 ]; then
+    aws_do iam create-access-key --user-name "$RUNNER_USER" \
+      --query 'AccessKey.[AccessKeyId,SecretAccessKey]'
+    printf 'DRY-RUN: zsvault add aws_ci_runner_access_key_id --type api_key --env-name AWS_ACCESS_KEY_ID --yes --value-stdin\n' >&3
+    printf 'DRY-RUN: zsvault add aws_ci_runner_secret_access_key --type api_key --env-name AWS_SECRET_ACCESS_KEY --yes --value-stdin\n' >&3
+  else
+    key_line="$(run_aws iam create-access-key --user-name "$RUNNER_USER" \
+      --query 'AccessKey.[AccessKeyId,SecretAccessKey]')"
+    key_id="$(printf '%s' "$key_line" | awk '{print $1}')"
+    [ -n "$key_id" ] || die "create-access-key returned no key id"
+    vault_ok=1
+    printf '%s' "$key_line" | awk '{printf "%s", $1}' \
+      | zsvault add aws_ci_runner_access_key_id --type api_key \
+          --env-name AWS_ACCESS_KEY_ID --yes --value-stdin >/dev/null || vault_ok=0
+    if [ "$vault_ok" = 1 ]; then
+      printf '%s' "$key_line" | awk '{printf "%s", $2}' \
+        | zsvault add aws_ci_runner_secret_access_key --type api_key \
+            --env-name AWS_SECRET_ACCESS_KEY --yes --value-stdin >/dev/null || vault_ok=0
+    fi
+    key_line=""
+    if [ "$vault_ok" = 0 ]; then
+      log "a zsvault write failed; deleting the IAM access key again"
+      run_aws iam delete-access-key --user-name "$RUNNER_USER" --access-key-id "$key_id" \
+        >/dev/null 2>&1 \
+        || die "could not store the runner key in ZS Vault AND could not delete it.
+Delete it by hand NOW:
+  aws iam delete-access-key --user-name ${RUNNER_USER} --access-key-id ${key_id}"
+      die "could not store the runner key in ZS Vault; the IAM key was deleted again.
+Fix zsvault, then re-run this script."
+    fi
+    log "runner key ${key_id} stored as aws_ci_runner_access_key_id and aws_ci_runner_secret_access_key"
+  fi
 fi
 
 # ── box.env ──────────────────────────────────────────────────────────────────
