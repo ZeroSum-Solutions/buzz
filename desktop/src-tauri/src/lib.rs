@@ -10,6 +10,12 @@ mod deep_link;
 mod egress_guard;
 mod event_sync;
 mod events;
+// Slice one of the Google Calendar integration: the authorization contract and
+// the event contract. Nothing here is wired to a command, the webview or the
+// sidebar yet — that is slice two — so the items below have no in-tree caller
+// and would read as dead code until they do.
+#[allow(dead_code)]
+mod google_calendar;
 mod huddle;
 mod identity_storage;
 mod initial_window;
