@@ -11,7 +11,9 @@ import {
   withFileAddedToFolder,
   withFileRemovedFromFolder,
   withFilesAddedToFolder,
+  withFilesRemovedFromFolder,
   withFolderParent,
+  wouldCreateFolderCycle,
 } from "./useFileFolders.ts";
 
 const CHANNEL_ID = "chan-1";
@@ -206,6 +208,71 @@ test("withFilesAddedToFolder still dedupes correctly against a folder past the d
     merged.event.tags.some((t) => t[0] === "e" && t[1] === "brand-new"),
   );
 });
+
+test("withFilesRemovedFromFolder removes every listed id in one event", () => {
+  const base = parseFolder(
+    folderEvent(buildCreateFolderTags(CHANNEL_ID, "Bulk"), { id: "e-base" }),
+  );
+  const withThree = parseFolder(
+    folderEvent(withFilesAddedToFolder(base, ["a", "b", "c"]) ?? [], {
+      id: "e-three",
+    }),
+  );
+  assert.deepEqual(withThree.fileEventIds.sort(), ["a", "b", "c"]);
+
+  // A sequential per-file loop that rebuilds each write from the same
+  // `withThree` reference is exactly the bug this bulk helper replaces:
+  // it would republish "b" and "c" every time because the stale reference
+  // never observed the prior removal. The bulk helper must remove both in
+  // a single tag list.
+  const removedTags = withFilesRemovedFromFolder(withThree, ["a", "b"]);
+  const afterBulkRemove = parseFolder(
+    folderEvent(removedTags, { id: "e-removed" }),
+  );
+  assert.deepEqual(afterBulkRemove.fileEventIds, ["c"]);
+});
+
+test("wouldCreateFolderCycle blocks nesting a folder under itself or its own descendant", () => {
+  const a = parseFolder(
+    folderEvent(buildCreateFolderTags(CHANNEL_ID, "A"), { id: "e-a" }),
+  );
+  const b = parseFolder(
+    folderEvent(withFolderParent(buildFolderStub(CHANNEL_ID, "B"), a.dTag), {
+      id: "e-b",
+    }),
+  );
+  const c = parseFolder(
+    folderEvent(withFolderParent(buildFolderStub(CHANNEL_ID, "C"), b.dTag), {
+      id: "e-c",
+    }),
+  );
+  const folders = [a, b, c];
+
+  // Self-nest.
+  assert.equal(wouldCreateFolderCycle(folders, a.dTag, a.dTag), true);
+  // Dropping A onto its grandchild C would make A a descendant of its own
+  // descendant — this is the bug ChannelFilesTab.tsx's drop handler let
+  // through by only checking direct self-nesting.
+  assert.equal(wouldCreateFolderCycle(folders, a.dTag, c.dTag), true);
+  // Dropping A onto its direct child B is the same defect one level up.
+  assert.equal(wouldCreateFolderCycle(folders, a.dTag, b.dTag), true);
+  // Moving a descendant under its own ancestor is a legitimate re-nest, not
+  // a cycle.
+  assert.equal(wouldCreateFolderCycle(folders, c.dTag, a.dTag), false);
+  // Unrelated folders never cycle.
+  const d = parseFolder(
+    folderEvent(buildCreateFolderTags(CHANNEL_ID, "D"), { id: "e-d" }),
+  );
+  assert.equal(wouldCreateFolderCycle([...folders, d], d.dTag, a.dTag), false);
+});
+
+function buildFolderStub(channelId, name) {
+  return parseFolder(
+    folderEvent(buildCreateFolderTags(channelId, name), {
+      id: `stub-${name}`,
+    }),
+  );
+}
 
 test("buildFileFolderMap groups every file id under its folder's d-tag", () => {
   const a = parseFolder(

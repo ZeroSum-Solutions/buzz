@@ -193,6 +193,25 @@ test("parseChannelFiles caps an oversized relay-sourced filename and caption", (
   );
 });
 
+test("parseChannelFiles caps an oversized relay-sourced mimeType", () => {
+  const event = relayEvent({
+    id: "event-oversized-mime",
+    tags: [
+      imetaTag({
+        url: "https://relay.example/media/abc.png",
+        m: "x".repeat(1000),
+      }),
+    ],
+  });
+
+  const [file] = parseChannelFiles([event]);
+
+  assert.ok(
+    file.mimeType.length <= 100,
+    `mimeType should be capped, got ${file.mimeType.length} chars`,
+  );
+});
+
 test("parseChannelFiles caps the number of attachments pulled from a single event", () => {
   const fields = [];
   for (let i = 0; i < 40; i++) {

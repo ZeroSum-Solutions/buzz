@@ -12,7 +12,7 @@ import {
   FolderInput,
 } from "lucide-react";
 import { FileRow, FileRowSkeleton } from "./FileCard";
-import type { FileFolder } from "./useFileFolders";
+import { type FileFolder, wouldCreateFolderCycle } from "./useFileFolders";
 import {
   categorizeFile,
   sortFiles,
@@ -58,6 +58,10 @@ export type ChannelFilesTabProps = {
     folder: FileFolder,
     eventId: string,
   ) => Promise<unknown>;
+  onRemoveFilesFromFolder?: (
+    folder: FileFolder,
+    eventIds: string[],
+  ) => Promise<unknown>;
   onSetFolderParent?: (
     folder: FileFolder,
     parentDTag?: string,
@@ -77,6 +81,7 @@ export function ChannelFilesTab({
   onAddFileToFolder,
   onAddFilesToFolder,
   onRemoveFileFromFolder,
+  onRemoveFilesFromFolder,
   onSetFolderParent,
 }: ChannelFilesTabProps) {
   const [category, setCategory] = useState<FileCategory>("all");
@@ -241,10 +246,12 @@ export function ChannelFilesTab({
       // Check if a folder is being dragged (nesting) vs a file
       const folderDTag = e.dataTransfer.getData("application/x-folder");
       if (folderDTag) {
-        // Don't nest a folder into itself or its children
-        if (folderDTag === folder.dTag) return;
         const draggedFolder = folders.find((f) => f.dTag === folderDTag);
         if (!draggedFolder) return;
+        // Don't nest a folder into itself or one of its own descendants —
+        // either makes the folder its own ancestor, which drops it (and
+        // everything under it) out of every walk that starts from a root.
+        if (wouldCreateFolderCycle(folders, folderDTag, folder.dTag)) return;
         onSetFolderParent?.(draggedFolder, folder.dTag);
         return;
       }
@@ -301,14 +308,18 @@ export function ChannelFilesTab({
   }
 
   async function handleBulkRemoveFromFolder() {
-    if (!onRemoveFileFromFolder || !selectedInFolder) return;
+    if (!onRemoveFilesFromFolder || !selectedInFolder) return;
     const folder = folders.find((f) => f.dTag === selectedInFolder);
     if (!folder) return;
-    const count = selectedIds.size;
-    for (const eventId of selectedIds) {
-      await onRemoveFileFromFolder(folder, eventId);
-    }
-    toast(`Removed ${count} file${count !== 1 ? "s" : ""} from ${folder.name}`);
+    const ids = Array.from(selectedIds);
+    // One event for the whole selection — a sequential per-file loop here
+    // published N separate replaceable events, each built from the same
+    // stale `folder` reference, so every iteration after the first re-added
+    // the files the previous iteration had just removed.
+    await onRemoveFilesFromFolder(folder, ids);
+    toast(
+      `Removed ${ids.length} file${ids.length !== 1 ? "s" : ""} from ${folder.name}`,
+    );
     setSelectedIds(new Set());
   }
 

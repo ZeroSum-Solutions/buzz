@@ -70,7 +70,11 @@ import { AgentSessionProvider } from "@/shared/context/AgentSessionContext";
 import { ProfilePanelProvider } from "@/shared/context/ProfilePanelContext";
 import { useChannelPaneOpeners } from "@/features/channels/ui/useChannelPaneOpeners";
 import { useMainInsetRef } from "@/shared/layout/MainInsetContext";
-import { channelContentTopPaddingMeasurement } from "@/shared/layout/chromeLayout";
+import {
+  channelChrome,
+  channelContentTopPaddingMeasurement,
+} from "@/shared/layout/chromeLayout";
+import { cn } from "@/shared/lib/cn";
 import { useMeasuredCssVariable } from "@/shared/layout/useMeasuredCssVariable";
 import { useElementWidth } from "@/shared/hooks/use-mobile";
 import { useThreadPanelWidth } from "@/shared/hooks/useThreadPanelWidth";
@@ -880,40 +884,60 @@ export function ChannelScreen({
               )
             ) : (
               <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-                <div
-                  className="shrink-0 border-b border-border bg-background px-4"
-                  role="tablist"
-                >
-                  <div className="flex gap-0">
-                    <button
-                      aria-selected={activeTab === CHANNEL_TAB_CHAT}
-                      className={`px-4 py-2.5 text-sm font-medium transition-colors border-b-2 -mb-px ${
-                        activeTab === CHANNEL_TAB_CHAT
-                          ? "border-foreground text-foreground"
-                          : "border-transparent text-muted-foreground hover:text-foreground"
-                      }`}
-                      onClick={() => setActiveTab(CHANNEL_TAB_CHAT)}
-                      role="tab"
-                      type="button"
-                    >
-                      Chat
-                    </button>
-                    <button
-                      aria-selected={activeTab === CHANNEL_TAB_FILES}
-                      className={`px-4 py-2.5 text-sm font-medium transition-colors border-b-2 -mb-px ${
-                        activeTab === CHANNEL_TAB_FILES
-                          ? "border-foreground text-foreground"
-                          : "border-transparent text-muted-foreground hover:text-foreground"
-                      }`}
-                      onClick={() => setActiveTab(CHANNEL_TAB_FILES)}
-                      role="tab"
-                      type="button"
-                    >
-                      Files
-                    </button>
+                {/* One shared header above the tab strip, not threaded into
+                    ChannelPane, so Chat and Files get identical channel
+                    title/actions instead of the Chat tab's own internal,
+                    sticky-backdropped copy. Hidden during a huddle
+                    transcript and in the narrow single-panel view (an
+                    auxiliary panel — thread, management — taking the full
+                    width), matching ChannelPane's own former
+                    `!isSinglePanelView && !isHuddleTranscript` gate for
+                    this same header. */}
+                {isHuddleTranscript || isSinglePanelView ? null : channelHeader}
+                {isHuddleTranscript ? null : (
+                  <div
+                    className={cn(
+                      // The header above renders with zero net flow height
+                      // (its own overlay negative-margin cancels it), so
+                      // without this the tab strip's real content sits at
+                      // the header's own start position and gets visually
+                      // covered by it — see channelChrome.clearHeaderMargin.
+                      channelChrome.clearHeaderMargin,
+                      "shrink-0 border-b border-border bg-background px-4",
+                    )}
+                    role="tablist"
+                  >
+                    <div className="flex gap-0">
+                      <button
+                        aria-selected={activeTab === CHANNEL_TAB_CHAT}
+                        className={`px-4 py-2.5 text-sm font-medium transition-colors border-b-2 -mb-px ${
+                          activeTab === CHANNEL_TAB_CHAT
+                            ? "border-foreground text-foreground"
+                            : "border-transparent text-muted-foreground hover:text-foreground"
+                        }`}
+                        onClick={() => setActiveTab(CHANNEL_TAB_CHAT)}
+                        role="tab"
+                        type="button"
+                      >
+                        Chat
+                      </button>
+                      <button
+                        aria-selected={activeTab === CHANNEL_TAB_FILES}
+                        className={`px-4 py-2.5 text-sm font-medium transition-colors border-b-2 -mb-px ${
+                          activeTab === CHANNEL_TAB_FILES
+                            ? "border-foreground text-foreground"
+                            : "border-transparent text-muted-foreground hover:text-foreground"
+                        }`}
+                        onClick={() => setActiveTab(CHANNEL_TAB_FILES)}
+                        role="tab"
+                        type="button"
+                      >
+                        Files
+                      </button>
+                    </div>
                   </div>
-                </div>
-                {activeTab === CHANNEL_TAB_CHAT ? (
+                )}
+                {isHuddleTranscript || activeTab === CHANNEL_TAB_CHAT ? (
               <React.Suspense
                 fallback={
                   <ChannelScreenLoadingFallback
@@ -936,7 +960,6 @@ export function ChannelScreen({
                     currentPubkey={currentPubkey}
                     canResetThreadPanelWidth={canResetThreadPanelWidth}
                     fetchOlder={fetchOlder}
-                    header={channelHeader}
                     {...{
                       idleAuxiliaryHeaderActions,
                       idleAuxiliaryOverridesThread,
@@ -1087,6 +1110,7 @@ export function ChannelScreen({
                     onDeleteFolder={fileFoldersHook.deleteFolder}
                     onJumpToMessage={handleJumpToMessage}
                     onRemoveFileFromFolder={fileFoldersHook.removeFileFromFolder}
+                    onRemoveFilesFromFolder={fileFoldersHook.removeFilesFromFolder}
                     onRenameFolder={fileFoldersHook.renameFolder}
                     onSetFolderParent={fileFoldersHook.setFolderParent}
                     senderAvatarUrls={fileSenderAvatarUrls}

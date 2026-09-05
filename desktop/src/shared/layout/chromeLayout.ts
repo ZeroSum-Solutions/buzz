@@ -60,4 +60,12 @@ export const channelChrome = {
   headerHeight: "h-(--buzz-channel-content-top-padding,5.75rem)",
   /** Negative margin for overlaid channel chrome that should not affect flow. */
   negativeMargin: "-mb-(--buzz-channel-content-top-padding,5.75rem)",
+  /**
+   * Margin-top that clears the measured channel header chrome for a plain
+   * in-flow sibling that renders directly after it (e.g. a tab strip) —
+   * the overlaid header's own negative margin gives it zero net height, so
+   * without this its real content sits at the header's start position and
+   * is visually covered by it.
+   */
+  clearHeaderMargin: "mt-(--buzz-channel-content-top-padding,5.75rem)",
 } as const;

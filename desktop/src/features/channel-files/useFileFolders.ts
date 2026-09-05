@@ -145,6 +145,51 @@ export function withFileRemovedFromFolder(
   return folder.event.tags.filter((t) => !(t[0] === "e" && t[1] === eventId));
 }
 
+/**
+ * Tags for removing multiple files from a folder in one event (avoids the
+ * race of publishing N separate replaceable events, where each iteration's
+ * write is built from a folder reference that has not yet observed the
+ * previous iteration's removal and so re-adds it).
+ */
+export function withFilesRemovedFromFolder(
+  folder: FileFolder,
+  eventIds: string[],
+): string[][] {
+  const idsToRemove = new Set(eventIds);
+  return folder.event.tags.filter(
+    (t) => !(t[0] === "e" && idsToRemove.has(t[1])),
+  );
+}
+
+/**
+ * Whether nesting `draggedDTag` under `targetDTag` would create a cyclic
+ * parent chain — true when `targetDTag` is `draggedDTag` itself, or is
+ * already a descendant of `draggedDTag`. Callers must reject the drop
+ * instead of calling {@link withFolderParent} when this returns true;
+ * doing so anyway makes the folder its own ancestor, which strands it (and
+ * everything under it) outside of every walk that starts from a root.
+ */
+export function wouldCreateFolderCycle(
+  folders: FileFolder[],
+  draggedDTag: string,
+  targetDTag: string,
+): boolean {
+  if (draggedDTag === targetDTag) return true;
+  const byDTag = new Map(folders.map((f) => [f.dTag, f]));
+  const visited = new Set<string>();
+  let current = byDTag.get(targetDTag);
+  while (current?.parentDTag) {
+    // A parent chain that already cycles back on itself is data we must
+    // not trust as a "safe" target — block the drop rather than risk
+    // looping forever or reinforcing the existing cycle.
+    if (visited.has(current.dTag)) return true;
+    visited.add(current.dTag);
+    if (current.parentDTag === draggedDTag) return true;
+    current = byDTag.get(current.parentDTag);
+  }
+  return false;
+}
+
 /** Tags for renaming a folder (new d-tag + name, file refs kept), plus whether the d-tag changed. */
 export function buildRenameFolderTags(
   folder: FileFolder,
@@ -322,6 +367,40 @@ export function useFileFolders(
     [channelId, currentPubkey, queryClient],
   );
 
+  /**
+   * Remove multiple files from a folder in a single event — avoids the same
+   * race a sequential per-file loop has (see {@link withFilesRemovedFromFolder}).
+   */
+  const removeFilesFromFolder = useCallback(
+    async (folder: FileFolder, eventIds: string[]) => {
+      if (!channelId || !currentPubkey || eventIds.length === 0) return;
+      try {
+        const event = await signRelayEvent({
+          kind: FILE_FOLDER_KIND,
+          content: "",
+          tags: withFilesRemovedFromFolder(folder, eventIds),
+          createdAt: Math.floor(Date.now() / 1000),
+        });
+        await relayClient.publishEvent(
+          event,
+          "Timed out removing files from the folder.",
+          "Failed to remove files from the folder.",
+        );
+        await queryClient.invalidateQueries({
+          queryKey: folderQueryKey(channelId),
+        });
+      } catch (error) {
+        toast.error(
+          error instanceof Error
+            ? error.message
+            : "Failed to remove files from the folder.",
+        );
+        throw error;
+      }
+    },
+    [channelId, currentPubkey, queryClient],
+  );
+
   const deleteFolder = useCallback(
     async (folder: FileFolder) => {
       if (!channelId || !currentPubkey) return;
@@ -448,6 +527,7 @@ export function useFileFolders(
     addFileToFolder,
     addFilesToFolder,
     removeFileFromFolder,
+    removeFilesFromFolder,
     deleteFolder,
     renameFolder,
     setFolderParent,
