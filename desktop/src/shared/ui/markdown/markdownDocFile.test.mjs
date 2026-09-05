@@ -8,6 +8,8 @@ import {
   MAX_MARKDOWN_DOC_BYTES,
   MAX_MARKDOWN_DOC_PREVIEW_LINES,
   MAX_MARKDOWN_DOC_PREVIEW_LINK_MARKERS,
+  MAX_MARKDOWN_DOC_PREVIEW_NESTING_DEPTH,
+  MAX_MARKDOWN_DOC_PREVIEW_TABLE_CELL_MARKERS,
 } from "./markdownDocFile.ts";
 
 // ── isMarkdownDocFilename ─────────────────────────────────────────────────
@@ -140,4 +142,112 @@ test("isMarkdownDocTooComplexForPreview: true for a one-line link-dense document
   assert.ok(!text.includes("\n"));
   assert.ok(text.length < MAX_MARKDOWN_DOC_BYTES);
   assert.equal(isMarkdownDocTooComplexForPreview(text), true);
+});
+
+// ── table-cell density (T9 round-3 critic finding F1) ─────────────────────
+//
+// The two gates above bound block count and inline-link density. A wide GFM
+// table passes both — few lines, not one `[` — while every cell is its own
+// mdast node: a 300-column, 100-row table is 62,194 bytes over 102 lines and
+// renders in 8,643 ms through the export's own path. The `|` count is the
+// quantity that tracks that cost.
+
+/** A GFM table with `cols` columns and `rows` body rows. */
+function gfmTable(cols, rows) {
+  const header = `|${Array.from({ length: cols }, (_, i) => `c${i}`).join("|")}|\n`;
+  const separator = `|${Array.from({ length: cols }, () => "-").join("|")}|\n`;
+  const row = `|${Array.from({ length: cols }, () => "x").join("|")}|\n`;
+  return header + separator + row.repeat(rows);
+}
+
+/** The `|` characters the gate counts. */
+function cellMarkers(text) {
+  return text.split("|").length - 1;
+}
+
+test("isMarkdownDocTooComplexForPreview: false at exactly the table-cell cap", () => {
+  // 12 columns × 228 rows: 2,990 markers, the widest table still admitted,
+  // measured at 163ms through renderMarkdownDocumentHtml.
+  const text = gfmTable(12, 228);
+  assert.ok(cellMarkers(text) <= MAX_MARKDOWN_DOC_PREVIEW_TABLE_CELL_MARKERS);
+  assert.equal(isMarkdownDocTooComplexForPreview(text), false);
+});
+
+test("isMarkdownDocTooComplexForPreview: true one table-cell marker past the cap", () => {
+  const text = `|${"x|".repeat(MAX_MARKDOWN_DOC_PREVIEW_TABLE_CELL_MARKERS)}`;
+  assert.equal(
+    cellMarkers(text),
+    MAX_MARKDOWN_DOC_PREVIEW_TABLE_CELL_MARKERS + 1,
+  );
+  assert.equal(isMarkdownDocTooComplexForPreview(text), true);
+});
+
+test("isMarkdownDocTooComplexForPreview: true for a wide table (critic F1 reproduction shape)", () => {
+  // The critic's own reproduction: 300 columns, 100 rows. Under the 2 MiB
+  // byte cap, 102 lines (under the line gate), no `[` at all (under the link
+  // gate) — and 8,643ms of synchronous parse.
+  const text = gfmTable(300, 100);
+  assert.ok(text.length < MAX_MARKDOWN_DOC_BYTES);
+  assert.ok(text.split("\n").length < MAX_MARKDOWN_DOC_PREVIEW_LINES);
+  assert.ok(!text.includes("["));
+  assert.equal(isMarkdownDocTooComplexForPreview(text), true);
+});
+
+test("isMarkdownDocTooComplexForPreview: a document with prose-scale pipes is not penalized", () => {
+  // Tables the size a document actually carries, plus pipes in running text,
+  // stay far under the cap.
+  const text = `# Report\n\n${gfmTable(4, 40)}\n\nUse \`a || b\` when either matches.\n`;
+  assert.equal(isMarkdownDocTooComplexForPreview(text), false);
+});
+
+// ── container nesting depth (T9 round-3 critic finding F1) ────────────────
+//
+// The parser re-enters the whole container stack on every line, so cost grows
+// with depth, not with line count: a list nested one level per line is
+// 801 lines and 647,890 bytes at depth 800 — under every gate above — and
+// renders in 11,066 ms.
+
+/** A list nested one level deeper on each line. */
+function nestedList(depth) {
+  let out = "";
+  for (let i = 0; i < depth; i++) out += `${"  ".repeat(i)}- item ${i}\n`;
+  return out;
+}
+
+test("isMarkdownDocTooComplexForPreview: false at exactly the nesting-depth cap", () => {
+  // The deepest line is indented MAX * 2 columns, which is exactly MAX levels.
+  const text = nestedList(MAX_MARKDOWN_DOC_PREVIEW_NESTING_DEPTH + 1);
+  assert.equal(isMarkdownDocTooComplexForPreview(text), false);
+});
+
+test("isMarkdownDocTooComplexForPreview: true one nesting level past the cap", () => {
+  const text = nestedList(MAX_MARKDOWN_DOC_PREVIEW_NESTING_DEPTH + 2);
+  assert.equal(isMarkdownDocTooComplexForPreview(text), true);
+});
+
+test("isMarkdownDocTooComplexForPreview: true for a deeply nested list (critic F1 reproduction shape)", () => {
+  const text = nestedList(800);
+  assert.ok(text.length < MAX_MARKDOWN_DOC_BYTES);
+  assert.ok(text.split("\n").length < MAX_MARKDOWN_DOC_PREVIEW_LINES);
+  assert.ok(!text.includes("["));
+  assert.equal(isMarkdownDocTooComplexForPreview(text), true);
+});
+
+test("isMarkdownDocTooComplexForPreview: counts `>` markers as nesting too", () => {
+  const shallow = `${"> ".repeat(MAX_MARKDOWN_DOC_PREVIEW_NESTING_DEPTH)}quoted\n`;
+  const deep = `${"> ".repeat(MAX_MARKDOWN_DOC_PREVIEW_NESTING_DEPTH + 1)}quoted\n`;
+  assert.equal(isMarkdownDocTooComplexForPreview(shallow), false);
+  assert.equal(isMarkdownDocTooComplexForPreview(deep), true);
+});
+
+test("isMarkdownDocTooComplexForPreview: a tab counts as four indent columns", () => {
+  // A tab-indented document must not slip past the depth gate by using one
+  // character per level.
+  const tabs = "\t".repeat(MAX_MARKDOWN_DOC_PREVIEW_NESTING_DEPTH);
+  assert.equal(isMarkdownDocTooComplexForPreview(`${tabs}- deep\n`), true);
+});
+
+test("isMarkdownDocTooComplexForPreview: an ordinary indented document stays under the depth cap", () => {
+  const text = `# Title\n\n- one\n  - two\n    - three\n\n\`\`\`js\n${" ".repeat(40)}const x = 1;\n\`\`\`\n`;
+  assert.equal(isMarkdownDocTooComplexForPreview(text), false);
 });

@@ -175,6 +175,67 @@ test("refuses a flat list of thousands of lines before it is rendered", async ()
   }
 });
 
+test("refuses a wide table before it is rendered", async () => {
+  const bridge = installBridge(() => true);
+  try {
+    // 300 columns × 100 rows: 62,194 bytes (under the byte cap), 102 lines
+    // (under the line gate), not one `[` (under the link gate) — and 8,643 ms
+    // of synchronous parse on the main thread if it is let through.
+    const columns = 300;
+    const header = `|${Array.from({ length: columns }, (_, i) => `c${i}`).join("|")}|\n`;
+    const separator = `|${Array.from({ length: columns }, () => "-").join("|")}|\n`;
+    const row = `|${Array.from({ length: columns }, () => "x").join("|")}|\n`;
+    const content = header + separator + row.repeat(100);
+    assert.ok(content.length < MAX_PDF_DOCUMENT_SOURCE_BYTES);
+    assert.ok(content.split("\n").length < 3000);
+    assert.ok(!content.includes("["));
+
+    const started = performance.now();
+    await assert.rejects(
+      exportMarkdownDocumentToPdf({ content, filename: "table.md" }),
+      /too many elements/,
+    );
+    const elapsed = performance.now() - started;
+
+    assert.equal(bridge.calls.length, 0);
+    assert.ok(
+      elapsed < GATE_BUDGET_MS,
+      `the gate must refuse before the parse, took ${elapsed}ms`,
+    );
+  } finally {
+    bridge.restore();
+  }
+});
+
+test("refuses a deeply nested list before it is rendered", async () => {
+  const bridge = installBridge(() => true);
+  try {
+    // One level deeper per line, 800 levels: 801 lines, 647,890 bytes, no `[`
+    // and no `|` — every other gate admits it, and it renders in 11,066 ms.
+    let content = "";
+    for (let depth = 0; depth < 800; depth++) {
+      content += `${"  ".repeat(depth)}- item ${depth}\n`;
+    }
+    assert.ok(content.length < MAX_PDF_DOCUMENT_SOURCE_BYTES);
+    assert.ok(content.split("\n").length < 3000);
+
+    const started = performance.now();
+    await assert.rejects(
+      exportMarkdownDocumentToPdf({ content, filename: "nested.md" }),
+      /too many elements/,
+    );
+    const elapsed = performance.now() - started;
+
+    assert.equal(bridge.calls.length, 0);
+    assert.ok(
+      elapsed < GATE_BUDGET_MS,
+      `the gate must refuse before the parse, took ${elapsed}ms`,
+    );
+  } finally {
+    bridge.restore();
+  }
+});
+
 test("a document just inside the complexity gate still exports", async () => {
   const bridge = installBridge(() => true);
   try {
@@ -186,6 +247,33 @@ test("a document just inside the complexity gate still exports", async () => {
       true,
     );
     assert.equal(bridge.calls.length, 1);
+  } finally {
+    bridge.restore();
+  }
+});
+
+test("a table and a nesting depth just inside the gate still export", async () => {
+  const bridge = installBridge(() => true);
+  try {
+    // 12 columns × 228 rows is 2,990 cell markers, and 128 levels is the
+    // deepest nesting admitted: the widest and deepest documents the panel
+    // still previews, and so the largest it offers to export. Rendering both
+    // is part of the assertion — the export path runs the real parse here.
+    const header = `|${Array.from({ length: 12 }, (_, i) => `c${i}`).join("|")}|\n`;
+    const separator = `|${Array.from({ length: 12 }, () => "-").join("|")}|\n`;
+    const row = `|${Array.from({ length: 12 }, () => "x").join("|")}|\n`;
+    let nested = "";
+    for (let depth = 0; depth < 129; depth++) {
+      nested += `${"  ".repeat(depth)}- item ${depth}\n`;
+    }
+    const content = `${header + separator + row.repeat(228)}\n${nested}`;
+
+    assert.equal(
+      await exportMarkdownDocumentToPdf({ content, filename: "edge-table.md" }),
+      true,
+    );
+    assert.equal(bridge.calls.length, 1);
+    assert.match(bridge.calls[0].payload.bodyHtml, /<table>/);
   } finally {
     bridge.restore();
   }

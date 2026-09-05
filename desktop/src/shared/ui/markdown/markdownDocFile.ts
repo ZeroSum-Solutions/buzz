@@ -65,21 +65,122 @@ export const MAX_MARKDOWN_DOC_PREVIEW_LINES = 3000;
 export const MAX_MARKDOWN_DOC_PREVIEW_LINK_MARKERS = 2000;
 
 /**
+ * Above this many `|` characters — the cell delimiter GFM tables are built
+ * from — a full Preview render is refused even when both gates above pass.
+ *
+ * A wide table is the shape neither gate above sees: it is few lines and has
+ * no `[` at all, yet every cell is its own mdast node with its own inline
+ * tokenizer run. Measured on this project's pinned parser through the export's
+ * own render path (`renderMarkdownDocumentHtml`), the cost tracks the delimiter
+ * count and not the shape that produced it — a 300-column table and a
+ * 40-column one cost the same at the same delimiter count:
+ *
+ * | table | `|` markers | source bytes | lines | render |
+ * |---|---|---|---|---|
+ * | 12 × 228 | 2,990 | 5,994 | 231 | 163 ms |
+ * | 300 × 8 | 3,010 | 6,810 | 10 | 106 ms |
+ * | 80 × 50 | 4,212 | 8,574 | 52 | 227 ms |
+ * | 40 × 200 | 8,282 | 16,634 | 202 | 681 ms |
+ * | 300 × 100 | 30,702 | 62,194 | 102 | 7,622 ms |
+ * | 300 × 600 | 181,502 | 363,194 | 602 | 1,138,668 ms |
+ *
+ * Every one of those is under the 2 MiB byte cap and under both gates above.
+ * 3,000 markers keeps the widest document still admitted at 163 ms measured —
+ * inside this app's 200 ms main-thread budget — while admitting any table a
+ * document realistically carries (a 12-column table needs 230 rows to reach
+ * it).
+ */
+export const MAX_MARKDOWN_DOC_PREVIEW_TABLE_CELL_MARKERS = 3000;
+
+/**
+ * Above this container nesting depth on any one line, a full Preview render is
+ * refused even when every gate above passes.
+ *
+ * Nesting is the second shape none of the counts above bound: cost grows with
+ * the depth of the container stack the parser has to re-enter on every line,
+ * not with the number of lines or inline markers. Measured the same way, a
+ * list nested one level per line: depth 100 renders in 36 ms, depth 200 in
+ * 147 ms, depth 400 in 953 ms, and depth 800 in 11,066 ms — 801 lines,
+ * 647,890 bytes, not one `[` or `|`, so it passes every other gate outright.
+ *
+ * Depth is counted from each line's leading run of indentation and `>`
+ * markers (two indent columns per level, one per `>`, whose single following
+ * space belongs to the marker), which is a cheap
+ * over-estimate: it counts indentation inside a fenced code block too, where
+ * nothing is nested. 128 leaves the deepest document still admitted at 63 ms
+ * measured, and stays clear of real documents — the deepest leading
+ * indentation in the 2,474 markdown files in this repository is 51 levels.
+ */
+export const MAX_MARKDOWN_DOC_PREVIEW_NESTING_DEPTH = 128;
+
+/**
  * Whether decoded markdown text is safe to run through the full Preview
  * parse. A single scan is linear and cheap — nothing like the parse it is
  * gating — so it is safe to run unconditionally before the expensive path.
+ *
+ * Every counter below bounds a quantity the parse actually spends time on:
+ * block nodes (lines), inline constructs (`[`), table cells (`|`), and
+ * container depth. Bytes bound none of them, which is why the byte cap above
+ * is not this check.
  */
 export function isMarkdownDocTooComplexForPreview(text: string): boolean {
   let lines = 1;
   let linkMarkers = 0;
+  let tableCellMarkers = 0;
+  // Leading indentation columns and `>` markers of the line being scanned;
+  // together they give the container depth the parser has to descend.
+  let inLinePrefix = true;
+  let prefixColumns = 0;
+  let prefixQuotes = 0;
+  // A block-quote marker consumes one following space (CommonMark), so that
+  // space is part of the marker and not indentation of its own.
+  let quoteSpacePending = false;
+  const tooDeep = () =>
+    (prefixColumns >> 1) + prefixQuotes >
+    MAX_MARKDOWN_DOC_PREVIEW_NESTING_DEPTH;
   for (let i = 0; i < text.length; i++) {
     const code = text.charCodeAt(i);
     if (code === 10 /* "\n" */) {
       lines++;
       if (lines > MAX_MARKDOWN_DOC_PREVIEW_LINES) return true;
-    } else if (code === 91 /* "[" */) {
+      inLinePrefix = true;
+      prefixColumns = 0;
+      prefixQuotes = 0;
+      quoteSpacePending = false;
+      continue;
+    }
+    if (inLinePrefix) {
+      if (code === 32 /* " " */) {
+        if (quoteSpacePending) quoteSpacePending = false;
+        else prefixColumns++;
+        continue;
+      }
+      if (code === 9 /* "\t" */) {
+        quoteSpacePending = false;
+        // A tab advances to the next four-column stop; four is markdown's own
+        // tab width, and over-counting here only makes the gate stricter.
+        prefixColumns += 4;
+        continue;
+      }
+      if (code === 62 /* ">" */) {
+        prefixQuotes++;
+        quoteSpacePending = true;
+        if (tooDeep()) return true;
+        continue;
+      }
+      // First character of the line's content: the prefix is complete.
+      inLinePrefix = false;
+      quoteSpacePending = false;
+      if (tooDeep()) return true;
+    }
+    if (code === 91 /* "[" */) {
       linkMarkers++;
       if (linkMarkers > MAX_MARKDOWN_DOC_PREVIEW_LINK_MARKERS) return true;
+    } else if (code === 124 /* "|" */) {
+      tableCellMarkers++;
+      if (tableCellMarkers > MAX_MARKDOWN_DOC_PREVIEW_TABLE_CELL_MARKERS) {
+        return true;
+      }
     }
   }
   return false;
