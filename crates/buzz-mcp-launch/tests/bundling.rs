@@ -20,7 +20,14 @@ fn repo_root() -> PathBuf {
 
 fn read(relative: &str) -> String {
     let path = repo_root().join(relative);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "{relative} is not readable at {}: {e}. Every path this test names must \
+             match `git ls-files` byte for byte, including case: a case-insensitive \
+             filesystem hides a mismatch that fails the Linux unit lane.",
+            path.display()
+        )
+    })
 }
 
 /// The slice of `text` from `anchor` up to `terminator`, so a match elsewhere
@@ -60,7 +67,9 @@ fn every_sidecar_placeholder_site_names_the_launcher() {
             "name: Create sidecar placeholders",
             "\n      - name:",
         ),
-        ("justfile", "_ensure-sidecar-stubs:", "\n\n"),
+        // Tracked as `Justfile`; a lowercase spelling only resolves on a
+        // case-insensitive filesystem.
+        ("Justfile", "_ensure-sidecar-stubs:", "\n\n"),
         ("scripts/bundle-sidecars.sh", "SIDECARS=(", ")"),
     ];
 
