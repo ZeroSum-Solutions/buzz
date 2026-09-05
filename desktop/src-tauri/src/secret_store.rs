@@ -41,7 +41,11 @@ pub enum KeyringProbe {
 
 /// Username used for the single blob keychain entry. All secrets are stored
 /// as a JSON map under this name within the service.
-const BLOB_KEY: &str = "secrets";
+///
+/// Re-exported from `buzz-secret-store`, which owns the blob format so the
+/// desktop (write side) and the `buzz-mcp-launch` sidecar (read side) can never
+/// drift on the key, the encoding, or the bounds.
+use buzz_secret_store_pkg::BLOB_KEY;
 
 // ── Interprocess advisory lock ─────────────────────────────────────────────
 //
@@ -318,11 +322,7 @@ impl SecretStore {
         let raw = self.read_blob_raw()?;
         let map = match raw {
             None => return Ok(None),
-            Some(bytes) => {
-                let json = String::from_utf8(bytes).map_err(|e| format!("blob utf8: {e}"))?;
-                serde_json::from_str::<HashMap<String, String>>(&json)
-                    .map_err(|e| format!("blob json: {e}"))?
-            }
+            Some(bytes) => buzz_secret_store_pkg::parse_blob(&bytes).map_err(|e| e.to_string())?,
         };
 
         // Only populate the cache if it is still empty — a concurrent
@@ -353,16 +353,16 @@ impl SecretStore {
     /// builds that lack hardened-runtime entitlements).
     #[cfg(feature = "system-keyring")]
     fn read_blob_raw_keyring(&self) -> Result<Option<Vec<u8>>, String> {
-        let entry =
-            keyring_entry(&self.service, BLOB_KEY).map_err(|e| format!("keyring entry: {e}"))?;
-        match entry.get_password() {
-            Ok(s) => Ok(Some(s.into_bytes())),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) if is_keyring_availability_error(&e.to_string()) => {
-                Err(format!("keyring unavailable: {e}"))
+        // The read itself lives in `buzz-secret-store` so the sidecar reads the
+        // exact entry this process writes. The availability discriminator stays
+        // here: it feeds the desktop-only file-fallback decision.
+        buzz_secret_store_pkg::keyring_source::read_blob_raw(&self.service).map_err(|e| {
+            if is_keyring_availability_error(&e) {
+                format!("keyring unavailable: {e}")
+            } else {
+                e
             }
-            Err(e) => Err(format!("keyring read: {e}")),
-        }
+        })
     }
 
     /// Atomically load the blob, apply `f` to a candidate map, write back if
@@ -410,11 +410,7 @@ impl SecretStore {
         let raw = self.read_blob_raw()?;
         let current: HashMap<String, String> = match raw {
             None => HashMap::new(),
-            Some(bytes) => {
-                let json = String::from_utf8(bytes).map_err(|e| format!("blob utf8: {e}"))?;
-                serde_json::from_str::<HashMap<String, String>>(&json)
-                    .map_err(|e| format!("blob json: {e}"))?
-            }
+            Some(bytes) => buzz_secret_store_pkg::parse_blob(&bytes).map_err(|e| e.to_string())?,
         };
 
         // Build the candidate state in a separate allocation so that a write
@@ -433,7 +429,10 @@ impl SecretStore {
         }
 
         // Write to keyring while still holding the file lock.
-        let json = serde_json::to_string(&next).map_err(|e| format!("blob serialize: {e}"))?;
+        // `serialize_blob` re-checks the `mcp:` record-count, value-size and
+        // whole-blob bounds, so an overflowing mutation is refused here rather
+        // than written as a blob no later read could accept.
+        let json = buzz_secret_store_pkg::serialize_blob(&next).map_err(|e| e.to_string())?;
         match self.write_blob_raw(json.as_bytes()) {
             Ok(()) => {
                 // Advance the cache to `next` only after the durable write succeeds.
