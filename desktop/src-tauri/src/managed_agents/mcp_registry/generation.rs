@@ -28,13 +28,18 @@
 //! and discarding it would delete the live configuration.
 
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 /// Generations kept on disk: the current one plus one to roll back to.
 pub const RETAINED_GENERATIONS: u64 = 2;
+
+/// The most the `current` pointer may hold. A `u64` in decimal is at most 20
+/// digits; anything past this is not a generation number, so the read is
+/// bounded rather than trusting a file another process could have grown.
+pub(super) const MAX_POINTER_BYTES: usize = 64;
 
 /// Phase of an in-flight configuration change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +158,9 @@ pub enum GenerationError {
     /// The journal on disk could not be read.
     #[error("configuration journal is unreadable: {0}")]
     Journal(String),
+    /// The `current` pointer exists but does not name a generation.
+    #[error("configuration pointer is unreadable: {0}")]
+    Pointer(String),
     /// A post-flip deletion is still owed. The journal keeps it; the next start
     /// retries it.
     #[error("configuration change is committed but {outstanding} cleanup step(s) are still owed: {reason}")]
@@ -215,18 +223,49 @@ impl GenerationStore {
 
     /// The adopted generation, or `None` before the first flip.
     ///
+    /// A pointer that exists but does not parse is an error, never `None`.
+    /// Read as "no generation" it would restart numbering at 1 over a tree
+    /// that already holds generation directories, so a commit would stage into
+    /// a live directory and adopt a mixture of two changes. Absence and
+    /// corruption are different states and only absence is recoverable by
+    /// writing generation 1.
+    ///
     /// # Errors
-    /// [`GenerationError::Io`] when the pointer exists but cannot be read.
+    /// [`GenerationError::Io`] when the pointer exists but cannot be read;
+    /// [`GenerationError::Pointer`] when what it holds is not a generation
+    /// number — too long, not UTF-8, or not a `u64`.
     pub fn current(&self) -> Result<Option<u64>, GenerationError> {
-        match std::fs::read_to_string(self.pointer_path()) {
-            Ok(text) => Ok(text.trim().parse().ok()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(GenerationError::Io {
-                operation: "read",
-                path: self.pointer_path().display().to_string(),
-                reason: e.to_string(),
-            }),
+        let path = self.pointer_path();
+        let io = |operation: &'static str, e: std::io::Error| GenerationError::Io {
+            operation,
+            path: path.display().to_string(),
+            reason: e.to_string(),
+        };
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(io("open", e)),
+        };
+        // Bounded one byte past the cap, so an oversized pointer is
+        // distinguishable from one that exactly fills it, and no more than
+        // that is ever read into memory. The exhausted limit is what reports
+        // it: widening the bound cannot leave the oversize case unreported.
+        let mut buffer = Vec::with_capacity(MAX_POINTER_BYTES + 1);
+        let mut bounded = file.take(MAX_POINTER_BYTES as u64 + 1);
+        bounded
+            .read_to_end(&mut buffer)
+            .map_err(|e| io("read", e))?;
+        let corrupt =
+            |reason: String| GenerationError::Pointer(format!("{}: {reason}", path.display()));
+        if bounded.limit() == 0 {
+            return Err(corrupt(format!("longer than {MAX_POINTER_BYTES} bytes")));
         }
+        let text = std::str::from_utf8(&buffer)
+            .map_err(|e| corrupt(format!("not UTF-8: {e}")))?
+            .trim();
+        text.parse()
+            .map(Some)
+            .map_err(|e| corrupt(format!("{text:?} is not a generation number: {e}")))
     }
 
     /// The directory spawn resolves through. Never a staged directory: a spawn

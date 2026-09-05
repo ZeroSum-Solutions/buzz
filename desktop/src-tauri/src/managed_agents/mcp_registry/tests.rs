@@ -12,7 +12,7 @@ use super::generate::{
 };
 use super::generation::{
     Deletion, FlipHooks, FlipStep, GenerationError, GenerationPlan, GenerationStore, JournalPhase,
-    NoHooks, NoSecrets, Reconciled, SecretRemover,
+    NoHooks, NoSecrets, Reconciled, SecretRemover, MAX_POINTER_BYTES,
 };
 use super::load::{parse_registry, RegistryError};
 use super::resolve::{resolve_for_agent, SpawnRefusal};
@@ -529,6 +529,73 @@ fn mcp_registry_generation_flip_is_atomic() {
             read_current(&store, "b.json").as_deref(),
             Some(expected.1),
             "reconcile changed the adopted configuration after {step:?}"
+        );
+    }
+}
+
+/// A `current` pointer that does not name a generation must block a commit,
+/// not read as "no generation yet".
+///
+/// Read as `None` the next commit would number itself 1 and stage into the
+/// live generation 1 directory, adopting a mixture of two changes over a tree
+/// that was never empty. Making `current` return `Ok(None)` on a parse failure
+/// fails this test at the first assertion.
+#[test]
+fn mcp_registry_a_corrupt_pointer_blocks_the_commit_and_changes_nothing() {
+    // Each case names the fragment its error must carry, so the read stays
+    // bounded: without the `take`, an oversized pointer would be read whole
+    // and reported as a parse failure instead.
+    for (corruption, expected) in [
+        (b"not-a-number".to_vec(), "is not a generation number"),
+        (Vec::new(), "is not a generation number"),
+        (vec![0xff, 0xfe], "not UTF-8"),
+        (vec![b'1'; MAX_POINTER_BYTES + 1], "longer than 64 bytes"),
+    ] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = GenerationStore::open(dir.path()).expect("opens");
+        store
+            .commit(
+                |_, _| Ok(plan(&[("a.json", "one")], vec![])),
+                &NoSecrets,
+                &NoHooks,
+            )
+            .expect("generation 1 lands");
+        let generation_one = std::fs::read_to_string(store.generation_dir(1).join("a.json"))
+            .expect("generation 1 is on disk");
+
+        std::fs::write(dir.path().join("current"), &corruption).expect("corrupt the pointer");
+
+        let error = store
+            .commit(
+                |_, _| Ok(plan(&[("a.json", "two")], vec![])),
+                &NoSecrets,
+                &NoHooks,
+            )
+            .expect_err("a commit must not run from a pointer it cannot read");
+        let GenerationError::Pointer(reason) = &error else {
+            panic!("{corruption:?}: {error:?}");
+        };
+        assert!(
+            reason.contains(expected),
+            "{corruption:?}: expected {expected:?} in {reason:?}"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(store.generation_dir(1).join("a.json")).ok(),
+            Some(generation_one),
+            "{corruption:?}: the refused commit staged over the live generation"
+        );
+        assert!(
+            !store.generation_dir(2).exists(),
+            "{corruption:?}: the refused commit staged a new generation"
+        );
+        assert!(
+            store.journal().expect("journal readable").is_none(),
+            "{corruption:?}: the refused commit left a journal entry"
+        );
+        assert!(
+            matches!(store.current(), Err(GenerationError::Pointer(_))),
+            "{corruption:?}: the pointer was rewritten"
         );
     }
 }
