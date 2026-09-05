@@ -5,6 +5,7 @@ import {
   fetchTeamCatalogPublications,
   type TeamCatalogPublication,
 } from "@/features/agents/lib/teamCatalogRelay";
+import { TEAM_CATALOG_QUERY_KEY_ROOT } from "@/features/agents/lib/catalogQueryKeys";
 import { personasQueryKey, teamsQueryKey } from "@/features/agents/hooks";
 import { relayClient } from "@/shared/api/relayClient";
 import { addTeamFromCatalog, setTeamShared } from "@/shared/api/tauriTeams";
@@ -23,7 +24,7 @@ import { KIND_TEAM_CATALOG } from "@/shared/constants/kinds";
  */
 
 export function teamCatalogQueryKey(communityId: string | null) {
-  return ["team-catalog", communityId] as const;
+  return [TEAM_CATALOG_QUERY_KEY_ROOT, communityId] as const;
 }
 
 export function useTeamCatalogQuery(communityId: string | null) {
