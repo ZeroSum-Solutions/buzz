@@ -1,5 +1,6 @@
 import { invokeTauri } from "@/shared/api/tauri";
 import { renderMarkdownDocumentHtml } from "@/shared/ui/markdown/documentMode";
+import { isMarkdownDocTooComplexForPreview } from "@/shared/ui/markdown/markdownDocFile";
 
 /**
  * Mirror of `MAX_DOCUMENT_HTML_BYTES` in
@@ -11,13 +12,18 @@ import { renderMarkdownDocumentHtml } from "@/shared/ui/markdown/documentMode";
 export const MAX_PDF_DOCUMENT_HTML_BYTES = 8 * 1024 * 1024;
 
 /**
- * Cap on the markdown source, checked before it is rendered.
+ * Cap on the markdown source, checked before it is rendered. It matches the
+ * viewer's own native 2 MiB fetch cap, so it refuses nothing the panel could
+ * have loaded.
  *
- * This is the bound that matters on this side: the render is the expensive
- * step, so refusing an oversized document before it runs is what keeps the
- * cost bounded rather than measuring the cost after paying it. It matches the
- * viewer's own native 2 MiB fetch cap, so a document that can be read in the
- * panel can always be exported.
+ * Bytes are *not* the quantity the render costs, and this cap alone does not
+ * bound it: the export runs the same mdast/micromark parse the Preview does,
+ * whose cost tracks parsed-node count. `"[a](http://e.co) "` repeated on one
+ * line is 17 bytes per link, so 111,025 links — measured at 9,379 ms and
+ * 1,105 MB on this project's pinned parser
+ * (`shared/ui/markdown/markdownDocFile.ts`) — is 1.80 MiB and passes this cap
+ * outright. The bound that matters is
+ * `isMarkdownDocTooComplexForPreview`, applied below.
  */
 export const MAX_PDF_DOCUMENT_SOURCE_BYTES = 2 * 1024 * 1024;
 
@@ -26,6 +32,9 @@ export const MAX_PDF_DOCUMENT_TITLE_CHARS = 200;
 
 export const PDF_DOCUMENT_TOO_LARGE_MESSAGE =
   "This document is too large to export as a PDF.";
+
+export const PDF_DOCUMENT_TOO_COMPLEX_MESSAGE =
+  "This document has too many elements to render as a PDF. Download it instead.";
 
 /**
  * The document title placed in the exported PDF's head: the attachment's
@@ -60,8 +69,9 @@ export type ExportMarkdownDocumentToPdfArgs = {
  * Render the document in document mode and hand it to the Rust exporter.
  *
  * Resolves `true` when a PDF was written and `false` when the user cancelled
- * the save dialog. Every other failure — an oversized document, a missing
- * browser, a failed write — rejects with a message the caller surfaces.
+ * the save dialog. Every other failure — an oversized document, one too
+ * complex to parse, a missing browser, a failed write — rejects with a message
+ * the caller surfaces.
  */
 export async function exportMarkdownDocumentToPdf({
   content,
@@ -69,6 +79,15 @@ export async function exportMarkdownDocumentToPdf({
 }: ExportMarkdownDocumentToPdfArgs): Promise<boolean> {
   if (utf8ByteLength(content) > MAX_PDF_DOCUMENT_SOURCE_BYTES) {
     throw new Error(PDF_DOCUMENT_TOO_LARGE_MESSAGE);
+  }
+  // The same predicate the panel gates Preview on, applied to the same parse.
+  // Export runs `renderMarkdownDocumentHtml`, which is `renderCachedMarkdown`
+  // with a different component map — the identical remark/micromark pipeline —
+  // so a document the panel refuses to preview would cost exactly as much
+  // here, on the same main thread, with a save dialog yet to appear. The panel
+  // hides the Export action for these documents; this is the enforcing check.
+  if (isMarkdownDocTooComplexForPreview(content)) {
+    throw new Error(PDF_DOCUMENT_TOO_COMPLEX_MESSAGE);
   }
   const bodyHtml = await renderMarkdownDocumentHtml(content);
   if (utf8ByteLength(bodyHtml) > MAX_PDF_DOCUMENT_HTML_BYTES) {

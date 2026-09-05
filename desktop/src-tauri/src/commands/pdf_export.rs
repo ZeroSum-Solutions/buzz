@@ -9,21 +9,48 @@
 //! only headless alternative needs `unsafe` Objective-C interop, so it is not
 //! a route on this fork — see the memo's "Route (a)".
 //!
+//! This module owns the browser child process rather than delegating the
+//! spawn to `headless_chrome::Browser::new`. Three properties depend on that
+//! ownership and none of them is available through the library's launcher:
+//!
+//! 1. **An absolute launch deadline.** The pinned `headless_chrome` 1.0.22
+//!    wraps its 30 s launch wait (`process.rs` `ws_url_from_output`) around a
+//!    blocking `BufRead::lines()` scan of the child's stderr, and its
+//!    `Wait::until` helper only compares the elapsed time *between* predicate
+//!    calls (`util.rs`). A browser that starts, holds stderr open and never
+//!    prints the DevTools banner parks that scan forever, so the timeout
+//!    never fires. [`launch_chrome`] moves the scan to its own thread and
+//!    bounds the launch with a channel deadline that holds regardless of what
+//!    the child does.
+//! 2. **Whole-tree containment.** The library's `TemporaryProcess::drop` kills
+//!    the direct PID only and discards every error, so Chrome's renderer, GPU
+//!    and zygote children are not owned by anything. [`ChromeChild`] puts the
+//!    child in its own process group on Unix and in a kill-on-close Job Object
+//!    on Windows, and every teardown failure is returned to the caller instead
+//!    of logged away.
+//! 3. **Nothing written outside the scratch directory.** The library creates
+//!    its own `rust-headless-chrome-profile*` temp directory when
+//!    `user_data_dir` is unset; this module points the profile, disk cache and
+//!    crash dumps at its own scratch directory, which is removed before the
+//!    export returns.
+//!
 //! The export never reaches the network. Two independent guards say so: the
 //! print document carries a `default-src 'none'` content-security policy that
 //! permits only `data:` images and the inline stylesheet, and the browser is
-//! launched with DNS resolution mapped to `~NOTFOUND` and every inherited
-//! proxy variable blanked. A remote image in a document therefore degrades to
-//! a visible placeholder instead of a silent fetch.
+//! launched with DNS resolution mapped to `~NOTFOUND`, no proxy, and a fully
+//! explicit environment built from empty (`env_clear`) so nothing about the
+//! shell that started Buzz can steer it. A remote image in a document
+//! therefore degrades to a visible placeholder instead of a silent fetch.
 
 use std::collections::HashMap;
-use std::ffi::OsStr;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStderr, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::Duration;
 
 use headless_chrome::types::PrintToPdfOptions;
-use headless_chrome::{Browser, LaunchOptionsBuilder};
+use headless_chrome::Browser;
 
 use crate::commands::export_util::pick_save_path;
 use crate::commands::media_filename::sanitize_filename;
@@ -48,9 +75,32 @@ const CHROME_LAUNCH_ARGS: [&str; 3] = [
     "--disable-remote-fonts",
 ];
 
-/// Proxy variables blanked in the browser child's environment. `Command::envs`
-/// adds to the inherited environment rather than replacing it, so every
-/// variable that could steer the child is named here explicitly.
+/// Flags that keep the export's browser out of the user's profile, off every
+/// background service, and out of any first-run interaction.
+///
+/// `--force-color-profile=srgb` is here for reproducibility rather than
+/// isolation: without it the raster depends on the display profile of whatever
+/// machine ran the export, and the recorded per-page hashes for the T9 fixture
+/// would not compare across machines.
+const CHROME_ISOLATION_ARGS: [&str; 10] = [
+    "--headless",
+    "--remote-debugging-port=0",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-gpu",
+    "--disable-dev-shm-usage",
+    "--disable-background-networking",
+    "--disable-extensions",
+    "--disable-sync",
+    "--force-color-profile=srgb",
+];
+
+/// Proxy variables blanked in the browser child's environment.
+///
+/// The child's environment is built from empty ([`chrome_process_env`] is
+/// applied after `Command::env_clear`), so these are already absent; naming
+/// and blanking them keeps the guard explicit and falsifiable if the child is
+/// ever spawned from an inherited environment again.
 const PROXY_ENV_VARS: [&str; 8] = [
     "HTTP_PROXY",
     "http_proxy",
@@ -61,6 +111,10 @@ const PROXY_ENV_VARS: [&str; 8] = [
     "FTP_PROXY",
     "ftp_proxy",
 ];
+
+/// The only `PATH` the browser child gets. A fixed value, not the harness's,
+/// so nothing on the launching shell's `PATH` can be resolved by the child.
+const CHROME_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
 /// Upper bound on the document-mode HTML accepted from the frontend.
 ///
@@ -84,8 +138,22 @@ pub(crate) const MAX_PDF_BYTES: usize = 64 * 1024 * 1024;
 /// Bound on any single DevTools round trip (navigate, print).
 const PAGE_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// Bound on how long an idle browser process may linger before it is killed.
+/// Bound on how long an idle browser connection may linger before it is
+/// dropped.
 const BROWSER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Absolute bound on the launch: from spawn to the DevTools endpoint. Enforced
+/// by this module's own deadline (see the module docs), so it holds even when
+/// the browser never writes the banner and never closes stderr.
+const BROWSER_LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bound on stderr bytes scanned for the DevTools banner. Chrome prints the
+/// banner within the first few kilobytes; a browser that writes more than this
+/// without announcing an endpoint has failed to start.
+const MAX_LAUNCH_STDERR_BYTES: u64 = 1024 * 1024;
+
+/// The line Chrome writes to stderr once its DevTools endpoint is listening.
+const DEVTOOLS_BANNER: &str = "DevTools listening on ";
 
 /// Escape text for insertion into HTML element or attribute content.
 fn escape_html_text(input: &str) -> String {
@@ -174,24 +242,274 @@ impl PdfExportRequest {
     }
 }
 
-/// The environment the browser child process is started with.
+/// The complete environment the browser child process is started with.
 ///
-/// `headless_chrome` hands this map to `Command::envs`, which merges into the
-/// inherited environment rather than replacing it, so the map names every
-/// variable that must not be taken from whatever shell launched Buzz: the
-/// proxy variables are blanked and `no_proxy` is set to `*` so an inherited
-/// proxy cannot route an export through a network hop, and `HOME` points at
-/// the export's own scratch directory so the child reads none of the user's
-/// browser state.
+/// It is applied after `Command::env_clear`, so this map is the child's whole
+/// environment and nothing about the shell that launched Buzz reaches it: the
+/// proxy variables are named and blanked, `no_proxy` is `*` so no export can
+/// be routed through a network hop, `PATH` is a fixed list rather than the
+/// harness's, and `HOME`, `TMPDIR` and the XDG directories all point at the
+/// export's own scratch directory so the child reads and writes none of the
+/// user's browser state.
 fn chrome_process_env(scratch_dir: &Path) -> HashMap<String, String> {
+    let scratch = scratch_dir.display().to_string();
     let mut env: HashMap<String, String> = PROXY_ENV_VARS
         .iter()
         .map(|key| ((*key).to_string(), String::new()))
         .collect();
     env.insert("NO_PROXY".to_string(), "*".to_string());
     env.insert("no_proxy".to_string(), "*".to_string());
-    env.insert("HOME".to_string(), scratch_dir.display().to_string());
+    env.insert("PATH".to_string(), CHROME_PATH.to_string());
+    env.insert("LC_ALL".to_string(), "C".to_string());
+    env.insert("HOME".to_string(), scratch.clone());
+    env.insert("TMPDIR".to_string(), scratch.clone());
+    env.insert("XDG_CONFIG_HOME".to_string(), scratch.clone());
+    env.insert("XDG_CACHE_HOME".to_string(), scratch.clone());
+    env.insert("XDG_DATA_HOME".to_string(), scratch);
     env
+}
+
+/// The exact command the export spawns: the browser at `chrome`, every
+/// directory it may write pointed inside `scratch_dir`, and an environment
+/// built from empty.
+fn chrome_command(chrome: &Path, scratch_dir: &Path) -> Command {
+    let mut command = Command::new(chrome);
+    command
+        .args(CHROME_ISOLATION_ARGS)
+        .arg(format!(
+            "--user-data-dir={}",
+            scratch_dir.join("profile").display()
+        ))
+        .arg(format!(
+            "--disk-cache-dir={}",
+            scratch_dir.join("cache").display()
+        ))
+        .arg(format!(
+            "--crash-dumps-dir={}",
+            scratch_dir.join("crash").display()
+        ))
+        .args(CHROME_LAUNCH_ARGS)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .env_clear()
+        .envs(chrome_process_env(scratch_dir));
+    command
+}
+
+/// A browser child process plus ownership of its whole descendant tree.
+///
+/// Chrome forks renderer, GPU and zygote children; killing the root PID alone
+/// leaves them running. On Unix the child leads its own process group, so a
+/// group signal reaches every descendant that has not left it; on Windows the
+/// child is frozen at spawn, assigned to a kill-on-close Job Object before any
+/// of its code runs, then resumed, so no descendant can exist outside the job.
+/// Failing to establish that ownership is an error, never a warning
+/// (`AGENTS.md`, "Bound every resource, loop, and process tree").
+struct ChromeChild {
+    child: Child,
+    #[cfg(windows)]
+    job: Option<crate::managed_agents::JobHandle>,
+    terminated: bool,
+}
+
+impl ChromeChild {
+    /// Spawn `command` with tree ownership established before the child runs.
+    fn spawn(mut command: Command) -> Result<Self, String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt as _;
+            // CREATE_SUSPENDED | CREATE_NO_WINDOW: freeze the child so the job
+            // takes ownership before it can fork, and keep a console window
+            // from flashing out of the GUI process.
+            command.creation_flags(0x0000_0004 | 0x0800_0000);
+        }
+
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut child = command
+            .spawn()
+            .map_err(|e| format!("PDF export could not start a browser: {e}"))?;
+
+        #[cfg(windows)]
+        let job = {
+            let Some(job) = crate::managed_agents::create_job_for_child(child.id()) else {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(
+                    "PDF export could not contain the browser's process tree, so it did not \
+                     start one."
+                        .to_string(),
+                );
+            };
+            if !crate::managed_agents::resume_process(child.id()) {
+                // Dropping the job kills the still-frozen child.
+                drop(job);
+                let _ = child.wait();
+                return Err("PDF export could not start the contained browser process.".to_string());
+            }
+            job
+        };
+
+        Ok(Self {
+            child,
+            #[cfg(windows)]
+            job: Some(job),
+            terminated: false,
+        })
+    }
+
+    /// Take the piped stderr the DevTools banner arrives on.
+    fn take_stderr(&mut self) -> Result<ChildStderr, String> {
+        self.child
+            .stderr
+            .take()
+            .ok_or_else(|| "PDF export could not read the browser's output.".to_string())
+    }
+
+    /// Kill the whole tree and reap the root. Idempotent; every failure is
+    /// returned with the PID that produced it.
+    fn terminate(&mut self) -> Result<(), String> {
+        if self.terminated {
+            return Ok(());
+        }
+        self.terminated = true;
+        let pid = self.child.id();
+
+        #[cfg(unix)]
+        // `terminate_process` signals the child's process group — SIGTERM,
+        // a bounded grace period, then SIGKILL — so descendants go with it.
+        let contained = crate::managed_agents::terminate_process(pid)
+            .map_err(|e| format!("PDF export could not stop the browser's process tree: {e}"));
+
+        #[cfg(windows)]
+        // Closing the kill-on-close job reaps every descendant, even once the
+        // root has exited.
+        let contained = {
+            drop(self.job.take());
+            Ok(())
+        };
+
+        #[cfg(not(any(unix, windows)))]
+        let contained: Result<(), String> =
+            Err("PDF export cannot contain a browser process tree on this platform.".to_string());
+
+        let reaped = self
+            .child
+            .wait()
+            .map(|_| ())
+            .map_err(|e| format!("PDF export could not reap the browser process {pid}: {e}"));
+
+        contained.and(reaped)
+    }
+}
+
+impl Drop for ChromeChild {
+    fn drop(&mut self) {
+        // Backstop for the paths that return before the explicit teardown;
+        // those paths surface the failure themselves, so this only reports
+        // what would otherwise be invisible.
+        if let Err(error) = self.terminate() {
+            eprintln!("buzz-desktop: pdf_export: {error}");
+        }
+    }
+}
+
+/// Scan the browser's stderr for the DevTools endpoint on its own thread.
+///
+/// The scan itself is unbounded in time — a browser may hold stderr open
+/// forever — which is exactly why it does not run on the caller's thread: the
+/// caller waits on the returned channel with a deadline. The scan is bounded
+/// in *bytes* so a chatty or hostile child cannot grow the buffer, and it
+/// keeps draining after the banner so a full stderr pipe never blocks the
+/// browser.
+fn spawn_devtools_url_reader(stderr: ChildStderr) -> Receiver<Result<String, String>> {
+    let (tx, rx) = mpsc::sync_channel::<Result<String, String>>(1);
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr.take(MAX_LAUNCH_STDERR_BYTES));
+        let mut scanned: u64 = 0;
+        let mut line = String::new();
+        let outcome = loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    break if scanned >= MAX_LAUNCH_STDERR_BYTES {
+                        Err(format!(
+                            "the browser wrote more than {MAX_LAUNCH_STDERR_BYTES} bytes without \
+                             reporting a DevTools endpoint"
+                        ))
+                    } else {
+                        Err("the browser exited before it reported a DevTools endpoint".to_string())
+                    };
+                }
+                Ok(read) => {
+                    scanned += read as u64;
+                    if let Some(offset) = line.find(DEVTOOLS_BANNER) {
+                        let url = line[offset + DEVTOOLS_BANNER.len()..].trim().to_string();
+                        if url.starts_with("ws://") {
+                            break Ok(url);
+                        }
+                    }
+                }
+                Err(e) => break Err(format!("the browser's output could not be read: {e}")),
+            }
+        };
+        // A receiver that has already given up on the deadline is gone; the
+        // send failing then is the expected case, not an error to report.
+        let _ = tx.send(outcome);
+
+        let mut rest = reader.into_inner().into_inner();
+        let mut sink = [0u8; 4096];
+        while matches!(rest.read(&mut sink), Ok(read) if read > 0) {}
+    });
+    rx
+}
+
+/// Append a teardown failure to the failure that caused the teardown, so
+/// neither is lost.
+fn with_teardown(primary: String, teardown: Result<(), String>) -> String {
+    match teardown {
+        Ok(()) => primary,
+        Err(secondary) => format!("{primary} ({secondary})"),
+    }
+}
+
+/// Start the browser and wait for its DevTools endpoint under an absolute
+/// deadline. On every failure path the process tree is torn down before the
+/// error is returned.
+fn launch_chrome(
+    chrome: &Path,
+    scratch_dir: &Path,
+    launch_timeout: Duration,
+) -> Result<(ChromeChild, String), String> {
+    let mut child = ChromeChild::spawn(chrome_command(chrome, scratch_dir))?;
+    let stderr = match child.take_stderr() {
+        Ok(stderr) => stderr,
+        Err(error) => {
+            let teardown = child.terminate();
+            return Err(with_teardown(error, teardown));
+        }
+    };
+
+    let banner = spawn_devtools_url_reader(stderr);
+    let outcome = match banner.recv_timeout(launch_timeout) {
+        Ok(Ok(url)) => return Ok((child, url)),
+        Ok(Err(reason)) => format!("PDF export could not start Chrome: {reason}."),
+        Err(RecvTimeoutError::Timeout) => format!(
+            "PDF export timed out starting Chrome: no DevTools endpoint after {} seconds.",
+            launch_timeout.as_secs()
+        ),
+        Err(RecvTimeoutError::Disconnected) => {
+            "PDF export could not start Chrome: its output ended unexpectedly.".to_string()
+        }
+    };
+    let teardown = child.terminate();
+    Err(with_teardown(outcome, teardown))
 }
 
 /// Print options: US Letter, backgrounds on, margins owned by the `@page`
@@ -226,12 +544,39 @@ fn chrome_executable() -> Result<PathBuf, String> {
     })
 }
 
+/// Drive an already-listening browser: open a tab, load the staged document,
+/// print it.
+fn print_page(devtools_ws_url: &str, page_url: &str) -> Result<Vec<u8>, String> {
+    let browser = Browser::connect_with_timeout(devtools_ws_url.to_string(), BROWSER_IDLE_TIMEOUT)
+        .map_err(|e| format!("PDF export could not connect to the browser: {e}"))?;
+    let tab = browser
+        .new_tab()
+        .map_err(|e| format!("PDF export could not open a page: {e}"))?;
+    let tab = tab.set_default_timeout(PAGE_TIMEOUT);
+    tab.navigate_to(page_url)
+        .map_err(|e| format!("PDF export could not load the document: {e}"))?;
+    tab.wait_until_navigated()
+        .map_err(|e| format!("PDF export timed out loading the document: {e}"))?;
+    tab.print_to_pdf(Some(print_options()))
+        .map_err(|e| format!("PDF export could not print the document: {e}"))
+}
+
 /// Render one print document to PDF bytes with the browser at `chrome`.
 ///
 /// Blocking: drives a child process over the DevTools protocol. Every failure
 /// is returned with the stage that produced it; nothing is written to disk
-/// outside the scratch directory, which is removed when this returns.
+/// outside the scratch directory, which is removed before this returns.
 fn render_print_document(chrome: &Path, document: &str) -> Result<Vec<u8>, String> {
+    render_print_document_within(chrome, document, BROWSER_LAUNCH_TIMEOUT)
+}
+
+/// [`render_print_document`] with the launch deadline supplied, so a test can
+/// exercise the deadline without waiting the production bound.
+fn render_print_document_within(
+    chrome: &Path,
+    document: &str,
+    launch_timeout: Duration,
+) -> Result<Vec<u8>, String> {
     if !chrome.is_file() {
         return Err(format!(
             "PDF export could not start a browser: {} is not an executable file.",
@@ -249,32 +594,25 @@ fn render_print_document(chrome: &Path, document: &str) -> Result<Vec<u8>, Strin
     let page_url = url::Url::from_file_path(&page_path)
         .map_err(|()| "PDF export could not address the staged document.".to_string())?;
 
-    let args: Vec<&OsStr> = CHROME_LAUNCH_ARGS.iter().map(OsStr::new).collect();
-    let options = LaunchOptionsBuilder::default()
-        .path(Some(chrome.to_path_buf()))
-        .headless(true)
-        .sandbox(true)
-        .ignore_certificate_errors(false)
-        .idle_browser_timeout(BROWSER_IDLE_TIMEOUT)
-        .args(args)
-        .process_envs(Some(chrome_process_env(scratch.path())))
-        .build()
-        .map_err(|e| format!("PDF export could not configure the browser: {e}"))?;
+    let (mut child, devtools_ws_url) = launch_chrome(chrome, scratch.path(), launch_timeout)?;
+    let printed = print_page(&devtools_ws_url, page_url.as_str());
+    let teardown = child.terminate();
+    let bytes = match printed {
+        Ok(bytes) => bytes,
+        Err(error) => return Err(with_teardown(error, teardown)),
+    };
+    teardown?;
 
-    let browser =
-        Browser::new(options).map_err(|e| format!("PDF export could not start Chrome: {e}"))?;
-    let tab = browser
-        .new_tab()
-        .map_err(|e| format!("PDF export could not open a page: {e}"))?;
-    let tab = tab.set_default_timeout(PAGE_TIMEOUT);
-    tab.navigate_to(page_url.as_str())
-        .map_err(|e| format!("PDF export could not load the document: {e}"))?;
-    tab.wait_until_navigated()
-        .map_err(|e| format!("PDF export timed out loading the document: {e}"))?;
-    let bytes = tab
-        .print_to_pdf(Some(print_options()))
-        .map_err(|e| format!("PDF export could not print the document: {e}"))?;
+    scratch
+        .close()
+        .map_err(|e| format!("PDF export could not clear its scratch directory: {e}"))?;
+    Ok(bytes)
+}
 
+/// Refuse a PDF larger than [`MAX_PDF_BYTES`] rather than write it. The bound
+/// is on the bytes that would reach the user's disk, so it is checked between
+/// the render and the write.
+fn bounded_pdf_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
     if bytes.len() > MAX_PDF_BYTES {
         return Err(format!(
             "The exported PDF is too large to save (limit {} MiB, got {} MiB).",
@@ -300,6 +638,33 @@ fn write_pdf_atomically(dest: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// The export pipeline, with its three side-effecting steps injected.
+///
+/// The order is the contract this function exists to hold, and it is the only
+/// place that order is expressed: nothing is rendered until the user has
+/// chosen a destination, so a cancelled dialog costs no browser and no
+/// seconds; and nothing is written until the rendered bytes are inside
+/// [`MAX_PDF_BYTES`], so an over-cap render never truncates the file the user
+/// picked. Returns `true` when a file was written, `false` when the dialog was
+/// cancelled.
+async fn run_export<PickFut, RenderFut>(
+    request: PdfExportRequest,
+    pick: impl FnOnce(String) -> PickFut,
+    render: impl FnOnce(String) -> RenderFut,
+    write: impl FnOnce(&Path, &[u8]) -> Result<(), String>,
+) -> Result<bool, String>
+where
+    PickFut: std::future::Future<Output = Result<Option<PathBuf>, String>>,
+    RenderFut: std::future::Future<Output = Result<Vec<u8>, String>>,
+{
+    let Some(dest) = pick(request.filename).await? else {
+        return Ok(false);
+    };
+    let bytes = bounded_pdf_bytes(render(request.document).await?)?;
+    write(&dest, &bytes)?;
+    Ok(true)
+}
+
 /// Export a rendered markdown document as a PDF through the native save
 /// dialog.
 ///
@@ -317,22 +682,20 @@ pub async fn export_document_pdf(
     app: tauri::AppHandle,
 ) -> Result<bool, String> {
     let request = PdfExportRequest::new(&body_html, &title, &filename)?;
-
-    let dest = match pick_save_path(&app, &request.filename, "PDF document", &["pdf"]).await? {
-        Some(path) => path,
-        None => return Ok(false),
-    };
-
-    let document = request.document;
-    let bytes = tauri::async_runtime::spawn_blocking(move || {
-        let chrome = chrome_executable()?;
-        render_print_document(&chrome, &document)
-    })
+    run_export(
+        request,
+        |name| async move { pick_save_path(&app, &name, "PDF document", &["pdf"]).await },
+        |document| async move {
+            tauri::async_runtime::spawn_blocking(move || {
+                let chrome = chrome_executable()?;
+                render_print_document(&chrome, &document)
+            })
+            .await
+            .map_err(|e| format!("PDF export did not finish: {e}"))?
+        },
+        write_pdf_atomically,
+    )
     .await
-    .map_err(|e| format!("PDF export did not finish: {e}"))??;
-
-    write_pdf_atomically(&dest, &bytes)?;
-    Ok(true)
 }
 
 #[cfg(test)]

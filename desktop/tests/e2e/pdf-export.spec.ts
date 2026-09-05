@@ -37,6 +37,10 @@ const DOC_MARKDOWN = [
   "",
 ].join("\n");
 
+// Above `MAX_MARKDOWN_DOC_PREVIEW_LINES` (3,000) and far under the 2 MiB byte
+// cap: the shape the panel refuses to preview, and so must not offer to print.
+const COMPLEX_MARKDOWN = "- entry\n".repeat(3200);
+
 type PdfExportMode = "saved" | "cancelled" | "failed";
 
 test.beforeEach(async ({ page }) => {
@@ -69,7 +73,7 @@ async function setExportMode(page: Page, mode: PdfExportMode) {
   }, mode);
 }
 
-async function openDocumentPanel(page: Page) {
+async function openDocumentPanel(page: Page, body = DOC_MARKDOWN) {
   await page.goto("/");
   await page.getByTestId("channel-general").click();
   await expect(page.getByTestId("chat-title")).toHaveText("general");
@@ -79,7 +83,7 @@ async function openDocumentPanel(page: Page) {
     page.getByRole("button", { name: "Attach file" }).click(),
   ]);
   await chooser.setFiles({
-    buffer: Buffer.from(DOC_MARKDOWN),
+    buffer: Buffer.from(body),
     mimeType: "text/markdown",
     name: "approval.md",
   });
@@ -170,4 +174,28 @@ test("an export failure is surfaced instead of being swallowed", async ({
     page.getByText("PDF export needs Google Chrome or Chromium installed"),
   ).toBeVisible();
   await expect(page.getByTestId("markdown-doc-export-pdf")).toBeEnabled();
+});
+
+test("a document too complex to preview offers no Export PDF action", async ({
+  page,
+}) => {
+  // The Export action and the Preview body are gated by one predicate
+  // (`isMarkdownDocTooComplexForPreview`), so the affordance and the panel
+  // agree. Before that gate the button was live on exactly these documents,
+  // and clicking it ran the parse the panel had just refused. This test fails
+  // if the button is offered again.
+  await page.route(`**/media/${DOC_SHA}.bin`, (route) =>
+    route.fulfill({
+      body: COMPLEX_MARKDOWN,
+      contentType: "application/octet-stream",
+    }),
+  );
+  await setExportMode(page, "saved");
+  await openDocumentPanel(page, COMPLEX_MARKDOWN);
+
+  await expect(
+    page.getByTestId("markdown-doc-preview-too-complex"),
+  ).toBeVisible();
+  await expect(page.getByTestId("markdown-doc-export-pdf")).toHaveCount(0);
+  expect((await exportPayloads(page))?.length ?? 0).toBe(0);
 });

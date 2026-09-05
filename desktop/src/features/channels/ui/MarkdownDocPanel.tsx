@@ -123,7 +123,22 @@ export function MarkdownDocPanel({
 
   const decoded = docQuery.data;
   const [isExportingPdf, setIsExportingPdf] = React.useState(false);
-  const documentText = decoded?.kind === "ok" ? decoded.text : null;
+
+  // Bounds the mdast/micromark parse by node count, independent of the byte
+  // cap above: a flat list of one-line items, or one line packed with links,
+  // still parses at superlinear cost well under 2 MiB (see markdownDocFile.ts).
+  // Preview and Export run that same parse, so one predicate gates both — a
+  // document too complex to preview is too complex to print. Code view is safe
+  // without this gate — SyntaxHighlightedCode bounds its own highlighting and
+  // plain-text fallback independently, so it stays available here.
+  const previewTooComplex =
+    decoded?.kind === "ok" && isMarkdownDocTooComplexForPreview(decoded.text);
+
+  // Exportable only when the document both decoded and is inside that bound,
+  // so the button is never offered for a document the panel itself refuses to
+  // render.
+  const documentText =
+    decoded?.kind === "ok" && !previewTooComplex ? decoded.text : null;
 
   // Export renders the document in document mode (links kept, attachments as
   // links, code never collapsed) and prints it through the Rust exporter.
@@ -147,14 +162,6 @@ export function MarkdownDocPanel({
     : decoded && decoded.kind !== "ok"
       ? decodeErrorMessage(decoded.kind)
       : null;
-
-  // Bounds Preview's mdast/micromark parse by line count, independent of the
-  // byte cap above: a flat list of one-line items well under 2 MiB still
-  // parses at superlinear cost (see markdownDocFile.ts). Code view is safe
-  // without this gate — SyntaxHighlightedCode bounds its own highlighting
-  // and plain-text fallback independently, so it stays available here.
-  const previewTooComplex =
-    decoded?.kind === "ok" && isMarkdownDocTooComplexForPreview(decoded.text);
 
   return (
     <AuxiliaryPanel

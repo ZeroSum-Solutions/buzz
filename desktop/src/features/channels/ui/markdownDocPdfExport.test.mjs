@@ -117,3 +117,76 @@ test("refuses an oversized document before it is rendered", async () => {
     bridge.restore();
   }
 });
+
+// The export runs the same mdast/micromark parse the Preview does, so the same
+// complexity predicate has to gate it. Both shapes below are far under the
+// 2 MiB source cap, which is exactly why bytes are the wrong bound: rendered,
+// each costs seconds of synchronous main-thread work. The elapsed-time
+// assertion is what makes these falsifiable — with the gate removed the render
+// runs and the call takes seconds, not milliseconds.
+const GATE_BUDGET_MS = 2000;
+
+test("refuses a link-dense one-liner before it is rendered", async () => {
+  const bridge = installBridge(() => true);
+  try {
+    // 60,000 links on ONE line: 1,020,000 bytes, under the byte cap, and one
+    // line, under the line-count gate.
+    const content = "[a](http://e.co) ".repeat(60000);
+    assert.ok(content.length < MAX_PDF_DOCUMENT_SOURCE_BYTES);
+    assert.equal(content.split("\n").length, 1);
+
+    const started = performance.now();
+    await assert.rejects(
+      exportMarkdownDocumentToPdf({ content, filename: "links.md" }),
+      /too many elements/,
+    );
+    const elapsed = performance.now() - started;
+
+    assert.equal(bridge.calls.length, 0);
+    assert.ok(
+      elapsed < GATE_BUDGET_MS,
+      `the gate must refuse before the parse, took ${elapsed}ms`,
+    );
+  } finally {
+    bridge.restore();
+  }
+});
+
+test("refuses a flat list of thousands of lines before it is rendered", async () => {
+  const bridge = installBridge(() => true);
+  try {
+    const content = "- a\n".repeat(40000);
+    assert.ok(content.length < MAX_PDF_DOCUMENT_SOURCE_BYTES);
+
+    const started = performance.now();
+    await assert.rejects(
+      exportMarkdownDocumentToPdf({ content, filename: "list.md" }),
+      /too many elements/,
+    );
+    const elapsed = performance.now() - started;
+
+    assert.equal(bridge.calls.length, 0);
+    assert.ok(
+      elapsed < GATE_BUDGET_MS,
+      `the gate must refuse before the parse, took ${elapsed}ms`,
+    );
+  } finally {
+    bridge.restore();
+  }
+});
+
+test("a document just inside the complexity gate still exports", async () => {
+  const bridge = installBridge(() => true);
+  try {
+    // 2,000 link markers and 2,999 lines: the largest document the panel will
+    // preview, and so the largest it offers to export.
+    const content = `${"[a](http://e.co)\n".repeat(2000)}${"text\n".repeat(999)}`;
+    assert.equal(
+      await exportMarkdownDocumentToPdf({ content, filename: "edge.md" }),
+      true,
+    );
+    assert.equal(bridge.calls.length, 1);
+  } finally {
+    bridge.restore();
+  }
+});
