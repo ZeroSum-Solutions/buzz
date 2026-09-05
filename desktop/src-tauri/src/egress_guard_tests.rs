@@ -291,6 +291,16 @@ const EVENTS_INVENTORY: &[(&str, usize, usize)] = &[
     // Stub-relay route in the tombstone-flush gate tests; production flush
     // publishes through the guarded boundary-1 funnel.
     ("src/commands/teams/pending/tests/gate.rs", 1, 0),
+    // Google Calendar API events collection — NOT a relay egress boundary and
+    // deliberately unguarded. The request goes to `www.googleapis.com` with a
+    // Google bearer token over the Calendar REST API; it carries no Nostr
+    // event and reaches no relay, so `assert_no_key_backup` (scope: relay-bound
+    // egress, see `egress_guard.rs`) has nothing to check here. The rows still
+    // fence the files: a fourth site in `client_tests.rs`, or a second one in
+    // `client.rs`, fails this scan and asks the question again.
+    ("src/google_calendar/client.rs", 1, 0), // `events_path`
+    ("src/google_calendar/client_tests.rs", 3, 0), // list/walk/percent-encoding fixtures
+    ("src/google_calendar/mock_server.rs", 1, 0), // mock Calendar route
 ];
 
 // Needles are assembled at runtime so this scan file itself contains no
