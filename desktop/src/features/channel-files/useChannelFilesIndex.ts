@@ -41,6 +41,8 @@ const EMPTY_SNAPSHOT: FilesIndexSnapshot = {
   complete: false,
   hasMore: false,
   pagesFetched: 0,
+  liveConnected: false,
+  liveTerminal: false,
   error: null,
 };
 
@@ -51,8 +53,13 @@ export type ChannelFilesIndexResult = {
   isLoading: boolean;
   isError: boolean;
   error: string | null;
-  /** Continue or retry the history walk. */
-  refetch: () => void;
+  /**
+   * What the error banner's Retry runs: re-open the live subscription if it is
+   * down, then continue the history walk.
+   */
+  retry: () => void;
+  /** Continue the history walk. */
+  loadOlder: () => void;
   /** More history can still be loaded and no page is in flight. */
   canLoadOlder: boolean;
 };
@@ -62,7 +69,9 @@ export type ChannelFilesIndexResult = {
  * rather than the loaded message window.
  *
  * `enabled` gates the whole machine: a channel whose Files tab has never been
- * opened opens no subscription and fetches no history.
+ * opened opens no subscription and fetches no history. Callers derive it with
+ * `isFilesIndexEnabled` (`filesTabActivation.ts`) so the gate is bound
+ * by a test of its own.
  */
 export function useChannelFilesIndex(
   activeChannel: Channel | null,
@@ -111,7 +120,13 @@ export function useChannelFilesIndex(
     [snapshot.index],
   );
 
-  const refetch = useCallback(() => {
+  const retry = useCallback(() => {
+    // Both halves, because either failure alone leaves a banner the other
+    // cannot clear: a dead subscription is not fixed by another history page.
+    void controllerRef.current?.retry();
+  }, []);
+
+  const loadOlder = useCallback(() => {
     void controllerRef.current?.loadMore();
   }, []);
 
@@ -126,7 +141,8 @@ export function useChannelFilesIndex(
     // rows is a banner over the rows, never a blanked list.
     isError: snapshot.error !== null && projection.files.length === 0,
     error: snapshot.error,
-    refetch,
+    retry,
+    loadOlder,
     canLoadOlder: snapshot.hasMore && !snapshot.isBackfilling,
   };
 }

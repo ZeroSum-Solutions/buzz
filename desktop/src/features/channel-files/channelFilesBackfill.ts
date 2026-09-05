@@ -12,6 +12,12 @@
  * Every page is ingested before its cursor is advanced, so an interruption
  * leaves a consistent prefix: the resumed run refetches at worst the page that
  * failed, and re-ingesting it changes nothing.
+ *
+ * Live and history failures are tracked apart, because they recover apart. A
+ * subscription that never opened leaves the tab loading a history it will then
+ * stop following, so `retryLive` re-opens it and `retry` — what the banner's
+ * Retry runs — drives both halves; the live banner is cleared only by a
+ * subscription that actually opened.
  */
 
 import type { RelayEvent } from "@/shared/api/types";
@@ -32,6 +38,18 @@ export const BACKFILL_PAGE_LIMIT = 100;
 export const MAX_BACKFILL_PAGES = 50;
 /** Relay-supplied failure text kept in the message shown to the user. */
 export const MAX_ERROR_DETAIL_LENGTH = 200;
+/**
+ * Attempts one controller makes to open its live subscription.
+ *
+ * Every attempt after the first is a user gesture — {@link
+ * ChannelFilesIndexController.retryLive} is only ever reached from the
+ * banner's Retry button and schedules nothing itself — so there is no
+ * self-amplifying refresh loop here to put a delay in front of. The cap is the
+ * terminal state `AGENTS.md`'s review-proven rule 4 asks for: a relay that
+ * refuses for ever stops being asked, and the message says the tab has to be
+ * reopened, which builds a fresh controller.
+ */
+export const MAX_LIVE_SUBSCRIBE_ATTEMPTS = 5;
 
 /** One keyset page request. `until`/`beforeId` are the previous page's tail. */
 export type FilesIndexPageRequest = {
@@ -52,6 +70,10 @@ export type FilesIndexSnapshot = {
   hasMore: boolean;
   /** History pages fetched since this controller was created. */
   pagesFetched: number;
+  /** True while a live subscription is open for this channel. */
+  liveConnected: boolean;
+  /** True once the live subscription has spent its last attempt. */
+  liveTerminal: boolean;
   /** Non-null when the user must be told the list is not the whole story. */
   error: string | null;
 };
@@ -61,6 +83,18 @@ export type ChannelFilesIndexController = {
   start: () => Promise<void>;
   /** Continue (or retry) the history walk after a stop. */
   loadMore: () => Promise<void>;
+  /**
+   * Open the live subscription again after it failed. Idempotent: a call made
+   * while a subscription is open, while one is being opened, or after the
+   * attempt budget is spent does not reach the relay.
+   */
+  retryLive: () => Promise<void>;
+  /**
+   * What the error banner's Retry does: re-open the live subscription if it is
+   * down, then continue the history walk. Either half alone leaves the other
+   * failure standing, which is what made the banner's Retry inert.
+   */
+  retry: () => Promise<void>;
   snapshot: () => FilesIndexSnapshot;
   /** Drop the subscription and ignore any page still in flight. */
   dispose: () => Promise<void>;
@@ -120,8 +154,15 @@ export function createChannelFilesIndexController({
   let historyError: string | null = null;
   let disposed = false;
   let started = false;
+  let liveConnected = false;
+  let liveAttempts = 0;
   let unsubscribe: (() => void | Promise<void>) | null = null;
   let subscribing: Promise<void> | null = null;
+
+  /** No subscription, and no attempts left to open one. */
+  function liveTerminal(): boolean {
+    return !liveConnected && liveAttempts >= MAX_LIVE_SUBSCRIBE_ATTEMPTS;
+  }
 
   function snapshot(): FilesIndexSnapshot {
     return {
@@ -130,6 +171,8 @@ export function createChannelFilesIndexController({
       complete,
       hasMore: !complete && !disposed,
       pagesFetched,
+      liveConnected,
+      liveTerminal: liveTerminal(),
       error: historyError ?? liveError,
     };
   }
@@ -145,8 +188,19 @@ export function createChannelFilesIndexController({
     return true;
   }
 
+  /**
+   * Open the live subscription, once. Idempotent on every state that makes a
+   * second relay call wrong: one already open, one already being opened, a
+   * disposed controller, or a spent attempt budget.
+   */
   async function subscribe(): Promise<void> {
-    subscribing = (async () => {
+    if (subscribing) {
+      await subscribing;
+      return;
+    }
+    if (disposed || liveConnected || liveTerminal()) return;
+    liveAttempts += 1;
+    const attempt = (async () => {
       try {
         const dispose = await subscribeLive(channelId, (event) => {
           if (disposed) return;
@@ -157,14 +211,28 @@ export function createChannelFilesIndexController({
           return;
         }
         unsubscribe = dispose;
+        liveConnected = true;
+        // The only place the live banner is cleared: a subscription that
+        // actually opened is the only thing that makes it untrue.
+        liveError = null;
+        emit();
       } catch (cause) {
         // Not fatal — history still loads — but the tab must say so, because
         // without it the list silently stops following the channel.
-        liveError = `Files are not receiving live updates: ${detail(cause)}`;
+        liveError = liveTerminal()
+          ? `Files are not receiving live updates: ${detail(
+              cause,
+            )}. Reopen the Files tab to try again.`
+          : `Files are not receiving live updates: ${detail(cause)}`;
         emit();
       }
     })();
-    await subscribing;
+    subscribing = attempt;
+    try {
+      await attempt;
+    } finally {
+      if (subscribing === attempt) subscribing = null;
+    }
   }
 
   async function backfill(): Promise<void> {
@@ -246,7 +314,15 @@ export function createChannelFilesIndexController({
       await backfill();
     },
     async loadMore() {
-      if (disposed || complete) return;
+      // `backfill` owns the disposed/complete/in-flight gates; a second copy
+      // here would be a guard no test could remove independently.
+      await backfill();
+    },
+    async retryLive() {
+      await subscribe();
+    },
+    async retry() {
+      await subscribe();
       await backfill();
     },
     snapshot,

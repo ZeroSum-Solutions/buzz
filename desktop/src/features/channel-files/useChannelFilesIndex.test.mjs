@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { after, afterEach, before, mock, test } from "node:test";
+import { JSDOM } from "jsdom";
 
 import {
   MAX_INDEXED_ATTACHMENT_EVENTS,
   MAX_INDEXED_DELETIONS,
   MAX_INDEXED_EDITS,
+  MAX_INDEXED_PUBKEY_LENGTH,
   boundIndexSource,
   emptyFilesIndex,
   ingestIndexEvents,
@@ -14,8 +16,13 @@ import {
   BACKFILL_PAGE_LIMIT,
   MAX_BACKFILL_PAGES,
   MAX_ERROR_DETAIL_LENGTH,
+  MAX_LIVE_SUBSCRIBE_ATTEMPTS,
   createChannelFilesIndexController,
+  oldestPageCursor,
 } from "./channelFilesBackfill.ts";
+import { isFilesIndexEnabled } from "./filesTabActivation.ts";
+import { relayClient } from "@/shared/api/relayClient";
+import { useChannelFilesIndex } from "./useChannelFilesIndex.ts";
 import {
   MAX_BULK_DROP_FILES,
   parseBulkDragDropEnabled,
@@ -98,13 +105,19 @@ function harness({ pages = [], subscribeFails = false } = {}) {
   let deliver = null;
   let disposed = false;
   let pageIndex = 0;
+  // `true` fails for ever; a number fails that many attempts and then opens.
+  let failuresLeft =
+    subscribeFails === true ? Number.POSITIVE_INFINITY : subscribeFails || 0;
   const snapshots = [];
 
   const controller = createChannelFilesIndexController({
     channelId: "channel-1",
-    subscribeLive: async (channelId, onEvent) => {
+    subscribeLive: async (_channelId, onEvent) => {
       calls.push("subscribe");
-      if (subscribeFails) throw new Error("relay socket refused");
+      if (failuresLeft > 0) {
+        failuresLeft -= 1;
+        throw new Error("relay socket refused");
+      }
       deliver = onEvent;
       return () => {
         disposed = true;
@@ -129,6 +142,7 @@ function harness({ pages = [], subscribeFails = false } = {}) {
     snapshots,
     deliver: (event) => deliver?.(event),
     isSubscriptionDisposed: () => disposed,
+    subscribeCalls: () => calls.filter((call) => call === "subscribe").length,
   };
 }
 
@@ -579,4 +593,513 @@ test("a page the index cannot read leaves the cursor where it was", async () => 
   assert.equal(h.requests[2].beforeId, h.requests[1].beforeId);
   const keys = fileKeys(h.controller);
   assert.equal(new Set(keys).size, keys.length, "the retry adds no duplicates");
+});
+
+// ---------------------------------------------------------------------------
+// The live subscription recovers, and the banner's Retry is what recovers it.
+// ---------------------------------------------------------------------------
+
+test("Retry opens the live subscription again and the next live event lands", async () => {
+  // The failure this binds: `subscribe` used to run only from `start`, which
+  // latched after one call, so a refused socket left the tab following nothing
+  // for its whole life and the banner's Retry only re-walked history.
+  const h = harness({ pages: [[fileEvent({ index: 1 })]], subscribeFails: 1 });
+
+  await h.controller.start();
+
+  assert.equal(h.subscribeCalls(), 1);
+  assert.match(h.controller.snapshot().error ?? "", /live updates/i);
+  assert.equal(h.controller.snapshot().liveConnected, false);
+
+  await h.controller.retry();
+
+  assert.equal(h.subscribeCalls(), 2, "Retry re-subscribes");
+  assert.equal(h.controller.snapshot().liveConnected, true);
+  assert.equal(
+    h.controller.snapshot().error,
+    null,
+    "a subscription that opened clears the banner",
+  );
+
+  h.deliver(fileEvent({ index: 2 }));
+
+  assert.deepEqual(
+    fileKeys(h.controller).length,
+    2,
+    "live events reach the index",
+  );
+});
+
+test("a live retry while the subscription is open does not reach the relay", async () => {
+  const h = harness({ pages: [[fileEvent({ index: 1 })]] });
+
+  await h.controller.start();
+  await h.controller.retryLive();
+  await h.controller.retryLive();
+
+  assert.equal(h.subscribeCalls(), 1, "an open subscription is not reopened");
+});
+
+test("a retry in flight leaves the banner standing until it succeeds", async () => {
+  // Clearing the banner when the attempt STARTS would tell the user the tab is
+  // following the channel again while it is still not.
+  let attempts = 0;
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const controller = createChannelFilesIndexController({
+    channelId: "channel-1",
+    subscribeLive: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("relay socket refused");
+      await gate;
+      return () => {};
+    },
+    fetchPage: async () => [],
+  });
+
+  await controller.start();
+  const banner = controller.snapshot().error;
+  assert.match(banner ?? "", /live updates/i);
+
+  const retrying = controller.retryLive();
+  await Promise.resolve();
+  assert.equal(controller.snapshot().error, banner);
+
+  release();
+  await retrying;
+
+  assert.equal(controller.snapshot().error, null);
+});
+
+test("the live subscription stops asking once its attempt budget is spent", async () => {
+  const h = harness({
+    pages: [[fileEvent({ index: 1 })]],
+    subscribeFails: true,
+  });
+
+  await h.controller.start();
+  for (
+    let attempt = 0;
+    attempt < MAX_LIVE_SUBSCRIBE_ATTEMPTS + 3;
+    attempt += 1
+  ) {
+    await h.controller.retryLive();
+  }
+
+  assert.equal(h.subscribeCalls(), MAX_LIVE_SUBSCRIBE_ATTEMPTS);
+  assert.equal(h.controller.snapshot().liveTerminal, true);
+  assert.match(h.controller.snapshot().error ?? "", /Reopen the Files tab/);
+});
+
+test("dispose closes a subscription that was still opening", async () => {
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  let closed = false;
+  const controller = createChannelFilesIndexController({
+    channelId: "channel-1",
+    subscribeLive: async () => {
+      await gate;
+      return () => {
+        closed = true;
+      };
+    },
+    fetchPage: async () => [],
+  });
+
+  const started = controller.start();
+  const disposing = controller.dispose();
+  release();
+  await disposing;
+
+  assert.equal(
+    closed,
+    true,
+    "dispose waits for the subscription it must close",
+  );
+  await started;
+});
+
+test("a disposed controller offers no more history", async () => {
+  const h = harness({ pages: [new Error("relay down")] });
+
+  await h.controller.start();
+  assert.equal(h.controller.snapshot().hasMore, true);
+
+  await h.controller.dispose();
+
+  assert.equal(h.controller.snapshot().hasMore, false);
+});
+
+test("a page cursor ignores an unusable timestamp", () => {
+  assert.deepEqual(
+    oldestPageCursor([
+      { id: hexId(1), created_at: Number.NaN },
+      { id: hexId(2), created_at: 50 },
+      { id: hexId(3), created_at: 70 },
+    ]),
+    { until: 50, beforeId: hexId(2) },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// The activation gate.
+// ---------------------------------------------------------------------------
+
+test("the index runs only for the channel whose Files tab was opened", () => {
+  assert.equal(isFilesIndexEnabled(null, "channel-a"), false);
+  assert.equal(isFilesIndexEnabled("channel-a", "channel-a"), true);
+  // A-Files then B-Chat: the previous channel's activation must not carry.
+  assert.equal(isFilesIndexEnabled("channel-a", "channel-b"), false);
+  assert.equal(isFilesIndexEnabled("channel-a", null), false);
+});
+
+// ---------------------------------------------------------------------------
+// Caps and retention.
+// ---------------------------------------------------------------------------
+
+test("an over-long pubkey is truncated and an unusable timestamp is refused", () => {
+  const bounded = boundIndexSource(
+    fileEvent({ index: 3, pubkey: "f".repeat(4_000) }),
+  );
+
+  assert.ok(bounded);
+  assert.equal(bounded.pubkey.length, MAX_INDEXED_PUBKEY_LENGTH);
+
+  assert.equal(
+    boundIndexSource(fileEvent({ index: 3, created_at: 1.5 })),
+    null,
+    "a non-integer timestamp is refused",
+  );
+  assert.equal(
+    boundIndexSource(fileEvent({ index: 3, created_at: -1 })),
+    null,
+    "a negative timestamp is refused",
+  );
+  assert.equal(
+    boundIndexSource(fileEvent({ index: 3, created_at: Number.NaN })),
+    null,
+  );
+});
+
+test("an index that hit a retention cap reports a truncated list", () => {
+  // Deletions, so the retained ROWS stay far under the projection's own row
+  // cap: this is the index's retention cap reaching the tab's notice, which is
+  // the #4428 property, and nothing else can produce it here.
+  const index = ingestIndexEvents(emptyFilesIndex(), [
+    fileEvent({ index: 1 }),
+    ...Array.from({ length: MAX_INDEXED_DELETIONS + 5 }, (_unused, i) =>
+      deletionEvent(hexId(700_000 + i), { id: hexId(400_000 + i) }),
+    ),
+  ]);
+
+  assert.equal(index.truncated, true);
+  const projection = selectIndexedFiles(index);
+  assert.equal(
+    projection.files.length,
+    1,
+    "the rows themselves are not capped",
+  );
+  assert.equal(
+    projection.truncated,
+    true,
+    "the tab is told the list is partial",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Edit and deletion overlay rules.
+// ---------------------------------------------------------------------------
+
+test("an older edit cannot displace a newer one", () => {
+  const target = fileEvent({ index: 6 });
+  let index = ingestIndexEvents(emptyFilesIndex(), [target]);
+  index = ingestIndexEvents(index, [
+    editEvent(target.id, {
+      id: hexId(810_001),
+      created_at: 9_000,
+      imeta: [
+        [
+          "imeta",
+          "url https://relay.example/media/newest.png",
+          "m image/png",
+          "filename newest.png",
+        ],
+      ],
+    }),
+  ]);
+  index = ingestIndexEvents(index, [
+    editEvent(target.id, {
+      id: hexId(810_002),
+      created_at: 1_000,
+      imeta: [
+        [
+          "imeta",
+          "url https://relay.example/media/stale.png",
+          "m image/png",
+          "filename stale.png",
+        ],
+      ],
+    }),
+  ]);
+
+  assert.deepEqual(
+    selectIndexedFiles(index).files.map((file) => file.filename),
+    ["newest.png"],
+  );
+});
+
+test("a deleted edit stops rewriting the message it edited", () => {
+  const target = fileEvent({ index: 7 });
+  const edit = editEvent(target.id, { id: hexId(820_001) });
+  let index = ingestIndexEvents(emptyFilesIndex(), [target, edit]);
+
+  assert.deepEqual(
+    selectIndexedFiles(index).files.map((file) => file.filename),
+    ["edited.png"],
+  );
+
+  index = ingestIndexEvents(index, [
+    deletionEvent(edit.id, { id: hexId(830_001) }),
+  ]);
+
+  assert.deepEqual(
+    selectIndexedFiles(index).files.map((file) => file.filename),
+    ["file-7.png"],
+    "the edit is gone, the message it edited is not",
+  );
+});
+
+test("an edit with an unusable id cannot rewrite a message", () => {
+  const target = fileEvent({ index: 8 });
+  const index = ingestIndexEvents(emptyFilesIndex(), [
+    target,
+    editEvent(target.id, { id: "not-a-hex-id" }),
+  ]);
+
+  assert.deepEqual(
+    selectIndexedFiles(index).files.map((file) => file.filename),
+    ["file-8.png"],
+  );
+});
+
+test("rows with the same timestamp keep one total order", () => {
+  const older = fileEvent({ index: 11, id: hexId(0x11), created_at: 5_000 });
+  const newer = fileEvent({ index: 12, id: hexId(0x22), created_at: 5_000 });
+  // Ingested largest id first, so insertion order and id order disagree.
+  const index = ingestIndexEvents(emptyFilesIndex(), [newer, older]);
+
+  assert.deepEqual(
+    selectIndexedFiles(index).files.map((file) => file.filename),
+    ["file-12.png", "file-11.png"],
+  );
+});
+
+test("an edit that arrived before its message is dropped when it proves forged", () => {
+  const target = fileEvent({ index: 13 });
+  // The edit lands first, when there is no author to check it against.
+  let index = ingestIndexEvents(emptyFilesIndex(), [
+    editEvent(target.id, { pubkey: "mallory" }),
+  ]);
+  assert.equal(index.edits.size, 1);
+
+  index = ingestIndexEvents(index, [target]);
+
+  assert.equal(index.edits.size, 0, "the forged edit is not retained");
+  assert.deepEqual(
+    selectIndexedFiles(index).files.map((file) => file.filename),
+    ["file-13.png"],
+  );
+});
+
+test("the projection refuses an edit signed by anyone but the author", () => {
+  // Built directly, because ingestion drops a forged edit before this point.
+  // The projection is the last thing between a forged edit and the user, and
+  // it holds on its own.
+  const source = boundIndexSource(fileEvent({ index: 14 }));
+  const forged = {
+    id: hexId(840_001),
+    pubkey: "mallory",
+    created_at: 9_999,
+    content: "forged",
+    tags: [
+      [
+        "imeta",
+        "url https://relay.example/media/forged.png",
+        "m image/png",
+        "filename forged.png",
+      ],
+    ],
+  };
+
+  const projection = selectIndexedFiles({
+    sources: new Map([[source.id, source]]),
+    deletions: new Set(),
+    edits: new Map([[source.id, forged]]),
+    truncated: false,
+  });
+
+  assert.deepEqual(
+    projection.files.map((file) => file.filename),
+    ["file-14.png"],
+  );
+});
+
+// ---------------------------------------------------------------------------
+// The hook, through the seams the app really uses: `relayClient` for the live
+// subscription and the Tauri command for history.
+// ---------------------------------------------------------------------------
+
+const dom = new JSDOM("<!doctype html><html><body></body></html>", {
+  url: "http://localhost",
+});
+
+before(() => {
+  Object.assign(globalThis, {
+    document: dom.window.document,
+    HTMLElement: dom.window.HTMLElement,
+    IS_REACT_ACT_ENVIRONMENT: true,
+    Node: dom.window.Node,
+    window: dom.window,
+  });
+});
+
+afterEach(async () => {
+  const { cleanup } = await import("@testing-library/react");
+  cleanup();
+  mock.restoreAll();
+});
+
+after(() => dom.window.close());
+
+const CHANNEL = { id: "channel-a" };
+
+/**
+ * Render the hook with both relay seams counted. `live` decides what the
+ * subscription does; `page` decides what one history page resolves to.
+ */
+async function renderFilesIndex({
+  enabled = true,
+  live = async () => () => {},
+  page = async () => [],
+} = {}) {
+  const { renderHook } = await import("@testing-library/react");
+  const calls = { subscribe: 0, fetch: 0 };
+  mock.method(relayClient, "subscribeToChannelLive", async (_id, onEvent) => {
+    calls.subscribe += 1;
+    return live(onEvent);
+  });
+  globalThis.window.__TAURI_INTERNALS__ = {
+    invoke: async (command) => {
+      if (command !== "get_channel_reconnect_repair") return null;
+      calls.fetch += 1;
+      return page();
+    },
+  };
+  const view = renderHook((props) => useChannelFilesIndex(CHANNEL, props), {
+    initialProps: enabled,
+  });
+  return { calls, view };
+}
+
+test("nothing reaches the relay until the Files tab is opened", async () => {
+  const { waitFor } = await import("@testing-library/react");
+  const { calls, view } = await renderFilesIndex({
+    enabled: false,
+    page: async () => [fileEvent({ index: 1 })],
+  });
+
+  // Give an effect that ignored the gate every chance to run.
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  assert.equal(calls.subscribe, 0, "no live subscription before Files is open");
+  assert.equal(calls.fetch, 0, "no history page before Files is open");
+
+  view.rerender(true);
+
+  await waitFor(() => {
+    assert.equal(calls.subscribe, 1);
+    assert.equal(calls.fetch, 1);
+  });
+});
+
+test("a live failure over rows is a banner, with no rows it is the error state", async () => {
+  const { waitFor } = await import("@testing-library/react");
+  const withRows = await renderFilesIndex({
+    live: async () => {
+      throw new Error("relay socket refused");
+    },
+    page: async () => [fileEvent({ index: 1 })],
+  });
+
+  await waitFor(() =>
+    assert.equal(withRows.view.result.current.files.length, 1),
+  );
+  assert.match(withRows.view.result.current.error ?? "", /live updates/i);
+  assert.equal(
+    withRows.view.result.current.isError,
+    false,
+    "rows are shown under the banner, never replaced by an error screen",
+  );
+  assert.equal(withRows.view.result.current.isLoading, false);
+
+  const { cleanup } = await import("@testing-library/react");
+  cleanup();
+  mock.restoreAll();
+
+  const empty = await renderFilesIndex({
+    live: async () => {
+      throw new Error("relay socket refused");
+    },
+    page: async () => [],
+  });
+
+  await waitFor(() => assert.equal(empty.view.result.current.isError, true));
+  assert.equal(empty.view.result.current.files.length, 0);
+});
+
+test("loading stops as soon as there is something to say", async () => {
+  const { act, waitFor } = await import("@testing-library/react");
+
+  const failing = await renderFilesIndex({
+    live: async () => {
+      throw new Error("relay socket refused");
+    },
+    page: () => new Promise(() => {}),
+  });
+
+  await waitFor(() => assert.notEqual(failing.view.result.current.error, null));
+  assert.equal(
+    failing.view.result.current.isLoading,
+    false,
+    "a surfaced failure is not a loading state",
+  );
+
+  const { cleanup } = await import("@testing-library/react");
+  cleanup();
+  mock.restoreAll();
+
+  let deliver;
+  const streaming = await renderFilesIndex({
+    live: async (onEvent) => {
+      deliver = onEvent;
+      return () => {};
+    },
+    page: () => new Promise(() => {}),
+  });
+
+  await waitFor(() => assert.ok(deliver));
+  await act(async () => {
+    deliver(fileEvent({ index: 2 }));
+  });
+
+  assert.equal(streaming.view.result.current.files.length, 1);
+  assert.equal(
+    streaming.view.result.current.isLoading,
+    false,
+    "rows are on screen, so the tab is not loading",
+  );
 });

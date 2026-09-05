@@ -94,6 +94,7 @@ import { GuardedChannelPane } from "./GuardedChannelPane";
 import { useNavigationGuard } from "./useNavigationGuard";
 import * as searchForwarding from "./searchTargetForwarding";
 import { ChannelFilesTab } from "@/features/channel-files/ChannelFilesTab";
+import { isFilesIndexEnabled } from "@/features/channel-files/filesTabActivation";
 import { useChannelFilesIndex } from "@/features/channel-files/useChannelFilesIndex";
 import { useFileFolders } from "@/features/channel-files/useFileFolders";
 import {
@@ -230,20 +231,29 @@ export function ChannelScreen({
     threadScrollTargetId,
   );
   useChannelSubscription(activeChannel);
-  // The Files projection re-parses the whole loaded message window on every
-  // live message, so it stays off until the user actually opens the tab for
-  // this channel; a Chat-only session never pays for it.
-  const [filesTabOpened, setFilesTabOpened] = React.useState(false);
+  // The attachment index opens a live relay subscription and walks the
+  // channel's history, so it stays off until the user actually opens the tab
+  // for this channel; a Chat-only session never pays for it. The state is the
+  // channel id, not a boolean, so a channel switch cannot carry the previous
+  // channel's activation into the render that first shows the next one.
+  const [filesTabOpenedChannelId, setFilesTabOpenedChannelId] = React.useState<
+    string | null
+  >(null);
   React.useEffect(() => {
-    if (activeTab === CHANNEL_TAB_FILES) setFilesTabOpened(true);
-  }, [activeTab]);
-  const channelFiles = useChannelFilesIndex(activeChannel, filesTabOpened);
+    if (activeTab === CHANNEL_TAB_FILES && activeChannelId) {
+      setFilesTabOpenedChannelId(activeChannelId);
+    }
+  }, [activeTab, activeChannelId]);
+  const channelFiles = useChannelFilesIndex(
+    activeChannel,
+    isFilesIndexEnabled(filesTabOpenedChannelId, activeChannelId),
+  );
   const fileFoldersHook = useFileFolders(activeChannelId, currentPubkey);
   // Reset to chat tab when switching channels
   // biome-ignore lint/correctness/useExhaustiveDependencies: activeChannelId is the intentional reset trigger
   React.useEffect(() => {
     setActiveTab(CHANNEL_TAB_CHAT);
-    setFilesTabOpened(false);
+    setFilesTabOpenedChannelId(null);
   }, [activeChannelId]);
   const { fetchOlder, hasOlderMessages, historyExhausted, isFetchingOlder } =
     useFetchOlderMessages(activeChannel);
@@ -1129,9 +1139,9 @@ export function ChannelScreen({
                     onCreateFolder={fileFoldersHook.createFolder}
                     onDeleteFolder={fileFoldersHook.deleteFolder}
                     onJumpToMessage={handleJumpToMessage}
-                    onLoadOlder={channelFiles.refetch}
+                    onLoadOlder={channelFiles.loadOlder}
                     onMoveFolder={fileFoldersHook.moveFolder}
-                    onRetryFiles={channelFiles.refetch}
+                    onRetryFiles={channelFiles.retry}
                     onRetryFolders={() => void fileFoldersHook.refetch()}
                     senderAvatarUrls={fileSenderAvatarUrls}
                     senderNames={fileSenderNames}

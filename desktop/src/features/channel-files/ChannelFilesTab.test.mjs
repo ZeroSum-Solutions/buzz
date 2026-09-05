@@ -520,3 +520,53 @@ test("a completed history walk offers no load-older control", async () => {
     cleanup();
   }
 });
+
+test("a truncated index tells the user the list is partial", async () => {
+  // The #4428 property: when a retention cap stops the index short of the
+  // channel, the tab must say so rather than present a partial list as whole.
+  const partial = await renderTab({
+    files: [{ url: "https://media.example/one.png", filename: "one.png" }],
+    truncated: true,
+  });
+  try {
+    assert.ok(
+      partial.screen.getByText(/Showing the most recent attachments only/),
+    );
+  } finally {
+    partial.cleanup();
+  }
+
+  const whole = await renderTab({
+    files: [{ url: "https://media.example/one.png", filename: "one.png" }],
+    truncated: false,
+  });
+  try {
+    assert.equal(
+      whole.screen.queryByText(/Showing the most recent attachments only/),
+      null,
+      "a complete list carries no partial-list notice",
+    );
+  } finally {
+    whole.cleanup();
+  }
+});
+
+test("the failure banner's Retry runs the retry it was given", async () => {
+  let retries = 0;
+  const { act, cleanup, screen } = await renderTab({
+    files: [{ url: "https://media.example/kept.png", filename: "kept.png" }],
+    filesError: "Files are not receiving live updates: relay socket refused",
+    onRetryFiles: () => {
+      retries += 1;
+    },
+  });
+  try {
+    const { fireEvent } = await import("@testing-library/react");
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    });
+    assert.equal(retries, 1, "the only recovery affordance must do something");
+  } finally {
+    cleanup();
+  }
+});
