@@ -145,12 +145,33 @@ fn chrome_launch_args_fail_every_dns_lookup() {
         "the browser must not be able to resolve a host: {CHROME_LAUNCH_ARGS:?}"
     );
     assert!(CHROME_LAUNCH_ARGS.contains(&"--no-proxy-server"));
+    assert!(
+        CHROME_LAUNCH_ARGS.contains(&"--disable-remote-fonts"),
+        "a remote font is a network fetch the print document's policy does not \
+         cover on its own: {CHROME_LAUNCH_ARGS:?}"
+    );
+}
+
+/// The Windows creation flags are the containment contract, so they are named
+/// constants with a compile-time guard (`pdf_export.rs`), mirroring
+/// `managed_agents/discovery/bounded_command.rs`. This asserts the same thing
+/// at runtime on the platform that can execute it.
+#[cfg(windows)]
+#[test]
+fn the_browser_is_spawned_suspended_and_windowless() {
+    assert_eq!(CHROME_CREATION_FLAGS & CREATE_SUSPENDED, CREATE_SUSPENDED);
+    assert_eq!(CHROME_CREATION_FLAGS & CREATE_NO_WINDOW, CREATE_NO_WINDOW);
 }
 
 #[test]
-fn chrome_process_env_blanks_inherited_proxies() {
+fn the_unix_browser_env_blanks_proxies_and_redirects_every_state_directory() {
     let scratch = std::path::Path::new("/tmp/buzz-pdf-export-test");
-    let env = chrome_process_env(scratch);
+    let scratch_value = scratch.display().to_string();
+    // A parent that has *every* variable set: what the child gets is only what
+    // this map names, never what the harness happens to carry.
+    let env = chrome_process_env_for(scratch, ChromeEnvTarget::Unix, |_| {
+        Some("inherited-from-the-harness".to_string())
+    });
     for key in PROXY_ENV_VARS {
         assert_eq!(
             env.get(key).map(String::as_str),
@@ -160,11 +181,110 @@ fn chrome_process_env_blanks_inherited_proxies() {
     }
     assert_eq!(env.get("NO_PROXY").map(String::as_str), Some("*"));
     assert_eq!(env.get("no_proxy").map(String::as_str), Some("*"));
+    assert_eq!(env.get("PATH").map(String::as_str), Some(CHROME_UNIX_PATH));
+    for key in [
+        "HOME",
+        "TMPDIR",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+    ] {
+        assert_eq!(
+            env.get(key),
+            Some(&scratch_value),
+            "{key} must point at the export's own scratch directory"
+        );
+    }
+    assert!(
+        !env.contains_key("SHELL"),
+        "nothing outside this map may reach the child: {env:?}"
+    );
+}
+
+/// The Windows environment is built and asserted on every platform.
+///
+/// After `env_clear` a Windows child keeps only what this map names, and
+/// Windows resolves the process image and its DLLs through `SystemRoot` and
+/// `WINDIR` — a child without them very likely does not start at all. The
+/// repo's own precedent is `commands/media_transcode.rs`, which restores the
+/// same loader variables for its ffmpeg child. Testing the pure builder rather
+/// than the spawn is what makes this assertion runnable on a Linux or macOS
+/// lane instead of waiting for a Windows one that does not exist.
+#[test]
+fn the_windows_browser_env_carries_the_loader_variables_and_no_unix_ones() {
+    let scratch = std::path::Path::new("/tmp/buzz-pdf-export-test");
+    let scratch_value = scratch.display().to_string();
+    let env = chrome_process_env_for(scratch, ChromeEnvTarget::Windows, |key| match key {
+        "SystemRoot" | "WINDIR" => Some("C:\\Windows".to_string()),
+        _ => Some("inherited-from-the-harness".to_string()),
+    });
+
+    for key in WINDOWS_LOADER_ENV_VARS {
+        assert_eq!(
+            env.get(key).map(String::as_str),
+            Some("C:\\Windows"),
+            "{key} must be carried over or the browser cannot start"
+        );
+    }
     assert_eq!(
-        env.get("HOME").map(String::as_str),
-        Some(scratch.display().to_string().as_str()),
+        env.get("PATH").map(String::as_str),
+        Some("C:\\Windows\\system32;C:\\Windows"),
+        "PATH must be rebuilt from SystemRoot, never inherited"
+    );
+    for key in ["TEMP", "TMP"] {
+        assert_eq!(
+            env.get(key),
+            Some(&scratch_value),
+            "{key} must point at the export's own scratch directory"
+        );
+    }
+    for key in PROXY_ENV_VARS {
+        assert_eq!(
+            env.get(key).map(String::as_str),
+            Some(""),
+            "{key} must be blanked on Windows too"
+        );
+    }
+    assert_eq!(env.get("no_proxy").map(String::as_str), Some("*"));
+    // Only the loader variables are taken from the parent, even though the
+    // lookup above answers every name.
+    assert!(
+        !env.contains_key("USERPROFILE") && !env.contains_key("APPDATA"),
+        "nothing outside the loader list may be inherited: {env:?}"
+    );
+    // The Unix map's variables mean nothing here and must not be shipped.
+    for key in [
+        "HOME",
+        "TMPDIR",
+        "LC_ALL",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+    ] {
+        assert!(!env.contains_key(key), "{key} has no meaning on Windows");
+    }
+}
+
+/// The command the export actually spawns builds its environment for the
+/// platform it is running on, not for whichever branch was written last.
+#[test]
+fn the_browser_env_is_built_for_the_host_platform() {
+    let scratch = std::path::Path::new("/tmp/buzz-pdf-export-test");
+    let scratch_value = scratch.display().to_string();
+    let env = chrome_process_env(scratch);
+    #[cfg(unix)]
+    assert_eq!(
+        env.get("HOME"),
+        Some(&scratch_value),
         "the browser must not read the user's home directory"
     );
+    #[cfg(windows)]
+    assert_eq!(
+        env.get("TEMP"),
+        Some(&scratch_value),
+        "the browser must write its temporary files inside the scratch directory"
+    );
+    assert_eq!(env.get("no_proxy").map(String::as_str), Some("*"));
 }
 
 #[test]
@@ -544,6 +664,60 @@ fn write_fake_chrome(dir: &std::path::Path) -> std::path::PathBuf {
     path
 }
 
+/// A stand-in browser that floods stderr instead of announcing an endpoint:
+/// it writes more than [`MAX_LAUNCH_STDERR_BYTES`] of banner-free noise, then
+/// holds the process open forever.
+#[cfg(unix)]
+fn write_flooding_chrome(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = dir.join("flooding-chrome");
+    // 1,200 lines of 1,023 characters is 1,228,800 bytes, past the 1 MiB cap.
+    std::fs::write(
+        &path,
+        "#!/bin/sh\n\
+         line=$(printf '%01023d' 0)\n\
+         yes \"$line\" | head -n 1200 >&2\n\
+         while :; do sleep 5; done\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// The stderr scan is bounded in bytes, and this is the test that fails when
+/// that bound is removed.
+///
+/// A browser that writes megabytes without ever printing the DevTools banner
+/// must be given up on at the cap, with the cap named in the error — not read
+/// until it decides to stop. With `.take(MAX_LAUNCH_STDERR_BYTES)` removed the
+/// scan keeps reading, the child never exits, and the launch fails with the
+/// deadline's message instead of this one.
+#[cfg(unix)]
+#[test]
+fn a_browser_that_floods_stderr_is_given_up_on_at_the_scan_cap() {
+    let dir = tempfile::Builder::new()
+        .prefix("buzz-pdf-export-flood-")
+        .tempdir()
+        .unwrap();
+    let chrome = write_flooding_chrome(dir.path());
+
+    let started = std::time::Instant::now();
+    let error = launch_chrome(&chrome, dir.path(), std::time::Duration::from_secs(5))
+        .err()
+        .expect("a browser that never reports an endpoint must not launch");
+    let elapsed = started.elapsed();
+
+    assert!(
+        error.contains(&format!("wrote more than {MAX_LAUNCH_STDERR_BYTES} bytes")),
+        "expected the stderr scan cap to fire, got: {error}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the cap must fire before the launch deadline, took {elapsed:?}"
+    );
+}
+
 #[cfg(unix)]
 fn read_when_present(path: &std::path::Path) -> String {
     for _ in 0..100 {
@@ -606,6 +780,10 @@ fn a_browser_that_never_reports_an_endpoint_is_bounded_and_its_tree_killed() {
     assert!(
         argv.contains(&"--no-proxy-server"),
         "the launch must refuse every proxy: {argv:?}"
+    );
+    assert!(
+        argv.contains(&"--disable-remote-fonts"),
+        "the launch must not fetch a remote font: {argv:?}"
     );
     assert!(
         argv.iter()

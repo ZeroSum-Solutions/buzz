@@ -112,9 +112,21 @@ const PROXY_ENV_VARS: [&str; 8] = [
     "ftp_proxy",
 ];
 
-/// The only `PATH` the browser child gets. A fixed value, not the harness's,
-/// so nothing on the launching shell's `PATH` can be resolved by the child.
-const CHROME_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+/// The only `PATH` a Unix browser child gets. A fixed value, not the
+/// harness's, so nothing on the launching shell's `PATH` can be resolved by
+/// the child.
+const CHROME_UNIX_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+/// The Windows variables the child is given back after `env_clear`.
+///
+/// Windows resolves the process image and its DLLs through these, so a child
+/// started without them very likely fails to start at all — the same reason
+/// and the same list as `commands/media_transcode.rs`, which restores exactly
+/// these for its ffmpeg child. `TEMP` and `TMP` are *not* restored from the
+/// parent here: they are the Windows spelling of `TMPDIR`, and the export
+/// points them at its own scratch directory instead, so the browser writes no
+/// temporary file outside it.
+const WINDOWS_LOADER_ENV_VARS: [&str; 2] = ["SystemRoot", "WINDIR"];
 
 /// Upper bound on the document-mode HTML accepted from the frontend.
 ///
@@ -154,6 +166,35 @@ const MAX_LAUNCH_STDERR_BYTES: u64 = 1024 * 1024;
 
 /// The line Chrome writes to stderr once its DevTools endpoint is listening.
 const DEVTOOLS_BANNER: &str = "DevTools listening on ";
+
+/// Freeze the browser so the Job Object takes ownership before any of its code
+/// runs (see [`ChromeChild::spawn`]).
+#[cfg(windows)]
+const CREATE_SUSPENDED: u32 = 0x0000_0004;
+
+/// Suppress the console window a GUI-spawned console child would otherwise
+/// flash.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// The exact creation flags the export's browser is spawned with.
+///
+/// `Command::creation_flags` *replaces* rather than accumulates, so this
+/// constant has to carry every flag the child needs — the same reason and the
+/// same shape as `managed_agents/discovery/bounded_command.rs`.
+#[cfg(windows)]
+const CHROME_CREATION_FLAGS: u32 = CREATE_SUSPENDED | CREATE_NO_WINDOW;
+
+/// Compile-time guard: the browser's flags must always carry *both* bits. An
+/// edit that drops `CREATE_SUSPENDED` (reopening the spawn-to-assign race that
+/// lets a renderer escape the job) or `CREATE_NO_WINDOW` (flashing a console
+/// out of the GUI process) fails the build on Windows rather than shipping
+/// silently.
+#[cfg(windows)]
+const _: () = {
+    assert!(CHROME_CREATION_FLAGS & CREATE_SUSPENDED == CREATE_SUSPENDED);
+    assert!(CHROME_CREATION_FLAGS & CREATE_NO_WINDOW == CREATE_NO_WINDOW);
+};
 
 /// Escape text for insertion into HTML element or attribute content.
 fn escape_html_text(input: &str) -> String {
@@ -242,16 +283,51 @@ impl PdfExportRequest {
     }
 }
 
-/// The complete environment the browser child process is started with.
+/// Which platform's environment [`chrome_process_env_for`] builds.
 ///
-/// It is applied after `Command::env_clear`, so this map is the child's whole
-/// environment and nothing about the shell that launched Buzz reaches it: the
-/// proxy variables are named and blanked, `no_proxy` is `*` so no export can
-/// be routed through a network hop, `PATH` is a fixed list rather than the
-/// harness's, and `HOME`, `TMPDIR` and the XDG directories all point at the
-/// export's own scratch directory so the child reads and writes none of the
-/// user's browser state.
-fn chrome_process_env(scratch_dir: &Path) -> HashMap<String, String> {
+/// Named rather than `cfg`-branched inside the builder so the Windows map can
+/// be asserted on every platform: the shape of an environment that only one
+/// CI lane can execute is exactly the kind of guard that otherwise ships
+/// untested.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChromeEnvTarget {
+    Unix,
+    Windows,
+}
+
+impl ChromeEnvTarget {
+    /// The platform this build targets.
+    const HOST: Self = if cfg!(windows) {
+        Self::Windows
+    } else {
+        Self::Unix
+    };
+}
+
+/// The complete environment the browser child process is started with, for
+/// `target`, reading the parent's variables through `inherited`.
+///
+/// It is applied after `Command::env_clear`, so the returned map is the
+/// child's whole environment and nothing about the shell that launched Buzz
+/// reaches it beyond what is named here: the proxy variables are named and
+/// blanked and `no_proxy` is `*` on both platforms, so no export can be routed
+/// through a network hop.
+///
+/// The rest is platform-specific because the two platforms need different
+/// variables to start a process at all:
+///
+/// - **Unix**: `PATH` is a fixed list rather than the harness's, and `HOME`,
+///   `TMPDIR` and the XDG directories all point at the export's own scratch
+///   directory so the child reads and writes none of the user's browser state.
+/// - **Windows**: none of those mean anything. The loader variables
+///   ([`WINDOWS_LOADER_ENV_VARS`]) are carried over from the parent because the
+///   image and DLL lookup needs them, `PATH` is rebuilt from `SystemRoot`
+///   rather than inherited, and `TEMP`/`TMP` point at the scratch directory.
+fn chrome_process_env_for(
+    scratch_dir: &Path,
+    target: ChromeEnvTarget,
+    inherited: impl Fn(&str) -> Option<String>,
+) -> HashMap<String, String> {
     let scratch = scratch_dir.display().to_string();
     let mut env: HashMap<String, String> = PROXY_ENV_VARS
         .iter()
@@ -259,14 +335,38 @@ fn chrome_process_env(scratch_dir: &Path) -> HashMap<String, String> {
         .collect();
     env.insert("NO_PROXY".to_string(), "*".to_string());
     env.insert("no_proxy".to_string(), "*".to_string());
-    env.insert("PATH".to_string(), CHROME_PATH.to_string());
-    env.insert("LC_ALL".to_string(), "C".to_string());
-    env.insert("HOME".to_string(), scratch.clone());
-    env.insert("TMPDIR".to_string(), scratch.clone());
-    env.insert("XDG_CONFIG_HOME".to_string(), scratch.clone());
-    env.insert("XDG_CACHE_HOME".to_string(), scratch.clone());
-    env.insert("XDG_DATA_HOME".to_string(), scratch);
+    match target {
+        ChromeEnvTarget::Unix => {
+            env.insert("PATH".to_string(), CHROME_UNIX_PATH.to_string());
+            env.insert("LC_ALL".to_string(), "C".to_string());
+            env.insert("HOME".to_string(), scratch.clone());
+            env.insert("TMPDIR".to_string(), scratch.clone());
+            env.insert("XDG_CONFIG_HOME".to_string(), scratch.clone());
+            env.insert("XDG_CACHE_HOME".to_string(), scratch.clone());
+            env.insert("XDG_DATA_HOME".to_string(), scratch);
+        }
+        ChromeEnvTarget::Windows => {
+            for key in WINDOWS_LOADER_ENV_VARS {
+                if let Some(value) = inherited(key) {
+                    env.insert(key.to_string(), value);
+                }
+            }
+            if let Some(root) = env.get("SystemRoot").cloned() {
+                env.insert("PATH".to_string(), format!("{root}\\system32;{root}"));
+            }
+            env.insert("TEMP".to_string(), scratch.clone());
+            env.insert("TMP".to_string(), scratch);
+        }
+    }
     env
+}
+
+/// [`chrome_process_env_for`] for the platform this build runs on, reading the
+/// real parent environment.
+fn chrome_process_env(scratch_dir: &Path) -> HashMap<String, String> {
+    chrome_process_env_for(scratch_dir, ChromeEnvTarget::HOST, |key| {
+        std::env::var(key).ok()
+    })
 }
 
 /// The exact command the export spawns: the browser at `chrome`, every
@@ -325,10 +425,7 @@ impl ChromeChild {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt as _;
-            // CREATE_SUSPENDED | CREATE_NO_WINDOW: freeze the child so the job
-            // takes ownership before it can fork, and keep a console window
-            // from flashing out of the GUI process.
-            command.creation_flags(0x0000_0004 | 0x0800_0000);
+            command.creation_flags(CHROME_CREATION_FLAGS);
         }
 
         #[cfg_attr(not(windows), allow(unused_mut))]
