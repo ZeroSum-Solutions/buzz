@@ -166,6 +166,9 @@ before(async () => {
 });
 
 afterEach(() => {
+  // A test that fails before releasing its held reload would otherwise leave the
+  // mutation in flight forever and the runner waiting on it.
+  releaseReload?.({ localUpdated: false });
   cleanup?.();
   for (const client of clients.splice(0)) {
     client.cancelQueries();
@@ -189,7 +192,10 @@ async function settle() {
 
 function newClient(queryOverrides = {}) {
   const client = new QueryClient({
-    defaultOptions: { queries: { retry: false, gcTime: 0, ...queryOverrides } },
+    defaultOptions: {
+      queries: { retry: false, gcTime: 0, ...queryOverrides },
+      mutations: { retry: false, gcTime: 0 },
+    },
   });
   clients.push(client);
   return client;
@@ -406,6 +412,9 @@ test("the instructions and Save are fenced while a reload is in flight", async (
   await act(async () => {
     fireEvent.click(screen.getByRole("button", { name: "Reload" }));
   });
+  // `isPending` reaches the field through TanStack's batched notifier, one
+  // macrotask after the click; the fence is asserted once that has landed.
+  await settle();
   assert.ok(releaseReload, "the reload must still be in flight");
 
   // The window the fence exists for: the answer will replace the instructions

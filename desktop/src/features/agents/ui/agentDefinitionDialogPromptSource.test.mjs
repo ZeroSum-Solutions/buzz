@@ -142,7 +142,10 @@ after(() => dom.window.close());
 
 function mount(initialValues, overrides = {}) {
   const client = new QueryClient({
-    defaultOptions: { queries: { retry: false, gcTime: 0 } },
+    defaultOptions: {
+      queries: { retry: false, gcTime: 0 },
+      mutations: { retry: false, gcTime: 0 },
+    },
   });
   clients.push(client);
   render(

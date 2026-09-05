@@ -145,7 +145,10 @@ async function mount(overrides = {}) {
   // real client: that is what invalidates the persona caches the reload just
   // made stale.
   const client = new QueryClient({
-    defaultOptions: { queries: { retry: false, gcTime: 0 } },
+    defaultOptions: {
+      queries: { retry: false, gcTime: 0 },
+      mutations: { retry: false, gcTime: 0 },
+    },
   });
   const tree = (extra = {}) =>
     createElement(
