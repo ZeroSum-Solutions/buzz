@@ -1093,6 +1093,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "buzz-secret-store",
  "dirs",
  "fs2",
  "getrandom 0.4.3",

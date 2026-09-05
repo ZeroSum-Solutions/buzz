@@ -21,6 +21,8 @@ use common::{openai_text, openai_tool_call, spawn_capturing_llm, Harness};
 
 /// The four identity variables the spawn boundary withholds from untrusted
 /// MCP servers.
+const CAPABILITY_VAR: &str = buzz_secret_store::CAPABILITY_ENV_VAR;
+
 const IDENTITY_VARS: &[&str] = &[
     "BUZZ_PRIVATE_KEY",
     "NOSTR_PRIVATE_KEY",
@@ -230,6 +232,77 @@ async fn untrusted_mcp_env_withheld_when_declared_on_the_wire() {
              the untrusted assertion above would pass vacuously"
         );
     }
+
+    h.shutdown().await;
+}
+
+/// The MCP capability crosses the spawn boundary for a registry-generated
+/// server and for nothing else.
+///
+/// This is the last hop of the desktop -> buzz-acp -> buzz-agent -> launcher
+/// chain. The desktop mints `BUZZ_MCP_CAPABILITY` for one agent and one
+/// configuration generation and puts it in the spawn environment; buzz-acp
+/// inherits it; here it has to reach the bundled launcher, which reads it from
+/// its own environment. Without it the launcher exits 1 with
+/// "BUZZ_MCP_CAPABILITY is not set" and the server never runs, so a
+/// credential-backed registry entry silently starts nothing.
+///
+/// Three assertions, each falsifiable on its own:
+///
+/// * the registry-launched child has it -- dropping the forwarding in
+///   `spawn_one` fails here;
+/// * the operator's own extra server does not -- putting the name in
+///   `PASSTHROUGH_ENV` instead, which would hand every MCP child a bearer
+///   token for the agent's references, fails here;
+/// * a wire-declared value does not reach an unmarked server either, so the
+///   marker cannot be bypassed by declaration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn untrusted_mcp_env_capability_reaches_only_a_registry_launched_server() {
+    let llm = spawn_capturing_llm(vec![
+        openai_tool_call("tc1", "extra__tool_0", json!({})),
+        openai_tool_call("tc2", "registry__tool_0", json!({})),
+        openai_text("done"),
+    ])
+    .await;
+    // The value never travels back: the fake server reports names only.
+    let mut h = Harness::spawn_with_env(&llm.url, &[(CAPABILITY_VAR, "v1.a1b2.7.00")]).await;
+
+    // The extra server also *declares* the capability in its wire env, which
+    // is the bypass the spawn boundary has to refuse.
+    let mut extra = server_decl("extra", false);
+    extra["env"]
+        .as_array_mut()
+        .expect("declaration has an env array")
+        .push(json!({ "name": CAPABILITY_VAR, "value": "v1.other.1.ff" }));
+
+    let mut registry = server_decl("registry", false);
+    registry["registry_launched"] = json!(true);
+
+    let sid = new_session(&mut h, vec![extra, registry]).await;
+    let p = h
+        .send(
+            "session/prompt",
+            json!({"sessionId": sid, "prompt": [{"type":"text","text":"go"}]}),
+        )
+        .await;
+    let r = h.recv_until_approving(|v| v["id"] == json!(p)).await;
+    assert!(r.get("error").is_none(), "prompt errored: {r}");
+
+    let captured = llm.captured.lock().await;
+    let extra_report = tool_result_text(&captured, 1);
+    let extra_names = env_names(&extra_report);
+    assert!(
+        !extra_names.contains(&CAPABILITY_VAR),
+        "an operator-declared MCP server was handed the agent's capability"
+    );
+
+    let registry_report = tool_result_text(&captured, 2);
+    let registry_names = env_names(&registry_report);
+    assert!(
+        registry_names.contains(&CAPABILITY_VAR),
+        "the registry-launched server was spawned without {CAPABILITY_VAR}; \
+         the launcher exits 1 and the server never starts"
+    );
 
     h.shutdown().await;
 }

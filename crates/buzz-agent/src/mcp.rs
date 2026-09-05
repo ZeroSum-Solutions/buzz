@@ -13,6 +13,8 @@ use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::sync::Mutex as AsyncMutex;
 
+use buzz_secret_store::CAPABILITY_ENV_VAR;
+
 use crate::config::{Config, HookServers};
 use crate::types::{clamp, AgentError, McpServerStdio, ToolDef, ToolResult, ToolResultContent};
 
@@ -123,6 +125,7 @@ struct ServerSpec {
     env: Vec<(String, String)>,
     cwd: String,
     trusted: bool,
+    registry_launched: bool,
 }
 
 enum ClientState {
@@ -252,6 +255,7 @@ impl McpRegistry {
                     .collect(),
                 cwd: cwd.to_owned(),
                 trusted: s.trusted,
+                registry_launched: s.registry_launched,
             };
             let (client, pgid, tool_names, raw_tools) = spawn_one(&spec, reg.init_timeout).await?;
             let server_idx = reg.servers.len();
@@ -842,7 +846,32 @@ async fn spawn_one(
         if !spec.trusted && is_buzz_identity_env(k) {
             continue;
         }
+        // The capability is never declaration-supplied. It is a bearer token
+        // for one agent's registry references, and the only place it may come
+        // from is this process's own environment, for a child the registry
+        // generated. A wire-declared value would let any `mcpServers` entry
+        // name one.
+        if k == CAPABILITY_ENV_VAR {
+            continue;
+        }
         cmd.env(k, v);
+    }
+    if spec.registry_launched {
+        // The last hop of memo decision 5's chain. The desktop mints the
+        // capability for (agent, configuration generation) and puts it in the
+        // spawn environment; buzz-acp inherits it and passes it to this
+        // process; here it reaches the bundled launcher, which reads it from
+        // its own environment and strips it before it starts the server.
+        //
+        // Forwarded to a registry-generated child and to no other: adding it
+        // to PASSTHROUGH_ENV would hand the same token to every
+        // operator-declared MCP server. Absent -- a build with no registry, or
+        // a client that declared the marker itself -- the launcher exits 1
+        // with "BUZZ_MCP_CAPABILITY is not set" rather than starting a server
+        // that cannot resolve anything.
+        if let Ok(capability) = std::env::var(CAPABILITY_ENV_VAR) {
+            cmd.env(CAPABILITY_ENV_VAR, capability);
+        }
     }
     cmd.current_dir(&spec.cwd);
     cmd.stderr(std::process::Stdio::inherit());

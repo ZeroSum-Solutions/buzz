@@ -5987,6 +5987,7 @@ fn build_mcp_servers(config: &Config) -> Result<Vec<McpServer>, ConfigError> {
                 env
             },
             trusted: true,
+            registry_launched: false,
         });
     }
 
@@ -6229,6 +6230,7 @@ fn append_extra_mcp_servers(
             args: extra.args.clone(),
             env: vec![],
             trusted: false,
+            registry_launched: false,
         });
     }
     Ok(())

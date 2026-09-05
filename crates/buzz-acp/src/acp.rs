@@ -44,6 +44,20 @@ pub struct McpServer {
     pub env: Vec<EnvVar>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub trusted: bool,
+    /// Whether this entry is one the desktop's MCP registry generated, and so
+    /// runs the bundled `buzz-mcp-launch` rather than an operator's own
+    /// command.
+    ///
+    /// Set only by [`crate::mcp_registry::append_registry_mcp_servers`], from
+    /// a file only the desktop writes. `buzz-agent` forwards
+    /// `BUZZ_MCP_CAPABILITY` — the per-agent, per-generation token the
+    /// launcher needs to resolve an `mcp:` reference — to a child declared
+    /// this way and to no other. Without the marker the launcher exits 1 with
+    /// "BUZZ_MCP_CAPABILITY is not set" and the server never starts; with it
+    /// on an arbitrary entry, an operator-declared server would hold a token
+    /// for every registry credential the agent has.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub registry_launched: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -2593,6 +2607,7 @@ mod tests {
                 },
             ],
             trusted: true,
+            registry_launched: false,
         };
         let serialized = serde_json::to_value(&server).unwrap();
         assert_eq!(serialized["name"].as_str(), Some("test-mcp"));

@@ -215,3 +215,151 @@ fn mcp_server_cap_mirrors_buzz_agent() {
         "buzz-acp's mirrored MCP server cap drifted from McpRegistry's"
     );
 }
+
+/// The registry chain, from the file the desktop writes to the environment the
+/// server is spawned with.
+///
+/// The desktop stages a generation, names it in `BUZZ_ACP_MCP_REGISTRY`, and
+/// puts `BUZZ_MCP_CAPABILITY` in the harness's spawn environment. buzz-acp
+/// turns the file into `mcpServers` entries; buzz-agent spawns them. The
+/// capability has to arrive at the child, because the child in production is
+/// `buzz-mcp-launch`, which reads the variable from its own environment and
+/// exits 1 with "BUZZ_MCP_CAPABILITY is not set" when it is absent -- so a
+/// break anywhere on this path leaves the operator with a registry server that
+/// silently never runs.
+///
+/// Everything but the launcher itself is real here: the real registry file
+/// shape, the real `McpServerSet::from_config`, the real wire JSON, a real
+/// buzz-agent child, a real `session/new`, and a real MCP subprocess reporting
+/// the names of the variables it was spawned with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registry_file_capability_reaches_the_spawned_server() {
+    let fake_mcp = env!("CARGO_BIN_EXE_fake-mcp");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let registry_path = dir.path().join("mcp-registry.json");
+    // The shape `render_buzz_acp_registry` writes: a bounded document of
+    // launcher invocations whose `env` blocks carry references, never values.
+    std::fs::write(
+        &registry_path,
+        serde_json::to_string(&json!({
+            "version": 1,
+            "servers": [{
+                "name": "registry",
+                "command": fake_mcp,
+                "args": [],
+                "env": [
+                    { "name": "FAKE_MCP_TOOL_COUNT", "value": "1" },
+                    { "name": "FAKE_MCP_ENV_REPORT", "value": "1" },
+                    { "name": "TOKEN", "value": "mcp:registry-token" },
+                ],
+            }],
+        }))
+        .expect("serializes"),
+    )
+    .expect("registry file written");
+
+    let args = buzz_acp::CliArgs::try_parse_from([
+        "buzz-acp",
+        "--private-key",
+        TEST_PRIVATE_KEY,
+        "--agent-command",
+        "buzz-agent",
+        "--mcp-command",
+        fake_mcp,
+        "--mcp-registry",
+        registry_path.to_str().expect("utf-8 path"),
+    ])
+    .expect("buzz-acp CLI args parse");
+    let config = buzz_acp::Config::from_args(args).expect("buzz-acp config");
+    let servers = buzz_acp::mcp_servers_wire_json(
+        &config,
+        buzz_acp::SessionOrigin {
+            channel_id: Some(CHANNEL_ID),
+            channel_type: Some("dm"),
+            agent_name: Some("Builder"),
+        },
+    )
+    .expect("mcpServers wire JSON");
+    let decls = servers.as_array().expect("mcpServers is an array");
+    let registry_decl = decls
+        .iter()
+        .find(|decl| decl["name"] == json!("registry"))
+        .unwrap_or_else(|| panic!("the registry entry did not reach the wire: {servers}"));
+    assert_eq!(
+        registry_decl["registry_launched"],
+        json!(true),
+        "the registry entry crossed the wire without its marker: {servers}"
+    );
+
+    let llm = spawn_capturing_llm(vec![
+        openai_tool_call("tc1", "registry__tool_0", json!({})),
+        openai_text("done"),
+    ])
+    .await;
+    // The desktop's half: the capability is in the harness's environment, and
+    // buzz-acp passes its own environment to the agent it spawns.
+    let mut h = Harness::spawn_with_env(&llm.url, &[("BUZZ_MCP_CAPABILITY", "v1.a1b2.7.00")]).await;
+    h.send(
+        "initialize",
+        json!({"protocolVersion":1,"clientCapabilities":{}}),
+    )
+    .await;
+    let _ = h.recv().await;
+    h.send(
+        "session/new",
+        json!({ "cwd": "/tmp", "mcpServers": servers }),
+    )
+    .await;
+    let r = h
+        .recv_until(|v| v.get("result").is_some() || v.get("error").is_some())
+        .await;
+    assert!(
+        r.get("error").is_none(),
+        "session/new rejected the mcpServers array buzz-acp produced: {r}"
+    );
+    let sid = r["result"]["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_owned();
+
+    let p = h
+        .send(
+            "session/prompt",
+            json!({"sessionId": sid, "prompt": [{"type":"text","text":"go"}]}),
+        )
+        .await;
+    let done = h.recv_until_approving(|v| v["id"] == json!(p)).await;
+    assert!(done.get("error").is_none(), "prompt errored: {done}");
+
+    let captured = llm.captured.lock().await;
+    let report = captured
+        .get(1)
+        .and_then(|c| c["messages"].as_array())
+        .expect("second LLM request carries the tool result")
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "tool")
+        .and_then(|m| m["content"].as_str())
+        .expect("tool result text")
+        .to_owned();
+    // Names only, never values: the fake server never echoes a variable's
+    // contents, so a capability cannot reach the test output.
+    let names: Vec<&str> = report.lines().map(str::trim).collect();
+    assert!(
+        names.contains(&"BUZZ_MCP_CAPABILITY"),
+        "the registry server was spawned without the capability, so the real \
+         launcher would have exited 1: {names:?}"
+    );
+    assert!(
+        names.contains(&"TOKEN"),
+        "the registry entry's declared env block did not reach the child: {names:?}"
+    );
+    for var in ["BUZZ_PRIVATE_KEY", "NOSTR_PRIVATE_KEY", "BUZZ_AUTH_TAG"] {
+        assert!(
+            !names.contains(&var),
+            "a registry server is untrusted and must not receive {var}: {names:?}"
+        );
+    }
+
+    h.shutdown().await;
+}

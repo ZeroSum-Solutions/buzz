@@ -240,6 +240,11 @@ pub fn parse_registry_file(bytes: &[u8], max_servers: usize) -> Result<Vec<McpSe
                 })
                 .collect(),
             trusted: false,
+            // The desktop wrote this file, and every entry in it names the
+            // bundled launcher. The marker is what makes `buzz-agent` hand the
+            // child `BUZZ_MCP_CAPABILITY`; without it every credential-backed
+            // registry server exits 1 before it runs.
+            registry_launched: true,
         });
     }
     Ok(servers)
@@ -337,6 +342,45 @@ mod tests {
         assert_eq!(servers[0].env[0].value, "mcp:github-token");
         // Untrusted: no Buzz identity variable, no hooks.
         assert!(!servers[0].trusted);
+        // Registry-launched: this entry runs the bundled launcher, so
+        // buzz-agent forwards BUZZ_MCP_CAPABILITY to it.
+        assert!(servers[0].registry_launched);
+    }
+
+    /// The marker crosses the wire under the name `buzz-agent` deserializes,
+    /// and only a registry entry carries it.
+    ///
+    /// The launcher reads the capability from its own inherited environment
+    /// and exits 1 without it, so an entry that reached `session/new` without
+    /// this field would start no server at all; and a marker on an extra
+    /// command would hand an operator's own process a bearer token for every
+    /// reference the agent can resolve. Both halves are asserted on the
+    /// serialized JSON, which is what the two crates actually agree on.
+    #[test]
+    fn registry_file_marks_only_its_own_servers_registry_launched() {
+        let mut servers = vec![McpServer {
+            name: "extra".to_string(),
+            command: "/opt/extra".to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+            trusted: false,
+            registry_launched: false,
+        }];
+        let generated = parse_registry_file(document(&stdio("github")).as_bytes(), MAX_MCP_SERVERS)
+            .expect("a well-formed document loads");
+        servers.extend(generated);
+
+        let wire = serde_json::to_value(&servers).expect("serializes");
+        assert_eq!(
+            wire[0].get("registry_launched"),
+            None,
+            "an operator's own server must not be marked: {wire}"
+        );
+        assert_eq!(
+            wire[1]["registry_launched"],
+            serde_json::json!(true),
+            "the registry entry lost its marker: {wire}"
+        );
     }
 
     #[test]
