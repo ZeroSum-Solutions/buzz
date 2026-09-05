@@ -1,535 +1,302 @@
-import { useCallback, useMemo } from "react";
+import { useCallback, useMemo, useRef } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { relayClient } from "@/shared/api/relayClient";
-import { signRelayEvent } from "@/shared/api/tauri";
+import {
+  nip44DecryptFromSelf,
+  nip44EncryptToSelf,
+  signRelayEvent,
+} from "@/shared/api/tauri";
 import type { RelayEvent } from "@/shared/api/types";
+import {
+  type FolderSnapshot,
+  type TransformResult,
+  buildFileFolderMap,
+  channelFolderDTag,
+  emptySnapshot,
+  newFolderId,
+  parseFolderPayload,
+  serializeSnapshot,
+  withFilesAssigned,
+  withFolderCreated,
+  withFolderDeleted,
+  withFolderMoved,
+  withFolderRenamed,
+} from "./folderStore";
 
 const FILE_FOLDER_KIND = 30078;
-const FILE_FOLDER_TAG = "file-folder";
+const FILE_FOLDER_TAG = "file-folders";
 const FOLDER_QUERY_KEY_PREFIX = "channel-file-folders";
 
-// Relay-sourced string/count caps applied at the DTO boundary (parseFolder)
-// — a hostile or buggy folder event must not be able to hand the UI an
-// unbounded name/d-tag to render, or an unbounded file list to enumerate.
-const MAX_FOLDER_NAME_LENGTH = 200;
-const MAX_FOLDER_DTAG_LENGTH = 300;
-const MAX_FOLDER_FILES = 500;
+export type { FolderNode, FolderSnapshot } from "./folderStore";
 
-function capString(value: string, maxLength: number): string {
-  return value.length > maxLength ? value.slice(0, maxLength) : value;
-}
-
-export type FileFolder = {
-  dTag: string;
-  name: string;
-  fileEventIds: string[];
-  /** Parent folder d-tag, if nested. */
-  parentDTag?: string;
-  event: RelayEvent;
+export type FolderQueryData = {
+  snapshot: FolderSnapshot;
+  /** Non-null when the stored payload could not be trusted as complete. */
+  invalidReason: string | null;
+  /** The replaceable event the snapshot came from, `null` when none exists. */
+  head: RelayEvent | null;
 };
 
-/** URL-safe slug for a folder name, used as the tail of its d-tag. */
-export function folderSlug(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-|-$/g, "");
-}
-
-/** The d-tag for a file folder: scoped to the channel, keyed by name slug. */
-export function folderDTag(channelId: string, slug: string): string {
-  return `files-${channelId}:${slug}`;
-}
-
-/**
- * Parse a kind:30078 file-folder event into a {@link FileFolder}, or `null`
- * if the event isn't a well-formed file-folder (wrong `t` tag, missing `d`).
- * Exported so the write-path helpers below, and their tests, share this
- * exact parsing — every mutation's round trip (build tags → parse them
- * back) is bound to the same production code the hook itself calls.
- */
-export function parseFolder(event: RelayEvent): FileFolder | null {
-  const rawDTag = event.tags.find((t) => t[0] === "d")?.[1];
-  const typeTag = event.tags.find((t) => t[0] === "t");
-  if (!rawDTag || typeTag?.[1] !== FILE_FOLDER_TAG) return null;
-  const dTag = capString(rawDTag, MAX_FOLDER_DTAG_LENGTH);
-
-  const rawName = event.tags.find((t) => t[0] === "name")?.[1] ?? "Untitled";
-  const name = capString(rawName, MAX_FOLDER_NAME_LENGTH);
-  const rawParentDTag = event.tags.find((t) => t[0] === "parent")?.[1];
-  const parentDTag =
-    rawParentDTag != null
-      ? capString(rawParentDTag, MAX_FOLDER_DTAG_LENGTH)
-      : undefined;
-  const fileEventIds = event.tags
-    .filter((t) => t[0] === "e")
-    .map((t) => t[1])
-    .filter(Boolean)
-    .slice(0, MAX_FOLDER_FILES);
-
-  return { dTag, name, fileEventIds, parentDTag, event };
-}
-
-function folderQueryKey(channelId: string) {
+export function folderQueryKey(channelId: string) {
   return [FOLDER_QUERY_KEY_PREFIX, channelId] as const;
 }
 
-/** Group file event IDs by owning folder dTag for fast lookup. */
-export function buildFileFolderMap(folders: FileFolder[]): Map<string, string> {
-  const map = new Map<string, string>();
-  for (const folder of folders) {
-    for (const eventId of folder.fileEventIds) {
-      map.set(eventId, folder.dTag);
-    }
-  }
-  return map;
+/**
+ * Whether a successful OK actually stored the event.
+ *
+ * The relay answers a replaceable write that lost a same-second race with a
+ * *successful* OK whose message reads `duplicate:…`, so "the promise resolved"
+ * is not "the update landed". An empty message is the ordinary accepted case
+ * on relays that send no detail; anything else that is not `Inserted` is
+ * treated as a conflict and retried against a freshly read head.
+ */
+export function isSupersededOk(message: string): boolean {
+  const trimmed = message.trim();
+  if (trimmed.length === 0) return false;
+  return !/^inserted$/i.test(trimmed);
 }
 
-/** Tags for a new file-folder event. */
-export function buildCreateFolderTags(
+async function readFolderEvent(
   channelId: string,
-  name: string,
-  parentDTag?: string,
-): string[][] {
-  const dTag = folderDTag(channelId, folderSlug(name));
-  const tags: string[][] = [
-    ["d", dTag],
-    ["t", FILE_FOLDER_TAG],
-    ["name", name],
-  ];
-  if (parentDTag) tags.push(["parent", parentDTag]);
-  return tags;
-}
-
-/** Tags for adding one file to a folder — replaces any existing `e` tag for it, adds one otherwise. */
-export function withFileAddedToFolder(
-  folder: FileFolder,
-  eventId: string,
-): string[][] {
-  return [
-    ...folder.event.tags.filter((t) => t[0] !== "e" || t[1] !== eventId),
-    ["e", eventId],
-  ];
-}
-
-/**
- * Tags for adding multiple files to a folder in one event (avoids the race
- * of publishing N separate replaceable events). Returns `null` when every
- * id is already present — no-op, caller should skip the write.
- */
-export function withFilesAddedToFolder(
-  folder: FileFolder,
-  eventIds: string[],
-): string[][] | null {
-  // Read existing ids from the folder's raw tags, not `folder.fileEventIds`
-  // — that field is capped at MAX_FOLDER_FILES for display, and merging
-  // against the truncated view would drop real "e" tags past the cap when
-  // the filter below runs.
-  const existingIds = new Set(
-    folder.event.tags.filter((t) => t[0] === "e").map((t) => t[1]),
-  );
-  const newIds = eventIds.filter((id) => !existingIds.has(id));
-  if (newIds.length === 0) return null;
-  return [
-    ...folder.event.tags.filter((t) => t[0] !== "e" || existingIds.has(t[1])),
-    ...newIds.map((id) => ["e", id] as [string, string]),
-  ];
-}
-
-/** Tags for removing one file from a folder. */
-export function withFileRemovedFromFolder(
-  folder: FileFolder,
-  eventId: string,
-): string[][] {
-  return folder.event.tags.filter((t) => !(t[0] === "e" && t[1] === eventId));
-}
-
-/**
- * Tags for removing multiple files from a folder in one event (avoids the
- * race of publishing N separate replaceable events, where each iteration's
- * write is built from a folder reference that has not yet observed the
- * previous iteration's removal and so re-adds it).
- */
-export function withFilesRemovedFromFolder(
-  folder: FileFolder,
-  eventIds: string[],
-): string[][] {
-  const idsToRemove = new Set(eventIds);
-  return folder.event.tags.filter(
-    (t) => !(t[0] === "e" && idsToRemove.has(t[1])),
-  );
-}
-
-/**
- * Whether nesting `draggedDTag` under `targetDTag` would create a cyclic
- * parent chain — true when `targetDTag` is `draggedDTag` itself, or is
- * already a descendant of `draggedDTag`. Callers must reject the drop
- * instead of calling {@link withFolderParent} when this returns true;
- * doing so anyway makes the folder its own ancestor, which strands it (and
- * everything under it) outside of every walk that starts from a root.
- */
-export function wouldCreateFolderCycle(
-  folders: FileFolder[],
-  draggedDTag: string,
-  targetDTag: string,
-): boolean {
-  if (draggedDTag === targetDTag) return true;
-  const byDTag = new Map(folders.map((f) => [f.dTag, f]));
-  const visited = new Set<string>();
-  let current = byDTag.get(targetDTag);
-  while (current?.parentDTag) {
-    // A parent chain that already cycles back on itself is data we must
-    // not trust as a "safe" target — block the drop rather than risk
-    // looping forever or reinforcing the existing cycle.
-    if (visited.has(current.dTag)) return true;
-    visited.add(current.dTag);
-    if (current.parentDTag === draggedDTag) return true;
-    current = byDTag.get(current.parentDTag);
+  pubkey: string,
+): Promise<FolderQueryData> {
+  const events = await relayClient.fetchEvents({
+    kinds: [FILE_FOLDER_KIND],
+    authors: [pubkey],
+    "#d": [channelFolderDTag(channelId)],
+    limit: 1,
+  });
+  const head = events.find((event) => event.pubkey === pubkey) ?? null;
+  if (!head) {
+    return { snapshot: emptySnapshot(), invalidReason: null, head: null };
   }
-  return false;
+
+  let plaintext: string;
+  try {
+    plaintext = await nip44DecryptFromSelf(head.content);
+  } catch {
+    return { snapshot: emptySnapshot(), invalidReason: "decrypt-failed", head };
+  }
+
+  const parsed = parseFolderPayload(plaintext);
+  if (!parsed.ok) {
+    return { snapshot: emptySnapshot(), invalidReason: parsed.reason, head };
+  }
+  return { snapshot: parsed.snapshot, invalidReason: null, head };
 }
 
-/** Tags for renaming a folder (new d-tag + name, file refs kept), plus whether the d-tag changed. */
-export function buildRenameFolderTags(
-  folder: FileFolder,
-  channelId: string,
-  newName: string,
-): { tags: string[][]; newDTag: string; dTagChanged: boolean } {
-  const newDTag = folderDTag(channelId, folderSlug(newName));
-  const tags = folder.event.tags
-    .filter((t) => t[0] !== "d" && t[0] !== "name")
-    .concat([
-      ["d", newDTag],
-      ["name", newName],
-    ]);
-  return { tags, newDTag, dTagChanged: newDTag !== folder.dTag };
-}
-
-/** Tags for moving a folder under `parentDTag` (or to root when omitted). */
-export function withFolderParent(
-  folder: FileFolder,
-  parentDTag?: string,
-): string[][] {
-  return folder.event.tags
-    .filter((t) => t[0] !== "parent")
-    .concat(parentDTag ? [["parent", parentDTag]] : []);
-}
-
+/**
+ * Folders and file assignments for one channel, held as a single encrypted
+ * kind:30078 aggregate per (user, channel).
+ *
+ * Every mutation is one publish, applied through a per-channel serial queue
+ * against the head this client last read, so two rapid actions cannot each
+ * build a write from the same stale state and drop one another's change.
+ */
 export function useFileFolders(
   channelId: string | null,
   currentPubkey?: string,
 ) {
   const queryClient = useQueryClient();
+  const queueRef = useRef<Promise<unknown>>(Promise.resolve());
+
+  const queryKey = folderQueryKey(channelId ?? "");
+  const queryFn = useCallback(async (): Promise<FolderQueryData> => {
+    if (!channelId || !currentPubkey) {
+      return { snapshot: emptySnapshot(), invalidReason: null, head: null };
+    }
+    return readFolderEvent(channelId, currentPubkey);
+  }, [channelId, currentPubkey]);
 
   const query = useQuery({
-    queryKey: folderQueryKey(channelId ?? ""),
-    queryFn: async () => {
-      if (!channelId || !currentPubkey) return [];
-      const events = await relayClient.fetchEvents({
-        kinds: [FILE_FOLDER_KIND],
-        authors: [currentPubkey],
-        limit: 50,
-      });
-      return events.map(parseFolder).filter(
-        (f): f is FileFolder =>
-          // biome-ignore lint/complexity/useOptionalChain: explicit null check is required for the `f is FileFolder` type predicate
-          f !== null && f.dTag.startsWith(`files-${channelId}:`),
-      );
-    },
+    queryKey,
+    queryFn,
     enabled: !!channelId && !!currentPubkey,
     staleTime: 30_000,
   });
 
-  const folders = query.data ?? [];
+  const data = query.data;
+  const snapshot = data?.snapshot ?? emptySnapshot();
+  const folders = snapshot.folders;
+  const invalidReason = data?.invalidReason ?? null;
 
-  const fileFolderMap = useMemo(() => buildFileFolderMap(folders), [folders]);
+  const fileFolderMap = useMemo(() => buildFileFolderMap(snapshot), [snapshot]);
 
-  const createFolder = useCallback(
-    async (name: string, parentDTag?: string): Promise<FileFolder | null> => {
-      if (!channelId || !currentPubkey) return null;
-      try {
-        const event = await signRelayEvent({
-          kind: FILE_FOLDER_KIND,
-          content: "",
-          tags: buildCreateFolderTags(channelId, name, parentDTag),
-        });
-        await relayClient.publishEvent(
-          event,
-          "Timed out creating folder.",
-          "Failed to create folder.",
-        );
-        await queryClient.invalidateQueries({
-          queryKey: folderQueryKey(channelId),
-        });
-        return parseFolder(event);
-      } catch (error) {
-        toast.error(
-          error instanceof Error ? error.message : "Failed to create folder.",
-        );
-        throw error;
-      }
+  const publishSnapshot = useCallback(
+    async (
+      next: FolderSnapshot,
+      head: RelayEvent | null,
+      failureMessage: string,
+    ): Promise<{ event: RelayEvent; superseded: boolean }> => {
+      const ciphertext = await nip44EncryptToSelf(serializeSnapshot(next));
+      const createdAt = Math.max(
+        Math.floor(Date.now() / 1_000),
+        (head?.created_at ?? 0) + 1,
+      );
+      const event = await signRelayEvent({
+        kind: FILE_FOLDER_KIND,
+        content: ciphertext,
+        createdAt,
+        tags: [
+          ["d", channelFolderDTag(channelId ?? "")],
+          ["t", FILE_FOLDER_TAG],
+        ],
+      });
+      let okMessage = "";
+      await relayClient.publishEvent(
+        event,
+        `Timed out ${failureMessage}`,
+        `Failed ${failureMessage}`,
+        (message) => {
+          okMessage = message;
+        },
+      );
+      return { event, superseded: isSupersededOk(okMessage) };
     },
-    [channelId, currentPubkey, queryClient],
-  );
-
-  const addFileToFolder = useCallback(
-    async (folder: FileFolder, eventId: string) => {
-      if (!channelId || !currentPubkey) return;
-      if (folder.fileEventIds.includes(eventId)) return;
-      try {
-        const event = await signRelayEvent({
-          kind: FILE_FOLDER_KIND,
-          content: "",
-          tags: withFileAddedToFolder(folder, eventId),
-          createdAt: Math.floor(Date.now() / 1000),
-        });
-        await relayClient.publishEvent(
-          event,
-          "Timed out adding the file to the folder.",
-          "Failed to add the file to the folder.",
-        );
-        await queryClient.invalidateQueries({
-          queryKey: folderQueryKey(channelId),
-        });
-      } catch (error) {
-        toast.error(
-          error instanceof Error
-            ? error.message
-            : "Failed to add the file to the folder.",
-        );
-        throw error;
-      }
-    },
-    [channelId, currentPubkey, queryClient],
-  );
-
-  /** Add multiple files to a folder in a single event — avoids race conditions. */
-  const addFilesToFolder = useCallback(
-    async (folder: FileFolder, eventIds: string[]) => {
-      if (!channelId || !currentPubkey || eventIds.length === 0) return;
-      const newTags = withFilesAddedToFolder(folder, eventIds);
-      if (newTags === null) return;
-      try {
-        const event = await signRelayEvent({
-          kind: FILE_FOLDER_KIND,
-          content: "",
-          tags: newTags,
-          createdAt: Math.floor(Date.now() / 1000),
-        });
-        await relayClient.publishEvent(
-          event,
-          "Timed out adding files to the folder.",
-          "Failed to add files to the folder.",
-        );
-        await queryClient.invalidateQueries({
-          queryKey: folderQueryKey(channelId),
-        });
-      } catch (error) {
-        toast.error(
-          error instanceof Error
-            ? error.message
-            : "Failed to add files to the folder.",
-        );
-        throw error;
-      }
-    },
-    [channelId, currentPubkey, queryClient],
-  );
-
-  const removeFileFromFolder = useCallback(
-    async (folder: FileFolder, eventId: string) => {
-      if (!channelId || !currentPubkey) return;
-      try {
-        const event = await signRelayEvent({
-          kind: FILE_FOLDER_KIND,
-          content: "",
-          tags: withFileRemovedFromFolder(folder, eventId),
-          createdAt: Math.floor(Date.now() / 1000),
-        });
-        await relayClient.publishEvent(
-          event,
-          "Timed out removing the file from the folder.",
-          "Failed to remove the file from the folder.",
-        );
-        await queryClient.invalidateQueries({
-          queryKey: folderQueryKey(channelId),
-        });
-      } catch (error) {
-        toast.error(
-          error instanceof Error
-            ? error.message
-            : "Failed to remove the file from the folder.",
-        );
-        throw error;
-      }
-    },
-    [channelId, currentPubkey, queryClient],
+    [channelId],
   );
 
   /**
-   * Remove multiple files from a folder in a single event — avoids the same
-   * race a sequential per-file loop has (see {@link withFilesRemovedFromFolder}).
+   * Serialise one transform onto the channel's mutation queue: read the head
+   * this client last saw, apply the transform to it, publish, and only then
+   * update the cache. A superseded acknowledgement re-reads the head and
+   * replays the transform once before surfacing an error — it is never
+   * reported to the user as a saved change.
    */
-  const removeFilesFromFolder = useCallback(
-    async (folder: FileFolder, eventIds: string[]) => {
-      if (!channelId || !currentPubkey || eventIds.length === 0) return;
-      try {
-        const event = await signRelayEvent({
-          kind: FILE_FOLDER_KIND,
-          content: "",
-          tags: withFilesRemovedFromFolder(folder, eventIds),
-          createdAt: Math.floor(Date.now() / 1000),
-        });
-        await relayClient.publishEvent(
-          event,
-          "Timed out removing files from the folder.",
-          "Failed to remove files from the folder.",
+  const runMutation = useCallback(
+    async (
+      failureMessage: string,
+      transform: (snapshot: FolderSnapshot) => TransformResult,
+    ): Promise<void> => {
+      if (!channelId || !currentPubkey) {
+        throw new Error("No channel is open.");
+      }
+
+      const run = async () => {
+        const readHead = async (force: boolean): Promise<FolderQueryData> => {
+          const cached = force
+            ? undefined
+            : queryClient.getQueryData<FolderQueryData>(queryKey);
+          if (cached) return cached;
+          return queryClient.fetchQuery({
+            queryKey,
+            queryFn,
+            staleTime: 0,
+          });
+        };
+
+        let current = await readHead(false);
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          if (current.invalidReason) {
+            throw new Error(
+              "This channel's folder data could not be read, so it cannot be changed. Reload the Files tab and try again.",
+            );
+          }
+          const result = transform(current.snapshot);
+          if (!result.ok) throw new Error(result.error);
+
+          const { event, superseded } = await publishSnapshot(
+            result.snapshot,
+            current.head,
+            failureMessage,
+          );
+          if (!superseded) {
+            queryClient.setQueryData<FolderQueryData>(queryKey, {
+              snapshot: result.snapshot,
+              invalidReason: null,
+              head: event,
+            });
+            void queryClient.invalidateQueries({ queryKey });
+            return;
+          }
+          current = await readHead(true);
+        }
+
+        throw new Error(
+          "Another device changed these folders at the same time. Try again.",
         );
-        await queryClient.invalidateQueries({
-          queryKey: folderQueryKey(channelId),
-        });
+      };
+
+      const queued = queueRef.current.then(run, run);
+      // Keep the chain alive for the next mutation without letting this
+      // rejection escape as an unhandled one; the awaited copy below is what
+      // the caller (and its toast) sees.
+      queueRef.current = queued.catch(() => undefined);
+      try {
+        await queued;
       } catch (error) {
         toast.error(
-          error instanceof Error
-            ? error.message
-            : "Failed to remove files from the folder.",
+          error instanceof Error ? error.message : `Failed ${failureMessage}`,
         );
         throw error;
       }
     },
-    [channelId, currentPubkey, queryClient],
+    [channelId, currentPubkey, publishSnapshot, queryClient, queryFn, queryKey],
   );
 
-  const deleteFolder = useCallback(
-    async (folder: FileFolder) => {
-      if (!channelId || !currentPubkey) return;
-      try {
-        // NIP-09 deletion: publish kind:5 referencing the folder event
-        const event = await signRelayEvent({
-          kind: 5,
-          content: "deleting file folder",
-          tags: [
-            ["e", folder.event.id],
-            ["k", String(FILE_FOLDER_KIND)],
-          ],
-        });
-        await relayClient.publishEvent(
-          event,
-          "Timed out deleting the folder.",
-          "Failed to delete the folder.",
-        );
-        await queryClient.invalidateQueries({
-          queryKey: folderQueryKey(channelId),
-        });
-      } catch (error) {
-        toast.error(
-          error instanceof Error
-            ? error.message
-            : "Failed to delete the folder.",
-        );
-        throw error;
-      }
-    },
-    [channelId, currentPubkey, queryClient],
+  const createFolder = useCallback(
+    (name: string, parent: string | null = null) =>
+      runMutation("creating the folder.", (current) =>
+        withFolderCreated(current, { id: newFolderId(), name, parent }),
+      ),
+    [runMutation],
   );
 
   const renameFolder = useCallback(
-    async (folder: FileFolder, newName: string) => {
-      if (!channelId || !currentPubkey) return;
-      const { tags, dTagChanged } = buildRenameFolderTags(
-        folder,
-        channelId,
-        newName,
-      );
-
-      try {
-        const event = await signRelayEvent({
-          kind: FILE_FOLDER_KIND,
-          content: "",
-          tags,
-          createdAt: Math.floor(Date.now() / 1000),
-        });
-        await relayClient.publishEvent(
-          event,
-          "Timed out renaming the folder.",
-          "Failed to rename the folder.",
-        );
-
-        // If the d-tag changed, also delete the old event. The rename above
-        // has already published, so this old-event cleanup is best-effort:
-        // report failure without rolling back the (successful) rename.
-        if (dTagChanged) {
-          const deleteEvent = await signRelayEvent({
-            kind: 5,
-            content: "",
-            tags: [
-              ["e", folder.event.id],
-              ["k", String(FILE_FOLDER_KIND)],
-            ],
-          });
-          await relayClient.publishEvent(
-            deleteEvent,
-            "Timed out cleaning up the renamed folder's old entry.",
-            "Failed to clean up the renamed folder's old entry.",
-          );
-        }
-
-        await queryClient.invalidateQueries({
-          queryKey: folderQueryKey(channelId),
-        });
-      } catch (error) {
-        toast.error(
-          error instanceof Error
-            ? error.message
-            : "Failed to rename the folder.",
-        );
-        throw error;
-      }
-    },
-    [channelId, currentPubkey, queryClient],
+    (id: string, name: string) =>
+      runMutation("renaming the folder.", (current) =>
+        withFolderRenamed(current, id, name),
+      ),
+    [runMutation],
   );
 
-  /** Move a folder under another folder (or to root when parentDTag=undefined). */
-  const setFolderParent = useCallback(
-    async (folder: FileFolder, parentDTag?: string) => {
-      if (!channelId || !currentPubkey) return;
-      try {
-        const event = await signRelayEvent({
-          kind: FILE_FOLDER_KIND,
-          content: "",
-          tags: withFolderParent(folder, parentDTag),
-          createdAt: Math.floor(Date.now() / 1000),
-        });
-        await relayClient.publishEvent(
-          event,
-          "Timed out moving the folder.",
-          "Failed to move the folder.",
-        );
-        await queryClient.invalidateQueries({
-          queryKey: folderQueryKey(channelId),
-        });
-      } catch (error) {
-        toast.error(
-          error instanceof Error ? error.message : "Failed to move the folder.",
-        );
-        throw error;
-      }
-    },
-    [channelId, currentPubkey, queryClient],
+  const deleteFolder = useCallback(
+    (id: string) =>
+      runMutation("deleting the folder.", (current) =>
+        withFolderDeleted(current, id),
+      ),
+    [runMutation],
+  );
+
+  const moveFolder = useCallback(
+    (id: string, parent: string | null) =>
+      runMutation("moving the folder.", (current) =>
+        withFolderMoved(current, id, parent),
+      ),
+    [runMutation],
+  );
+
+  const assignFiles = useCallback(
+    (fileKeys: string[], folderId: string | null) =>
+      runMutation(
+        folderId === null
+          ? "removing the files from the folder."
+          : "moving the files to the folder.",
+        (current) => withFilesAssigned(current, fileKeys, folderId),
+      ),
+    [runMutation],
   );
 
   return {
+    snapshot,
     folders,
     fileFolderMap,
     isLoading: query.isPending,
+    isError: query.isError,
+    error: query.error,
+    invalidReason,
+    /** Mutations are only safe against a complete, valid, loaded snapshot. */
+    canMutate:
+      !!channelId &&
+      !!currentPubkey &&
+      query.isSuccess &&
+      invalidReason === null,
+    refetch: query.refetch,
     createFolder,
-    addFileToFolder,
-    addFilesToFolder,
-    removeFileFromFolder,
-    removeFilesFromFolder,
-    deleteFolder,
     renameFolder,
-    setFolderParent,
+    deleteFolder,
+    moveFolder,
+    assignFiles,
   };
 }
