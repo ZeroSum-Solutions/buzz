@@ -670,6 +670,102 @@ test("terminal CLOSED deletes subscription and does not retry", () => {
   assert.equal(firedAt.length, 0, "terminal CLOSED must not retry");
 });
 
+// ── Test: a terminal CLOSED tells the subscription's owner ────────────────────
+//
+// A terminal CLOSED deletes the subscription and never re-sends its REQ, so its
+// owner stops receiving events for the rest of the session. Without this
+// notification the owner keeps rendering as though it were still following the
+// filter — a terminal failure read as an authoritative success.
+
+test("terminal CLOSED notifies the live subscription's owner once, with the message", () => {
+  resetAll(0);
+  const notified = [];
+  const subscription = {
+    mode: "live",
+    filter: { kinds: [9], "#h": ["ch-1"], limit: 50 },
+    onEvent: () => {},
+    resolveReady: () => {},
+    onTerminalClose: (message) => notified.push(message),
+  };
+  const subscriptions = new Map([["live-1", subscription]]);
+
+  handleRelayClosed({
+    subscriptions,
+    subId: "live-1",
+    message: "error: too many subscriptions",
+    sendReq: () => Promise.resolve(),
+  });
+
+  assert.deepEqual(notified, ["error: too many subscriptions"]);
+  assert.equal(
+    subscription.onTerminalClose,
+    undefined,
+    "the handler is cleared so a repeated CLOSED cannot notify twice",
+  );
+});
+
+test("a retryable CLOSED does not notify the owner", () => {
+  resetAll(0);
+  let notified = 0;
+  const subscriptions = new Map([
+    [
+      "live-1",
+      {
+        mode: "live",
+        filter: { kinds: [9], "#h": ["ch-1"], limit: 50 },
+        onEvent: () => {},
+        resolveReady: () => {},
+        onTerminalClose: () => {
+          notified += 1;
+        },
+      },
+    ],
+  ]);
+
+  handleRelayClosed({
+    subscriptions,
+    subId: "live-1",
+    message: "relay restarting",
+    sendReq: () => Promise.resolve(),
+  });
+
+  assert.equal(
+    notified,
+    0,
+    "a retryable CLOSED recovers on its own; telling the owner it is down would be wrong",
+  );
+});
+
+test("a throwing terminal-close handler does not escape the frame dispatch", () => {
+  resetAll(0);
+  const subscriptions = new Map([
+    [
+      "live-1",
+      {
+        mode: "live",
+        filter: { kinds: [9], "#h": ["ch-1"], limit: 50 },
+        onEvent: () => {},
+        resolveReady: () => {},
+        onTerminalClose: () => {
+          throw new Error("owner blew up");
+        },
+      },
+    ],
+  ]);
+
+  // This runs inside the inbound frame dispatch: a throw here would abandon
+  // the rest of that frame's handling — every other subscription's CLOSED,
+  // and the NOTICE branch below it.
+  handleRelayClosed({
+    subscriptions,
+    subId: "live-1",
+    message: "blocked: banned",
+    sendReq: () => Promise.resolve(),
+  });
+
+  assert.equal(subscriptions.has("live-1"), false);
+});
+
 // ── Test: rejecting closeSubscription does not produce an unhandled rejection ─
 //
 // Load-bearing for the `.catch(() => {})` guard on the op-timeout CLOSE send.

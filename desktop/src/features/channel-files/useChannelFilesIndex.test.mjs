@@ -693,6 +693,109 @@ test("the live subscription stops asking once its attempt budget is spent", asyn
   assert.match(h.controller.snapshot().error ?? "", /Reopen the Files tab/);
 });
 
+test("a malformed live event leaves the index unchanged and never throws", () => {
+  // The relay's EVENT payload is `JSON.parse`d and cast (`relayClientSession`
+  // `handleWsMessage`), so every field is untrusted shape, not just untrusted
+  // content. Reading one as a string is what threw a TypeError out of the
+  // dispatcher and discarded the rest of the batch.
+  const hostile = [
+    { ...fileEvent({ index: 1 }), pubkey: 42 },
+    { ...fileEvent({ index: 2 }), content: { body: "x" } },
+    { ...fileEvent({ index: 3 }), tags: "not-a-list" },
+    { ...fileEvent({ index: 4 }), id: 7 },
+    { ...fileEvent({ index: 5 }), created_at: "soon" },
+    null,
+    "an event",
+  ];
+
+  for (const event of hostile) {
+    const before = emptyFilesIndex();
+    const after = ingestIndexEvents(before, [event]);
+    if (after !== before) {
+      // The two that survive are indexable; their bad fields must be dropped,
+      // never read.
+      for (const source of after.sources.values()) {
+        assert.equal(typeof source.pubkey, "string");
+        assert.equal(typeof source.content, "string");
+      }
+    }
+  }
+
+  assert.equal(
+    ingestIndexEvents(emptyFilesIndex(), [
+      { ...fileEvent({ index: 1 }), pubkey: 42 },
+    ]).sources.get(hexId(1)).pubkey,
+    "",
+    "a non-string pubkey becomes empty, so the projection stays total",
+  );
+  assert.equal(
+    ingestIndexEvents(emptyFilesIndex(), [
+      { ...fileEvent({ index: 3 }), tags: "not-a-list" },
+    ]),
+    emptyFilesIndex(),
+    "an event with no readable imeta tag is not indexed at all",
+  );
+});
+
+test("a failing snapshot sink becomes a banner, not a throw into the relay", async () => {
+  // `onChange` is React's state setter, so it carries a render. The live
+  // callback runs inside the relay client's shared dispatcher, which walks one
+  // buffer for every subscription in a bare loop: a throw here discards the
+  // rest of that batch for the timeline, unread counts and huddles too.
+  let live = null;
+  let armed = false;
+  const controller = createChannelFilesIndexController({
+    channelId: "channel-1",
+    subscribeLive: async (_channelId, onEvent) => {
+      live = onEvent;
+      return () => {};
+    },
+    fetchPage: async () => [],
+    onChange: () => {
+      if (armed) throw new Error("render failed");
+    },
+  });
+
+  await controller.start();
+  armed = true;
+
+  assert.doesNotThrow(() => live(fileEvent({ index: 9 })));
+  assert.match(
+    controller.snapshot().error ?? "",
+    /live updates/i,
+    "the failure is surfaced to the user, not swallowed",
+  );
+});
+
+test("a live event that lands while dispose is in flight is ignored", async () => {
+  // `dispose` marks the controller disposed and then awaits the unsubscribe.
+  // A buffered event flushed in that window would otherwise index into a
+  // channel view that is already gone.
+  let live = null;
+  let release;
+  const closing = new Promise((resolve) => {
+    release = resolve;
+  });
+  const controller = createChannelFilesIndexController({
+    channelId: "channel-1",
+    subscribeLive: async (_channelId, onEvent) => {
+      live = onEvent;
+      return async () => {
+        await closing;
+      };
+    },
+    fetchPage: async () => [],
+  });
+
+  await controller.start();
+  const disposing = controller.dispose();
+  live(fileEvent({ index: 7 }));
+  release();
+  await disposing;
+
+  assert.equal(controller.snapshot().index.sources.size, 0);
+});
+
 test("dispose closes a subscription that was still opening", async () => {
   let release;
   const gate = new Promise((resolve) => {
@@ -988,7 +1091,9 @@ async function renderFilesIndex({
 } = {}) {
   const { renderHook } = await import("@testing-library/react");
   const calls = { subscribe: 0, fetch: 0 };
-  mock.method(relayClient, "subscribeToChannelLive", async (_id, onEvent) => {
+  // The seam the hook really uses: `subscribeLive`, which is the only relay
+  // entry point that reports readiness and a later terminal CLOSED.
+  mock.method(relayClient, "subscribeLive", async (_filter, onEvent) => {
     calls.subscribe += 1;
     return live(onEvent);
   });

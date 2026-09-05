@@ -98,6 +98,22 @@ function isEventId(value: unknown): value is string {
   return typeof value === "string" && EVENT_ID_PATTERN.test(value);
 }
 
+/**
+ * A relay-supplied string field, type-checked and length-capped.
+ *
+ * `RelayEvent` describes what a well-behaved relay sends, not what arrives:
+ * the inbound frame is `JSON.parse`d and cast (`relayClientSession.ts`,
+ * `handleWsMessage`), so `pubkey` or `content` can be a number, an object or
+ * absent. Reading one as a string without this check throws a `TypeError` out
+ * of the ingest — on the live path, out of the relay's shared event dispatcher,
+ * which then drops the rest of that batch for every other subscription.
+ * Returning `""` keeps every field total, and the cap is the same one every
+ * other relay-sourced string in this module gets.
+ */
+function boundRelayString(value: unknown, maxLength: number): string {
+  return typeof value === "string" ? value.slice(0, maxLength) : "";
+}
+
 function isDeletionKind(kind: number): boolean {
   return kind === KIND_DELETION || kind === KIND_NIP29_DELETE_EVENT;
 }
@@ -144,10 +160,10 @@ export function boundIndexSource(event: RelayEvent): IndexedSource | null {
   if (tags.length === 0) return null;
   return {
     id: event.id,
-    pubkey: (event.pubkey ?? "").slice(0, MAX_INDEXED_PUBKEY_LENGTH),
+    pubkey: boundRelayString(event.pubkey, MAX_INDEXED_PUBKEY_LENGTH),
     created_at: event.created_at,
     tags,
-    content: (event.content ?? "").slice(0, MAX_CONTENT_PREFIX_LENGTH),
+    content: boundRelayString(event.content, MAX_CONTENT_PREFIX_LENGTH),
   };
 }
 
@@ -158,10 +174,10 @@ function boundIndexEdit(event: RelayEvent): IndexedEdit | null {
   }
   return {
     id: event.id,
-    pubkey: (event.pubkey ?? "").slice(0, MAX_INDEXED_PUBKEY_LENGTH),
+    pubkey: boundRelayString(event.pubkey, MAX_INDEXED_PUBKEY_LENGTH),
     created_at: event.created_at,
     tags: boundImetaTags(event.tags),
-    content: (event.content ?? "").slice(0, MAX_CONTENT_PREFIX_LENGTH),
+    content: boundRelayString(event.content, MAX_CONTENT_PREFIX_LENGTH),
   };
 }
 

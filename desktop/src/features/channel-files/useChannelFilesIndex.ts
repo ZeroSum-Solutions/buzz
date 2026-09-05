@@ -9,6 +9,7 @@ import {
   type FilesIndexSnapshot,
   createChannelFilesIndexController,
 } from "./channelFilesBackfill";
+import { subscribeChannelFilesLive } from "./channelFilesLiveSubscription";
 import { emptyFilesIndex, selectIndexedFiles } from "./channelFilesIndex";
 import type { ChannelFile } from "./useChannelFiles";
 
@@ -91,8 +92,8 @@ export function useChannelFilesIndex(
     let cancelled = false;
     const controller = createChannelFilesIndexController({
       channelId,
-      subscribeLive: (id, onEvent) =>
-        relayClient.subscribeToChannelLive(id, onEvent),
+      subscribeLive: (id, onEvent, handlers) =>
+        subscribeChannelFilesLive(relayClient, id, onEvent, handlers),
       fetchPage: fetchHistoryPage,
       onChange: (next) => {
         if (!cancelled) setSnapshot(next);
