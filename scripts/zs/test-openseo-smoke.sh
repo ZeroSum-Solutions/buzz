@@ -173,6 +173,37 @@ check "an adapter in none of the three places fails" 1 "$RC"
 check_says "the message names the managed prefix it searched" "$EMPTY_DATA/Buzz/node-tools/bin (the Buzz-managed npm prefix)" "$OUT"
 check_says "the message names PATH as the last place searched" "3. PATH" "$OUT"
 
+echo "== the write-set containment guard =="
+# The smoke script no longer hashes the operator's ~/.claude.json: a live Claude
+# Code session rewrites that file every few seconds, so the bracket failed
+# spuriously. The guard binds to the generator's own `wrote<TAB>path` report
+# instead, and these cases prove it still catches an escape. Removing the
+# containment test in openseo-smoke.sh, or widening it to accept any path,
+# leaves them red.
+guard() { # guard <root> <report> -> sets OUT, RC
+  local root="$1" report="$2"
+  set +e
+  OUT=$( { OPENSEO_SMOKE_LIB=1 . "$SMOKE"; assert_writes_under_root "$root" "$report"; } 2>&1 )
+  RC=$?
+  set -e
+}
+
+GUARD_ROOT="$STUBS/sandbox"
+guard "$GUARD_ROOT" "$(printf 'wrote\t%s/.mcp.json\nwrote\t%s/.claude/settings.local.json\n' "$GUARD_ROOT" "$GUARD_ROOT")"
+check "a write set wholly inside the root passes" 0 "$RC"
+
+guard "$GUARD_ROOT" "$(printf 'wrote\t%s/.mcp.json\nwrote\t%s/.claude.json\n' "$GUARD_ROOT" "$HOME")"
+check "a write that escapes the root fails" 1 "$RC"
+check_says "the message names the escaping path" "$HOME/.claude.json" "$OUT"
+
+guard "$GUARD_ROOT" "$(printf 'wrote\t%s/../.claude.json\n' "$GUARD_ROOT")"
+check "a write reached through '..' fails" 1 "$RC"
+check_says "the message names the traversal" "'..' component" "$OUT"
+
+guard "$GUARD_ROOT" ""
+check "an empty write set fails rather than passing vacuously" 1 "$RC"
+check_says "the message says the guard proved nothing" "proved nothing" "$OUT"
+
 echo "== the ACP driver owns the process tree it starts =="
 # An ACP adapter is a supervisor: it spawns the runtime CLI and every MCP
 # server, and reaps them from its own exit handler. A driver that SIGKILLs the

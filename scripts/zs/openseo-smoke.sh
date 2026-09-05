@@ -15,7 +15,8 @@
 #        This script never fakes a result.
 #     2. Generate the runtime's config with the app's own generator
 #        (desktop/src-tauri/src/managed_agents/agent_config_gen, driven through
-#        the `openseo-config-emit` example) into a throwaway sandbox directory.
+#        the `openseo-config-emit` example) into a throwaway sandbox directory,
+#        and assert that every file the generator reports writing is inside it.
 #     3. Parse the generated file back and assert its structure — the server
 #        name, transport, command and environment *names*, and the scoped
 #        approval list. No environment value is ever written to a generated
@@ -128,6 +129,57 @@
 #                               `$XDG_DATA_HOME` or `~/.local/share`).
 
 set -euo pipefail
+
+# ── guard: the generator writes only under the sandbox root ──────────────────
+# Bound to the generator's OWN report: `openseo-config-emit generate` prints one
+# `wrote<TAB><path>` line per file it wrote, and every one of them must lie
+# under the root this run gave it.
+#
+# This replaces a hash bracket over $HOME/.claude.json, $HOME/.claude/settings.json
+# and $HOME/.codex/config.toml. Any live Claude Code session rewrites
+# ~/.claude.json every few seconds, so that bracket failed spuriously and blamed
+# this generator for another process's write. A report the generator produced
+# itself cannot be perturbed by anything else on the machine.
+#
+# Exercised directly by scripts/zs/test-openseo-smoke.sh, which sources this
+# file with OPENSEO_SMOKE_LIB=1 and calls the function with a write set that
+# escapes the root.
+assert_writes_under_root() { # assert_writes_under_root <root> <generate output>
+  local root="$1" output="$2" tag path count=0
+  while IFS=$'\t' read -r tag path; do
+    [ "$tag" = "wrote" ] || continue
+    count=$((count + 1))
+    case "$path" in
+      */../*|*/..)
+        echo "FAIL: the generator reported a write with a '..' component." >&2
+        echo "      path: $path" >&2
+        return 1
+        ;;
+    esac
+    case "$path" in
+      "$root"/*) ;;
+      *)
+        echo "FAIL: the generator reported writing outside the sandbox root." >&2
+        echo "      root: $root" >&2
+        echo "      path: $path" >&2
+        return 1
+        ;;
+    esac
+  done <<EOF
+$output
+EOF
+  if [ "$count" -eq 0 ]; then
+    echo "FAIL: the generator reported no writes, so the containment guard proved nothing." >&2
+    return 1
+  fi
+  return 0
+}
+
+# Test seam: sourcing this file with OPENSEO_SMOKE_LIB=1 defines the guards above
+# and returns, running nothing.
+if [ "${OPENSEO_SMOKE_LIB:-0}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 usage() {
   cat >&2 <<'USAGE'
@@ -345,35 +397,12 @@ if [ ! -x "$FAKE_MCP" ]; then
   exit 1
 fi
 
-# Snapshot the operator's own configuration. The generator writes only under the
-# root it is given, and this proves it for this run too.
-if command -v shasum >/dev/null 2>&1; then
-  hash_file() { shasum -a 256 "$1" | cut -d' ' -f1; }
-elif command -v sha256sum >/dev/null 2>&1; then
-  hash_file() { sha256sum "$1" | cut -d' ' -f1; }
-else
-  echo "FAIL: neither shasum nor sha256sum is available to fingerprint the operator's config." >&2
-  exit 1
-fi
-operator_state() {
-  for path in "$HOME/.claude.json" "$HOME/.claude/settings.json" "$HOME/.codex/config.toml"; do
-    if [ -e "$path" ]; then
-      echo "$path present $(hash_file "$path")"
-    else
-      echo "$path absent"
-    fi
-  done
-}
-
 emit() {
   cargo run -q --manifest-path "$TAURI_MANIFEST" --example openseo-config-emit -- "$@"
 }
 
-# Build the generator BEFORE the snapshot. A cold `cargo build` can take
-# minutes, and anything on the machine that touches ~/.claude.json inside that
-# window would otherwise be reported as "generation changed the operator's own
-# configuration" — a false failure that blames this generator for someone
-# else's write. The snapshot now brackets the generate call and nothing else.
+# Build the generator up front so a cold compile is not folded into the
+# generate step below, whose output the containment guard reads.
 echo "== building the config generator =="
 cargo build -q --manifest-path "$TAURI_MANIFEST" --example openseo-config-emit
 
@@ -392,8 +421,7 @@ fi
 CALL_LOG="$SANDBOX/fake-mcp-calls.log"
 
 echo "== generating the $RUNTIME config =="
-BEFORE=$(operator_state)
-emit generate \
+GENERATED=$(emit generate \
   --runtime "$RUNTIME" \
   --root "$SANDBOX" \
   --codex-home "$CODEX_SANDBOX_HOME" \
@@ -403,15 +431,11 @@ emit generate \
   --server-arg "FAKE_MCP_CALL_LOG=$CALL_LOG" \
   --server-arg "FAKE_MCP_TOOL_COUNT=0" \
   --server-arg "$FAKE_MCP" \
-  --skill "$SKILL_NAME=$SKILL_FIXTURE"
-
-AFTER=$(operator_state)
-if [ "$BEFORE" != "$AFTER" ]; then
-  echo "FAIL: generation changed the operator's own configuration." >&2
-  diff <(echo "$BEFORE") <(echo "$AFTER") >&2 || true
-  exit 1
-fi
-echo "  ok: the operator's own ~/.claude.json and ~/.codex are untouched"
+  --skill "$SKILL_NAME=$SKILL_FIXTURE")
+printf '%s\n' "$GENERATED"
+assert_writes_under_root "$SANDBOX" "$GENERATED"
+echo "  ok: every file the generator reported writing is inside the sandbox;"
+echo "      the operator's own ~/.claude.json and ~/.codex were never named"
 
 echo "== asserting the generated file's structure =="
 VERIFY=$(emit verify --runtime "$RUNTIME" --root "$SANDBOX" --codex-home "$CODEX_SANDBOX_HOME")
@@ -450,11 +474,12 @@ fi
 # exit 1 on it, which made a skills-only generation unverifiable.
 echo "== asserting a skills-only generation verifies too =="
 SKILLS_ONLY="$SANDBOX/skills-only"
-emit generate \
+SKILLS_ONLY_GENERATED=$(emit generate \
   --runtime "$RUNTIME" \
   --root "$SKILLS_ONLY" \
   --codex-home "$SKILLS_ONLY/codex-home" \
-  --skill "$SKILL_NAME=$SKILL_FIXTURE" >/dev/null
+  --skill "$SKILL_NAME=$SKILL_FIXTURE")
+assert_writes_under_root "$SANDBOX" "$SKILLS_ONLY_GENERATED"
 SKILLS_ONLY_VERIFY=$(emit verify \
   --runtime "$RUNTIME" --root "$SKILLS_ONLY" --codex-home "$SKILLS_ONLY/codex-home")
 if ! printf '%s\n' "$SKILLS_ONLY_VERIFY" | grep -qF "$(printf 'skill\t%s' "$SKILL_NAME")"; then
