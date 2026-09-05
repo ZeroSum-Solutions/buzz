@@ -9,9 +9,12 @@
 //!
 //! * **Claude** reads a project `.mcp.json` from the directory the harness was
 //!   spawned in. Managed agents are spawned with
-//!   `current_dir(default_agent_workdir())` (`managed_agents/runtime.rs:564`),
-//!   so that directory — `~/.buzz`, falling back to `$HOME` — is the project
-//!   root, and [`claude_project_config_root`] returns it.
+//!   `current_dir(default_agent_workdir())` (`managed_agents/runtime.rs:564`).
+//!   That function falls back to `$HOME` when the nest is missing;
+//!   [`claude_project_config_root`] deliberately does **not** — it returns the
+//!   Buzz-owned nest (`~/.buzz`) only when it exists as a real directory, and
+//!   `None` otherwise, so a missing or symlinked nest can never turn the
+//!   operator's home directory into this generator's write root.
 //! * **Codex** reads `<CODEX_HOME>/config.toml`
 //!   (`config_bridge::codex::codex_config_path`).
 //! * **Skills** are discovered per runtime under the catalog's `skill_dir`
@@ -25,12 +28,17 @@
 //!   root the caller passes in, so the operator's own `~/.claude.json` and
 //!   `~/.codex` are unreachable from here. [`plan_claude_paths`] and
 //!   [`plan_codex_paths`] report the exact set a write would touch.
+//! * It never follows a symlink into a directory it did not create, and it
+//!   never changes the permissions of a directory that already existed — see
+//!   the "Symlinks and permissions" section of [`mod@write`].
 //! * It never writes a literal environment value. A server that needs a
 //!   credential names the variable it wants in
 //!   [`McpTransport::Stdio::env_passthrough`]; the generator emits a
 //!   `"${NAME}"` placeholder, so no secret can reach the file. Every value in a
 //!   generated file is either operator-chosen structure (a command, an
-//!   argument, a URL) or a placeholder.
+//!   argument, a URL) or a placeholder. The agent's own identity variables are
+//!   refused outright ([`DENIED_ENV_NAMES`]): forwarding one would hand an
+//!   arbitrary MCP child the key the agent signs relay events with.
 //! * A custom `CLAUDE_CONFIG_DIR` / `CODEX_HOME` starts a fresh keychain
 //!   namespace and leaves the CLI logged out unless
 //!   `CLAUDE_SECURESTORAGE_CONFIG_DIR` is managed too
@@ -86,7 +94,29 @@ pub const MAX_SKILL_BODY_BYTES: usize = 64 * 1024;
 /// Skill names the nest already owns. Writing one would clobber the
 /// `buzz-cli` skill symlink `nest.rs` maintains under every runtime's skill
 /// directory.
+///
+/// Compared case-insensitively: the name becomes a directory name, and APFS
+/// and NTFS are case-insensitive, so `BUZZ-CLI` and `buzz-cli` are the same
+/// directory on the filesystems this ships on.
 const RESERVED_SKILL_NAMES: &[&str] = &["buzz-cli"];
+
+/// Environment variable names [`McpTransport::Stdio::env_passthrough`] refuses.
+///
+/// These four are the managed agent's own identity: `runtime.rs` sets
+/// `BUZZ_PRIVATE_KEY` and `BUZZ_RELAY_URL` on every spawn, `NOSTR_PRIVATE_KEY`
+/// mirrors the key, and `BUZZ_AUTH_TAG` scopes it. A generated config that
+/// forwarded one would expand it from the runtime's own environment into an
+/// arbitrary stdio MCP child, which could then sign as the agent on the relay.
+/// `crates/buzz-acp/README.md` withholds exactly these four from untrusted
+/// extra servers; this generator refuses to name them at all.
+///
+/// Compared case-insensitively, so a case variant cannot slip past the list.
+pub const DENIED_ENV_NAMES: &[&str] = &[
+    "BUZZ_PRIVATE_KEY",
+    "NOSTR_PRIVATE_KEY",
+    "BUZZ_RELAY_URL",
+    "BUZZ_AUTH_TAG",
+];
 
 /// Why a spec was rejected, or a write failed.
 ///
@@ -246,6 +276,8 @@ impl McpServerSpec {
         let mut seen = std::collections::BTreeSet::new();
         for (index, key) in env_passthrough.iter().enumerate() {
             check_env_name("server.env_passthrough", index, key)?;
+            // Environment variable names are case-sensitive on Unix, so the
+            // duplicate check is exact here; the deny-list above is not.
             if !seen.insert(key.as_str()) {
                 return Err(ConfigGenError::Duplicate {
                     field: "server.env_passthrough",
@@ -321,7 +353,10 @@ impl PinnedSkill {
     /// body exceeds [`MAX_SKILL_BODY_BYTES`].
     pub fn new(name: &str, body: &str) -> Result<Self, ConfigGenError> {
         check_name("skill.name", 0, name)?;
-        if RESERVED_SKILL_NAMES.contains(&name) {
+        if RESERVED_SKILL_NAMES
+            .iter()
+            .any(|reserved| reserved.eq_ignore_ascii_case(name))
+        {
             return Err(ConfigGenError::Invalid {
                 field: "skill.name",
                 index: 0,
@@ -375,9 +410,14 @@ impl AgentRuntimeConfigSpec {
     ) -> Result<Self, ConfigGenError> {
         check_count("servers", servers.len(), MAX_SERVERS)?;
         check_count("skills", skills.len(), MAX_SKILLS)?;
+        // Case-folded on both collections. A skill name becomes a directory
+        // name on a case-insensitive filesystem (APFS, NTFS), where `Audit` and
+        // `audit` are one directory and the second write would silently
+        // overwrite the first; a server name is a config key, and two entries
+        // differing only in case collide in `<server>__<tool>` downstream.
         let mut seen_servers = std::collections::BTreeSet::new();
         for (index, server) in servers.iter().enumerate() {
-            if !seen_servers.insert(server.name.as_str()) {
+            if !seen_servers.insert(server.name.to_ascii_lowercase()) {
                 return Err(ConfigGenError::Duplicate {
                     field: "servers",
                     index,
@@ -386,7 +426,7 @@ impl AgentRuntimeConfigSpec {
         }
         let mut seen_skills = std::collections::BTreeSet::new();
         for (index, skill) in skills.iter().enumerate() {
-            if !seen_skills.insert(skill.name.as_str()) {
+            if !seen_skills.insert(skill.name.to_ascii_lowercase()) {
                 return Err(ConfigGenError::Duplicate {
                     field: "skills",
                     index,
@@ -419,18 +459,36 @@ impl AgentRuntimeConfigSpec {
 }
 
 /// The directory a managed agent's Claude project `.mcp.json` belongs in: the
-/// working directory the spawn path gives every managed agent
-/// (`managed_agents/runtime.rs:564`).
+/// Buzz nest (`~/.buzz`), which is also the working directory the spawn path
+/// gives every managed agent (`managed_agents/runtime.rs:564`).
 ///
-/// Returns `None` in the same sandboxed cases `default_agent_workdir` does, so
-/// a caller with no home directory writes nothing rather than guessing.
+/// Returns `None` unless the nest exists as a real directory. This is
+/// deliberately narrower than `default_agent_workdir`, which falls back to
+/// `$HOME` when the nest is missing or is a symlink: that fallback would make
+/// this generator write `$HOME/.mcp.json` and `$HOME/.claude/skills/…` into the
+/// operator's own home directory. A caller that gets `None` writes nothing.
 ///
-/// The directory is shared by every managed agent, so a file written here is
-/// visible to all of them. Callers that need per-agent isolation must supply
-/// their own root.
+/// The directory is shared by every managed agent — `runtime.rs` gives them all
+/// the same working directory — so a file written here is visible to all of
+/// them, not to one named agent. Per-agent scope is not achievable through this
+/// root; a caller needing it must supply its own and arrange for the runtime to
+/// be spawned there.
 #[must_use]
 pub fn claude_project_config_root() -> Option<std::path::PathBuf> {
-    super::default_agent_workdir()
+    buzz_owned_root(super::nest_dir())
+}
+
+/// Keeps a candidate root only when it exists as a real directory.
+///
+/// Split out from [`claude_project_config_root`] so the rule is testable
+/// without a home directory: `symlink_metadata` does not follow the final
+/// component, so a symlinked nest is rejected rather than resolved.
+fn buzz_owned_root(candidate: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    candidate.filter(|p| {
+        p.symlink_metadata()
+            .map(|m| m.file_type().is_dir())
+            .unwrap_or(false)
+    })
 }
 
 /// The skill directory a runtime discovers, relative to its working directory,
@@ -496,7 +554,8 @@ fn check_name(field: &'static str, index: usize, value: &str) -> Result<(), Conf
 }
 
 /// An environment variable name: 1..=[`MAX_ENV_NAME_BYTES`] bytes of ASCII
-/// alphanumerics or `_`, not starting with a digit.
+/// alphanumerics or `_`, not starting with a digit, and not one of
+/// [`DENIED_ENV_NAMES`].
 fn check_env_name(field: &'static str, index: usize, value: &str) -> Result<(), ConfigGenError> {
     check_len(field, index, value, MAX_ENV_NAME_BYTES)?;
     let valid = !value.is_empty()
@@ -507,6 +566,17 @@ fn check_env_name(field: &'static str, index: usize, value: &str) -> Result<(), 
             field,
             index,
             expected: "ASCII alphanumerics or '_', not starting with a digit",
+        });
+    }
+    if DENIED_ENV_NAMES
+        .iter()
+        .any(|denied| denied.eq_ignore_ascii_case(value))
+    {
+        return Err(ConfigGenError::Invalid {
+            field,
+            index,
+            expected: "a variable that is not the agent's own relay identity \
+                       (BUZZ_PRIVATE_KEY, NOSTR_PRIVATE_KEY, BUZZ_RELAY_URL, BUZZ_AUTH_TAG)",
         });
     }
     Ok(())

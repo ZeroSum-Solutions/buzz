@@ -404,9 +404,10 @@ fn claude_write_places_skills_then_the_project_config() {
         written,
         vec![
             root.join(".claude/skills/probe/SKILL.md"),
+            root.join(".claude/settings.local.json"),
             root.join(".mcp.json"),
         ],
-        "skills first, the config that activates them last"
+        "skills first, then the approval, the config that activates them last"
     );
     assert!(root.join(".claude/skills/probe/SKILL.md").is_file());
     let on_disk = std::fs::read_to_string(root.join(".mcp.json")).expect("read");
@@ -551,4 +552,421 @@ fn generation_never_targets_the_operators_own_config() {
         forbidden.iter().map(|p| p.exists()).collect::<Vec<bool>>(),
         "generation changed whether an operator config file exists"
     );
+}
+
+// ------------------------------------------------- case-insensitive collisions
+
+/// APFS and NTFS are case-insensitive, so a case variant of a reserved name is
+/// the same directory. Pure logic — the host filesystem does not decide it.
+#[test]
+fn a_reserved_skill_name_is_refused_in_any_case() {
+    for bad in ["buzz-cli", "BUZZ-CLI", "Buzz-Cli"] {
+        assert!(
+            PinnedSkill::new(bad, "body").is_err(),
+            "{bad:?} resolves to the nest's own buzz-cli skill directory"
+        );
+    }
+}
+
+/// Two skills differing only in case are one directory on the filesystems this
+/// ships on, so the second would silently overwrite the first.
+#[test]
+fn skill_names_that_differ_only_in_case_are_a_duplicate() {
+    let skills = vec![skill("Audit"), skill("audit")];
+    assert!(matches!(
+        AgentRuntimeConfigSpec::new(Vec::new(), skills),
+        Err(ConfigGenError::Duplicate {
+            field: "skills",
+            index: 1
+        })
+    ));
+}
+
+/// Server names collide the same way in the qualified `<server>__<tool>` name.
+#[test]
+fn server_names_that_differ_only_in_case_are_a_duplicate() {
+    let servers = vec![
+        McpServerSpec::http("Audit", "https://a.test/mcp").expect("http"),
+        McpServerSpec::http("audit", "https://b.test/mcp").expect("http"),
+    ];
+    assert!(matches!(
+        AgentRuntimeConfigSpec::new(servers, Vec::new()),
+        Err(ConfigGenError::Duplicate {
+            field: "servers",
+            index: 1
+        })
+    ));
+}
+
+// ------------------------------------------------------- identity env deny-list
+
+/// Forwarding one of these would expand the agent's own signing key into an
+/// arbitrary stdio MCP child, which could then sign as the agent on the relay.
+#[test]
+fn the_agents_identity_variables_cannot_be_forwarded() {
+    assert_eq!(
+        DENIED_ENV_NAMES,
+        [
+            "BUZZ_PRIVATE_KEY",
+            "NOSTR_PRIVATE_KEY",
+            "BUZZ_RELAY_URL",
+            "BUZZ_AUTH_TAG"
+        ]
+    );
+    for denied in DENIED_ENV_NAMES {
+        for spelling in [
+            (*denied).to_string(),
+            denied.to_ascii_lowercase(),
+            format!("{}{}", &denied[..1], denied[1..].to_ascii_lowercase()),
+        ] {
+            let err = McpServerSpec::stdio("s", "/bin/true", &[], std::slice::from_ref(&spelling))
+                .expect_err("an identity variable must be refused");
+            assert!(
+                matches!(
+                    err,
+                    ConfigGenError::Invalid {
+                        field: "server.env_passthrough",
+                        ..
+                    }
+                ),
+                "{spelling} was accepted: {err}"
+            );
+        }
+    }
+    // A neighbouring name is still allowed, so the rule is a deny-list and not
+    // a prefix ban.
+    assert!(McpServerSpec::stdio("s", "/bin/true", &[], &["BUZZ_PUBLIC_KEY".to_string()]).is_ok());
+}
+
+// --------------------------------------------- the write root is Buzz-owned
+
+/// `default_agent_workdir` falls back to `$HOME`; this root must not. A
+/// missing nest yields `None` — the caller writes nothing — and a symlinked
+/// nest is refused rather than resolved.
+#[test]
+fn the_project_root_is_the_nest_or_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let real = dir.path().join("nest");
+    std::fs::create_dir(&real).expect("mkdir");
+    assert_eq!(buzz_owned_root(Some(real.clone())), Some(real.clone()));
+
+    let missing = dir.path().join("absent");
+    assert_eq!(
+        buzz_owned_root(Some(missing.clone())),
+        None,
+        "a missing nest must not fall back to the operator's home directory"
+    );
+
+    #[cfg(unix)]
+    {
+        let link = dir.path().join("linked-nest");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        assert!(link.is_dir(), "the symlink does resolve to a directory");
+        assert_eq!(
+            buzz_owned_root(Some(link)),
+            None,
+            "a symlinked nest is a redirect, not a root"
+        );
+    }
+
+    assert_eq!(buzz_owned_root(None), None);
+}
+
+#[test]
+fn the_project_root_is_never_the_operators_home_directory() {
+    if let Some(root) = claude_project_config_root() {
+        assert_eq!(
+            Some(root.clone()),
+            crate::managed_agents::nest_dir(),
+            "the only root this generator offers is the Buzz nest"
+        );
+        assert_ne!(
+            Some(root),
+            dirs::home_dir(),
+            "the operator's home directory is never a write root"
+        );
+    }
+}
+
+// ------------------------------------------- symlinks and directory permissions
+
+/// A managed agent can write in the shared root, so it can plant a symlink
+/// where a skill directory belongs. The write must fail there rather than
+/// resolve through it.
+#[cfg(unix)]
+#[test]
+fn a_planted_symlink_in_the_skill_path_is_refused_not_followed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("root");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(root.join(".claude/skills")).expect("mkdir");
+    std::fs::create_dir_all(&outside).expect("mkdir outside");
+    std::fs::write(outside.join("SKILL.md"), b"the victim's own skill").expect("seed");
+    std::os::unix::fs::symlink(&outside, root.join(".claude/skills/victim")).expect("symlink");
+    let outside_mode = mode_of(&outside);
+
+    let spec = spec_with(vec![stdio_server()], vec![skill("victim")]);
+    let err = write_claude_project_config(&root, &spec).expect_err("must refuse the symlink");
+    assert!(
+        matches!(&err, ConfigGenError::Io { path, source }
+            if path.contains("victim") && source.contains("symlink")),
+        "the failure names the planted path: {err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside.join("SKILL.md")).expect("read"),
+        "the victim's own skill",
+        "nothing was written through the symlink"
+    );
+    assert_eq!(
+        mode_of(&outside),
+        outside_mode,
+        "the symlink target was not re-permissioned"
+    );
+    assert!(
+        !root.join(".mcp.json").exists(),
+        "no server is activated by a refused write"
+    );
+}
+
+#[cfg(unix)]
+fn mode_of(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o7777
+}
+
+/// The guard that keeps a generated file private. Removing the `0o600` leaves
+/// this red.
+#[cfg(unix)]
+#[test]
+fn generated_files_are_owner_only() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let spec = spec_with(vec![stdio_server()], vec![skill("probe")]);
+    for path in write_claude_project_config(root, &spec).expect("write") {
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "{} is not owner-only",
+            path.display()
+        );
+    }
+}
+
+/// The guard that keeps a directory this module creates private — and the one
+/// that stops it re-permissioning a directory it did not create. Removing
+/// either leaves this red.
+#[cfg(unix)]
+#[test]
+fn created_directories_are_owner_only_and_the_caller_s_root_is_untouched() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).expect("mkdir");
+    set_mode(&root, 0o755);
+    let root_mode = mode_of(&root);
+
+    let spec = spec_with(vec![stdio_server()], vec![skill("probe")]);
+    write_claude_project_config(&root, &spec).expect("write");
+
+    for created in [".claude", ".claude/skills", ".claude/skills/probe"] {
+        assert_eq!(
+            mode_of(&root.join(created)),
+            0o700,
+            "{created} is not owner-only"
+        );
+    }
+    assert_eq!(
+        mode_of(&root),
+        root_mode,
+        "the caller's root was re-permissioned; it belongs to whoever made it"
+    );
+}
+
+/// The `.mcp.json` parent *is* the root, so the previous
+/// `set_permissions(parent, 0o700)` chmod-ed the caller's root on every plain
+/// successful run. This pins that it no longer does, on a root that is not a
+/// tempdir default.
+#[cfg(unix)]
+#[test]
+fn a_pre_existing_directory_in_the_chain_keeps_its_permissions() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(root.join(".claude/skills")).expect("mkdir");
+    set_mode(&root.join(".claude"), 0o755);
+    let claude_mode = mode_of(&root.join(".claude"));
+
+    let spec = spec_with(vec![stdio_server()], vec![skill("probe")]);
+    write_claude_project_config(&root, &spec).expect("write");
+    assert_eq!(mode_of(&root.join(".claude")), claude_mode);
+}
+
+#[cfg(unix)]
+fn set_mode(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+}
+
+/// A symlink standing where a generated config file belongs is reported, not
+/// replaced — even though `rename` would replace it safely.
+#[cfg(unix)]
+#[test]
+fn a_symlink_where_the_config_file_belongs_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).expect("mkdir");
+    let decoy = dir.path().join("decoy.json");
+    std::fs::write(&decoy, b"{}").expect("seed");
+    std::os::unix::fs::symlink(&decoy, root.join(".mcp.json")).expect("symlink");
+
+    let err = write_claude_project_config(&root, &spec_with(vec![stdio_server()], Vec::new()))
+        .expect_err("must refuse");
+    assert!(
+        matches!(&err, ConfigGenError::Io { source, .. } if source.contains("symlink")),
+        "{err}"
+    );
+    assert_eq!(std::fs::read_to_string(&decoy).expect("read"), "{}");
+}
+
+/// The staging name must not be derivable from the process id: another writer
+/// in the shared root could compute it and pre-plant a symlink there.
+#[test]
+fn the_staging_name_is_not_derived_from_the_process_id() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    for i in 0..4 {
+        let spec = spec_with(Vec::new(), vec![skill(&format!("probe{i}"))]);
+        write_claude_project_config(root, &spec).expect("write");
+    }
+    let pid_fragment = format!(".{}.", std::process::id());
+    for path in walk(root) {
+        let name = path.to_string_lossy().into_owned();
+        assert!(
+            !name.contains("buzz-config-gen"),
+            "staging file left: {name}"
+        );
+        assert!(!name.contains(&pid_fragment), "pid-derived name: {name}");
+    }
+}
+
+fn walk(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path.clone());
+            }
+            out.push(path);
+        }
+    }
+    out
+}
+
+// ------------------------------------------ Claude's scoped MCP approval list
+
+/// Claude ignores a project-scoped MCP server the project has not approved, so
+/// `.mcp.json` alone is a silent no-tool run. Removing the approval write
+/// leaves this red.
+#[test]
+fn claude_generation_approves_exactly_the_servers_it_declares() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let spec = spec_with(
+        vec![
+            stdio_server(),
+            McpServerSpec::http("openseo", "https://app.openseo.so/mcp").expect("http"),
+        ],
+        vec![skill("probe")],
+    );
+    let written = write_claude_project_config(root, &spec).expect("write");
+    assert_eq!(
+        written,
+        vec![
+            root.join(".claude/skills/probe/SKILL.md"),
+            root.join(".claude/settings.local.json"),
+            root.join(".mcp.json"),
+        ],
+        "skills, then the approval, then the config that activates them"
+    );
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join(".claude/settings.local.json")).expect("read"),
+    )
+    .expect("JSON");
+    let approved: Vec<&str> = doc["enabledMcpjsonServers"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(approved, vec!["openseo-fake", "openseo"]);
+    assert!(
+        doc.get("enableAllProjectMcpServers").is_none(),
+        "the list is scoped to these servers, never a blanket approval"
+    );
+}
+
+#[test]
+fn the_approval_list_preserves_other_settings_and_is_absent_without_servers() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(".claude")).expect("mkdir");
+    std::fs::write(
+        root.join(".claude/settings.local.json"),
+        b"{\"permissions\":{\"allow\":[\"Bash\"]},\"enabledMcpjsonServers\":[\"stale\"]}",
+    )
+    .expect("seed");
+
+    write_claude_project_config(root, &spec_with(vec![stdio_server()], Vec::new())).expect("write");
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join(".claude/settings.local.json")).expect("read"),
+    )
+    .expect("JSON");
+    assert_eq!(doc["permissions"]["allow"][0], "Bash", "other keys survive");
+    assert_eq!(doc["enabledMcpjsonServers"][0], "openseo-fake");
+    assert_eq!(
+        doc["enabledMcpjsonServers"]
+            .as_array()
+            .expect("array")
+            .len(),
+        1,
+        "the list names this spec's servers, not a stale one"
+    );
+
+    let skills_only = tempfile::tempdir().expect("tempdir");
+    let written =
+        write_claude_project_config(skills_only.path(), &spec_with(Vec::new(), vec![skill("s")]))
+            .expect("write");
+    assert!(
+        !written
+            .iter()
+            .any(|p| p.ends_with(".claude/settings.local.json")),
+        "no servers, nothing to approve"
+    );
+}
+
+/// A settings file this module cannot parse is reported, never replaced.
+#[test]
+fn an_unparseable_settings_file_is_reported_not_clobbered() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(".claude")).expect("mkdir");
+    std::fs::write(root.join(".claude/settings.local.json"), b"not json").expect("seed");
+    let err = write_claude_project_config(root, &spec_with(vec![stdio_server()], Vec::new()))
+        .expect_err("must refuse");
+    assert!(
+        matches!(&err, ConfigGenError::Io { source, .. } if source.contains("not valid JSON")),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join(".claude/settings.local.json")).expect("read"),
+        "not json"
+    );
+    assert!(!root.join(".mcp.json").exists(), "and nothing is activated");
 }

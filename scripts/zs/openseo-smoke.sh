@@ -17,12 +17,21 @@
 #        (desktop/src-tauri/src/managed_agents/agent_config_gen, driven through
 #        the `openseo-config-emit` example) into a throwaway sandbox directory.
 #     3. Parse the generated file back and assert its structure — the server
-#        name, transport, command and environment *names*. No environment value
-#        is ever written to a generated file.
+#        name, transport, command and environment *names*, and the scoped
+#        approval list. No environment value is ever written to a generated
+#        file.
 #     4. Spawn the runtime's ACP adapter the way the managed-agent spawn path
 #        does — explicit environment, explicit working directory, newline
-#        JSON-RPC on stdio (managed_agents/runtime.rs:564) — send one prompt,
-#        and assert the reply lists the fake server's tool.
+#        JSON-RPC on stdio (managed_agents/runtime.rs:564) — and assert two
+#        independent things with two prompts:
+#          a. the runtime CALLED the fake server's tool. The tool's name is
+#             drawn fresh from /dev/urandom on every run and given to the
+#             server through its own argv, so it appears in no file the model
+#             can read, and the proof is the server's OWN call log
+#             (FAKE_MCP_CALL_LOG), not the transcript. A run where the server
+#             never started cannot pass.
+#          b. the runtime lists the pinned `openseo-smoke` skill. Its own
+#             prompt, its own assertion — the tool half does not imply it.
 #
 # WHERE THE ACP ADAPTER COMES FROM
 #
@@ -56,13 +65,37 @@
 #
 #       a. Launch Buzz from the Dock (not from a terminal, so the DMG's minimal
 #          PATH and login-shell PATH augmentation are the ones under test).
-#       b. Confirm the agent's working directory is ~/.buzz, and copy the
-#          generated `.mcp.json` (Claude) or `config.toml` (Codex) this script
-#          leaves behind with OPENSEO_SMOKE_KEEP=1 into place there.
-#       c. Ask the agent in a channel to list its tools, and confirm `tool_0`
-#          and the `openseo-smoke` skill are both visible.
-#       d. Remove the copied file afterwards. ~/.buzz is shared by every
-#          managed agent.
+#       b. Confirm the agent's working directory is ~/.buzz, then copy ALL of
+#          what this script leaves behind with OPENSEO_SMOKE_KEEP=1 into it —
+#          not just the config file. For Claude that is three things:
+#            $SANDBOX/.mcp.json                       -> ~/.buzz/.mcp.json
+#            $SANDBOX/.claude/settings.local.json     -> ~/.buzz/.claude/
+#            $SANDBOX/.claude/skills/openseo-smoke/   -> ~/.buzz/.claude/skills/
+#          The settings file is load-bearing, not optional: Claude ignores a
+#          project-scoped MCP server the project has not approved, so a lone
+#          `.mcp.json` yields NO tools and no error. Merge it by hand if
+#          ~/.buzz/.claude/settings.local.json already exists. For Codex the
+#          config file is $CODEX_HOME/config.toml and the skills go to
+#          ~/.buzz/.codex/skills/.
+#       c. Ask the agent in a channel to call the tool the generated config
+#          names (the run prints it) and to list its skills; confirm the tool
+#          result comes back and `openseo-smoke` is listed.
+#       d. Remove the copied files afterwards. ~/.buzz is shared by every
+#          managed agent — see SCOPE below.
+#
+# SCOPE (a declared deviation, not an oversight)
+#
+#   Per-agent scope is NOT achievable through this path and is not claimed.
+#   `runtime.rs:564` gives every managed agent the same working directory
+#   (`default_agent_workdir()`, i.e. ~/.buzz), and Claude reads no other
+#   project root. So a `.mcp.json` or a pinned skill placed there reaches
+#   EVERY managed Claude agent, not the two the ticket names. Scoping to one
+#   agent needs a per-agent working directory on the spawn path, which is
+#   T7 work, not this ticket's.
+#
+#   The Dock-launched acceptance is likewise manual (steps a-d above), not
+#   automated: driving the app GUI and posting in a relay channel are both
+#   outside what this script may do.
 #
 #   * Anything after vendor approval. Once DataForSEO is approved and a spend
 #     limit is set, the post-approval half (a self-hosted OpenSEO container,
@@ -86,6 +119,8 @@
 #                               (the default) does.
 #   OPENSEO_SMOKE_ACP_BIN_DIR   directory holding the ACP adapter, tried before
 #                               the Buzz-managed npm prefix and PATH.
+#   OPENSEO_SMOKE_TOOL          test seam: pin the per-run tool name instead of
+#                               drawing it from /dev/urandom.
 #   OPENSEO_SMOKE_DATA_DIR      test seam: stand in for the platform data
 #                               directory that holds `Buzz/node-tools/bin` and
 #                               `Buzz/runtimes/node` (macOS `~/Library/
@@ -137,9 +172,20 @@ TAURI_MANIFEST="$REPO_ROOT/desktop/src-tauri/Cargo.toml"
 SKILL_NAME="openseo-smoke"
 SKILL_FIXTURE="$REPO_ROOT/scripts/zs/fixtures/$SKILL_NAME/SKILL.md"
 SERVER_NAME="openseo-fake"
-# fake_mcp.rs returns FAKE_MCP_TOOL_COUNT tools named tool_0.. — one by default,
-# so the expected name needs no environment variable to be deterministic.
-EXPECTED_TOOL="tool_0"
+
+# The tool name is drawn fresh per run. `tool_0`, fake_mcp.rs's default, is a
+# name the model could reproduce from the fixture skill or from this repository
+# without the server ever starting — a circular assertion. An unguessable name
+# can only reach the transcript through a live tools/list from the server.
+if [ -n "${OPENSEO_SMOKE_TOOL:-}" ]; then
+  EXPECTED_TOOL="$OPENSEO_SMOKE_TOOL"
+elif [ -r /dev/urandom ]; then
+  EXPECTED_TOOL="smoke_$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+else
+  echo "FAIL: /dev/urandom is unreadable, so no unguessable tool name can be drawn." >&2
+  echo "      Set OPENSEO_SMOKE_TOOL to pin one explicitly." >&2
+  exit 1
+fi
 
 # The CLI, ACP adapter and login probe for each runtime, taken from the
 # known-ACP-runtime catalog (desktop/src-tauri/src/managed_agents/discovery/catalog.rs).
@@ -318,18 +364,45 @@ operator_state() {
     fi
   done
 }
-BEFORE=$(operator_state)
 
-echo "== generating the $RUNTIME config =="
 emit() {
   cargo run -q --manifest-path "$TAURI_MANIFEST" --example openseo-config-emit -- "$@"
 }
+
+# Build the generator BEFORE the snapshot. A cold `cargo build` can take
+# minutes, and anything on the machine that touches ~/.claude.json inside that
+# window would otherwise be reported as "generation changed the operator's own
+# configuration" — a false failure that blames this generator for someone
+# else's write. The snapshot now brackets the generate call and nothing else.
+echo "== building the config generator =="
+cargo build -q --manifest-path "$TAURI_MANIFEST" --example openseo-config-emit
+
+# The fake server is started by the runtime, not by this script, so its
+# per-run configuration has to travel in its own argv: the generator writes no
+# environment VALUE to a config file by design, and `${NAME}` expansion is the
+# runtime's behaviour rather than something to assume. `env` applies them.
+ENV_BIN=""
+for candidate in /usr/bin/env /bin/env; do
+  if [ -x "$candidate" ]; then ENV_BIN="$candidate"; break; fi
+done
+if [ -z "$ENV_BIN" ]; then
+  echo "FAIL: no executable env(1) at /usr/bin/env or /bin/env." >&2
+  exit 1
+fi
+CALL_LOG="$SANDBOX/fake-mcp-calls.log"
+
+echo "== generating the $RUNTIME config =="
+BEFORE=$(operator_state)
 emit generate \
   --runtime "$RUNTIME" \
   --root "$SANDBOX" \
   --codex-home "$CODEX_SANDBOX_HOME" \
   --server-name "$SERVER_NAME" \
-  --server-command "$FAKE_MCP" \
+  --server-command "$ENV_BIN" \
+  --server-arg "FAKE_MCP_NAMED_TOOLS=$EXPECTED_TOOL" \
+  --server-arg "FAKE_MCP_CALL_LOG=$CALL_LOG" \
+  --server-arg "FAKE_MCP_TOOL_COUNT=0" \
+  --server-arg "$FAKE_MCP" \
   --skill "$SKILL_NAME=$SKILL_FIXTURE"
 
 AFTER=$(operator_state)
@@ -349,26 +422,57 @@ expect_line() {
     exit 1
   fi
 }
-expect_line "$(printf 'server\t%s\tstdio\t%s' "$SERVER_NAME" "$FAKE_MCP")"
+expect_line "$(printf 'server\t%s\tstdio\t%s' "$SERVER_NAME" "$ENV_BIN")"
 expect_line "$(printf 'skill\t%s' "$SKILL_NAME")"
+if [ "$RUNTIME" = "claude" ]; then
+  # Claude ignores a project-scoped MCP server the project has not approved, so
+  # `.mcp.json` on its own is a silent no-tool run. The generator writes the
+  # scoped approval next to it; assert it is there and names this server.
+  expect_line "$(printf 'approved\t%s' "$SERVER_NAME")"
+  if grep -q 'enableAllProjectMcpServers' "$SANDBOX/.claude/settings.local.json"; then
+    echo "FAIL: the approval is a blanket one; it must name each server." >&2
+    exit 1
+  fi
+fi
 if printf '%s\n' "$VERIFY" | grep -q 'dataforseo\|DATAFORSEO'; then
   echo "FAIL: a DataForSEO reference reached the pre-approval config." >&2
   exit 1
 fi
-echo "  ok: one stdio server and one pinned skill, no vendor reference"
+if [ "$RUNTIME" = "claude" ]; then
+  echo "  ok: one stdio server, one pinned skill, a scoped approval, no vendor reference"
+else
+  echo "  ok: one stdio server and one pinned skill, no vendor reference"
+fi
+
+# A spec may pin skills and declare no server at all — that is what the
+# post-approval OpenSEO skill bundle looks like before its server is added.
+# `verify` used to treat a config file with no server table as malformed and
+# exit 1 on it, which made a skills-only generation unverifiable.
+echo "== asserting a skills-only generation verifies too =="
+SKILLS_ONLY="$SANDBOX/skills-only"
+emit generate \
+  --runtime "$RUNTIME" \
+  --root "$SKILLS_ONLY" \
+  --codex-home "$SKILLS_ONLY/codex-home" \
+  --skill "$SKILL_NAME=$SKILL_FIXTURE" >/dev/null
+SKILLS_ONLY_VERIFY=$(emit verify \
+  --runtime "$RUNTIME" --root "$SKILLS_ONLY" --codex-home "$SKILLS_ONLY/codex-home")
+if ! printf '%s\n' "$SKILLS_ONLY_VERIFY" | grep -qF "$(printf 'skill\t%s' "$SKILL_NAME")"; then
+  echo "FAIL: a skills-only generation does not report its skill." >&2
+  printf '%s\n' "$SKILLS_ONLY_VERIFY" >&2
+  exit 1
+fi
+if printf '%s\n' "$SKILLS_ONLY_VERIFY" | grep -q '^server'; then
+  echo "FAIL: a skills-only generation reported a server it never declared." >&2
+  printf '%s\n' "$SKILLS_ONLY_VERIFY" >&2
+  exit 1
+fi
+echo "  ok: zero servers and one skill verify cleanly"
 
 if [ "$STAGE" = "config" ]; then
   echo "PASS (stage=config): the $RUNTIME config declares one stdio server and one pinned skill."
   echo "                     Run without OPENSEO_SMOKE_STAGE to spawn the runtime and assert its reply."
   exit 0
-fi
-
-# Claude prompts interactively before it will use a project-scoped MCP server.
-# The sandbox — and only the sandbox — pre-approves them, so an unattended run
-# is not silently a no-tool run. Nothing outside $SANDBOX is written.
-if [ "$RUNTIME" = "claude" ]; then
-  mkdir -p "$SANDBOX/.claude"
-  printf '{\n  "enableAllProjectMcpServers": true\n}\n' > "$SANDBOX/.claude/settings.local.json"
 fi
 
 echo "== spawning $ADAPTER and sending one prompt =="
@@ -389,8 +493,13 @@ CHILD_PATH="$(dirname "$ADAPTER_PATH"):$CHILD_PATH"
 DRIVER_ARGS=(
   --command "$ADAPTER_PATH"
   --cwd "$SANDBOX"
-  --prompt "List the names of every tool you can call, one per line. Do not call any of them."
+  # Two prompts, two independent assertions. The first requires a real tool
+  # CALL, whose proof is the server's own call log below; the second requires
+  # skill discovery on its own, so neither result stands in for the other.
+  --prompt "Call the tool named $EXPECTED_TOOL with no arguments, then reply with the exact text it returned."
+  --prompt "List the names of the skills available to you, one per line. Do not use any of them."
   --expect "$EXPECTED_TOOL"
+  --expect "$SKILL_NAME"
   --env "PATH=$CHILD_PATH"
   --env "HOME=$HOME"
   # USER is not cosmetic here: the Claude Agent SDK looks its subscription
@@ -411,4 +520,20 @@ if [ "$RUNTIME" = "codex" ]; then
 fi
 node "$REPO_ROOT/scripts/zs/openseo-smoke-acp.mjs" "${DRIVER_ARGS[@]}"
 
-echo "PASS: $RUNTIME discovered the fake MCP server's $EXPECTED_TOOL and the $SKILL_NAME skill"
+# The transcript assertion above says the names reached the model. This says
+# the server ran and was invoked — written by fake_mcp.rs itself on each
+# tools/call, out of band of anything the model can produce.
+if [ ! -s "$CALL_LOG" ]; then
+  echo "FAIL: the fake MCP server logged no tool call at $CALL_LOG." >&2
+  echo "      The reply named $EXPECTED_TOOL but the server was never invoked;" >&2
+  echo "      a transcript alone does not prove the discovery path works." >&2
+  exit 1
+fi
+if ! grep -qx "$EXPECTED_TOOL" "$CALL_LOG"; then
+  echo "FAIL: the fake MCP server logged a call, but never to $EXPECTED_TOOL:" >&2
+  sed 's/^/        /' "$CALL_LOG" >&2
+  exit 1
+fi
+echo "  ok: the fake MCP server recorded a call to $EXPECTED_TOOL ($(wc -l < "$CALL_LOG" | tr -d ' ') call(s))"
+
+echo "PASS: $RUNTIME called the fake MCP server's $EXPECTED_TOOL and lists the $SKILL_NAME skill"

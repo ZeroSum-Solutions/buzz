@@ -173,6 +173,70 @@ check "an adapter in none of the three places fails" 1 "$RC"
 check_says "the message names the managed prefix it searched" "$EMPTY_DATA/Buzz/node-tools/bin (the Buzz-managed npm prefix)" "$OUT"
 check_says "the message names PATH as the last place searched" "3. PATH" "$OUT"
 
+echo "== the ACP driver owns the process tree it starts =="
+# An ACP adapter is a supervisor: it spawns the runtime CLI and every MCP
+# server, and reaps them from its own exit handler. A driver that SIGKILLs the
+# adapter alone orphans that whole tree on every failing run (AGENTS.md
+# Review-Proven Rule 4). This stands a fake supervisor in for the adapter: it
+# spawns a long grandchild, records its pid, and never answers a request, so
+# the driver must hit its timeout and take the grandchild down with the parent.
+DRIVER="$HERE/openseo-smoke-acp.mjs"
+if command -v node >/dev/null 2>&1; then
+  TREE_DIR="$STUBS/tree"
+  mkdir -p "$TREE_DIR"
+  cat > "$TREE_DIR/fake-adapter" <<'ADAPTER'
+#!/bin/sh
+# A supervisor that never answers, holding one long-lived grandchild.
+sleep 600 &
+echo "$!" > "$GRANDCHILD_PID_FILE"
+wait
+ADAPTER
+  chmod +x "$TREE_DIR/fake-adapter"
+  set +e
+  OUT=$(GRANDCHILD_PID_FILE="$TREE_DIR/pid" node "$DRIVER" \
+    --command "$TREE_DIR/fake-adapter" \
+    --cwd "$TREE_DIR" \
+    --prompt "never answered" \
+    --expect "never matched" \
+    --timeout 3000 \
+    --env "PATH=$PATH" \
+    --env "GRANDCHILD_PID_FILE=$TREE_DIR/pid" 2>&1)
+  RC=$?
+  set -e
+  check "a driver run that times out fails" 1 "$RC"
+  check_says "the timeout is reported" "no reply within" "$OUT"
+  GRANDCHILD=$(cat "$TREE_DIR/pid" 2>/dev/null || echo "")
+  if [ -z "$GRANDCHILD" ]; then
+    echo "  FAIL: the fake adapter never recorded a grandchild pid"
+    fail=1
+  else
+    sleep 1
+    if kill -0 "$GRANDCHILD" 2>/dev/null; then
+      echo "  FAIL: grandchild $GRANDCHILD survived the driver — the process tree leaked"
+      kill -9 "$GRANDCHILD" 2>/dev/null || true
+      fail=1
+    else
+      echo "  PASS: the whole process tree died with the adapter"
+    fi
+  fi
+else
+  echo "  SKIP: node is not on PATH, so the driver cannot be exercised"
+fi
+
+echo "== the driver requires at least one prompt and one expectation =="
+if command -v node >/dev/null 2>&1; then
+  set +e
+  OUT=$(node "$DRIVER" --command /bin/true --cwd "$STUBS" --expect x 2>&1); RC=$?
+  set -e
+  check "no --prompt is an error" 1 "$RC"
+  check_says "the message names --prompt" "--prompt is required" "$OUT"
+  set +e
+  OUT=$(node "$DRIVER" --command /bin/true --cwd "$STUBS" --prompt x 2>&1); RC=$?
+  set -e
+  check "no --expect is an error" 1 "$RC"
+  check_says "the message names --expect" "--expect is required" "$OUT"
+fi
+
 if [ "$fail" -ne 0 ]; then
   echo "FAILED"
   exit 1

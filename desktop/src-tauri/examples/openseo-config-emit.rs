@@ -161,6 +161,11 @@ fn verify(args: &Args) -> Res<()> {
     for (name, record) in servers {
         println!("server\t{name}\t{record}");
     }
+    if args.runtime == "claude" {
+        for name in read_claude_approvals(&root.join(".claude/settings.local.json"))? {
+            println!("approved\t{name}");
+        }
+    }
     let skill_root = root.join(runtime_skill_dir(&args.runtime)?);
     if skill_root.is_dir() {
         let mut names: Vec<String> = std::fs::read_dir(&skill_root)
@@ -177,6 +182,29 @@ fn verify(args: &Args) -> Res<()> {
     Ok(())
 }
 
+/// The server names Claude's project settings approve, in file order.
+///
+/// Claude ignores a project-scoped MCP server the project has not approved, so
+/// an unapproved `.mcp.json` is a silent no-tool run. Reporting the list makes
+/// the caller able to assert the approval, not just the declaration.
+fn read_claude_approvals(path: &Path) -> Res<Vec<String>> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("read {}: {e}", path.display()).into()),
+    };
+    let doc: serde_json::Value = serde_json::from_str(&raw)?;
+    Ok(doc
+        .get("enabledMcpjsonServers")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 /// `kind<TAB>target<TAB>args<TAB>env-names`, with `,` between list entries.
 fn record(kind: &str, target: &str, args: &[String], env: &[String]) -> String {
     format!("{kind}\t{target}\t{}\t{}", args.join(","), env.join(","))
@@ -185,10 +213,13 @@ fn record(kind: &str, target: &str, args: &[String], env: &[String]) -> String {
 fn read_claude(path: &Path) -> Res<BTreeMap<String, String>> {
     let raw = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let doc: serde_json::Value = serde_json::from_str(&raw)?;
+    // A spec that pins only skills declares no servers. Absent is zero
+    // servers, not a malformed document.
+    let empty = serde_json::Map::new();
     let servers = doc
         .get("mcpServers")
         .and_then(|v| v.as_object())
-        .ok_or("no mcpServers object")?;
+        .unwrap_or(&empty);
     let mut out = BTreeMap::new();
     for (name, entry) in servers {
         let strings = |key: &str| -> Vec<String> {
@@ -226,10 +257,13 @@ fn read_claude(path: &Path) -> Res<BTreeMap<String, String>> {
 fn read_codex(path: &Path) -> Res<BTreeMap<String, String>> {
     let raw = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let doc: toml::Table = raw.parse()?;
+    // A spec that pins only skills declares no servers. Absent is zero
+    // servers, not a malformed document.
+    let empty = toml::map::Map::new();
     let servers = doc
         .get("mcp_servers")
         .and_then(toml::Value::as_table)
-        .ok_or("no mcp_servers table")?;
+        .unwrap_or(&empty);
     let mut out = BTreeMap::new();
     for (name, entry) in servers {
         let args: Vec<String> = entry
