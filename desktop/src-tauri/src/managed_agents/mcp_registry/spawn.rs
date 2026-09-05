@@ -21,14 +21,31 @@ use super::generation::GenerationStore;
 use super::paths::{RegistryPaths, BUZZ_ACP_REGISTRY_FILE, MAX_ARTEFACT_BYTES, REFUSAL_FILE};
 use crate::managed_agents::McpConfigPlacement;
 
-/// Every environment variable this module ever sets.
+/// Every environment variable a plan can set, at **any** placement.
 ///
 /// The spawn strips all of them before it applies the plan, so an ambient
 /// value inherited from the desktop's own environment can never stand in for
-/// one the plan did not set. A stale `BUZZ_MCP_CAPABILITY` is the case that
-/// matters: it would hand a child a token for a generation that no longer
-/// exists.
-pub const MANAGED_ENV_VARS: &[&str] = &[BUZZ_ACP_REGISTRY_ENV_VAR, CAPABILITY_ENV_VAR];
+/// one the plan did not set. Two cases matter and they are different. A stale
+/// `BUZZ_MCP_CAPABILITY` would hand a child a token for a generation that no
+/// longer exists. An ambient `CODEX_HOME` — the operator's own Codex root, in
+/// the desktop's environment because the operator exported it — would become
+/// the agent's configuration root whenever its plan is empty, which is the
+/// root memo decision 9 is written against.
+///
+/// The env-rooted names are read from the runtime catalog rather than listed
+/// here, so a runtime added with a new [`McpConfigPlacement::EnvRootedDir`]
+/// variable cannot be added without its variable being stripped.
+pub fn managed_env_vars() -> Vec<&'static str> {
+    let mut vars = vec![BUZZ_ACP_REGISTRY_ENV_VAR, CAPABILITY_ENV_VAR];
+    for runtime in crate::managed_agents::discovery::KNOWN_ACP_RUNTIMES {
+        if let McpConfigPlacement::EnvRootedDir { var, .. } = runtime.mcp_config_placement {
+            if !vars.contains(&var) {
+                vars.push(var);
+            }
+        }
+    }
+    vars
+}
 
 /// What a spawn has to apply to its command.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

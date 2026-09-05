@@ -33,8 +33,20 @@ pub struct GeneratedServer {
 }
 
 /// Build the launcher invocation for one registry entry.
-pub fn generate_server(launcher: &str, entry: &RegistryEntry) -> GeneratedServer {
-    let mut args = Vec::new();
+///
+/// `keychain_service` is the service name the **desktop** stores its secret
+/// blob under, and it is written into every generated argv. The launcher's own
+/// default is the release name `buzz-desktop` (`buzz-mcp-launch/src/cli.rs`),
+/// while the desktop uses `buzz-desktop-dev` in debug builds and a per-slug
+/// name on demo builds — so on every build but release-non-demo a generated
+/// server that omitted the flag would start and then fail to resolve a single
+/// reference.
+pub fn generate_server(
+    launcher: &str,
+    keychain_service: &str,
+    entry: &RegistryEntry,
+) -> GeneratedServer {
+    let mut args = vec!["--service".to_string(), keychain_service.to_string()];
     let mut env = BTreeMap::new();
 
     match &entry.transport {

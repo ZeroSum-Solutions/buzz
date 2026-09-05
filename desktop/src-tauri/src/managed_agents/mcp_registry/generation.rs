@@ -27,6 +27,7 @@
 //! is an adopted change one write short of its record, not a half-staged tree,
 //! and discarding it would delete the live configuration.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -76,6 +77,17 @@ pub struct Journal {
     pub phase: JournalPhase,
     /// Deletions still owed, in order.
     pub deletions: Vec<Deletion>,
+    /// Secret records this change wrote **before** the pointer moved, and the
+    /// discard of an unadopted generation therefore has to remove.
+    ///
+    /// A `PREPARED` journal names them because the write that follows it is
+    /// not covered by the pointer rename: without this list a crash between
+    /// the two would leave generation-`n` keys in the store with nothing
+    /// naming them, and the next convergence — which recomputes the same `n`
+    /// — would adopt them. A `FLIPPED` journal carries none: an adopted
+    /// generation's records are the live ones.
+    #[serde(default)]
+    pub rollback: Vec<Deletion>,
 }
 
 /// What one commit will write and then clean up.
@@ -85,6 +97,11 @@ pub struct GenerationPlan {
     pub files: Vec<(PathBuf, String)>,
     /// Deletions to run after the flip.
     pub deletions: Vec<Deletion>,
+    /// Secret records this change adds, written by [`GenerationStore::commit`]
+    /// **after** the `PREPARED` journal names them for rollback and before the
+    /// first staged file. A plan builder must not write them itself: a write
+    /// the journal does not yet name is a torn prefix nothing can clean up.
+    pub secrets: BTreeMap<String, String>,
 }
 
 /// Removes a secret from the durable store.
@@ -98,6 +115,16 @@ pub trait SecretRemover {
     /// A message when the store could not be reached; the journal keeps the
     /// deletion and the next start retries it.
     fn remove(&self, key: &str) -> Result<(), String>;
+
+    /// Insert or overwrite `entries`, leaving every other record alone.
+    ///
+    /// Called by [`GenerationStore::commit`] only, and only after the
+    /// `PREPARED` journal names every key as rollback debt.
+    ///
+    /// # Errors
+    /// A message when the store is unavailable or the write breaches a blob
+    /// bound. Nothing is adopted: the pointer has not moved.
+    fn write_all(&self, entries: &BTreeMap<String, String>) -> Result<(), String>;
 }
 
 /// A remover that never fails. Used where a plan has no secret deletions.
@@ -107,13 +134,21 @@ impl SecretRemover for NoSecrets {
     fn remove(&self, _key: &str) -> Result<(), String> {
         Ok(())
     }
+
+    fn write_all(&self, _entries: &BTreeMap<String, String>) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Named points a test can fail the commit at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlipStep {
-    /// The `PREPARED` journal entry has been written and fsynced.
+    /// The `PREPARED` journal entry has been written and fsynced — the step
+    /// immediately **before** the secret-store write.
     JournalPrepared,
+    /// Every secret record the plan adds has been written — the step
+    /// immediately **after** it.
+    SecretsWritten,
     /// The staged file at this index has been written and fsynced.
     FileWritten(usize),
     /// The pointer has been renamed onto `current`.
@@ -215,6 +250,11 @@ impl GenerationStore {
 
     fn journal_path(&self) -> PathBuf {
         self.root.join("journal.json")
+    }
+
+    /// Where a journal version is written before it is renamed into place.
+    fn journal_staging_path(&self) -> PathBuf {
+        self.root.join("journal.json.next")
     }
 
     fn lock_path(&self) -> PathBuf {
@@ -347,12 +387,31 @@ impl GenerationStore {
             }
         }
 
+        // The rollback list names every secret this change is about to write,
+        // so the `PREPARED` journal is durable *before* the first secret
+        // mutation. Without it the write below is a durable change no record
+        // names: a crash between the two would leave generation-`next` keys in
+        // the store, the pointer would still name the base, and the retry —
+        // which recomputes this same `next` — would adopt them.
+        let rollback: Vec<Deletion> = plan
+            .secrets
+            .keys()
+            .map(|key| Deletion::Secret { key: key.clone() })
+            .collect();
         self.write_journal(&Journal {
             generation: next,
             phase: JournalPhase::Prepared,
             deletions: deletions.clone(),
+            rollback: rollback.clone(),
         })?;
         self.inject(hooks, FlipStep::JournalPrepared)?;
+
+        if !plan.secrets.is_empty() {
+            secrets
+                .write_all(&plan.secrets)
+                .map_err(GenerationError::Plan)?;
+        }
+        self.inject(hooks, FlipStep::SecretsWritten)?;
 
         let staged = self.generation_dir(next);
         // A leftover directory from a discarded PREPARED generation must not
@@ -372,10 +431,14 @@ impl GenerationStore {
         self.rename_pointer(next)?;
         self.inject(hooks, FlipStep::PointerRenamed)?;
 
+        // The pointer has moved, so the records the rollback list named are
+        // the live generation's: the debt is discharged by adoption, not by a
+        // deletion, and the list is cleared here.
         self.write_journal(&Journal {
             generation: next,
             phase: JournalPhase::Flipped,
             deletions: deletions.clone(),
+            rollback: Vec::new(),
         })?;
         self.inject(hooks, FlipStep::JournalFlipped)?;
 
@@ -418,9 +481,27 @@ impl GenerationStore {
         match journal.phase {
             JournalPhase::Prepared if !adopted => {
                 // Staged but never adopted: the previous generation is still
-                // the current one, so the half-staged tree is discarded whole.
-                // The journal is cleared only once the tree is actually gone,
-                // so a failed discard is retried rather than forgotten.
+                // the current one, so the half-staged tree is discarded whole,
+                // and every secret record this generation wrote before the
+                // pointer would have moved is removed with it. A failed
+                // removal is owed, not forgotten: the journal keeps what is
+                // left and the next start retries it.
+                if !journal.rollback.is_empty() {
+                    let (remaining, failure) = retry_deletions(self, &journal.rollback, secrets)?;
+                    if let Some(reason) = failure {
+                        let outstanding = remaining.len();
+                        self.write_journal(&Journal {
+                            generation: journal.generation,
+                            phase: JournalPhase::Prepared,
+                            deletions: journal.deletions.clone(),
+                            rollback: remaining,
+                        })?;
+                        return Err(GenerationError::CleanupPending {
+                            outstanding,
+                            reason,
+                        });
+                    }
+                }
                 remove_tree(&self.generation_dir(journal.generation))?;
                 self.clear_journal()?;
                 Ok(Reconciled::DiscardedStaging {
@@ -467,6 +548,7 @@ impl GenerationStore {
                             generation: self.current()?.unwrap_or_default(),
                             phase: JournalPhase::Flipped,
                             deletions: remaining,
+                            rollback: Vec::new(),
                         })?;
                         return Err(injected);
                     }
@@ -486,6 +568,7 @@ impl GenerationStore {
                 generation: self.current()?.unwrap_or_default(),
                 phase: JournalPhase::Flipped,
                 deletions: remaining,
+                rollback: Vec::new(),
             })?;
             return Err(GenerationError::CleanupPending {
                 outstanding,
@@ -501,10 +584,26 @@ impl GenerationStore {
             .map_err(|reason| GenerationError::Injected { step, reason })
     }
 
+    /// Write the journal through a sibling file and a rename.
+    ///
+    /// `File::create` truncates, so writing straight onto `journal.json` puts
+    /// the only record of an owed deletion through a window in which it is
+    /// neither the old entry nor the new one. A crash there leaves malformed
+    /// JSON, [`GenerationStore::journal`] then fails, and every later mutation
+    /// is refused with a debt nothing can read — the credential the operator
+    /// revoked stays in the keychain for good. The staging name is fixed, and
+    /// the rename replaces it, so a crash can leave at most one of them
+    /// behind. Same shape as [`GenerationStore::rename_pointer`].
     fn write_journal(&self, journal: &Journal) -> Result<(), GenerationError> {
         let body =
             serde_json::to_string(journal).map_err(|e| GenerationError::Journal(e.to_string()))?;
-        write_file_synced(&self.journal_path(), &body)?;
+        let staging = self.journal_staging_path();
+        write_file_synced(&staging, &body)?;
+        std::fs::rename(&staging, self.journal_path()).map_err(|e| GenerationError::Io {
+            operation: "rename",
+            path: self.journal_path().display().to_string(),
+            reason: e.to_string(),
+        })?;
         sync_dir(&self.root)
     }
 
@@ -531,6 +630,33 @@ impl GenerationStore {
         })?;
         sync_dir(&self.root)
     }
+}
+
+/// Run `deletions` in order, returning what is still owed and why the first
+/// failure failed.
+///
+/// Shared by the post-flip path and the discard path so a rollback is retried
+/// on exactly the terms an adoption's cleanup is.
+fn retry_deletions(
+    store: &GenerationStore,
+    deletions: &[Deletion],
+    secrets: &dyn SecretRemover,
+) -> Result<(Vec<Deletion>, Option<String>), GenerationError> {
+    let mut remaining = Vec::new();
+    let mut first_failure = None;
+    for deletion in deletions {
+        let outcome = match deletion {
+            Deletion::Secret { key } => secrets.remove(key),
+            Deletion::Generation { number } => {
+                remove_tree(&store.generation_dir(*number)).map_err(|e| e.to_string())
+            }
+        };
+        if let Err(reason) = outcome {
+            first_failure.get_or_insert(reason);
+            remaining.push(deletion.clone());
+        }
+    }
+    Ok((remaining, first_failure))
 }
 
 /// The outcome of a reconcile.

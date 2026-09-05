@@ -499,7 +499,7 @@ pub(crate) struct McpEnvApplied(());
 /// secret read with an authorization error instead of starting without
 /// servers.
 pub(crate) fn strip_mcp_registry_env(cmd: &mut std::process::Command) -> McpEnvStripped {
-    for key in super::mcp_registry::spawn::MANAGED_ENV_VARS {
+    for key in super::mcp_registry::spawn::managed_env_vars() {
         cmd.env_remove(key);
     }
     McpEnvStripped(())
@@ -558,6 +558,20 @@ fn mcp_registry_paths<R: tauri::Runtime>(
     )))
 }
 
+/// Whether the MCP registry may configure this runtime at all.
+///
+/// Gated on `mcp_registry_available`, not on `mcp_transports`. The two answer
+/// different questions: `mcp_transports` says what the registry may offer a
+/// runtime *if* it configures it, while availability says whether that
+/// runtime's isolated configuration root has been verified on a real launch.
+/// Memo decision 9 keeps Claude and Codex unavailable until it has, because
+/// configuring either moves the spawn's working directory and writes a config
+/// root their logins may not survive. A transports-based gate would turn both
+/// on, since both declare `[Stdio, Http]`.
+pub(crate) fn registry_configures(runtime_meta: Option<&KnownAcpRuntime>) -> bool {
+    runtime_meta.is_some_and(|meta| meta.mcp_registry_available)
+}
+
 /// Resolve this spawn's MCP registry plan.
 ///
 /// Returns an empty plan when no generation has been adopted, when this agent
@@ -568,9 +582,10 @@ fn mcp_registry_spawn_plan<R: tauri::Runtime>(
     record: &ManagedAgentRecord,
     runtime_meta: Option<&KnownAcpRuntime>,
 ) -> Result<super::mcp_registry::spawn::McpSpawnPlan, String> {
-    // A runtime the registry may offer nothing to needs no plan at all, so an
-    // unknown or MCP-less harness never touches the staging tree.
-    let Some(meta) = runtime_meta.filter(|meta| !meta.mcp_transports.is_empty()) else {
+    if !registry_configures(runtime_meta) {
+        return Ok(super::mcp_registry::spawn::McpSpawnPlan::default());
+    }
+    let Some(meta) = runtime_meta else {
         return Ok(super::mcp_registry::spawn::McpSpawnPlan::default());
     };
     let Some(paths) = mcp_registry_paths(app)? else {

@@ -205,6 +205,22 @@ pub(crate) struct KnownAcpRuntime {
     pub mcp_transports: &'static [McpTransport],
     /// Transports this runtime's own config file accepts.
     pub mcp_native_transports: &'static [McpTransport],
+    /// Whether the MCP registry may configure this runtime **at all**.
+    ///
+    /// A separate fact from [`Self::mcp_transports`], which answers "what may
+    /// the registry offer this runtime if it offers it anything". This one
+    /// answers "has this runtime's isolated configuration root been verified
+    /// on a real launch", and memo decision 9 of
+    /// `docs/plans/2026-09-04-mcp-registry-design.md` answers it `false` for
+    /// every runtime but buzz-agent: Claude and Codex need a per-agent root
+    /// and a moved working directory, and neither has been shown to preserve
+    /// the operator's login. Turning one on without that verification launches
+    /// a logged-out agent from a directory off the nest.
+    ///
+    /// Widening this set is a code change with a test to update
+    /// (`mcp_registry_only_verified_runtimes_are_configured`), which is the
+    /// point.
+    pub mcp_registry_available: bool,
 }
 
 impl KnownAcpRuntime {
@@ -271,6 +287,7 @@ impl KnownAcpRuntime {
             mcp_config_placement: McpConfigPlacement::Unsupported,
             mcp_transports: &[],
             mcp_native_transports: &[],
+            mcp_registry_available: false,
         }
     }
 }

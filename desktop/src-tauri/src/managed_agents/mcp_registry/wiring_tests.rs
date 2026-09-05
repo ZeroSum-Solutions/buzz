@@ -20,10 +20,15 @@ use super::generate::BUZZ_ACP_REGISTRY_ENV_VAR;
 use super::generation::SecretRemover;
 use super::load::{parse_registry, LoadedRegistry};
 use super::paths::{RegistryPaths, AGENTS_SUBDIR, BUZZ_ACP_REGISTRY_FILE, REFUSAL_FILE};
-use super::spawn::{plan_for_spawn, McpSpawnPlan, MANAGED_ENV_VARS};
+use super::spawn::{managed_env_vars, plan_for_spawn, McpSpawnPlan};
 use crate::managed_agents::{McpConfigPlacement, McpTransport};
 
 const LAUNCHER: &str = "/Applications/Buzz.app/Contents/MacOS/buzz-mcp-launch";
+
+/// The keychain service a convergence writes into every generated argv. The
+/// production caller passes `crate::app_state::keyring_service()`, which
+/// `mcp_registry_generated_argv_names_the_desktops_keychain_service` binds.
+const SERVICE: &str = "buzz-desktop-dev.wiring-tests";
 const AGENT_A: &str = "a1b2c3";
 const AGENT_B: &str = "d4e5f6";
 
@@ -38,6 +43,7 @@ const SERVER_BIN: &str = "C:/buzz/bin";
 struct FakeStore {
     source: MemoryBlobSource,
     refuse_delete: Mutex<Option<String>>,
+    refuse_write: Mutex<bool>,
 }
 
 impl FakeStore {
@@ -65,18 +71,21 @@ impl SecretRemover for FakeStore {
         self.source.remove(key);
         Ok(())
     }
+
+    fn write_all(&self, entries: &BTreeMap<String, String>) -> Result<(), String> {
+        if *self.refuse_write.lock().expect("lock") {
+            return Err("keychain refused the write".to_string());
+        }
+        for (key, value) in entries {
+            self.source.insert(key, value);
+        }
+        Ok(())
+    }
 }
 
 impl SecretStoreIo for FakeStore {
     fn read_all(&self) -> Result<BTreeMap<String, String>, String> {
         Ok(self.map())
-    }
-
-    fn write_all(&self, entries: &BTreeMap<String, String>) -> Result<(), String> {
-        for (key, value) in entries {
-            self.source.insert(key, value);
-        }
-        Ok(())
     }
 }
 
@@ -172,6 +181,7 @@ fn mcp_registry_deleted_server_stops_authenticating() {
             &["gh", "sn"],
         )],
         LAUNCHER,
+        SERVICE,
         &store,
         &nonces,
     )
@@ -215,6 +225,7 @@ fn mcp_registry_deleted_server_stops_authenticating() {
         &one,
         &[selection(AGENT_A, McpConfigPlacement::Unsupported, &["sn"])],
         LAUNCHER,
+        SERVICE,
         &store,
         &nonces,
     )
@@ -297,6 +308,7 @@ fn mcp_registry_a_failed_revocation_is_owed_not_abandoned() {
             &["gh", "sn"],
         )],
         LAUNCHER,
+        SERVICE,
         &store,
         &nonces,
     )
@@ -320,6 +332,7 @@ fn mcp_registry_a_failed_revocation_is_owed_not_abandoned() {
         &one,
         &[selection(AGENT_A, McpConfigPlacement::Unsupported, &["sn"])],
         LAUNCHER,
+        SERVICE,
         &store,
         &nonces,
     )
@@ -335,6 +348,7 @@ fn mcp_registry_a_failed_revocation_is_owed_not_abandoned() {
         &one,
         &[selection(AGENT_A, McpConfigPlacement::Unsupported, &["sn"])],
         LAUNCHER,
+        SERVICE,
         &store,
         &nonces,
     )
@@ -357,6 +371,7 @@ fn mcp_registry_spawn_hands_over_the_generation_file_and_the_capability() {
         &registry(&stdio("gh", "github")),
         &[selection(AGENT_A, McpConfigPlacement::Unsupported, &["gh"])],
         LAUNCHER,
+        SERVICE,
         &store,
         &CountingNonces::default(),
     )
@@ -426,6 +441,7 @@ fn mcp_registry_a_toggle_changes_only_the_named_agents_config() {
             selection(AGENT_B, placement, &["sn"]),
         ],
         LAUNCHER,
+        SERVICE,
         &store,
         &nonces,
     )
@@ -463,6 +479,7 @@ fn mcp_registry_a_toggle_changes_only_the_named_agents_config() {
             selection(AGENT_B, placement, &["sn"]),
         ],
         LAUNCHER,
+        SERVICE,
         &store,
         &nonces,
     )
@@ -495,6 +512,7 @@ fn mcp_registry_an_env_rooted_placement_gets_its_own_root() {
         &registry(&stdio("gh", "github")),
         &[selection(AGENT_A, placement, &["gh"])],
         LAUNCHER,
+        SERVICE,
         &store,
         &CountingNonces::default(),
     )
@@ -535,6 +553,7 @@ fn mcp_registry_a_staged_refusal_refuses_the_spawn() {
         // `sn` is not in the registry at all.
         &[selection(AGENT_A, McpConfigPlacement::Unsupported, &["sn"])],
         LAUNCHER,
+        SERVICE,
         &store,
         &CountingNonces::default(),
     )
@@ -565,6 +584,7 @@ fn mcp_registry_generated_servers_without_a_binding_refuse_the_spawn() {
         &registry(&stdio("gh", "github")),
         &[selection(AGENT_A, McpConfigPlacement::Unsupported, &["gh"])],
         LAUNCHER,
+        SERVICE,
         &store,
         &CountingNonces::default(),
     )
@@ -608,6 +628,7 @@ fn mcp_registry_an_agent_with_no_servers_gets_an_empty_plan() {
         &registry(&stdio("gh", "github")),
         &[selection(AGENT_A, McpConfigPlacement::Unsupported, &["gh"])],
         LAUNCHER,
+        SERVICE,
         &store,
         &CountingNonces::default(),
     )
@@ -622,11 +643,165 @@ fn mcp_registry_an_agent_with_no_servers_gets_an_empty_plan() {
     assert!(plan.is_empty());
 }
 
-/// Every variable a plan sets for the handed-over placement is one the spawn
-/// strips first, so an ambient value cannot stand in for one the plan did not
-/// set. Dropping either name from `MANAGED_ENV_VARS` fails this.
+/// Every variable a plan sets, at **every** placement, is one the spawn strips
+/// first — so an ambient value inherited from the desktop cannot stand in for
+/// one the plan did not set.
+///
+/// Driving only the handed-over placement is what let `CODEX_HOME` sit outside
+/// the stripped set: an `EnvRootedDir` plan sets it, and a Codex agent whose
+/// plan is empty would otherwise inherit the operator's own Codex root.
+/// Dropping any name from `managed_env_vars()` fails this.
 #[test]
 fn mcp_registry_managed_variables_cover_what_a_plan_sets() {
+    let placements = [
+        McpConfigPlacement::Unsupported,
+        McpConfigPlacement::ProjectFileInWorkdir { file: ".mcp.json" },
+        McpConfigPlacement::EnvRootedDir {
+            var: "CODEX_HOME",
+            file: "config.toml",
+        },
+    ];
+    for placement in placements {
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = paths(root.path());
+        let store = FakeStore::default();
+        converge(
+            &paths,
+            &registry(&stdio("gh", "github")),
+            &[selection(AGENT_A, placement, &["gh"])],
+            LAUNCHER,
+            SERVICE,
+            &store,
+            &CountingNonces::default(),
+        )
+        .expect("converges");
+
+        let plan =
+            plan_for_spawn(&paths, AGENT_A, placement, binding_reader(&store)).expect("resolves");
+        assert!(!plan.set.is_empty(), "{placement:?} set nothing");
+        for (key, _) in &plan.set {
+            assert!(
+                managed_env_vars().contains(&key.as_str()),
+                "{key} is set by a {placement:?} plan but never stripped before the user env layer"
+            );
+        }
+    }
+}
+
+/// The registry configures only a runtime whose isolated configuration root
+/// has been verified on a real launch, which memo decision 9 says is
+/// buzz-agent alone in v1.
+///
+/// The gate is the shipped predicate `mcp_registry_spawn_plan` calls. Widening
+/// it — back to `!mcp_transports.is_empty()`, or by flipping one runtime's
+/// availability — fails here, which is the point: Claude and Codex both
+/// declare `[Stdio, Http]`, so a transports-based gate turns both on and moves
+/// their working directories off the nest.
+#[test]
+fn mcp_registry_only_verified_runtimes_are_configured() {
+    use crate::managed_agents::discovery::KNOWN_ACP_RUNTIMES;
+    use crate::managed_agents::runtime::registry_configures;
+
+    let configured: Vec<&str> = KNOWN_ACP_RUNTIMES
+        .iter()
+        .filter(|runtime| registry_configures(Some(runtime)))
+        .map(|runtime| runtime.id)
+        .collect();
+    assert_eq!(
+        configured,
+        vec!["buzz-agent"],
+        "memo decision 9: no other runtime's isolated root has been verified"
+    );
+
+    for id in ["claude", "codex"] {
+        let runtime = KNOWN_ACP_RUNTIMES
+            .iter()
+            .find(|runtime| runtime.id == id)
+            .expect("catalog entry");
+        assert!(
+            !runtime.mcp_transports.is_empty(),
+            "{id} declares transports, so a transports-based gate would configure it"
+        );
+        assert!(!registry_configures(Some(runtime)), "{id} was configured");
+    }
+    assert!(
+        !registry_configures(None),
+        "an unknown harness must never be configured"
+    );
+}
+
+/// One pointer names one generation for every agent, so a convergence is
+/// whole-set by construction.
+///
+/// Converging a subset would delete every other agent's `mcp:` records — their
+/// credentials and their binding record — because the deletion sweep is by
+/// generation, and would leave them with no artefacts under the adopted
+/// generation either. Refuse instead, and leave the store untouched.
+#[test]
+fn mcp_registry_converge_refuses_a_partial_agent_set() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let paths = paths(root.path());
+    let store = FakeStore::default();
+    let registry = registry(&format!(
+        "{},{}",
+        stdio("gh", "github"),
+        stdio("ln", "linear")
+    ));
+    converge(
+        &paths,
+        &registry,
+        &[
+            selection(AGENT_A, McpConfigPlacement::Unsupported, &["gh"]),
+            selection(AGENT_B, McpConfigPlacement::Unsupported, &["ln"]),
+        ],
+        LAUNCHER,
+        SERVICE,
+        &store,
+        &CountingNonces::default(),
+    )
+    .expect("converges");
+    let before = store.map();
+    assert!(before.contains_key(&binding_key_for(AGENT_B, 1)));
+
+    let error = converge(
+        &paths,
+        &registry,
+        &[selection(AGENT_A, McpConfigPlacement::Unsupported, &["gh"])],
+        LAUNCHER,
+        SERVICE,
+        &store,
+        &CountingNonces::default(),
+    )
+    .expect_err("a partial convergence must be refused");
+    assert!(
+        matches!(&error, ConvergeError::MissingAgent(agent) if agent == AGENT_B),
+        "{error:?}"
+    );
+    assert_eq!(store.map(), before, "the refused convergence changed state");
+
+    // The other agent is still spawnable, which is what the refusal protects.
+    assert!(plan_for_spawn(
+        &paths,
+        AGENT_B,
+        McpConfigPlacement::Unsupported,
+        binding_reader(&store)
+    )
+    .expect("resolves")
+    .set
+    .iter()
+    .any(|(key, _)| key == CAPABILITY_ENV_VAR));
+}
+
+/// Every generated argv names the keychain service the **desktop** stores its
+/// blob under.
+///
+/// The launcher's own default is the release name `buzz-desktop`, while the
+/// desktop uses `buzz-desktop-dev` in debug builds and a per-slug name on demo
+/// builds. Omitting the flag would let every spawn succeed and every reference
+/// then fail to resolve, on every build but release-non-demo.
+#[test]
+fn mcp_registry_generated_argv_names_the_desktops_keychain_service() {
+    let service = crate::app_state::keyring_service();
     let root = tempfile::tempdir().expect("tempdir");
     let paths = paths(root.path());
     let store = FakeStore::default();
@@ -635,25 +810,40 @@ fn mcp_registry_managed_variables_cover_what_a_plan_sets() {
         &registry(&stdio("gh", "github")),
         &[selection(AGENT_A, McpConfigPlacement::Unsupported, &["gh"])],
         LAUNCHER,
+        service,
         &store,
         &CountingNonces::default(),
     )
     .expect("converges");
 
-    let plan = plan_for_spawn(
-        &paths,
-        AGENT_A,
-        McpConfigPlacement::Unsupported,
-        binding_reader(&store),
+    let body = std::fs::read_to_string(
+        paths
+            .generations_root()
+            .join("generations")
+            .join("1")
+            .join(AGENTS_SUBDIR)
+            .join(AGENT_A)
+            .join(BUZZ_ACP_REGISTRY_FILE),
     )
-    .expect("resolves");
-    assert!(!plan.set.is_empty());
-    for (key, _) in &plan.set {
-        assert!(
-            MANAGED_ENV_VARS.contains(&key.as_str()),
-            "{key} is set by a plan but never stripped before the user env layer"
-        );
-    }
+    .expect("readable");
+    let document: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+    let args = document["servers"][0]["args"]
+        .as_array()
+        .expect("generated args");
+    let flag = args
+        .iter()
+        .position(|arg| arg == "--service")
+        .expect("no generated argv names a keychain service");
+    assert_eq!(
+        args[flag + 1],
+        serde_json::Value::String(service.to_string()),
+        "the generated argv names a service the desktop does not write to"
+    );
+    // The default the flag overrides, so the two names cannot silently agree.
+    assert_eq!(
+        buzz_mcp_launch_pkg::cli::DEFAULT_KEYCHAIN_SERVICE,
+        "buzz-desktop"
+    );
 }
 
 /// An agent id is the only caller-supplied component of these paths, so it is
@@ -682,6 +872,7 @@ fn mcp_registry_a_hostile_agent_id_reaches_no_path() {
                 &registry(&stdio("gh", "github")),
                 &[selection(hostile, McpConfigPlacement::Unsupported, &["gh"])],
                 LAUNCHER,
+                SERVICE,
                 &store,
                 &CountingNonces::default(),
             ),
@@ -709,6 +900,7 @@ fn mcp_registry_converge_bounds_agents_and_refuses_duplicates() {
                 selection(AGENT_A, McpConfigPlacement::Unsupported, &[]),
             ],
             LAUNCHER,
+            SERVICE,
             &store,
             &CountingNonces::default(),
         ),
@@ -730,6 +922,7 @@ fn mcp_registry_converge_bounds_agents_and_refuses_duplicates() {
             &registry,
             &many,
             LAUNCHER,
+            SERVICE,
             &store,
             &CountingNonces::default(),
         ),
@@ -750,6 +943,7 @@ fn mcp_registry_no_generated_file_carries_a_secret() {
         &registry(&stdio("gh", "github")),
         &[selection(AGENT_A, placement, &["gh"])],
         LAUNCHER,
+        SERVICE,
         &store,
         &CountingNonces::default(),
     )
@@ -803,7 +997,7 @@ fn reference(id: &str) -> McpSecretRef {
 ///
 /// `std::process::Command` records explicit overrides, so a removal is
 /// observable as `(key, None)` and a set as `(key, Some(value))` without
-/// spawning anything. Emptying `MANAGED_ENV_VARS`, or dropping either loop
+/// spawning anything. Emptying `managed_env_vars()`, or dropping either loop
 /// body, fails this — and deleting either *call* from `spawn_agent_child` is a
 /// compile error, because the strip's token is consumed by the apply and the
 /// apply's by `spawn_with_effort_proof`.
@@ -819,6 +1013,7 @@ fn mcp_registry_the_spawn_seam_strips_before_it_sets() {
         &registry(&stdio("gh", "github")),
         &[selection(AGENT_A, McpConfigPlacement::Unsupported, &["gh"])],
         LAUNCHER,
+        SERVICE,
         &store,
         &CountingNonces::default(),
     )
@@ -834,7 +1029,7 @@ fn mcp_registry_the_spawn_seam_strips_before_it_sets() {
     // An ambient value for every managed variable, as a harness environment
     // carrying a stale generation's capability would have.
     let mut command = std::process::Command::new("true");
-    for key in MANAGED_ENV_VARS {
+    for key in managed_env_vars() {
         command.env(key, "AMBIENT");
     }
     let stripped = crate::managed_agents::strip_mcp_registry_env(&mut command);
@@ -847,7 +1042,7 @@ fn mcp_registry_the_spawn_seam_strips_before_it_sets() {
             )
         })
         .collect();
-    for key in MANAGED_ENV_VARS {
+    for key in managed_env_vars() {
         assert_eq!(
             overrides
                 .iter()

@@ -11,11 +11,19 @@
 //! all: the binding record it verifies against belongs to that generation too.
 //!
 //! Ordering matters and is deliberate. The carried-forward secrets and the new
-//! binding records are written **before** the flip, so at the instant the
-//! pointer moves the new generation already resolves. A crash between the two
-//! leaves keys nothing points at, which the next convergence's deletions
-//! sweep; the reverse order would leave an adopted generation whose servers
-//! cannot authenticate.
+//! binding records are handed to [`GenerationStore::commit`] in the plan, not
+//! written here: the store names every one of their keys in the `PREPARED`
+//! journal before it writes any of them, and removes them again if the
+//! generation is discarded. They still land **before** the flip, so at the
+//! instant the pointer moves the new generation already resolves; the reverse
+//! order would leave an adopted generation whose servers cannot authenticate,
+//! and writing them ahead of the journal would leave a durable change no
+//! record names.
+//!
+//! A convergence is whole-set: it takes every agent at once. One pointer names
+//! one generation for all of them, so a subset would both revoke the agents
+//! left out and leave them with no artefacts. [`ConvergeError::MissingAgent`]
+//! refuses that rather than doing either.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -74,13 +82,6 @@ pub trait SecretStoreIo: super::generation::SecretRemover {
     /// reported as "empty": that would silently drop every carried-forward
     /// secret and adopt a generation whose servers cannot authenticate.
     fn read_all(&self) -> Result<BTreeMap<String, String>, String>;
-
-    /// Insert or overwrite `entries`, leaving every other record alone.
-    ///
-    /// # Errors
-    /// A message when the store is unavailable or the write breaches a blob
-    /// bound.
-    fn write_all(&self, entries: &BTreeMap<String, String>) -> Result<(), String>;
 }
 
 /// Where the unguessable half of a capability comes from.
@@ -123,6 +124,16 @@ pub enum ConvergeError {
     /// The staging tree refused the change.
     #[error(transparent)]
     Generation(#[from] GenerationError),
+    /// The store holds `mcp:` records for an agent this convergence was not
+    /// given. One pointer names one generation for every agent, so a
+    /// convergence is whole-set by construction: an agent left out would have
+    /// no artefacts and no binding record under the adopted generation, and
+    /// its next spawn would refuse.
+    #[error(
+        "agent `{0}` holds mcp registry state but was not given to this convergence; a \
+         convergence covers every agent at once — pass it with an empty selection to retire it"
+    )]
+    MissingAgent(String),
 }
 
 /// What a convergence adopted.
@@ -147,6 +158,7 @@ pub fn converge<S: SecretStoreIo>(
     registry: &LoadedRegistry,
     agents: &[AgentSelection],
     launcher: &str,
+    keychain_service: &str,
     secrets: &S,
     nonces: &dyn NonceSource,
 ) -> Result<Converged, ConvergeError> {
@@ -165,12 +177,32 @@ pub fn converge<S: SecretStoreIo>(
 
     let store = GenerationStore::open(&paths.generations_root())?;
     let mut refused: Vec<(String, String)> = Vec::new();
+    // Set inside the plan builder, read after a failure: the builder can only
+    // return a `GenerationError`, and the whole-set breach is not one.
+    let mut missing_agent: Option<String> = None;
 
-    let generation = store.commit(
+    let commit = store.commit(
         |base, _base_dir| {
             refused.clear();
             let next = base.map(|number| number + 1).unwrap_or(1);
             let existing = secrets.read_all().map_err(GenerationError::Plan)?;
+            // Whole-set precondition. `stale_secret_deletions` below revokes
+            // every `mcp:` record outside the adopted generation, and the
+            // generation is global, so converging a subset would both delete
+            // the agents left out and leave them without a binding record.
+            // Refuse instead of doing either.
+            if let Some(outsider) = existing
+                .keys()
+                .filter_map(|key| agent_of_key(key))
+                .find(|agent| !seen.contains(agent))
+            {
+                let outsider = outsider.to_string();
+                missing_agent = Some(outsider.clone());
+                return Err(GenerationError::Plan(format!(
+                    "agent `{outsider}` holds mcp registry state but was not given to this \
+                     convergence"
+                )));
+            }
 
             let mut files: Vec<(PathBuf, String)> = Vec::new();
             let mut carried: BTreeMap<String, String> = BTreeMap::new();
@@ -221,30 +253,50 @@ pub fn converge<S: SecretStoreIo>(
                 let generated: Vec<GeneratedServer> = resolved
                     .servers
                     .iter()
-                    .map(|entry| generate_server(launcher, entry))
+                    .map(|entry| generate_server(launcher, keychain_service, entry))
                     .collect();
                 for (name, body) in render_artefacts(agent.placement, &generated)? {
                     files.push((dir.join(name), body));
                 }
             }
 
-            // Written before the flip: at the instant the pointer moves, the
-            // adopted generation's secrets already resolve.
-            secrets.write_all(&carried).map_err(GenerationError::Plan)?;
-
+            // Handed to the store rather than written here: `commit` names
+            // every one of these keys in the `PREPARED` journal before it
+            // writes any of them, so a crash mid-write leaves debt the next
+            // start can find. Writing them from inside the builder would put
+            // the mutation ahead of its own record.
             Ok(GenerationPlan {
                 files,
                 deletions: stale_secret_deletions(&existing, next),
+                secrets: carried,
             })
         },
         secrets,
         &NoHooks,
-    )?;
+    );
+
+    let generation = match commit {
+        Ok(generation) => generation,
+        Err(error) => {
+            return Err(match missing_agent {
+                Some(agent) => ConvergeError::MissingAgent(agent),
+                None => ConvergeError::Generation(error),
+            })
+        }
+    };
 
     Ok(Converged {
         generation,
         refused,
     })
+}
+
+/// The agent id in an `mcp:<agent>:<generation>:<rest>` blob key, or `None`
+/// when the key is not one.
+fn agent_of_key(key: &str) -> Option<&str> {
+    let rest = key.strip_prefix(MCP_NAMESPACE_PREFIX)?;
+    let agent = rest.split(':').next()?;
+    (!agent.is_empty()).then_some(agent)
 }
 
 /// Re-key every reference one agent's selected servers name, from the base
