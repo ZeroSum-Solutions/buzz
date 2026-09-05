@@ -6,6 +6,9 @@ use base64::Engine;
 use nostr::{EventBuilder, JsonUtil, Keys, Kind, Tag};
 use sha2::{Digest, Sha256};
 
+use crate::attachment::{
+    classify_attachment, AttachmentKind, ClassifiedAttachment, MAX_UPLOAD_BYTES,
+};
 use crate::error::CliError;
 
 /// Descriptor returned by the relay after a successful upload.
@@ -36,44 +39,96 @@ pub struct BlobDescriptor {
     pub duration: Option<f64>,
 }
 
+/// A file uploaded to the relay, with the local facts the message event that
+/// references it needs.
+///
+/// The relay's descriptor alone cannot say what the file was called or which
+/// pipeline it took: a document with no magic bytes comes back as
+/// `application/octet-stream` under a `.bin` blob key.
+#[derive(Debug, Clone)]
+pub struct UploadedAttachment {
+    /// Descriptor the relay returned for the stored blob.
+    pub descriptor: BlobDescriptor,
+    /// Which relay pipeline the file took.
+    pub kind: AttachmentKind,
+    /// Bounded base name of the local file, for the `imeta` `filename` field.
+    pub filename: String,
+}
+
+impl UploadedAttachment {
+    /// Pair a relay descriptor with the classification the upload used.
+    fn new(classified: ClassifiedAttachment, descriptor: BlobDescriptor) -> Self {
+        Self {
+            descriptor,
+            kind: classified.kind,
+            filename: classified.filename,
+        }
+    }
+}
+
+/// Maximum byte length of a single `imeta` field value.
+///
+/// Every value but `filename` is relay-sourced: [`build_imeta_tag`] copies the
+/// upload response into an event this client signs and publishes to a channel,
+/// so the response is bounded here rather than trusted. 512 bytes is far above
+/// any URL, hash, dimension, blurhash or thumbnail URL the relay produces.
+const MAX_IMETA_FIELD_BYTES: usize = 512;
+
+/// Render one `imeta` field, refusing an over-long value or one carrying a
+/// control character instead of signing it into an event.
+fn imeta_field(key: &str, value: &str) -> Result<String, CliError> {
+    if value.len() > MAX_IMETA_FIELD_BYTES {
+        return Err(CliError::Other(format!(
+            "oversized imeta {key} field: {} bytes (max {MAX_IMETA_FIELD_BYTES})",
+            value.len()
+        )));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(CliError::Other(format!(
+            "imeta {key} field contains a control character"
+        )));
+    }
+    Ok(format!("{key} {value}"))
+}
+
 /// Build an `imeta` tag array from a BlobDescriptor (NIP-92 media metadata).
-pub fn build_imeta_tag(d: &BlobDescriptor) -> Vec<String> {
+///
+/// `filename` is the attachment's local base name. The desktop keys its
+/// document viewer and Files tab off this field, never off the blob URL or the
+/// MIME type, because a file with no magic bytes is stored under a `.bin` blob
+/// key as `application/octet-stream`.
+///
+/// The tag carries at most ten fields, each bounded by
+/// [`MAX_IMETA_FIELD_BYTES`]; an oversized or control-character value is an
+/// error rather than a silently truncated field.
+pub fn build_imeta_tag(
+    d: &BlobDescriptor,
+    filename: Option<&str>,
+) -> Result<Vec<String>, CliError> {
     let mut tag = vec![
         "imeta".to_string(),
-        format!("url {}", d.url),
-        format!("m {}", d.mime_type),
-        format!("x {}", d.sha256),
+        imeta_field("url", &d.url)?,
+        imeta_field("m", &d.mime_type)?,
+        imeta_field("x", &d.sha256)?,
         format!("size {}", d.size),
     ];
+    if let Some(name) = filename {
+        tag.push(imeta_field("filename", name)?);
+    }
     if let Some(ref dim) = d.dim {
-        tag.push(format!("dim {dim}"));
+        tag.push(imeta_field("dim", dim)?);
     }
     if let Some(ref bh) = d.blurhash {
-        tag.push(format!("blurhash {bh}"));
+        tag.push(imeta_field("blurhash", bh)?);
     }
     if let Some(ref th) = d.thumb {
-        tag.push(format!("thumb {th}"));
+        tag.push(imeta_field("thumb", th)?);
     }
     if let Some(dur) = d.duration {
         tag.push(format!("duration {dur}"));
     }
-    tag
+    Ok(tag)
 }
-
-/// MIME types accepted for upload.
-const ALLOWED_MIMES: &[&str] = &[
-    "image/jpeg",
-    "image/png",
-    "image/gif",
-    "image/webp",
-    "video/mp4",
-];
-
-/// Maximum file size for image uploads (50 MB).
-const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
-
-/// Maximum file size for video uploads (500 MB).
-const MAX_VIDEO_BYTES: u64 = 500 * 1024 * 1024;
 
 /// Sign a NIP-98 HTTP auth event (kind:27235) and return the Authorization header value.
 ///
@@ -1159,7 +1214,25 @@ impl BuzzClient {
 
     /// Upload a file to the relay's Blossom endpoint.
     /// Returns a BlobDescriptor on success.
+    ///
+    /// Prefer [`BuzzClient::upload_attachment`] when the caller also needs the
+    /// file name or the pipeline the file took; this wrapper exists for
+    /// `buzz upload file`, which prints only the descriptor.
     pub async fn upload_file(&self, file_path: &str) -> Result<BlobDescriptor, CliError> {
+        self.upload_attachment(file_path)
+            .await
+            .map(|uploaded| uploaded.descriptor)
+    }
+
+    /// Upload a file to the relay and return it with the local facts a message
+    /// event needs.
+    ///
+    /// Images and video take their own relay pipelines, with the legacy
+    /// `/media/upload` fallback the older relays need. Every other file takes
+    /// the relay's generic file path on `/upload` only — the legacy endpoint
+    /// answers a non-image body with `disallowed content type`, so retrying
+    /// there would turn a clear failure into a confusing one.
+    pub async fn upload_attachment(&self, file_path: &str) -> Result<UploadedAttachment, CliError> {
         // 1. Read file — validate it exists and is a regular file
         let metadata = std::fs::metadata(file_path)
             .map_err(|e| CliError::Other(format!("cannot access {file_path}: {e}")))?;
@@ -1167,24 +1240,29 @@ impl BuzzClient {
             return Err(CliError::Usage(format!("{file_path} is not a file")));
         }
 
+        // Bound the read itself. No pipeline accepts more than MAX_UPLOAD_BYTES,
+        // so a larger file is refused from its metadata rather than buffered in
+        // memory first; the per-kind cap below still applies to what is read.
+        if metadata.len() > MAX_UPLOAD_BYTES {
+            return Err(CliError::Usage(format!(
+                "file too large: {} bytes (max {})",
+                metadata.len(),
+                MAX_UPLOAD_BYTES
+            )));
+        }
+
         let bytes = std::fs::read(file_path)
             .map_err(|e| CliError::Other(format!("failed to read {file_path}: {e}")))?;
 
-        // 2. Detect MIME from magic bytes
-        let mime = infer::get(&bytes)
-            .map(|t| t.mime_type().to_string())
-            .unwrap_or_else(|| "application/octet-stream".to_string());
+        // 2. Classify from magic bytes, falling back to the extension for the
+        //    text formats that have none. Refusals here happen before any
+        //    request, so a denied file never leaves the machine.
+        let classified = classify_attachment(file_path, &bytes)?;
+        let kind = classified.kind;
+        let mime = classified.content_type.clone();
 
-        if !ALLOWED_MIMES.contains(&mime.as_str()) {
-            return Err(CliError::Usage(format!("unsupported file type: {mime}")));
-        }
-
-        // 3. Size check
-        let max = if mime.starts_with("video/") {
-            MAX_VIDEO_BYTES
-        } else {
-            MAX_IMAGE_BYTES
-        };
+        // 3. Size check against the pipeline's own cap.
+        let max = kind.max_bytes();
         if bytes.len() as u64 > max {
             return Err(CliError::Usage(format!(
                 "file too large: {} bytes (max {})",
@@ -1198,10 +1276,10 @@ impl BuzzClient {
 
         // 5. PUT request to the BUD-02 /upload endpoint with a generous timeout.
         // Auth is signed per attempt — matches the per-attempt signing pattern in download_media.
-        let upload_timeout = if mime.starts_with("video/") {
-            Duration::from_secs(600)
-        } else {
-            Duration::from_secs(120)
+        // Documents share the video budget: their cap is twice the image cap.
+        let upload_timeout = match kind {
+            AttachmentKind::Image => Duration::from_secs(120),
+            AttachmentKind::Video | AttachmentKind::Document => Duration::from_secs(600),
         };
         let url = format!("{}/upload", self.relay_url);
         let upload_body = bytes::Bytes::from(bytes);
@@ -1244,12 +1322,14 @@ impl BuzzClient {
         // If the primary /upload endpoint definitively doesn't exist on this relay version
         // (404 or 405), fall back to the legacy /media/upload endpoint.  The 404/405 switch
         // itself is not retried; only transient failures on the selected legacy endpoint are.
+        // Documents never fall back: the legacy endpoint is image-only.
         match result {
-            Ok(desc) => return Ok(desc),
+            Ok(descriptor) => return Ok(UploadedAttachment::new(classified, descriptor)),
             Err(CliError::Relay { status: s, body: _ })
-                if should_retry_legacy_upload(
-                    reqwest::StatusCode::from_u16(s).unwrap_or(reqwest::StatusCode::NOT_FOUND),
-                ) =>
+                if kind.allows_legacy_fallback()
+                    && should_retry_legacy_upload(
+                        reqwest::StatusCode::from_u16(s).unwrap_or(reqwest::StatusCode::NOT_FOUND),
+                    ) =>
             {
                 // Fall through to legacy endpoint below.
             }
@@ -1257,34 +1337,37 @@ impl BuzzClient {
         }
 
         let legacy_url = format!("{}/media/upload", self.relay_url);
-        self.with_retry_body(|| {
-            let upload_body = upload_body.clone();
-            let legacy_url = legacy_url.clone();
-            let mime = mime.clone();
-            let sha256 = sha256.clone();
-            async move {
-                let auth_header = sign_blossom_upload(&self.keys, &sha256, &mime, &self.relay_url)?;
-                let resp = self
-                    .with_auth_tag(
-                        self.http
-                            .put(&legacy_url)
-                            .timeout(upload_timeout)
-                            .header("Authorization", auth_header)
-                            .header("Content-Type", &mime)
-                            .header("X-SHA-256", &sha256)
-                            .body(upload_body),
-                    )
-                    .send()
-                    .await?;
-                if !resp.status().is_success() {
-                    let status = resp.status().as_u16();
-                    let body = resp.text().await.unwrap_or_default();
-                    return Err(CliError::Relay { status, body });
+        let descriptor = self
+            .with_retry_body(|| {
+                let upload_body = upload_body.clone();
+                let legacy_url = legacy_url.clone();
+                let mime = mime.clone();
+                let sha256 = sha256.clone();
+                async move {
+                    let auth_header =
+                        sign_blossom_upload(&self.keys, &sha256, &mime, &self.relay_url)?;
+                    let resp = self
+                        .with_auth_tag(
+                            self.http
+                                .put(&legacy_url)
+                                .timeout(upload_timeout)
+                                .header("Authorization", auth_header)
+                                .header("Content-Type", &mime)
+                                .header("X-SHA-256", &sha256)
+                                .body(upload_body),
+                        )
+                        .send()
+                        .await?;
+                    if !resp.status().is_success() {
+                        let status = resp.status().as_u16();
+                        let body = resp.text().await.unwrap_or_default();
+                        return Err(CliError::Relay { status, body });
+                    }
+                    resp.json::<BlobDescriptor>().await.map_err(CliError::from)
                 }
-                resp.json::<BlobDescriptor>().await.map_err(CliError::from)
-            }
-        })
-        .await
+            })
+            .await?;
+        Ok(UploadedAttachment::new(classified, descriptor))
     }
 
     /// Download a Blossom media blob using BUD-01 `t=get` auth.
@@ -2593,5 +2676,395 @@ mod tests {
             built.headers().get("x-auth-tag").is_none(),
             "x-auth-tag header must not be present when no auth tag is configured"
         );
+    }
+}
+
+/// Attachment upload behaviour: what the CLI puts on the wire for a document
+/// versus an image, and what it refuses before opening a connection.
+#[cfg(test)]
+mod attachment_upload_tests {
+    use std::io::Write;
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+
+    use axum::body::Bytes;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::put;
+    use axum::Router;
+    use nostr::Keys;
+    use tokio::net::TcpListener;
+
+    use super::{build_imeta_tag, BlobDescriptor, BuzzClient};
+    use crate::attachment::{AttachmentKind, MAX_FILE_BYTES, MAX_IMAGE_BYTES, MAX_UPLOAD_BYTES};
+
+    /// One request the fake relay received.
+    #[derive(Debug, Clone)]
+    struct Recorded {
+        path: String,
+        content_type: String,
+        body: Vec<u8>,
+    }
+
+    type Log = Arc<Mutex<Vec<Recorded>>>;
+
+    /// A minimal `BlobDescriptor` JSON body, as the relay's generic file path
+    /// returns it: no `dim`, no `blurhash`, no `thumb`.
+    fn descriptor_json(mime: &str, size: usize) -> String {
+        format!(
+            r#"{{"url":"https://relay.test/media/deadbeef.bin","sha256":"deadbeef","size":{size},"type":"{mime}","uploaded":0}}"#
+        )
+    }
+
+    /// Spawn a fake relay that records every upload request and answers
+    /// `/upload` with `upload_status` and `/media/upload` with 200.
+    async fn fake_relay(upload_status: StatusCode) -> (String, Log) {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+
+        async fn record(
+            path: &str,
+            log: &Log,
+            headers: &HeaderMap,
+            body: Bytes,
+        ) -> (StatusCode, String) {
+            let content_type = headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let size = body.len();
+            log.lock().unwrap().push(Recorded {
+                path: path.to_string(),
+                content_type: content_type.clone(),
+                body: body.to_vec(),
+            });
+            (StatusCode::OK, descriptor_json(&content_type, size))
+        }
+
+        type S = (Log, StatusCode);
+        let app = Router::new()
+            .route(
+                "/upload",
+                put(
+                    |State((log, status)): State<S>, headers: HeaderMap, body: Bytes| async move {
+                        let (_, ok_body) = record("/upload", &log, &headers, body).await;
+                        if status.is_success() {
+                            (status, ok_body)
+                        } else {
+                            (status, "no such endpoint".to_string())
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/media/upload",
+                put(
+                    |State((log, _)): State<S>, headers: HeaderMap, body: Bytes| async move {
+                        record("/media/upload", &log, &headers, body).await
+                    },
+                ),
+            )
+            .with_state((log.clone(), upload_status));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), log)
+    }
+
+    fn test_client(base_url: &str) -> BuzzClient {
+        BuzzClient::new(base_url.to_string(), Keys::generate(), None, None).unwrap()
+    }
+
+    /// A JPEG signature long enough for `infer`.
+    const JPEG: &[u8] = &[
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01,
+    ];
+
+    /// Write `contents` to a temp file whose name ends in `suffix`.
+    fn temp_file(suffix: &str, contents: &[u8]) -> tempfile::NamedTempFile {
+        let mut file = tempfile::Builder::new().suffix(suffix).tempfile().unwrap();
+        file.write_all(contents).unwrap();
+        file.flush().unwrap();
+        file
+    }
+
+    /// A sparse file of `len` bytes, prefixed with `prefix` so it still sniffs.
+    /// `set_len` does not write the tail, so the file costs no disk.
+    fn sparse_file(suffix: &str, prefix: &[u8], len: u64) -> tempfile::NamedTempFile {
+        let file = temp_file(suffix, prefix);
+        file.as_file().set_len(len).unwrap();
+        file
+    }
+
+    /// A markdown report has no magic bytes, so the CLI declares its type from
+    /// the extension and ships the file byte for byte.
+    #[tokio::test]
+    async fn a_document_is_uploaded_byte_for_byte_with_a_declared_content_type() {
+        let contents = b"# Report\n\n| a | b |\n| - | - |\n| 1 | 2 |\n\ndone\n";
+        let file = temp_file(".md", contents);
+        let (base, log) = fake_relay(StatusCode::OK).await;
+
+        let uploaded = test_client(&base)
+            .upload_attachment(file.path().to_str().unwrap())
+            .await
+            .expect("a markdown document must be accepted");
+
+        assert_eq!(uploaded.kind, AttachmentKind::Document);
+        assert!(
+            uploaded.filename.ends_with(".md"),
+            "filename must be the local base name, got {}",
+            uploaded.filename
+        );
+
+        let requests = log.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1, "a document uses /upload only");
+        assert_eq!(requests[0].path, "/upload");
+        assert_eq!(requests[0].content_type, "text/markdown");
+        assert_eq!(
+            requests[0].body, contents,
+            "the relay must receive the file byte for byte"
+        );
+    }
+
+    /// The legacy endpoint is image-only, so a 404 on `/upload` for a document
+    /// is the final answer.
+    #[tokio::test]
+    async fn a_document_never_falls_back_to_the_legacy_endpoint() {
+        let file = temp_file(".md", b"# Report\n");
+        let (base, log) = fake_relay(StatusCode::NOT_FOUND).await;
+
+        let error = test_client(&base)
+            .upload_attachment(file.path().to_str().unwrap())
+            .await
+            .expect_err("a 404 on /upload must surface");
+        assert!(
+            matches!(error, crate::error::CliError::Relay { status: 404, .. }),
+            "got {error:?}"
+        );
+
+        let requests = log.lock().unwrap().clone();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.path == "/media/upload")
+                .count(),
+            0,
+            "a document must never reach the legacy endpoint"
+        );
+    }
+
+    /// Images keep the legacy fallback older relays need.
+    #[tokio::test]
+    async fn an_image_still_falls_back_to_the_legacy_endpoint() {
+        let file = temp_file(".jpg", JPEG);
+        let (base, log) = fake_relay(StatusCode::NOT_FOUND).await;
+
+        let uploaded = test_client(&base)
+            .upload_attachment(file.path().to_str().unwrap())
+            .await
+            .expect("an image must fall back to /media/upload");
+        assert_eq!(uploaded.kind, AttachmentKind::Image);
+
+        let requests = log.lock().unwrap().clone();
+        assert_eq!(
+            requests.iter().filter(|r| r.path == "/upload").count(),
+            1,
+            "the primary endpoint is tried first"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.path == "/media/upload")
+                .count(),
+            1,
+            "the legacy endpoint answers the 404"
+        );
+        assert_eq!(requests[0].content_type, "image/jpeg");
+    }
+
+    /// A document over the relay's `max_file_bytes` is refused on this machine.
+    #[tokio::test]
+    async fn a_document_over_its_cap_is_refused_before_any_request() {
+        let file = sparse_file(".md", b"# Report\n", MAX_FILE_BYTES + 1);
+        let (base, log) = fake_relay(StatusCode::OK).await;
+
+        let error = test_client(&base)
+            .upload_attachment(file.path().to_str().unwrap())
+            .await
+            .expect_err("an oversized document must be refused");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "file too large: {} bytes (max {MAX_FILE_BYTES})",
+                MAX_FILE_BYTES + 1
+            )
+        );
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "nothing may reach the relay once the cap is exceeded"
+        );
+    }
+
+    /// An image over `max_image_bytes` still reports the image cap, unchanged.
+    #[tokio::test]
+    async fn an_image_over_its_cap_still_reports_the_image_cap() {
+        let file = sparse_file(".jpg", JPEG, MAX_IMAGE_BYTES + 1);
+        let (base, log) = fake_relay(StatusCode::OK).await;
+
+        let error = test_client(&base)
+            .upload_attachment(file.path().to_str().unwrap())
+            .await
+            .expect_err("an oversized image must be refused");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "file too large: {} bytes (max {MAX_IMAGE_BYTES})",
+                MAX_IMAGE_BYTES + 1
+            )
+        );
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    /// A file larger than every pipeline's cap is refused from its metadata, so
+    /// it is never buffered in memory.
+    #[tokio::test]
+    async fn a_file_over_every_cap_is_refused_before_it_is_read() {
+        let file = sparse_file(".md", b"# Report\n", MAX_UPLOAD_BYTES + 1);
+        let (base, log) = fake_relay(StatusCode::OK).await;
+
+        let error = test_client(&base)
+            .upload_attachment(file.path().to_str().unwrap())
+            .await
+            .expect_err("a file over every cap must be refused");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "file too large: {} bytes (max {MAX_UPLOAD_BYTES})",
+                MAX_UPLOAD_BYTES + 1
+            )
+        );
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    /// A denied type is refused with the deny-list reason and never uploaded.
+    #[tokio::test]
+    async fn a_denied_type_never_reaches_the_relay() {
+        let file = temp_file(".svg", b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>");
+        let (base, log) = fake_relay(StatusCode::OK).await;
+
+        let error = test_client(&base)
+            .upload_attachment(file.path().to_str().unwrap())
+            .await
+            .expect_err("an SVG must be refused");
+        assert_eq!(error.to_string(), "disallowed content type: image/svg+xml");
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "nothing on the deny list may leave the machine"
+        );
+    }
+
+    fn document_descriptor() -> BlobDescriptor {
+        BlobDescriptor {
+            url: "https://relay.test/media/deadbeef.bin".to_string(),
+            sha256: "deadbeef".to_string(),
+            size: 42,
+            mime_type: "text/markdown".to_string(),
+            uploaded: 0,
+            dim: None,
+            blurhash: None,
+            thumb: None,
+            duration: None,
+        }
+    }
+
+    /// The desktop keys its markdown viewer off the imeta `filename` field, so
+    /// a document's tag must carry it alongside `m`, `x` and `size` — and
+    /// nothing that only an image has.
+    #[test]
+    fn a_document_tag_carries_the_filename_and_no_image_fields() {
+        let tag = build_imeta_tag(&document_descriptor(), Some("plan.md")).unwrap();
+
+        assert_eq!(tag[0], "imeta");
+        assert!(tag.contains(&"filename plan.md".to_string()), "{tag:?}");
+        assert!(tag.contains(&"m text/markdown".to_string()), "{tag:?}");
+        assert!(tag.contains(&"x deadbeef".to_string()), "{tag:?}");
+        assert!(tag.contains(&"size 42".to_string()), "{tag:?}");
+        assert!(
+            !tag.iter().any(|f| f.starts_with("dim ")),
+            "a document has no dimensions: {tag:?}"
+        );
+        assert!(
+            !tag.iter().any(|f| f.starts_with("blurhash ")),
+            "a document has no blurhash: {tag:?}"
+        );
+    }
+
+    /// Images gain the same field, so the Files tab can name them too.
+    #[test]
+    fn an_image_tag_carries_the_filename_and_keeps_its_own_fields() {
+        let mut descriptor = document_descriptor();
+        descriptor.mime_type = "image/png".to_string();
+        descriptor.dim = Some("800x600".to_string());
+        descriptor.blurhash = Some("LEHV6nWB".to_string());
+
+        let tag = build_imeta_tag(&descriptor, Some("shot.png")).unwrap();
+        assert!(tag.contains(&"filename shot.png".to_string()), "{tag:?}");
+        assert!(tag.contains(&"dim 800x600".to_string()), "{tag:?}");
+        assert!(tag.contains(&"blurhash LEHV6nWB".to_string()), "{tag:?}");
+    }
+
+    /// Every field the relay supplies is bounded at this DTO: an oversized
+    /// value is an error, not a truncated field signed into a public event.
+    #[test]
+    fn an_oversized_relay_field_is_refused_rather_than_truncated() {
+        let mut descriptor = document_descriptor();
+        descriptor.url = format!(
+            "https://relay.test/{}",
+            "a".repeat(super::MAX_IMETA_FIELD_BYTES)
+        );
+
+        let error = build_imeta_tag(&descriptor, Some("plan.md")).unwrap_err();
+        assert!(
+            error.to_string().starts_with("oversized imeta url field:"),
+            "got {error}"
+        );
+
+        let mut descriptor = document_descriptor();
+        descriptor.blurhash = Some("b".repeat(super::MAX_IMETA_FIELD_BYTES + 1));
+        let error = build_imeta_tag(&descriptor, Some("plan.md")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("oversized imeta blurhash field:"),
+            "got {error}"
+        );
+    }
+
+    /// A control character in a relay-supplied value would break the tag it is
+    /// rendered into, so it is refused too.
+    #[test]
+    fn a_control_character_in_a_relay_field_is_refused() {
+        let mut descriptor = document_descriptor();
+        descriptor.mime_type = "text/markdown\nx evil".to_string();
+
+        let error = build_imeta_tag(&descriptor, Some("plan.md")).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "imeta m field contains a control character"
+        );
+    }
+
+    /// The tag is bounded in count as well as in field length.
+    #[test]
+    fn the_tag_carries_a_bounded_number_of_fields() {
+        let mut descriptor = document_descriptor();
+        descriptor.dim = Some("800x600".to_string());
+        descriptor.blurhash = Some("LEHV6nWB".to_string());
+        descriptor.thumb = Some("https://relay.test/t.jpg".to_string());
+        descriptor.duration = Some(1.5);
+
+        let tag = build_imeta_tag(&descriptor, Some("clip.mp4")).unwrap();
+        assert_eq!(tag.len(), 10, "every field present is ten entries: {tag:?}");
     }
 }

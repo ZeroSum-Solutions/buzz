@@ -2,7 +2,7 @@ use buzz_sdk::{DeleteMessageOptions, DiffMeta, ThreadRef, VoteDirection};
 use nostr::PublicKey;
 use uuid::Uuid;
 
-use crate::client::{normalize_events, normalize_write_response, BuzzClient};
+use crate::client::{normalize_events, normalize_write_response, BuzzClient, UploadedAttachment};
 use crate::error::CliError;
 use crate::validate::{
     infer_language, parse_event_id, parse_uuid, read_or_stdin, truncate_diff,
@@ -11,6 +11,26 @@ use crate::validate::{
 use buzz_sdk::mentions::{
     extract_at_mentions_with_known, extract_nostr_uris, strip_code_regions, MENTION_CAP,
 };
+
+/// Append each attachment's preview line to the message content.
+///
+/// Images and video get an inline `![image]`/`![video]` link so every client
+/// renders them in place. A document gets nothing: it is not renderable inline,
+/// and its `imeta` tag already carries the URL, MIME type and file name the
+/// desktop needs to offer it as a viewer panel or a Files-tab entry.
+fn content_with_attachments(content: &str, uploads: &[UploadedAttachment]) -> String {
+    let mut media_content = String::new();
+    for uploaded in uploads {
+        if let Some(line) = uploaded.kind.content_line(&uploaded.descriptor.url) {
+            media_content.push_str(&line);
+        }
+    }
+    if media_content.is_empty() {
+        content.to_string()
+    } else {
+        format!("{content}{media_content}")
+    }
+}
 
 /// Extract the thread root event ID from a Nostr tag array.
 ///
@@ -649,26 +669,19 @@ pub async fn cmd_send_message(
 
     // Upload files and build imeta tags
     let mut media_tags: Vec<Vec<String>> = Vec::new();
-    let mut media_content = String::new();
+    let mut uploads: Vec<UploadedAttachment> = Vec::new();
     for file_path in &p.files {
-        let desc = client
-            .upload_file(file_path)
+        let uploaded = client
+            .upload_attachment(file_path)
             .await
             .map_err(|e| CliError::Other(format!("upload failed for {file_path}: {e}")))?;
-        media_tags.push(crate::client::build_imeta_tag(&desc));
-        if desc.mime_type.starts_with("video/") {
-            media_content.push_str("\n![video](");
-        } else {
-            media_content.push_str("\n![image](");
-        }
-        media_content.push_str(&desc.url);
-        media_content.push(')');
+        media_tags.push(crate::client::build_imeta_tag(
+            &uploaded.descriptor,
+            Some(&uploaded.filename),
+        )?);
+        uploads.push(uploaded);
     }
-    let final_content = if media_content.is_empty() {
-        p.content.clone()
-    } else {
-        format!("{}{media_content}", p.content)
-    };
+    let final_content = content_with_attachments(&p.content, &uploads);
 
     // Build thread ref if replying. `--reply-to` is the immediate parent; the
     // thread root is derived from the parent's NIP-10 tags via the relay.
@@ -1084,9 +1097,9 @@ pub async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::{
-        channel_id_from_event, cmd_get_thread, cmd_send_message, event_mention_pubkeys,
-        find_root_from_tags, format_events, match_profiles_by_name, merge_message_mentions,
-        missing_members, normalize_explicit_mentions, parse_member_pubkeys,
+        channel_id_from_event, cmd_get_thread, cmd_send_message, content_with_attachments,
+        event_mention_pubkeys, find_root_from_tags, format_events, match_profiles_by_name,
+        merge_message_mentions, missing_members, normalize_explicit_mentions, parse_member_pubkeys,
         resolve_names_to_pubkeys, resolve_thread_target, thread_ref_from_event,
         thread_ref_from_parent_tags, BuzzClient, CliError, Uuid,
     };
@@ -1886,6 +1899,61 @@ mod tests {
         assert!(
             emoji_tags.is_empty(),
             "palette-error fallback must produce no emoji tags, got: {emoji_tags:?}"
+        );
+    }
+
+    fn uploaded(kind: crate::attachment::AttachmentKind, url: &str) -> super::UploadedAttachment {
+        super::UploadedAttachment {
+            descriptor: crate::client::BlobDescriptor {
+                url: url.to_string(),
+                sha256: "deadbeef".to_string(),
+                size: 42,
+                mime_type: "application/octet-stream".to_string(),
+                uploaded: 0,
+                dim: None,
+                blurhash: None,
+                thumb: None,
+                duration: None,
+            },
+            kind,
+            filename: "plan.md".to_string(),
+        }
+    }
+
+    /// A document attachment adds nothing to the message content — the `imeta`
+    /// tag carries it, and an `![image]` line would render a broken image in
+    /// every client.
+    #[test]
+    fn a_document_attachment_adds_no_line_to_the_content() {
+        use crate::attachment::AttachmentKind;
+
+        let content = content_with_attachments(
+            "T15 check",
+            &[uploaded(
+                AttachmentKind::Document,
+                "https://relay.test/media/deadbeef.bin",
+            )],
+        );
+        assert_eq!(content, "T15 check");
+        assert!(!content.contains("!["), "no inline media line: {content}");
+    }
+
+    /// Images and video keep the inline lines they always had, in order.
+    #[test]
+    fn image_and_video_attachments_keep_their_inline_lines() {
+        use crate::attachment::AttachmentKind;
+
+        let content = content_with_attachments(
+            "look",
+            &[
+                uploaded(AttachmentKind::Image, "https://relay.test/a.jpg"),
+                uploaded(AttachmentKind::Video, "https://relay.test/b.mp4"),
+                uploaded(AttachmentKind::Document, "https://relay.test/c.bin"),
+            ],
+        );
+        assert_eq!(
+            content,
+            "look\n![image](https://relay.test/a.jpg)\n![video](https://relay.test/b.mp4)"
         );
     }
 }
