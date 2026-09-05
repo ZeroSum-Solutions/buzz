@@ -531,10 +531,16 @@ fn parse_event(
             .and_then(Value::as_str)
             .map(|etag| TruncatedText::cap(etag, MAX_ETAG_CHARS).value),
         status,
+        // An id that had to be cut is a *different* id, so it is dropped
+        // rather than truncated. It is display metadata only, so absent is
+        // safe; the etag below is capped instead, because an absent etag would
+        // remove the `If-Match` fence while a cut one only fails the mutation.
         recurring_event_id: object
             .get("recurringEventId")
             .and_then(Value::as_str)
-            .map(|raw| TruncatedText::cap(raw, MAX_ID_CHARS).value),
+            .map(|raw| TruncatedText::cap(raw, MAX_ID_CHARS))
+            .filter(|capped| !capped.truncated)
+            .map(|capped| capped.value),
         start,
         end,
         summary: text("summary", MAX_SUMMARY_CHARS),

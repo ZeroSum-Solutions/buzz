@@ -24,7 +24,7 @@
 //! a token cannot reach a UI payload by accident. Persistence goes through the
 //! private wire form below, which is reachable only from this module.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use super::redact::Redacted;
 use super::revocation::{PendingRevocation, RevocationState, MAX_PENDING_REVOCATIONS};
@@ -164,7 +164,10 @@ pub enum JournalStep {
 }
 
 /// One state change, with its own predicate.
-#[derive(Debug)]
+///
+/// `Clone` so a commit can hand the transition to a store seam that takes a
+/// re-callable closure; the clone never leaves the commit.
+#[derive(Debug, Clone)]
 pub enum Change {
     /// Write the first binding, or the one after a disconnect.
     Connect(Box<Binding>),
@@ -510,23 +513,60 @@ pub fn deserialize_envelope(raw: &str) -> Result<CalendarEnvelope, String> {
     })
 }
 
+/// One read-modify-write of the whole blob. Refusing means writing nothing.
+pub type BlobMutation<'f> = &'f mut dyn FnMut(&mut HashMap<String, String>) -> Result<(), String>;
+
+/// The store-wide compare-and-set primitive an envelope commit runs through.
+///
+/// A seam over
+/// [`SecretStore::mutate_checked`](crate::secret_store::SecretStore::mutate_checked)
+/// so the shipped [`KeychainEnvelopes::commit`] — the predicate wiring, the
+/// refusal capture and the error mapping — is the code a test drives. The
+/// implementation must hold one lock across the whole read-modify-write, build
+/// the candidate separately from the current state, and write nothing at all
+/// when `f` returns an error.
+pub trait CheckedBlob {
+    /// Read-modify-write the whole blob under one lock, refusing on `f`'s error.
+    ///
+    /// # Errors
+    /// Returns `f`'s error when the mutation refuses, or the backend's error
+    /// when the store is unavailable or the write fails.
+    fn mutate_checked(&self, f: BlobMutation<'_>) -> Result<(), String>;
+
+    /// Read the whole blob without migrating anything.
+    ///
+    /// # Errors
+    /// Returns the backend's error when the store is unavailable.
+    fn load_all_readonly(&self) -> Result<Option<HashMap<String, String>>, String>;
+}
+
+impl CheckedBlob for crate::secret_store::SecretStore {
+    fn mutate_checked(&self, f: BlobMutation<'_>) -> Result<(), String> {
+        crate::secret_store::SecretStore::mutate_checked(self, |map| f(map))
+    }
+
+    fn load_all_readonly(&self) -> Result<Option<HashMap<String, String>>, String> {
+        crate::secret_store::SecretStore::load_all_readonly(self)
+    }
+}
+
 /// The [`SecretStore`](crate::secret_store::SecretStore)-backed envelope store.
 ///
 /// Every commit runs inside `SecretStore::mutate_checked`, which holds the
 /// interprocess advisory lock and re-reads the durable blob before the
 /// predicate sees it.
-pub struct KeychainEnvelopes<'a> {
-    store: &'a crate::secret_store::SecretStore,
+pub struct KeychainEnvelopes<'a, S: CheckedBlob + ?Sized = crate::secret_store::SecretStore> {
+    store: &'a S,
 }
 
-impl<'a> KeychainEnvelopes<'a> {
+impl<'a, S: CheckedBlob + ?Sized> KeychainEnvelopes<'a, S> {
     /// Wrap `store`.
-    pub fn new(store: &'a crate::secret_store::SecretStore) -> Self {
+    pub fn new(store: &'a S) -> Self {
         Self { store }
     }
 }
 
-impl EnvelopeStore for KeychainEnvelopes<'_> {
+impl<S: CheckedBlob + ?Sized> EnvelopeStore for KeychainEnvelopes<'_, S> {
     fn commit(
         &self,
         key: &str,
@@ -534,20 +574,28 @@ impl EnvelopeStore for KeychainEnvelopes<'_> {
         context: &CommitContext,
     ) -> Result<(), CommitError> {
         let mut refusal: Option<TransitionError> = None;
-        let outcome = self.store.mutate_checked(|map| {
-            let mut envelope = match map.get(key) {
-                Some(raw) => deserialize_envelope(raw)?,
-                None => CalendarEnvelope::default(),
+        let outcome = {
+            let refusal = &mut refusal;
+            let mut apply = move |map: &mut HashMap<String, String>| -> Result<(), String> {
+                let mut envelope = match map.get(key) {
+                    Some(raw) => deserialize_envelope(raw)?,
+                    None => CalendarEnvelope::default(),
+                };
+                if let Err(error) = change.clone().apply(&mut envelope, context) {
+                    *refusal = Some(error.clone());
+                    return Err(error.to_string());
+                }
+                map.insert(key.to_string(), serialize_envelope(&envelope)?);
+                Ok(())
             };
-            if let Err(error) = change.apply(&mut envelope, context) {
-                refusal = Some(error.clone());
-                return Err(error.to_string());
-            }
-            map.insert(key.to_string(), serialize_envelope(&envelope)?);
-            Ok(())
-        });
+            self.store.mutate_checked(&mut apply)
+        };
         match (outcome, refusal) {
             (Ok(()), _) => Ok(()),
+            // A refusal is the predicate's verdict and names the transition; a
+            // store error is the backend's and never does. Collapsing the two
+            // would tell a caller that a keychain outage was a refused
+            // compare-and-set, or the reverse.
             (Err(_), Some(refusal)) => Err(CommitError::Refused(refusal)),
             (Err(detail), None) => Err(CommitError::Store(detail)),
         }

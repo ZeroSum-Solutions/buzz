@@ -250,6 +250,38 @@ impl SecretStore {
     }
 }
 
+/// Build the candidate blob for a checked read-modify-write.
+///
+/// `Ok(None)` means the mutation was a no-op and no durable write is needed.
+/// An `Err` means the mutation *refused*: the caller must write nothing, which
+/// is what makes a compare-and-set possible — the predicate runs on the
+/// freshly-read durable state inside the lock and its verdict is the only thing
+/// that decides whether a write happens.
+///
+/// Separate from the keychain I/O so that contract is testable on every
+/// platform, with no OS keyring in the loop.
+///
+/// # Errors
+/// Returns `f`'s error verbatim when the mutation refuses.
+#[cfg_attr(not(feature = "system-keyring"), allow(dead_code))]
+fn checked_candidate<F>(
+    current: &HashMap<String, String>,
+    f: F,
+) -> Result<Option<HashMap<String, String>>, String>
+where
+    F: FnOnce(&mut HashMap<String, String>) -> Result<(), String>,
+{
+    let mut next = current.clone();
+    // `?`, not a discarded result: a refusal must abandon the candidate rather
+    // than write it.
+    f(&mut next)?;
+    if &next == current {
+        Ok(None)
+    } else {
+        Ok(Some(next))
+    }
+}
+
 /// Whether a keyring error string indicates the backend itself is unavailable
 /// (vs. a per-entry error like "not found"). Mirrors goose's discriminator
 /// (`crates/goose/src/config/base.rs`): treat dbus / Secret Service / platform
@@ -452,21 +484,18 @@ impl SecretStore {
         };
 
         // Build the candidate state in a separate allocation so that a write
-        // failure below cannot leave the cache ahead of durable storage.
-        let mut next = current.clone();
-        // A refusing mutation returns before anything is written, so the
-        // durable blob and the cache both stay on `current`.
-        f(&mut next)?;
-
-        // Skip the keychain write when the candidate equals the freshly-read
-        // durable state — no I/O needed and no keychain ACL prompt on macOS.
-        if next == current {
+        // failure below cannot leave the cache ahead of durable storage, and
+        // so that a refusing mutation writes nothing at all.
+        let Some(next) = checked_candidate(&current, f)? else {
+            // Skip the keychain write when the candidate equals the
+            // freshly-read durable state — no I/O needed and no keychain ACL
+            // prompt on macOS.
             // Update the cache to the fresh read even on no-op so subsequent
             // reads in this process see any keys another process may have added.
             let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
             *guard = Some(current);
             return Ok(());
-        }
+        };
 
         // Write to keyring while still holding the file lock.
         // `serialize_blob` re-checks the `mcp:` record-count, value-size and
@@ -1341,5 +1370,55 @@ mod tests {
         );
         // Agent key should also be gone.
         assert_eq!(store3.load("agent:abc123").unwrap(), None);
+    }
+
+    // ── The compare-and-set seam (`mutate_checked`) ───────────────────────
+    //
+    // These drive the shipped candidate builder every `mutate_checked` call
+    // goes through. They need no OS keychain, so they run on every platform
+    // and in CI — unlike the keychain-backed tests above, which are ignored.
+
+    #[test]
+    fn checked_candidate_refusal_abandons_the_candidate() {
+        // The guard: `f(&mut next)?`. Turn it into `let _ = f(&mut next);` and
+        // a refused predicate writes anyway, destroying the compare-and-set
+        // every calendar transition depends on.
+        let current = HashMap::from([("a".to_string(), "1".to_string())]);
+        let refused = checked_candidate(&current, |map| {
+            map.insert("a".to_string(), "2".to_string());
+            Err("the predicate refuses".to_string())
+        });
+        assert_eq!(refused, Err("the predicate refuses".to_string()));
+        assert_eq!(
+            current.get("a").map(String::as_str),
+            Some("1"),
+            "the freshly-read state is never mutated in place"
+        );
+    }
+
+    #[test]
+    fn checked_candidate_writes_only_a_real_change() {
+        let current = HashMap::from([("a".to_string(), "1".to_string())]);
+        assert_eq!(
+            checked_candidate(&current, |_| Ok(())),
+            Ok(None),
+            "a no-op mutation must not reach the keychain"
+        );
+        assert_eq!(
+            checked_candidate(&current, |map| {
+                map.insert("a".to_string(), "1".to_string());
+                Ok(())
+            }),
+            Ok(None),
+            "writing back the same value is still a no-op"
+        );
+        let changed = checked_candidate(&current, |map| {
+            map.insert("b".to_string(), "2".to_string());
+            Ok(())
+        })
+        .expect("an accepted mutation produces a candidate")
+        .expect("a real change is written");
+        assert_eq!(changed.get("b").map(String::as_str), Some("2"));
+        assert_eq!(changed.get("a").map(String::as_str), Some("1"));
     }
 }

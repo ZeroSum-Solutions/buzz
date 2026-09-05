@@ -9,9 +9,9 @@ use serde_json::json;
 
 use super::binding::CalendarEnvelope;
 use super::dto::{
-    derive_capability, parse_events_page, AccessRole, EventField, EventKind, EventStatus,
-    EventTime, TruncatedText, MAX_DESCRIPTION_CHARS, MAX_EVENTS_PER_PAGE, MAX_LOCATION_CHARS,
-    MAX_SUMMARY_CHARS,
+    derive_capability, parse_events_page, AccessRole, DtoError, EventField, EventKind, EventStatus,
+    EventTime, TruncatedText, MAX_DESCRIPTION_CHARS, MAX_ETAG_CHARS, MAX_EVENTS_PER_PAGE,
+    MAX_ID_CHARS, MAX_LOCATION_CHARS, MAX_PAGE_TOKEN_CHARS, MAX_SUMMARY_CHARS, MAX_TIME_ZONE_CHARS,
 };
 use super::failure::{
     classify_list, classify_mutation, classify_token, FailureState, MutationReason, TerminalReason,
@@ -21,7 +21,8 @@ use super::interval::{Coverage, ProvenInterval, TruncationReason, Window};
 use super::loopback::{CallbackListener, ListenerError, ListenerLimits};
 use super::oauth::{
     check_exchange, verify_callback_query, verify_id_token, AuthRequest, CallbackError,
-    ExchangeError, IdTokenError, IdTokenExpectations, IdTokenSignatureVerifier, PkcePair, SCOPES,
+    ExchangeError, IdTokenError, IdTokenExpectations, IdTokenSignatureVerifier, PkcePair,
+    MAX_ID_TOKEN_BYTES, SCOPES,
 };
 use super::redact::Redacted;
 use super::testing::{binding, CLIENT_ID, SENTINEL};
@@ -719,4 +720,179 @@ fn google_calendar_loopback_stops_after_the_connection_cap() {
         .expect_err("the cap ends the wait");
     let _ = sender.join();
     assert_eq!(error, ListenerError::TooManyConnections(2));
+}
+
+#[test]
+fn google_calendar_loopback_times_out_with_no_connection_at_all() {
+    let listener = CallbackListener::bind().expect("a loopback port binds");
+    let limits = ListenerLimits {
+        max_request_bytes: 8192,
+        max_connections: 8,
+        read_timeout_ms: 5_000,
+        wait_timeout_ms: 120,
+    };
+    let started = std::time::Instant::now();
+    let error = listener
+        .wait_for_callback(&limits)
+        .expect_err("the wait ends on its own deadline");
+    assert_eq!(error, ListenerError::TimedOut);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "the wait must end on `wait_timeout_ms`, not on the read timeout"
+    );
+}
+
+#[test]
+fn google_calendar_loopback_deadline_bounds_a_stalled_connection() {
+    // The failure this binds: the per-read timeout is the only bound inside
+    // `read_callback`, and it resets on every byte. A local process that sends
+    // one byte and then goes quiet — never sending CRLFCRLF — holds the whole
+    // flow for the full read timeout, and one that sends a byte just inside
+    // each timeout holds it for `max_request_bytes` times that. Carrying the
+    // wait's deadline into the read loop is what stops both.
+    let listener = CallbackListener::bind().expect("a loopback port binds");
+    let port = listener.port();
+    let limits = ListenerLimits {
+        max_request_bytes: 8192,
+        max_connections: 8,
+        // Two orders of magnitude past the whole wait: only the wait's own
+        // deadline can end this connection.
+        read_timeout_ms: 30_000,
+        wait_timeout_ms: 250,
+    };
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sender_stop = std::sync::Arc::clone(&stop);
+    let sender = std::thread::spawn(move || {
+        use std::io::Write as _;
+        let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+            return;
+        };
+        // One byte of a request head that is never terminated, then silence
+        // while the connection stays open.
+        if stream.write_all(b"G").is_err() || stream.flush().is_err() {
+            return;
+        }
+        while !sender_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    });
+
+    let started = std::time::Instant::now();
+    let error = listener
+        .wait_for_callback(&limits)
+        .expect_err("a connection that never finishes its request cannot hold the wait open");
+    let elapsed = started.elapsed();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = sender.join();
+
+    assert_eq!(error, ListenerError::TimedOut);
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "the wait ran for {elapsed:?} against a 250 ms budget; the deadline must bound the \
+         connection, not each read"
+    );
+}
+
+// ── The remaining field caps (T12a decision 1) ────────────────────────────
+
+#[test]
+fn google_calendar_caps_the_id_etag_zone_and_page_token() {
+    // Every one of these leaves the DTO on a wire: the id addresses an event,
+    // the etag becomes an `If-Match` header, the zone is rendered, and the page
+    // token becomes the next request's `pageToken` query value. Each is bounded
+    // in the way its use allows — an id that would be cut is refused or
+    // dropped, because a cut id names a different event.
+    let page_token = "t".repeat(MAX_PAGE_TOKEN_CHARS + 500);
+    let body = json!({
+        "accessRole": "owner",
+        "timeZone": "Z".repeat(MAX_TIME_ZONE_CHARS + 40),
+        "nextPageToken": page_token,
+        "items": [{
+            "id": "i".repeat(MAX_ID_CHARS),
+            "etag": "e".repeat(MAX_ETAG_CHARS + 300),
+            "recurringEventId": "r".repeat(MAX_ID_CHARS + 700),
+            "status": "confirmed",
+            "summary": "capped",
+            "start": {
+                "dateTime": "2026-01-01T10:00:00Z",
+                "timeZone": "z".repeat(MAX_TIME_ZONE_CHARS + 9),
+            },
+            "end": { "dateTime": "2026-01-01T11:00:00Z" },
+        }],
+    })
+    .to_string();
+
+    let page = parse_events_page(body.as_bytes(), body.len()).expect("the page parses");
+    assert_eq!(
+        page.default_time_zone.as_deref().map(str::len),
+        Some(MAX_TIME_ZONE_CHARS),
+        "the calendar zone is capped"
+    );
+    assert_eq!(
+        page.next_page_token.as_deref().map(str::len),
+        Some(MAX_PAGE_TOKEN_CHARS),
+        "the token that becomes the next outbound query value is capped"
+    );
+    let event = page.events.first().expect("the item parses");
+    assert_eq!(event.id.len(), MAX_ID_CHARS);
+    assert_eq!(
+        event.etag.as_deref().map(str::len),
+        Some(MAX_ETAG_CHARS),
+        "a cut etag still fences: it can only fail the mutation, never clobber"
+    );
+    assert_eq!(
+        event.recurring_event_id, None,
+        "an id that would have to be cut is dropped, never truncated into another id"
+    );
+    match &event.start {
+        EventTime::Timed { time_zone, .. } => assert_eq!(
+            time_zone.as_deref().map(str::len),
+            Some(MAX_TIME_ZONE_CHARS)
+        ),
+        other => panic!("expected a timed start, got {other:?}"),
+    }
+}
+
+#[test]
+fn google_calendar_event_id_over_the_cap_is_refused_not_truncated() {
+    let body = json!({
+        "accessRole": "owner",
+        "items": [{
+            "id": "i".repeat(MAX_ID_CHARS + 1),
+            "status": "confirmed",
+            "start": { "dateTime": "2026-01-01T10:00:00Z" },
+            "end": { "dateTime": "2026-01-01T11:00:00Z" },
+        }],
+    })
+    .to_string();
+    let error = parse_events_page(body.as_bytes(), body.len())
+        .expect_err("an id over the cap is not an event this build can address");
+    assert_eq!(
+        error,
+        DtoError::InvalidField {
+            index: 0,
+            field: "id"
+        }
+    );
+}
+
+#[test]
+fn google_calendar_id_token_over_the_byte_cap_is_refused_before_it_is_split() {
+    let oversized = format!(
+        "{}.{}.{}",
+        "a".repeat(MAX_ID_TOKEN_BYTES),
+        "b".repeat(16),
+        "c".repeat(16)
+    );
+    assert!(oversized.len() > MAX_ID_TOKEN_BYTES);
+    let expectations = IdTokenExpectations {
+        client_id: CLIENT_ID.to_string(),
+        nonce: Redacted::new("nonce".to_string()),
+        now_ms: 0,
+    };
+    assert_eq!(
+        verify_id_token(&oversized, &AcceptSignature, &expectations),
+        Err(IdTokenError::Malformed("over the byte cap")),
+        "the byte cap runs before the token is split, so nothing downstream sees it"
+    );
 }

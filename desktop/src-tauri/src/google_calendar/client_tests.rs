@@ -264,20 +264,189 @@ fn google_calendar_unknown_token_is_a_failure_not_an_empty_calendar() {
 }
 
 #[test]
-fn google_calendar_transport_pins_https_and_never_reads_a_proxy_from_the_environment() {
+fn google_calendar_transport_pins_the_google_origin_and_path() {
     let config = TransportConfig::google();
     assert!(!config.reads_environment_proxy());
-    assert!(config.base_url.starts_with("https://"));
-    let plaintext = TransportConfig::loopback("http://calendar.internal/");
-    let error = HttpTransport::new(&plaintext).expect_err("a plaintext base is refused");
-    assert!(
-        error.contains("https"),
-        "only a loopback test server may be plaintext: {error}"
+    assert_eq!(config.base_url(), "https://www.googleapis.com/calendar/v3/");
+    assert!(HttpTransport::new(&config).is_ok());
+
+    // Every one of these starts with the right characters and none of them is
+    // Google. A prefix check on the base URL accepts them; parsing the origin
+    // does not.
+    for rejected in [
+        "http://www.googleapis.com/calendar/v3/",
+        "https://www.googleapis.com.evil.test/calendar/v3/",
+        "https://www.googleapis.com:8443/calendar/v3/",
+        "https://www.googleapis.com/drive/v3/",
+        "https://www.googleapis.com/calendar/v3",
+        "https://user:secret@www.googleapis.com/calendar/v3/",
+        "https://www.googleapis.com/calendar/v3/?to=https://evil.test/",
+        "not-a-url",
+    ] {
+        let mut config = TransportConfig::google();
+        config.force_base_url_for_test(rejected);
+        assert!(
+            HttpTransport::new(&config).is_err(),
+            "`{rejected}` is not the Google Calendar origin and must not carry a bearer token"
+        );
+    }
+}
+
+/// A listener that accepts and immediately closes, counting what reached it.
+struct ProxySentinel {
+    addr: std::net::SocketAddr,
+    seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ProxySentinel {
+    fn start() -> Self {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("the proxy sentinel binds a loopback port");
+        let addr = listener.local_addr().expect("the sentinel has an address");
+        listener
+            .set_nonblocking(true)
+            .expect("the sentinel polls for shutdown");
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_seen = std::sync::Arc::clone(&seen);
+        let worker_stop = std::sync::Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok(_) => {
+                        worker_seen.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            }
+        });
+        Self {
+            addr,
+            seen,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.addr.port())
+    }
+
+    fn connections(&self) -> usize {
+        self.seen.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for ProxySentinel {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Build a transport with every proxy variable pointing at `proxy`.
+///
+/// reqwest reads the environment once, when the client is built, so the
+/// variables are set only around that call and restored immediately. The
+/// process environment is global, and this is the narrowest window in which the
+/// containment can be observed at all: nothing else in this module reads a
+/// proxy variable, because every shipped configuration disables proxy lookup.
+fn transport_with_proxy_env(config: &TransportConfig, proxy: &str) -> HttpTransport {
+    const VARS: [&str; 6] = [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ];
+    let saved: Vec<(&str, Option<String>)> = VARS
+        .iter()
+        .map(|key| (*key, std::env::var(key).ok()))
+        .collect();
+    for key in VARS {
+        std::env::set_var(key, proxy);
+    }
+    let built = HttpTransport::new(config);
+    for (key, previous) in saved {
+        match previous {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+    built.expect("a loopback transport builds")
+}
+
+#[test]
+fn google_calendar_transport_never_routes_a_bearer_token_through_an_environment_proxy() {
+    // The containment this binds: a managed agent runs at operator trust and
+    // can set `HTTPS_PROXY` in this process's environment. Without
+    // `no_proxy()`, every `Authorization: Bearer` header would go to a host the
+    // agent named. The negative control below proves the assertion can fail.
+    let server = MockGoogle::start(1, 1_000_000);
+    let sentinel = ProxySentinel::start();
+    let base = server.base_url();
+
+    // Negative control: a configuration that *does* read the environment sends
+    // the request to the sentinel instead of the server.
+    let leaky = transport_with_proxy_env(
+        &TransportConfig::loopback_reading_environment_proxy(base.clone()),
+        &sentinel.url(),
     );
-    let no_slash = TransportConfig::loopback("https://www.googleapis.com/calendar/v3");
+    let leaked = leaky.send(
+        &CalendarRequest {
+            method: HttpMethod::Get,
+            path: "calendars/probe/events".to_string(),
+            query: Vec::new(),
+            body: None,
+            if_match: None,
+        },
+        &Redacted::new(ALICE_TOKEN.to_string()),
+        2_000,
+        1024,
+    );
     assert!(
-        HttpTransport::new(&no_slash).is_err(),
-        "a base without a trailing slash would compose the wrong URL"
+        leaked.is_err(),
+        "the sentinel is not a proxy, so a routed request cannot succeed"
+    );
+    assert!(
+        sentinel.connections() > 0,
+        "the negative control must actually reach the sentinel, or this test proves nothing"
+    );
+    let routed = sentinel.connections();
+    server.with_state(|state| state.requests.clear());
+
+    // The shipped configuration, with the same environment set at build time,
+    // reaches the server directly.
+    let pinned = transport_with_proxy_env(&TransportConfig::loopback(base), &sentinel.url());
+    let response = pinned
+        .send(
+            &CalendarRequest {
+                method: HttpMethod::Get,
+                path: format!("calendars/{CALENDAR_ID}/events"),
+                query: vec![("maxResults".to_string(), "1".to_string())],
+                body: None,
+                if_match: None,
+            },
+            &Redacted::new(ALICE_TOKEN.to_string()),
+            5_000,
+            64 * 1024,
+        )
+        .expect("the pinned transport reaches the loopback server directly");
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        server.with_state(|state| state.requests.len()),
+        1,
+        "the request must arrive at the server itself"
+    );
+    assert_eq!(
+        sentinel.connections(),
+        routed,
+        "no part of the pinned request may reach the proxy the environment named"
     );
 }
 
@@ -461,4 +630,106 @@ fn google_calendar_default_window_is_the_120_day_horizon() {
     assert_eq!(window.start_ms, -30 * 24 * 60 * 60 * 1000);
     assert_eq!(window.end_ms, 90 * 24 * 60 * 60 * 1000);
     assert_eq!(super::stale_after_ms(1_000), 1_000 + super::STALE_AFTER_MS);
+}
+
+#[test]
+fn google_calendar_walk_never_accumulates_past_the_event_cap() {
+    // The overshoot this binds: extending `events` with a whole page and only
+    // then checking the cap returns up to `max_events + page - 1` events. With
+    // a page of 4 and a cap of 3 that is 4, over T11 decision 6's row bound.
+    let server = MockGoogle::start(8, 1_000_000);
+    server.with_state(|state| state.page_size = 4);
+    let transport = transport_for(&server);
+    let limits = FetchLimits {
+        max_events: 3,
+        ..FetchLimits::default()
+    };
+    let batch = fetch_events(
+        &transport,
+        &frozen_clock(),
+        CALENDAR_ID,
+        window(),
+        &Redacted::new(ALICE_TOKEN.to_string()),
+        &limits,
+    )
+    .expect("the event cap truncates");
+    assert_eq!(
+        batch.events.len(),
+        3,
+        "the walk must never hold more events than the cap allows"
+    );
+    assert_eq!(
+        batch.interval.coverage,
+        Coverage::Truncated(TruncationReason::EventCap)
+    );
+    // The dropped fourth event of the page shares the page's largest start, so
+    // the proven interval must end at the last *kept* start, not the page's.
+    let last_kept_start = batch
+        .events
+        .last()
+        .and_then(|event| event.start.start_lower_bound_ms())
+        .expect("a timed event has a start");
+    assert_eq!(batch.interval.end_ms, last_kept_start);
+    assert!(!batch.interval.proves_instant(last_kept_start));
+}
+
+#[test]
+fn google_calendar_walk_binds_the_events_list_query_google_is_asked_for() {
+    // Deleting any of these from the query leaves the walk working against the
+    // mock and silently wrong against Google: without `singleEvents` a
+    // recurring series arrives unexpanded (T12a decision 5 puts expansion at
+    // Google), without `orderBy=startTime` the proven interval of decision 13
+    // is unsound because pages are unordered, and without `timeMin`/`timeMax`
+    // the walk asks for the whole calendar rather than T11 decision 6's window.
+    let server = MockGoogle::start(3, 1_000_000);
+    let transport = transport_for(&server);
+    let window = Window::new(1_000_000, 1_000_000 + 7 * 24 * 60 * 60 * 1000);
+    fetch_events(
+        &transport,
+        &frozen_clock(),
+        CALENDAR_ID,
+        window,
+        &Redacted::new(ALICE_TOKEN.to_string()),
+        &FetchLimits::default(),
+    )
+    .expect("the walk completes");
+
+    let (method, path, query) = server.with_state(|state| {
+        state
+            .requests
+            .first()
+            .cloned()
+            .expect("the walk made a request")
+    });
+    assert_eq!(method, "GET");
+    let decoded_path = percent_encoding::percent_decode_str(&path)
+        .decode_utf8_lossy()
+        .to_string();
+    assert_eq!(decoded_path, format!("/calendars/{CALENDAR_ID}/events"));
+    let pairs: std::collections::HashMap<String, String> = query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(key, value)| {
+            (
+                key.to_string(),
+                percent_encoding::percent_decode_str(value)
+                    .decode_utf8_lossy()
+                    .to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(pairs.get("singleEvents").map(String::as_str), Some("true"));
+    assert_eq!(pairs.get("orderBy").map(String::as_str), Some("startTime"));
+    assert_eq!(
+        pairs.get("maxResults").map(String::as_str),
+        Some(super::client::PAGE_SIZE.to_string().as_str())
+    );
+    let (time_min, time_max) =
+        super::dto::window_bounds_rfc3339(window).expect("the window is expressible");
+    assert_eq!(pairs.get("timeMin"), Some(&time_min));
+    assert_eq!(pairs.get("timeMax"), Some(&time_max));
+    assert!(
+        !query.contains("Bearer") && !query.contains(ALICE_TOKEN),
+        "no credential may appear in a URL: {query}"
+    );
 }

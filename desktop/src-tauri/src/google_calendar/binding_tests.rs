@@ -1,15 +1,20 @@
 //! Tests for the stored envelope, its compare-and-set predicates and the
 //! revocation journal (T11 decisions 2, 5, 6 and 9).
 //!
-//! Each predicate has a test that fails when the predicate is deleted, and the
-//! concurrent case is a barrier-held race over the shipped transition code.
+//! Every commit here runs through the shipped `KeychainEnvelopes::commit` over
+//! an in-memory blob that honours the same compare-and-set contract as
+//! `SecretStore::mutate_checked`; only the keychain I/O is replaced. So each
+//! predicate has a test that fails when the predicate is deleted, the
+//! refusal-versus-store error mapping is under test, and the concurrent case is
+//! a barrier-held race over the shipped transition code.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Barrier, Mutex};
 
 use super::binding::{
-    deserialize_envelope, envelope_key, serialize_envelope, CalendarEnvelope, Change,
-    CommitContext, CommitError, EnvelopeStore, JournalStep, TransitionError, ENVELOPE_KEY_PREFIX,
+    deserialize_envelope, envelope_key, serialize_envelope, BlobMutation, CalendarEnvelope, Change,
+    CheckedBlob, CommitContext, CommitError, EnvelopeStore, JournalStep, KeychainEnvelopes,
+    TransitionError, ENVELOPE_KEY_PREFIX,
 };
 use super::redact::Redacted;
 use super::revocation::{
@@ -20,11 +25,69 @@ use super::testing::{binding, context, CLIENT_ID, PUBKEY, SENTINEL};
 
 // ── The envelope and its predicates (T11 decisions 2, 5 and 6) ────────────
 
-/// An envelope store that serializes commits exactly as the keychain one does:
-/// one lock, a fresh read inside it, and no write when the predicate refuses.
+/// A blob that honours [`CheckedBlob`]'s contract exactly as
+/// `SecretStore::mutate_checked` does: one lock held across the whole
+/// read-modify-write, the candidate built in a separate allocation, and nothing
+/// written when the predicate refuses.
+///
+/// Only the keychain I/O is replaced. Every test below still commits through
+/// the shipped [`KeychainEnvelopes::commit`], so the predicate wiring, the
+/// refusal capture and the refusal-versus-store error mapping are production
+/// code under test.
+#[derive(Default)]
+struct MemoryBlob {
+    blob: Mutex<HashMap<String, String>>,
+    /// When set, the durable write fails after the predicate accepted — the
+    /// backend-error path, which is not a refusal.
+    write_fails: bool,
+}
+
+impl CheckedBlob for MemoryBlob {
+    fn mutate_checked(&self, f: BlobMutation<'_>) -> Result<(), String> {
+        let mut guard = self.blob.lock().expect("the store lock is not poisoned");
+        let mut next = guard.clone();
+        f(&mut next)?;
+        if self.write_fails {
+            return Err("keyring write: the backend is unavailable".to_string());
+        }
+        *guard = next;
+        Ok(())
+    }
+
+    fn load_all_readonly(&self) -> Result<Option<HashMap<String, String>>, String> {
+        Ok(Some(
+            self.blob
+                .lock()
+                .expect("the store lock is not poisoned")
+                .clone(),
+        ))
+    }
+}
+
+/// The shipped envelope store over an in-memory blob.
 #[derive(Default)]
 struct MemoryEnvelopes {
-    blob: Mutex<HashMap<String, String>>,
+    backing: MemoryBlob,
+}
+
+impl MemoryEnvelopes {
+    fn failing_writes() -> Self {
+        Self {
+            backing: MemoryBlob {
+                write_fails: true,
+                ..MemoryBlob::default()
+            },
+        }
+    }
+
+    /// Put a raw value in the blob, to exercise an unreadable stored envelope.
+    fn seed_raw(&self, key: &str, raw: &str) {
+        self.backing
+            .blob
+            .lock()
+            .expect("the store lock is not poisoned")
+            .insert(key.to_string(), raw.to_string());
+    }
 }
 
 impl EnvelopeStore for MemoryEnvelopes {
@@ -34,28 +97,63 @@ impl EnvelopeStore for MemoryEnvelopes {
         change: Change,
         context: &CommitContext,
     ) -> Result<(), CommitError> {
-        let mut blob = self.blob.lock().expect("the store lock is not poisoned");
-        let mut envelope = match blob.get(key) {
-            Some(raw) => deserialize_envelope(raw).map_err(CommitError::Store)?,
-            None => CalendarEnvelope::default(),
-        };
-        change
-            .apply(&mut envelope, context)
-            .map_err(CommitError::Refused)?;
-        blob.insert(
-            key.to_string(),
-            serialize_envelope(&envelope).map_err(CommitError::Store)?,
-        );
-        Ok(())
+        KeychainEnvelopes::new(&self.backing).commit(key, change, context)
     }
 
     fn read(&self, key: &str) -> Result<CalendarEnvelope, CommitError> {
-        let blob = self.blob.lock().expect("the store lock is not poisoned");
-        match blob.get(key) {
-            Some(raw) => deserialize_envelope(raw).map_err(CommitError::Store),
-            None => Ok(CalendarEnvelope::default()),
-        }
+        KeychainEnvelopes::new(&self.backing).read(key)
     }
+}
+
+#[test]
+fn google_calendar_a_backend_failure_is_never_reported_as_a_refused_predicate() {
+    // The two error arms of the shipped commit: a refusal names the transition
+    // the predicate rejected, a store error carries the backend's message and
+    // names no transition. Swapping them would tell a caller a keychain outage
+    // was a lost compare-and-set, and the caller would stop retrying.
+    let store = MemoryEnvelopes::failing_writes();
+    let key = envelope_key(PUBKEY);
+    let error = store
+        .commit(&key, Change::Connect(Box::new(binding(1))), &context(0))
+        .expect_err("a failing durable write is surfaced");
+    match error {
+        CommitError::Store(detail) => assert!(
+            detail.contains("backend is unavailable"),
+            "the backend's own message must survive: {detail}"
+        ),
+        other => panic!("a backend failure is not a refusal, got {other:?}"),
+    }
+    assert!(
+        store
+            .read(&key)
+            .expect("the envelope reads")
+            .active_binding
+            .is_none(),
+        "a failed write leaves nothing durable"
+    );
+}
+
+#[test]
+fn google_calendar_an_unreadable_stored_envelope_refuses_the_commit() {
+    // An envelope this build cannot read is never replaced with the default:
+    // that would drop a live journal entry. It is a store error, not a refusal.
+    let store = MemoryEnvelopes::default();
+    let key = envelope_key(PUBKEY);
+    store.seed_raw(
+        &key,
+        "{\"version\":999,\"active_binding\":null,\"pending\":[]}",
+    );
+    let error = store
+        .commit(&key, Change::Connect(Box::new(binding(1))), &context(0))
+        .expect_err("an unreadable envelope is not silently replaced");
+    assert!(
+        matches!(error, CommitError::Store(_)),
+        "an unreadable envelope is a store error, got {error:?}"
+    );
+    assert!(
+        store.read(&key).is_err(),
+        "the unreadable value is still there, not overwritten"
+    );
 }
 
 #[test]
@@ -449,4 +547,78 @@ fn google_calendar_envelope_key_is_outside_the_agent_namespace() {
         "no agent reference can name the calendar credential"
     );
     assert!(!buzz_secret_store_pkg::looks_like_reference(&key));
+}
+
+#[test]
+fn google_calendar_no_agent_capability_resolves_the_calendar_credential() {
+    // T11 decision 9: an agent has no authority over the calendar credential.
+    // The string check above is necessary and not sufficient — this drives the
+    // shipped `McpSecretLookup::resolve`, the one seam an agent's tools read
+    // secrets through, over a blob that really holds the envelope, with a
+    // capability that really resolves that agent's own secrets.
+    use buzz_secret_store_pkg::testing::MemoryBlobSource;
+    use buzz_secret_store_pkg::{AgentCapability, McpSecretLookup, McpSecretRef};
+
+    let key = envelope_key(PUBKEY);
+    let store = MemoryEnvelopes::default();
+    store
+        .commit(&key, Change::Connect(Box::new(binding(1))), &context(0))
+        .expect("the binding commits");
+    let envelope_blob = store
+        .backing
+        .blob
+        .lock()
+        .expect("the store lock is not poisoned")
+        .clone();
+    assert!(
+        envelope_blob
+            .get(&key)
+            .is_some_and(|raw| raw.contains(SENTINEL)),
+        "the fixture must really hold the credential, or this test proves nothing"
+    );
+
+    let source = MemoryBlobSource::default();
+    for (record, value) in &envelope_blob {
+        source.insert(record, value);
+    }
+    let capability = AgentCapability::mint("agent-one", 1, [7u8; 16]).expect("a valid agent id");
+    source.insert(
+        &buzz_secret_store_pkg::binding_key(&capability),
+        capability.binding_value(),
+    );
+    // The agent's own secret resolves, so the lookup below is refusing the
+    // calendar record specifically and not failing for an unrelated reason.
+    let own = McpSecretRef::parse("mcp:api-token").expect("a valid reference");
+    source.insert(
+        &buzz_secret_store_pkg::storage_key(&capability, &own),
+        "the agent's own secret",
+    );
+    let lookup = McpSecretLookup::new(source);
+    assert!(
+        lookup.resolve(&capability, &own).is_ok(),
+        "the control must resolve, or a refusal below means nothing"
+    );
+
+    // Everything an agent could write in a reference position to try to name
+    // the calendar record.
+    for attempt in [
+        key.clone(),
+        format!("mcp:{key}"),
+        format!("mcp:{ENVELOPE_KEY_PREFIX}"),
+        format!("mcp:../{key}"),
+        format!("mcp:{PUBKEY}"),
+        "mcp:identity".to_string(),
+    ] {
+        match McpSecretRef::parse(&attempt) {
+            Err(_) => {}
+            Ok(reference) => {
+                let resolved = lookup.resolve(&capability, &reference);
+                assert!(
+                    resolved.is_err(),
+                    "`{attempt}` resolved to a value; no agent reference may reach the calendar \
+                     credential"
+                );
+            }
+        }
+    }
 }

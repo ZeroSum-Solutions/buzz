@@ -187,19 +187,21 @@ fn serve(stream: TcpStream, state: &Arc<Mutex<MockState>>) {
     let idle = std::time::Duration::from_secs(60);
     let _ = stream.set_read_timeout(Some(idle));
     let _ = stream.set_write_timeout(Some(idle));
-    let Ok(clone) = stream.try_clone() else {
-        return;
-    };
-    let mut reader = BufReader::new(clone);
-    let mut writer = stream;
+    // `&TcpStream` implements both `Read` and `Write`, so the reader and the
+    // writer share one socket with no `dup`. A `try_clone` here used to close
+    // the connection silently when the process was near its descriptor limit —
+    // which the client sees as a reset in the middle of its request, a fixture
+    // defect that looks exactly like a transport bug.
+    let mut reader = BufReader::new(&stream);
+    let mut writer = &stream;
     while serve_one(&mut reader, &mut writer, state) {}
 }
 
 /// Read one request and answer it. Returns whether the connection may carry
 /// another.
 fn serve_one(
-    reader: &mut BufReader<TcpStream>,
-    writer: &mut TcpStream,
+    reader: &mut BufReader<&TcpStream>,
+    writer: &mut &TcpStream,
     state: &Arc<Mutex<MockState>>,
 ) -> bool {
     let mut request_line = String::new();

@@ -9,8 +9,10 @@
 //!
 //! The transport is a seam ([`CalendarTransport`]) so the walk, the caps and
 //! the classification are the same code in a test as in the app. The shipped
-//! transport pins HTTPS, refuses redirects and does not read proxy settings
-//! from the process environment.
+//! transport pins one origin and path prefix — parsed, not prefix-matched —
+//! refuses redirects, and does not read proxy settings from the process
+//! environment, because a managed agent at operator trust can name both the
+//! redirect target and the proxy.
 
 use std::io::Read as _;
 use std::time::Duration;
@@ -390,14 +392,29 @@ pub fn fetch_events<T: CalendarTransport + ?Sized, C: Clock + ?Sized>(
             default_time_zone = page.default_time_zone.clone();
         }
         dropped_cancelled += page.dropped_cancelled;
-        if let Some(max_start) = page.max_start_lower_bound_ms() {
+        page_token = page.next_page_token;
+
+        // The cap bounds what is *accumulated*, so it is applied to the page
+        // before the page is added: extending first and checking after would
+        // return up to `max_events + PAGE_SIZE - 1` events, over the partition
+        // bound the cap exists to hold.
+        let room = limits.max_events.saturating_sub(events.len());
+        let overshot = page.events.len() > room;
+        let mut kept = page.events;
+        kept.truncate(room);
+        // The proven bound comes from what was kept, never from what the page
+        // carried: a start whose siblings were dropped at the cap is not proven.
+        if let Some(max_start) = kept
+            .iter()
+            .filter_map(|event| event.start.start_lower_bound_ms())
+            .max()
+        {
             last_complete_max_start =
                 Some(last_complete_max_start.map_or(max_start, |seen| seen.max(max_start)));
         }
-        events.extend(page.events);
-        page_token = page.next_page_token;
+        events.extend(kept);
 
-        if events.len() >= limits.max_events {
+        if overshot || events.len() >= limits.max_events {
             stop!(TruncationReason::EventCap, None);
         }
         if page_token.is_none() {
@@ -595,16 +612,41 @@ fn encode_segment(raw: &str) -> String {
 
 // ── The shipped transport ─────────────────────────────────────────────────
 
+/// Which origin a transport is allowed to reach.
+///
+/// Not a free-form URL: an origin the caller could name is an origin an agent
+/// that reached the caller could name, and every request carries a bearer
+/// token. Only the two variants below exist, and one of them is test-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    /// The real Google Calendar API.
+    Google,
+    /// A loopback mock. Test-only.
+    #[cfg(test)]
+    LoopbackTest,
+}
+
+/// The exact scheme and host a shipped transport may reach.
+const GOOGLE_ORIGIN: (&str, &str, u16) = ("https", "www.googleapis.com", 443);
+/// The path prefix a shipped transport may reach below that origin.
+const GOOGLE_PATH_PREFIX: &str = "/calendar/v3/";
+
 /// Where the API lives and what the transport is allowed to do to reach it.
 #[derive(Debug, Clone)]
 pub struct TransportConfig {
-    /// Root the request path is composed onto, with a trailing slash.
-    pub base_url: String,
+    /// Root the request path is composed onto, with a trailing slash. Private:
+    /// it is checked against [`TransportConfig::origin`] when the transport is
+    /// built, and no caller may substitute another value.
+    base_url: String,
+    /// The origin the base URL must belong to.
+    origin: Origin,
     /// Whether proxy settings may be read from the process environment.
     ///
-    /// Always false: managed agents run at operator trust and can set
-    /// `HTTPS_PROXY` in this process's environment, and a bearer token must not
-    /// be routed by anything a spawned agent can name. There is no setter.
+    /// False in every shipped configuration: managed agents run at operator
+    /// trust and can set `HTTPS_PROXY` in this process's environment, and a
+    /// bearer token must not be routed by anything a spawned agent can name.
+    /// There is no setter; the only constructor that sets it is test-only and
+    /// exists so the containment has a test that fails when it is removed.
     use_environment_proxy: bool,
 }
 
@@ -612,15 +654,34 @@ impl TransportConfig {
     /// The Google Calendar API root.
     pub fn google() -> Self {
         Self {
-            base_url: "https://www.googleapis.com/calendar/v3/".to_string(),
+            base_url: format!(
+                "{}://{}{GOOGLE_PATH_PREFIX}",
+                GOOGLE_ORIGIN.0, GOOGLE_ORIGIN.1
+            ),
+            origin: Origin::Google,
             use_environment_proxy: false,
         }
+    }
+
+    /// The base URL requests are composed onto.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     /// Whether this configuration would read proxy settings from the
     /// environment.
     pub fn reads_environment_proxy(&self) -> bool {
         self.use_environment_proxy
+    }
+
+    /// Replace the base URL while keeping the origin the configuration pins.
+    ///
+    /// Test-only, and the only way to construct a Google-origin configuration
+    /// whose base URL is wrong: the shipped constructor cannot produce one, so
+    /// without this the origin check would have nothing to reject.
+    #[cfg(test)]
+    pub(crate) fn force_base_url_for_test(&mut self, base_url: impl Into<String>) {
+        self.base_url = base_url.into();
     }
 
     /// A configuration pointed at a loopback test server.
@@ -631,7 +692,69 @@ impl TransportConfig {
     pub(crate) fn loopback(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
+            origin: Origin::LoopbackTest,
             use_environment_proxy: false,
+        }
+    }
+
+    /// A loopback configuration that *does* read proxy settings from the
+    /// environment.
+    ///
+    /// Test-only, and the negative control for the containment: with it a
+    /// request follows `HTTPS_PROXY`, and without it the same request does not.
+    #[cfg(test)]
+    pub(crate) fn loopback_reading_environment_proxy(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            origin: Origin::LoopbackTest,
+            use_environment_proxy: true,
+        }
+    }
+}
+
+/// Check that `base_url` is exactly the origin and path prefix `origin` allows.
+///
+/// Parsing rather than prefix-matching: `https://www.googleapis.com.evil.test/`
+/// and `https://user@evil.test/?x=https://www.googleapis.com/` both start with
+/// the right characters and neither is Google.
+fn check_base_url(base_url: &str, origin: Origin) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(base_url)
+        .map_err(|error| format!("the calendar API base is not a URL: {error}"))?;
+    if !base_url.ends_with('/') {
+        return Err("the calendar API base must end in `/`".to_string());
+    }
+    if parsed.username() != "" || parsed.password().is_some() {
+        return Err("the calendar API base must carry no credentials".to_string());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("the calendar API base must carry no query or fragment".to_string());
+    }
+    match origin {
+        Origin::Google => {
+            let (scheme, host, port) = GOOGLE_ORIGIN;
+            if parsed.scheme() != scheme
+                || parsed.host_str() != Some(host)
+                || parsed.port_or_known_default() != Some(port)
+            {
+                return Err(format!(
+                    "the calendar API base must be {scheme}://{host}, got `{base_url}`"
+                ));
+            }
+            if !parsed.path().starts_with(GOOGLE_PATH_PREFIX) {
+                return Err(format!(
+                    "the calendar API base must be under {GOOGLE_PATH_PREFIX}, got `{base_url}`"
+                ));
+            }
+            Ok(())
+        }
+        #[cfg(test)]
+        Origin::LoopbackTest => {
+            if parsed.host_str() != Some("127.0.0.1") {
+                return Err(format!(
+                    "a loopback test base must be on 127.0.0.1, got `{base_url}`"
+                ));
+            }
+            Ok(())
         }
     }
 }
@@ -653,19 +776,11 @@ impl HttpTransport {
     /// Build a transport for `config`.
     ///
     /// # Errors
-    /// Returns a message when the base URL is not absolute, when it is not
-    /// HTTPS outside a test, or when the HTTP client cannot be built.
+    /// Returns a message when the base URL is not the exact origin and path
+    /// prefix the configuration's origin allows, or when the HTTP client
+    /// cannot be built.
     pub fn new(config: &TransportConfig) -> Result<Self, String> {
-        let plaintext_allowed = cfg!(test) && config.base_url.starts_with("http://127.0.0.1:");
-        if !config.base_url.starts_with("https://") && !plaintext_allowed {
-            return Err(format!(
-                "the calendar API base must be https, got `{}`",
-                config.base_url
-            ));
-        }
-        if !config.base_url.ends_with('/') {
-            return Err("the calendar API base must end in `/`".to_string());
-        }
+        check_base_url(&config.base_url, config.origin)?;
         let mut builder = reqwest::blocking::Client::builder()
             // A redirect would replay the bearer token at whatever host the
             // response named.

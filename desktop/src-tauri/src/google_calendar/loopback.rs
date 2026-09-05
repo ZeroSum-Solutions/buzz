@@ -3,9 +3,12 @@
 //! The installed-app flow redirects to `http://127.0.0.1:<port>`, so this
 //! process briefly accepts connections from anything running as the user. The
 //! listener therefore bounds the three quantities that cost: bytes read per
-//! connection, connections accepted before it gives up, and time — both per
-//! read and over the whole wait. One flow is in flight at a time; the caller
-//! drops the previous listener before binding a new one, so the newest wins.
+//! connection, connections accepted before it gives up, and time. The time
+//! bound is one deadline for the whole wait, carried into the per-connection
+//! read loop: a per-read timeout alone resets on every byte, so a local process
+//! that dribbles one byte per timeout would hold the flow open for hours. One
+//! flow is in flight at a time; the caller drops the previous listener before
+//! binding a new one, so the newest wins.
 
 use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
@@ -15,7 +18,11 @@ use std::time::{Duration, Instant};
 pub const MAX_REQUEST_BYTES: usize = 8 * 1024;
 /// Largest number of connections one wait accepts before giving up.
 pub const MAX_CONNECTIONS: usize = 8;
-/// Longest one connection may take to deliver its request line.
+/// Longest one connection may go without delivering another byte.
+///
+/// This is the idle bound only. The whole wait is bounded by
+/// [`WAIT_TIMEOUT_MS`], which is carried into the read loop, so a connection
+/// can never outlive the wait it belongs to.
 pub const READ_TIMEOUT_MS: u64 = 5_000;
 /// Longest the whole wait may take.
 pub const WAIT_TIMEOUT_MS: u64 = 5 * 60 * 1000;
@@ -27,7 +34,8 @@ pub struct ListenerLimits {
     pub max_request_bytes: usize,
     /// Largest number of connections accepted.
     pub max_connections: usize,
-    /// Longest one connection may take, in milliseconds.
+    /// Longest one connection may go without delivering another byte, in
+    /// milliseconds. Never longer than the remainder of `wait_timeout_ms`.
     pub read_timeout_ms: u64,
     /// Longest the whole wait may take, in milliseconds.
     pub wait_timeout_ms: u64,
@@ -114,26 +122,32 @@ impl CallbackListener {
     /// # Errors
     /// See [`ListenerError`].
     pub fn wait_for_callback(&self, limits: &ListenerLimits) -> Result<String, ListenerError> {
-        let started = Instant::now();
-        let wait = Duration::from_millis(limits.wait_timeout_ms);
+        let deadline = Instant::now() + Duration::from_millis(limits.wait_timeout_ms);
         let mut connections = 0usize;
         while connections < limits.max_connections {
-            if started.elapsed() >= wait {
+            if Instant::now() >= deadline {
                 return Err(ListenerError::TimedOut);
             }
             match self.listener.accept() {
                 Ok((stream, _)) => {
                     connections += 1;
-                    match read_callback(stream, limits) {
-                        Ok(Some(query)) => return Ok(query),
+                    // The wait's own deadline goes with the connection, so one
+                    // slow client cannot outlast the wait by dribbling bytes.
+                    match read_callback(stream, limits, deadline) {
+                        Ok(Callback::Received(query)) => return Ok(query),
                         // A refused connection is counted, not fatal: a browser
                         // preflight or a favicon request must not end the flow.
-                        Ok(None) => continue,
+                        Ok(Callback::Refused) => continue,
+                        Ok(Callback::WaitExpired) => return Err(ListenerError::TimedOut),
                         Err(error) => return Err(ListenerError::Io(error)),
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(25));
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(ListenerError::TimedOut);
+                    }
+                    std::thread::sleep(remaining.min(Duration::from_millis(25)));
                 }
                 Err(error) => return Err(ListenerError::Io(error.to_string())),
             }
@@ -142,16 +156,28 @@ impl CallbackListener {
     }
 }
 
-/// Read one request and answer it. `Ok(None)` means the connection was refused
-/// for a bound or a shape, and the caller may accept another.
-fn read_callback(mut stream: TcpStream, limits: &ListenerLimits) -> Result<Option<String>, String> {
-    let timeout = Duration::from_millis(limits.read_timeout_ms.max(1));
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(|error| error.to_string())?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(|error| error.to_string())?;
+/// What one accepted connection produced.
+enum Callback {
+    /// A usable `GET` with a query string.
+    Received(String),
+    /// Refused for a bound or a shape. Another connection may still arrive.
+    Refused,
+    /// The whole wait's deadline passed while this connection was being read.
+    WaitExpired,
+}
+
+/// Read one request and answer it.
+///
+/// `deadline` is the whole wait's deadline, not this connection's: each read
+/// waits for the shorter of the idle bound and the wait's remainder, so the
+/// total time this function can consume is bounded by the wait even when the
+/// client keeps sending a byte just before every idle timeout.
+fn read_callback(
+    mut stream: TcpStream,
+    limits: &ListenerLimits,
+    deadline: Instant,
+) -> Result<Callback, String> {
+    let idle = Duration::from_millis(limits.read_timeout_ms.max(1));
     stream
         .set_nonblocking(false)
         .map_err(|error| error.to_string())?;
@@ -163,8 +189,20 @@ fn read_callback(mut stream: TcpStream, limits: &ListenerLimits) -> Result<Optio
         // an attacker cannot make this buffer grow.
         if filled > limits.max_request_bytes {
             respond(&mut stream, 413, "Request too large.");
-            return Ok(None);
+            return Ok(Callback::Refused);
         }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            respond(&mut stream, 408, "Timed out.");
+            return Ok(Callback::WaitExpired);
+        }
+        let slice = remaining.min(idle);
+        stream
+            .set_read_timeout(Some(slice))
+            .map_err(|error| error.to_string())?;
+        stream
+            .set_write_timeout(Some(slice))
+            .map_err(|error| error.to_string())?;
         match stream.read(&mut buffer[filled..]) {
             Ok(0) => break,
             Ok(read) => {
@@ -180,41 +218,47 @@ fn read_callback(mut stream: TcpStream, limits: &ListenerLimits) -> Result<Optio
                 if error.kind() == std::io::ErrorKind::WouldBlock
                     || error.kind() == std::io::ErrorKind::TimedOut =>
             {
+                // Distinguish the idle bound from the wait's own deadline: the
+                // first refuses one connection, the second ends the wait.
+                if Instant::now() >= deadline {
+                    respond(&mut stream, 408, "Timed out.");
+                    return Ok(Callback::WaitExpired);
+                }
                 respond(&mut stream, 408, "Timed out.");
-                return Ok(None);
+                return Ok(Callback::Refused);
             }
             Err(error) => return Err(error.to_string()),
         }
     }
     if filled > limits.max_request_bytes {
         respond(&mut stream, 413, "Request too large.");
-        return Ok(None);
+        return Ok(Callback::Refused);
     }
 
     let head = String::from_utf8_lossy(&buffer[..filled]);
     let Some(request_line) = head.lines().next() else {
         respond(&mut stream, 400, "Empty request.");
-        return Ok(None);
+        return Ok(Callback::Refused);
     };
     let mut parts = request_line.split_whitespace();
     let (Some(method), Some(target)) = (parts.next(), parts.next()) else {
         respond(&mut stream, 400, "Malformed request.");
-        return Ok(None);
+        return Ok(Callback::Refused);
     };
     if method != "GET" {
         respond(&mut stream, 405, "Only GET is accepted.");
-        return Ok(None);
+        return Ok(Callback::Refused);
     }
     let Some((_, query)) = target.split_once('?') else {
         respond(&mut stream, 400, "No authorization parameters.");
-        return Ok(None);
+        return Ok(Callback::Refused);
     };
     respond(
         &mut stream,
         200,
         "Buzz has the authorization response. You can close this tab.",
     );
-    Ok(Some(query.to_string()))
+    Ok(Callback::Received(query.to_string()))
 }
 
 /// Write one fixed response. A failure here is not fatal: the request was
