@@ -29,6 +29,7 @@ export type FileFolder = {
   event: RelayEvent;
 };
 
+/** URL-safe slug for a folder name, used as the tail of its d-tag. */
 export function folderSlug(name: string): string {
   return name
     .toLowerCase()
@@ -36,6 +37,7 @@ export function folderSlug(name: string): string {
     .replace(/^-|-$/g, "");
 }
 
+/** The d-tag for a file folder: scoped to the channel, keyed by name slug. */
 export function folderDTag(channelId: string, slug: string): string {
   return `files-${channelId}:${slug}`;
 }
