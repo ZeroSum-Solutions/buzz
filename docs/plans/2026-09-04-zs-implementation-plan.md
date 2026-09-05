@@ -295,11 +295,42 @@ the root workspace excludes that manifest (`Cargo.toml:35`).
   ```
 - Bar: upstream's `command_search_dirs` semantics for dev builds unchanged.
 
+### T14 · feat/path-links — local file paths in messages open on this Mac (S)
+
+- Branch `feat/path-links`, after wave 4. Agents post report paths as text (`audit/verify/...md`, `buzz/approvals/<item>.html`). T15 attaches new files; this covers every path already in the history and any agent that forgets. Render a path token inside inline code (backticks) as a link when it resolves to an existing regular file under the sending agent's working directory or `$HOME/projects`. Click opens it with the OS default handler through Tauri's opener (macOS `open`), never executes it, never follows a symlink outside those roots, never asks the relay. Bare words never qualify. Nothing is resolved while a channel renders; resolution happens on hover or click. A `.md` under 2 MiB opens in the T2 viewer panel instead of the OS.
+- Tests: a tokenizer test file `pathLinks.test.mjs` next to the tokenizer (relative and absolute paths, `..` traversal rejected, symlink escape rejected, a path to a missing file stays text), a Rust test for the resolver's root containment (`commands/path_links_tests.rs`, registered in `commands/mod.rs`), and one e2e spec in the smoke allow-list that clicks a backticked `.md` path and asserts the viewer panel opens.
+- Eval:
+  ```
+  just desktop-test
+  cd desktop/src-tauri && cargo test commands::path_links
+  just desktop-e2e-smoke   # output lists path-links
+  ```
+- Acceptance: in the Broken English approvals channel, clicking the backticked `.html` path in an existing approval message opens the page in the browser; clicking a `.md` path opens the viewer; a path to a file that does not exist renders as plain text.
+- Bar: T2's viewer contract and Tauri opener scoping.
+
+### T15 · feat/cli-attach-documents — `buzz messages send --file` accepts documents (S)
+
+- Branch `feat/cli-attach-documents`. Today `crates/buzz-cli/src/client.rs:64` (`ALLOWED_MIMES`) admits only images and mp4, and `client.rs:1178` refuses everything else, so an agent that runs `buzz messages send --file report.md` gets "unsupported file type" and attaches nothing. The relay already accepts documents: `crates/buzz-relay/src/api/media.rs:362-420` routes a non-image body on `/upload` to `buzz_media::process_file_upload`, which checks the deny list at `crates/buzz-media/src/validation.rs:87` and the `max_file_bytes` cap (`crates/buzz-media/src/config.rs:78`). The desktop keys its markdown viewer off the imeta filename field, never the blob URL or MIME (`desktop/src/shared/ui/markdown/markdownDocFile.ts:5-9`; verify the exact field name in `desktop/src/shared/ui/markdown/parseImeta.ts` and match it).
+- Scope, CLI only, no relay or desktop change: (1) `upload_file` accepts any file whose sniffed type is an image, a video, or absent from the relay deny list; for a file with no magic bytes, declare the Content-Type from the extension (`.md`/`.markdown` text/markdown, `.html` text/html, `.pdf` application/pdf, `.csv` text/csv, `.json` application/json, `.txt` text/plain, otherwise application/octet-stream) and send it on `/upload` only; the legacy `/media/upload` fallback stays image-only. (2) Documents are capped client-side at the relay's `max_file_bytes` default with the same error shape as images. (3) `build_imeta_tag` (`client.rs:40`) gains the filename field for every attachment so the viewer and the Files tab classify it. (4) `messages send` (`crates/buzz-cli/src/commands/messages.rs:650-665`) appends `![image](url)` only for images and `![video](url)` for video; a document adds nothing to the content, the imeta tag carries it. (5) `buzz upload file` keeps printing the descriptor.
+- Tests that must exist and pass in `cargo nextest run -p buzz-cli`: content type by extension (each mapping, a `.bin` fallback, an uppercase extension); a `.md` body with no magic bytes is accepted while `.svg` and `.exe` bodies are refused with the deny-list reason before any request; the imeta tag for a document carries the filename field, `m text/markdown`, `x` and `size`, and no `dim` or `blurhash`; a document over the cap is refused client-side; `send` content for a document attachment has no `![image]` line. One test against the in-repo relay (the harness the `Backend Integration (relay e2e)` job uses, or a `buzz-relay` integration test that boots the router) uploads a real `.md` through `upload_file` and reads the blob back byte for byte; if no such harness can run from the crate, say so in the PR and record the manual command run against a local relay.
+- Eval:
+  ```
+  cargo nextest run -p buzz-cli
+  cargo clippy -p buzz-cli --all-targets -- -D warnings
+  just file-size-check
+  ```
+  After landing and the next app install, Devin runs from a shell with an agent's `BUZZ_PRIVATE_KEY`: `buzz messages send --channel <test channel> --content "T15 check" --file docs/plans/2026-09-04-zs-implementation-plan.md`, and the `.md` opens in the T2 viewer and lists in the T3 Files tab. The builder never posts to the live relay.
+- Acceptance: agents can attach markdown, HTML, PDF, CSV and JSON reports with `--file`; images and video behave exactly as before; the desktop opens the `.md` from the imeta filename; nothing on the deny list leaves the machine.
+- Bar: the desktop's own upload path in `desktop/src-tauri/src/commands/media.rs:425-475` (declared MIME, `/upload` first, legacy fallback only on 404 or 405) and the relay's `process_file_upload` contract.
+
 ## Order and parallelism
 
-Wave 1 (parallel build; serialized landing): T1, T2, T4, T5, T13, T8, T11.
-Wave 2: T3 (after wave 1 lands), then T3b after T3 lands; T7 memo then T7 (after T4); T12a (after T11); T6 config-generation half (fake server; the OpenSEO half waits for approval).
-Wave 3: T9 (after T2 and T8), T10 (after T3b), T12 (after T12a).
+Wave 1 (parallel build; serialized landing): T1 (landed, PR #6), T2 (landed, PR #5), T4 (landed,
+PR #4), T5 (landed, PR #7), T13 (landed, PR #1), T8 (landed, PR #3), T11 (landed, PR #2).
+Wave 2: T3 (landed, PR #11), then T3b after T3 lands (not started); T7 memo (landed, PR #9) then
+T7a (open, PR #14, not yet enqueued); T12a (open, PR #15, not yet enqueued); T6 config-generation
+half (fake server; landed, PR #8); the OpenSEO live half still waits for DataForSEO approval.
+Wave 3: T9 (landed, PR #13), T10 (after T3b, not started), T12 (after T12a, not started).
 
 ## Ticket list for GitHub issues
 
@@ -357,6 +388,50 @@ Created on the fork only when Devin asks. Titles:
   do not re-run it.
 - Scratch import branches from ports (`pr-<N>`) are left in place; deleting a branch needs Devin's
   explicit go-ahead on this machine.
+
+## Operational notes from waves 2 to 4 (2026-09-05)
+
+- Long pre-push hooks under load can outlast the SSH idle window. Git opens the SSH session
+  before the hooks run, so a slow hook run kills the push with exit 141 and nothing transfers.
+  Push with `GIT_SSH_COMMAND="ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=40"` and check
+  the exit code explicitly. A killed push can leave a zero-byte `.git/index.lock`; remove it only
+  after confirming no git process is still running.
+- Merge `origin/zs/main` into the branch before marking a PR ready. `dorny/paths-filter` run
+  against a stale base counts `zs/main`'s own changes since the branch forked, so it runs the
+  Rust and Postgres lanes even on a docs-only PR.
+- Local Playwright: `playwright.config.ts` sets `reuseExistingServer` when not on CI, so two
+  worktrees both running e2e on port 4173 silently test each other's build. Run e2e through a
+  scratch config on a free port with `reuseExistingServer: false`.
+- The Claude session limit can stop a workflow mid-run. Resume with the same run id so the
+  agents that already finished replay from cache instead of rerunning.
+- Merge-queue ejections seen so far: flaky `cluster_global_probe` postgres tests (now retried,
+  PR #10); apt mirror dropouts during the Playwright `install-deps` step (now retried, PR #10);
+  `inbox-live-update.spec.ts` scroll baseline (fixed in PR #12); `persistent-agent-audience.spec.ts`
+  and shard-3 five-second timeouts (still flaky; rerun and say so in the PR).
+- A header-box change moved `chromeWrapperRef` and shifted the channel column by 42 px without
+  failing any existing test, until the file-drop overlay no longer lined up with the drop zone.
+  The geometry test in `channel-files-tab.spec.ts` now binds the measured chrome height to the
+  header box so a future shift fails that test directly.
+- The T3 Files tab replaced upstream PR 4316's per-folder plaintext kind:30078 events with one
+  encrypted event per user and channel (folders v2). The relay is Block-hosted for this fork, so
+  relay-side scoping for the plaintext folder events cannot be deployed here.
+- Windows-only code paths (Job Objects, `launcher_windows` tests) run for the first time on CI,
+  not locally. Two harness bugs surfaced there: `Command::output` closing stdin, and a fixture
+  that assumed a Unix-absolute path.
+
+### Follow-up tickets filed
+
+- T2b: render markdown documents in a worker and bound the hast tree (from the T9 critic's
+  findings F7 and F8).
+- T3c: relay-side channel scoping for folder events, if the team ever self-hosts a relay.
+- T7a follow-ups carried in PR 14: unsafe acceptance for the Windows launcher, the
+  desktop-standalone sidecar list, a memo amendment for the Windows containment shape, and the
+  ten run-3 WARNs.
+- T6 live half still needs DataForSEO approval before it can run.
+- R1 (agent descriptions) is blocked on the "Agent-managed profiles" setting decision.
+- T14 and T15 filed 2026-09-05: the `buzz` CLI refuses non-image attachments, so agents post
+  report paths as text and nothing in a channel is clickable. T15 fixes the CLI; T14 makes the
+  existing paths open locally. The Broken English posting rule changes only after T15 is installed.
 
 ## Review log
 
