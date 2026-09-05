@@ -332,3 +332,68 @@ test("a folder row exposes its disclosure state and a keyboard move affordance",
     cleanup();
   }
 });
+
+/**
+ * A stand-in for the browser's `DataTransfer`, which jsdom does not implement.
+ * The drop path reads back exactly what the drag start wrote, so the stub only
+ * has to carry the key/value pairs between the two events.
+ */
+function stubDataTransfer() {
+  const store = new Map();
+  return {
+    dropEffect: "",
+    effectAllowed: "",
+    getData: (type) => store.get(type) ?? "",
+    setData: (type, value) => {
+      store.set(type, String(value));
+    },
+  };
+}
+
+test("dragging a file row onto a folder row assigns that one file to the folder", async () => {
+  const assignments = [];
+  const { act, cleanup, files, screen } = await renderTab({
+    files: [{ url: "https://media.example/a.png", filename: "a.png" }],
+    snapshot: {
+      folders: [{ id: FOLDER_ID, name: "Inbox", parent: null }],
+      files: {},
+    },
+    fileFolderMap: new Map(),
+    onAssignFiles: async (keys, folderId) => {
+      assignments.push([keys, folderId]);
+      return true;
+    },
+    onMoveFolder: async () => {},
+  });
+  try {
+    const { fireEvent } = await import("@testing-library/react");
+    const fileRow = screen
+      .getByRole("link", { name: "a.png", exact: true })
+      .closest('[draggable="true"]');
+    const folderRow = screen
+      .getByRole("button", { name: /Inbox/ })
+      .closest('[draggable="true"]');
+    assert.ok(fileRow, "the file row is draggable");
+    assert.ok(folderRow, "the folder row is a drop target");
+
+    const dataTransfer = stubDataTransfer();
+    await act(async () => {
+      fireEvent.dragStart(fileRow, { dataTransfer });
+    });
+    assert.equal(
+      dataTransfer.getData("text/plain"),
+      files[0].key,
+      "the drag carries the attachment key, not the message id",
+    );
+
+    await act(async () => {
+      fireEvent.dragOver(folderRow, { dataTransfer });
+    });
+    await act(async () => {
+      fireEvent.drop(folderRow, { dataTransfer });
+    });
+    assert.deepEqual(assignments, [[[files[0].key], FOLDER_ID]]);
+  } finally {
+    cleanup();
+  }
+});

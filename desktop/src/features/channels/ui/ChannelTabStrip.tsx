@@ -29,10 +29,10 @@ export type ChannelTabStripProps = {
  * panel each tab owns.
  *
  * The strip rides *inside* the channel header rather than between the header
- * and the tab content: the header is an overlay whose measured title-row
- * height drives every downstream offset (timeline padding, sticky day
- * divider, shared blur band), and a sibling strip would add a second,
- * unmeasured offset all of those miss.
+ * and the tab content: the header is an overlay whose measured height drives
+ * every downstream offset (timeline padding, sticky day divider, shared blur
+ * band), and a sibling strip would add a second, unmeasured offset all of
+ * those miss.
  */
 export function ChannelTabStrip({ activeTab, onSelect }: ChannelTabStripProps) {
   const refs = React.useRef<Array<HTMLButtonElement | null>>([]);

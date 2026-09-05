@@ -53,6 +53,88 @@ async function assertNoOverlap(page: Page) {
 }
 
 test.describe("channel Files tab", () => {
+  test("the tab strip grows the header box without shrinking the Chat column", async ({
+    page,
+  }) => {
+    // The composer chip is labelled from the upload descriptor the bridge
+    // answers with, so name it after the file this test drops.
+    await installMockBridge(page, {
+      uploadDescriptors: [
+        {
+          url: `https://mock.relay/media/${"c".repeat(64)}.pdf`,
+          sha256: "c".repeat(64),
+          size: 5,
+          type: "application/pdf",
+          uploaded: Math.floor(Date.now() / 1000),
+          filename: "handover.pdf",
+        },
+      ],
+    });
+    await page.goto("/");
+    await page.getByTestId(`channel-${CHANNEL_NAME}`).click();
+    await expect(page.getByTestId("chat-title")).toHaveText(CHANNEL_NAME);
+    // The strip is present and Chat is the selected tab: this is the layout
+    // every assertion below is about.
+    await expect(page.getByRole("tab", { name: "Files" })).toBeVisible();
+    await expect(page.getByRole("tab", { name: "Chat" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+
+    // The channel header is a measured overlay: the chrome wrapper's height
+    // becomes --buzz-channel-content-top-padding and that same variable is its
+    // negative bottom margin, so the header contributes zero flow height. The
+    // tab strip lives inside that measured box, so the variable must equal the
+    // whole header — measuring the title row alone would leave the strip's
+    // height uncancelled and push the entire Chat column down by it.
+    const measured = await page.evaluate(() => {
+      const header = document.querySelector<HTMLElement>(
+        '[data-testid="chat-header"]',
+      );
+      if (!header) return null;
+      const declared = getComputedStyle(header)
+        .getPropertyValue("--buzz-channel-content-top-padding")
+        .trim();
+      return {
+        declaredPx: Number.parseFloat(declared),
+        headerHeight: header.getBoundingClientRect().height,
+      };
+    });
+    expect(measured, "the channel header is on screen").not.toBeNull();
+    expect(
+      measured?.declaredPx,
+      "the measured chrome variable must span the whole header, tab strip included",
+    ).toBeCloseTo(measured?.headerHeight ?? 0, 0);
+
+    // The consequence that the regression actually broke: the channel column's
+    // drop overlay must still cover the column edge to edge, and a drop on it
+    // must still attach to the composer while Chat is the active tab.
+    const dataTransfer = await page.evaluateHandle(() => {
+      const transfer = new DataTransfer();
+      transfer.items.add(
+        new File(["notes"], "handover.pdf", { type: "application/pdf" }),
+      );
+      return transfer;
+    });
+    const dropZone = page.getByTestId("channel-drop-zone");
+    await dropZone.dispatchEvent("dragenter", { dataTransfer });
+    const overlay = dropZone.getByTestId("drop-zone-overlay");
+    await expect(overlay).toBeVisible();
+    const [dropZoneBox, overlayBox] = await Promise.all([
+      dropZone.boundingBox(),
+      overlay.boundingBox(),
+    ]);
+    expect(
+      overlayBox,
+      "the drop overlay covers the whole channel column",
+    ).toEqual(dropZoneBox);
+
+    await dropZone.dispatchEvent("drop", { dataTransfer });
+    await expect(page.getByTestId("message-composer")).toContainText(
+      "handover.pdf",
+    );
+  });
+
   test("lists file attachments, labels a Markdown file by its imeta filename, and jumps back to the message", async ({
     page,
   }) => {

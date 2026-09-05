@@ -1105,7 +1105,7 @@ export function ChannelScreen({
                   <>
                     {channelHeader}
                     {/* The header overlays the top of this column (its own
-                        negative margin cancels its measured title row), so the
+                        negative margin cancels its measured height), so the
                         Files content clears exactly that one measured offset —
                         the same offset MessageTimeline applies on Chat. */}
                     <div

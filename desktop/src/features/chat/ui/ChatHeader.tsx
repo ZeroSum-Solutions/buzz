@@ -24,9 +24,14 @@ type ChatHeaderProps = {
   actions?: React.ReactNode;
   belowSystemChrome?: boolean;
   /**
-   * Ref to the measured title row. Its height becomes
-   * `--buzz-channel-content-top-padding`, so it deliberately excludes `tabs`
-   * — every header-relative offset downstream clears the title row only.
+   * Ref to the outer chrome wrapper when `belowSystemChrome` is true. Its
+   * height becomes `--buzz-channel-content-top-padding`, and the same
+   * variable is the wrapper's own negative bottom margin, so the header
+   * contributes zero flow height and overlays the content below it. `tabs`
+   * is inside that box on purpose: leaving it out would make the wrapper
+   * taller than the margin cancels, pushing the whole column down by the
+   * strip's height and shrinking every child of the column — including the
+   * channel drop-zone overlay — by that much.
    */
   chromeWrapperRef?: React.Ref<HTMLDivElement>;
   title: string;
@@ -135,11 +140,11 @@ export function ChatHeader({
       data-testid="chat-header"
       data-tauri-drag-region
     >
-      {/* The measured row. `py-2` lives here rather than on <header> so the
-          measured chrome height stays the title row alone even when `tabs`
-          grows the header box, and so <header>'s own inline padding (read by
-          the header-action gap assertions) is unchanged. */}
-      <div className="py-2" ref={chromeWrapperRef}>
+      {/* `py-2` lives on the title row rather than on <header> so `tabs`
+          renders flush under it instead of below a stale 8px gap, and so
+          <header>'s own inline padding (read by the header-action gap
+          assertions) is unchanged. */}
+      <div className="py-2">
         <div className="flex h-9 min-w-0 items-center gap-2.5">
           <div className="min-w-0 flex-1">
             <div className="group/title flex min-w-0 items-center gap-[4px] overflow-hidden">
@@ -198,6 +203,7 @@ export function ChatHeader({
 
   return (
     <div
+      ref={chromeWrapperRef}
       className={cn(
         "pointer-events-none relative z-40 overflow-visible rounded-tl-xl",
         transparentChrome
