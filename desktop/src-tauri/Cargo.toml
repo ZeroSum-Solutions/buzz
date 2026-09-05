@@ -69,6 +69,9 @@ user-idle = { version = "0.6", default-features = false }
 
 [dependencies]
 atomic-write-file = "0.3"
+# Cross-process advisory file lock for the configuration-mutation lock. Kept off
+# std's `File::lock` so the crate stays buildable on the declared 1.88 MSRV.
+fs2 = "0.4"
 anyhow = "1"
 dirs = "6"
 tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }
@@ -107,6 +110,11 @@ buzz_persona_pkg = { package = "buzz-persona", path = "../../crates/buzz-persona
 buzz_sdk_pkg = { package = "buzz-sdk", path = "../../crates/buzz-sdk" }
 buzz_agent_pkg = { package = "buzz-agent", path = "../../crates/buzz-agent" }
 buzz_secret_store_pkg = { package = "buzz-secret-store", path = "../../crates/buzz-secret-store" }
+# Registry validation asks the launcher for the upstream and proxy-variable
+# rules rather than keeping a second copy that can drift. `default-features =
+# false` keeps the keyring backend out of a desktop build that turned its own
+# `system-keyring` off.
+buzz_mcp_launch_pkg = { package = "buzz-mcp-launch", path = "../../crates/buzz-mcp-launch", default-features = false }
 buzz_voice_pkg = { package = "buzz-voice", path = "../../crates/buzz-voice" }
 buzz_terminal = { package = "buzz-terminal", path = "crates/buzz-terminal" }
 buzz_ws_client_pkg = { package = "buzz-ws-client", path = "../../crates/buzz-ws-client" }
@@ -147,6 +155,7 @@ rubato = "3.0"
 audioadapter-buffers = "3.0"
 tempfile = "3"
 strip-ansi-escapes = "0.2"
+thiserror = "2"
 tracing = "0.1"
 
 [dev-dependencies]

@@ -717,6 +717,51 @@ pub struct AcpRuntimeCatalogEntry {
     pub mcp_native_transports: Vec<super::discovery::McpTransport>,
 }
 
+impl AcpRuntimeCatalogEntry {
+    /// Neutral values for a harness the app did not compile in.
+    ///
+    /// A preset or custom entry is plain ACP: no MCP sidecar, no env-var model
+    /// switching, no thinking knobs, and no MCP registry support. `avatar_url`
+    /// is empty on purpose — a catalog entry never carries a user-supplied
+    /// icon URL, and the UI falls back to a bundled asset.
+    ///
+    /// Only the identity and availability of the harness need to be filled in
+    /// by the caller; everything else is already what a plain ACP entry means.
+    pub fn plain_acp() -> Self {
+        Self {
+            id: String::new(),
+            label: String::new(),
+            avatar_url: String::new(),
+            availability: AcpAvailabilityStatus::NotInstalled,
+            command: None,
+            binary_path: None,
+            default_args: Vec::new(),
+            mcp_command: None,
+            model_env_var: None,
+            provider_env_var: None,
+            thinking_env_var: None,
+            effort_canonical_values: None,
+            max_tokens_env_var: None,
+            context_limit_env_var: None,
+            max_rounds_env_var: None,
+            install_hint: String::new(),
+            install_instructions_url: String::new(),
+            can_auto_install: false,
+            requires_external_cli: false,
+            underlying_cli_path: None,
+            node_required: false,
+            auth_status: AuthStatus::NotApplicable,
+            login_hint: None,
+            source: HarnessSource::Custom,
+            definition_env: BTreeMap::new(),
+            max_parallelism: None,
+            mcp_config_placement: super::discovery::McpConfigPlacement::Unsupported,
+            mcp_transports: Vec::new(),
+            mcp_native_transports: Vec::new(),
+        }
+    }
+}
+
 /// Result of a single install step (CLI or adapter).
 #[derive(Debug, Clone, Serialize)]
 pub struct InstallStepResult {

@@ -1093,6 +1093,7 @@ dependencies = [
  "block2",
  "buzz-agent",
  "buzz-core",
+ "buzz-mcp-launch",
  "buzz-media",
  "buzz-persona",
  "buzz-sdk",
@@ -1108,6 +1109,7 @@ dependencies = [
  "earshot",
  "ed25519-dalek",
  "flate2",
+ "fs2",
  "futures-util",
  "getrandom 0.2.17",
  "hex",
@@ -1161,6 +1163,7 @@ dependencies = [
  "tauri-plugin-window-state",
  "tauri-utils",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite 0.29.0",
  "tokio-util",
@@ -1174,6 +1177,24 @@ dependencies = [
  "windows-sys 0.61.2",
  "zeroize",
  "zip 8.6.0",
+]
+
+[[package]]
+name = "buzz-mcp-launch"
+version = "0.1.0"
+dependencies = [
+ "buzz-secret-store",
+ "clap",
+ "nix 0.31.3",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

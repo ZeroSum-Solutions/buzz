@@ -225,6 +225,57 @@ impl KnownAcpRuntime {
 }
 
 #[cfg(test)]
+impl KnownAcpRuntime {
+    /// A neutral runtime for tests that care about two or three fields.
+    ///
+    /// Deliberately `#[cfg(test)]` and not a `Default` impl: the catalog stays
+    /// exhaustive, so adding a capability fact still forces a decision on every
+    /// real runtime. It only spares the hand-listed test literals, which
+    /// otherwise have to be edited — and can be edited wrongly — for a field
+    /// they do not exercise.
+    pub(crate) fn test_stub() -> Self {
+        Self {
+            id: "",
+            label: "",
+            commands: &[],
+            aliases: &[],
+            avatar_url: "",
+            mcp_command: None,
+            mcp_hooks: false,
+            underlying_cli: None,
+            cli_install_commands: &[],
+            cli_install_commands_windows: &[],
+            adapter_install_commands: &[],
+            cli_install_instructions_url: "",
+            adapter_install_instructions_url: "",
+            cli_install_hint: "",
+            adapter_install_hint: "",
+            skill_dir: None,
+            supports_acp_model_switching: false,
+            model_env_var: None,
+            provider_env_var: None,
+            provider_locked: false,
+            default_env: &[],
+            config_file_path: None,
+            config_file_format: None,
+            supports_acp_native_config: false,
+            thinking_env_var: None,
+            effort_normalization: None,
+            effort_accepted_values: None,
+            max_tokens_env_var: None,
+            context_limit_env_var: None,
+            max_rounds_env_var: None,
+            required_normalized_fields: &[],
+            login_hint: None,
+            auth_probe_args: None,
+            mcp_config_placement: McpConfigPlacement::Unsupported,
+            mcp_transports: &[],
+            mcp_native_transports: &[],
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::super::known_acp_runtime_exact;
     use super::{McpConfigPlacement, McpTransport};
