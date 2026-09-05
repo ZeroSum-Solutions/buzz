@@ -31,6 +31,9 @@ mod managed_agent_definition;
 pub(crate) mod media;
 mod media_animated;
 mod media_download;
+#[cfg(test)]
+#[path = "media_download_tests.rs"]
+mod media_download_tests;
 mod media_fetch_cancellation;
 mod media_filename;
 mod media_gif;

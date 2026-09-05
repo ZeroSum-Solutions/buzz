@@ -228,6 +228,12 @@ desktop-tauri-test: _ensure-sidecar-stubs
 desktop-terminal-performance-test:
     cargo test --manifest-path desktop/src-tauri/crates/buzz-terminal/Cargo.toml --release --test latency g3_renderer_acquire_stays_within_frame_budget -- --ignored --exact --nocapture
 
+# Measure the markdown document viewer's panel-ready and main-thread budgets.
+# Excluded from shared CI for the same reason as the terminal latency gate: the
+# budgets are host-relative and a loaded runner fails them without a regression.
+desktop-markdown-doc-performance-test:
+    cd desktop && BUZZ_RUN_PERF_MEASURE=1 pnpm test:e2e:smoke -- --grep "MEASURE: a fixed ~500 KB document"
+
 # Verify compiled-flag behavior under both compile states (clean + capability set).
 # Runs the auto-connect and owner-only access focused tests twice with
 # independently supplied expected values; build.rs rerun-if-env-changed

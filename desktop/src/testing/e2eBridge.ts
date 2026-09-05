@@ -460,6 +460,28 @@ type E2eConfig = {
      *  (e.g. `["link-preview-image"]` fails only the thumbnail, favicon survives). */
     linkPreviewUploadErrorFilenames?: string[];
     searchProfiles?: MockSearchProfileSeed[];
+    /** Pubkeys whose profile stays fully seeded (via `searchProfiles` or
+     *  managed/relay agent registration) but is withheld from `search_users`
+     *  results. Lets a spec isolate `get_users_batch` (which still resolves
+     *  these normally) from global user search, so an assertion that
+     *  depends on an `about` reaching the UI can only pass through the
+     *  batch fallback. */
+    usersBatchOnlyPubkeys?: string[];
+    /** Hold every `get_users_batch` call from the first render (equivalent
+     *  to calling `__BUZZ_E2E_HOLD_USERS_BATCH__(true)` before the app
+     *  could issue one). Without this, an app-shell-wide caller that
+     *  resolves before a spec's own interaction (e.g. the agent-observer
+     *  bridge's blanket profile sweep) can pre-warm `useUsersBatchQuery`'s
+     *  per-pubkey delta-fetch cache for the same pubkeys a later, narrower
+     *  caller wants — so the later caller's `useUsersBatchQuery` resolves
+     *  from cache and never issues its own IPC call, making a raw
+     *  `get_users_batch` call count unable to observe it at all. Starting
+     *  held keeps every caller's request recorded (`__BUZZ_E2E_COMMAND_
+     *  PAYLOADS__` still records a held call immediately) before any of
+     *  them can resolve and cache; release with
+     *  `__BUZZ_E2E_HOLD_USERS_BATCH__(false)` once every request of
+     *  interest has been recorded. */
+    startWithUsersBatchHeld?: boolean;
     updateAvailable?: boolean;
     updateChannelDelayMs?: number;
     updateDownloadDelayMs?: number;
@@ -715,6 +737,7 @@ type RawUserProfileSummary = {
   display_name: string | null;
   name?: string | null;
   avatar_url: string | null;
+  about?: string | null;
   nip05_handle: string | null;
   owner_pubkey: string | null;
   is_agent?: boolean;
@@ -1738,6 +1761,60 @@ let cancelledMediaFetchIds = new Set<string>();
 let mockMediaFetchControllers = new Map<string, AbortController>();
 let deferNextChannelsRead = false;
 let deferredChannelsReadResolve: (() => void) | null = null;
+
+/**
+ * Shared mock for `fetch_media_bytes` and `fetch_markdown_doc_bytes`: both
+ * real Rust commands stream through the same `request_id`-keyed
+ * cancellation registry (`begin_media_fetch` / `finish_media_fetch`), so
+ * this mirrors that with one `AbortController` per `requestId` — a spec
+ * asserting `__BUZZ_E2E_MEDIA_FETCH_STATE__.active` returns to zero after
+ * close/replace/community-switch exercises both commands identically.
+ */
+async function runCancellableMediaFetch(
+  input: { requestId?: string; url: string },
+  options?: { maxBytes?: number },
+): Promise<ArrayBuffer> {
+  const requestId = input.requestId ?? crypto.randomUUID();
+  const controller = new AbortController();
+  mockMediaFetchControllers.set(requestId, controller);
+  if (cancelledMediaFetchIds.has(requestId)) controller.abort();
+  if (!window.__BUZZ_E2E_MEDIA_FETCH_STATE__) {
+    window.__BUZZ_E2E_MEDIA_FETCH_STATE__ = { active: 0, peak: 0 };
+  }
+  const stats = window.__BUZZ_E2E_MEDIA_FETCH_STATE__;
+  stats.active += 1;
+  stats.peak = Math.max(stats.peak, stats.active);
+  try {
+    if (window.__BUZZ_E2E_HOLD_MEDIA_FETCHES__) {
+      await new Promise<never>((_resolve, reject) => {
+        const rejectCancelled = () =>
+          reject(new DOMException("fetch cancelled", "AbortError"));
+        if (controller.signal.aborted) {
+          rejectCancelled();
+          return;
+        }
+        controller.signal.addEventListener("abort", rejectCancelled, {
+          once: true,
+        });
+      });
+    }
+    const response = await fetch(input.url, { signal: controller.signal });
+    if (!response.ok) throw new Error(`fetch failed: ${response.status}`);
+    const buffer = await response.arrayBuffer();
+    if (
+      options?.maxBytes !== undefined &&
+      buffer.byteLength > options.maxBytes
+    ) {
+      throw new Error(
+        `file too large (max ${options.maxBytes / (1024 * 1024)} MiB)`,
+      );
+    }
+    return buffer;
+  } finally {
+    stats.active -= 1;
+    mockMediaFetchControllers.delete(requestId);
+  }
+}
 
 const mockDisplayNames = new Map<string, string>([
   [MOCK_IDENTITY_PUBKEY, DEFAULT_MOCK_IDENTITY.display_name],
@@ -2767,6 +2844,12 @@ function seedMockSearchProfiles(config?: E2eConfig) {
     if (seed.isAgent) {
       mockAgentPubkeys.add(pubkey);
     }
+  }
+}
+
+function seedMockUsersBatchOnlyPubkeys(config?: E2eConfig) {
+  for (const pubkey of config?.mock?.usersBatchOnlyPubkeys ?? []) {
+    mockUsersBatchOnlyPubkeys.add(pubkey.toLowerCase());
   }
 }
 
@@ -4157,6 +4240,9 @@ function handleGetWorkflowRuns(args: {
 function handleGetRunApprovals(_args: { workflowId: string; runId: string }) {
   return { approvals: [] };
 }
+
+// Pubkeys withheld from `search_users` results — see `usersBatchOnlyPubkeys`.
+const mockUsersBatchOnlyPubkeys = new Set<string>();
 
 const mockProfiles = new Map<string, RawProfile>([
   [
@@ -6948,6 +7034,7 @@ async function handleGetUsersBatch(
         display_name: profile.display_name,
         name: profile.name ?? null,
         avatar_url: profile.avatar_url,
+        about: profile.about,
         nip05_handle: profile.nip05_handle,
         owner_pubkey: profile.owner_pubkey,
         is_agent: profile.is_agent ?? false,
@@ -6973,6 +7060,7 @@ async function handleGetUsersBatch(
       display_name: content.display_name ?? content.name ?? null,
       name: content.name ?? null,
       avatar_url: content.picture ?? null,
+      about: content.about ?? null,
       nip05_handle: content.nip05 ?? null,
       owner_pubkey:
         ((ev.tags ?? []) as string[][]).find(
@@ -7002,6 +7090,7 @@ async function handleGetUsersBatch(
       display_name: profile.display_name,
       name: profile.name ?? null,
       avatar_url: profile.avatar_url,
+      about: profile.about,
       nip05_handle: profile.nip05_handle,
       owner_pubkey: profile.owner_pubkey,
       is_agent: profile.is_agent ?? false,
@@ -7033,6 +7122,7 @@ async function handleSearchUsers(
     const limit = args.limit ?? 8;
     const page = Math.max(Number(args.cursor ?? 1) || 1, 1);
     const allResults = listMockProfiles()
+      .filter((profile) => !mockUsersBatchOnlyPubkeys.has(profile.pubkey))
       .filter((profile) => {
         if (normalizedQuery.length === 0) {
           return true;
@@ -7059,6 +7149,7 @@ async function handleSearchUsers(
         pubkey: profile.pubkey,
         display_name: profile.display_name,
         avatar_url: profile.avatar_url,
+        about: profile.about,
         nip05_handle: profile.nip05_handle,
         owner_pubkey: profile.owner_pubkey,
         is_agent: profile.is_agent ?? false,
@@ -7085,6 +7176,7 @@ async function handleSearchUsers(
       pubkey: ev.pubkey ?? "",
       display_name: content.display_name ?? content.name ?? null,
       avatar_url: content.picture ?? null,
+      about: content.about ?? null,
       nip05_handle: content.nip05 ?? null,
       owner_pubkey:
         ((ev.tags ?? []) as string[][]).find(
@@ -11319,7 +11411,7 @@ export function maybeInstallE2eTauriMocks() {
   deferredLinkPreviewMetadataQueue = [];
   deferredLinkPreviewUploadQueue = [];
   deferredThreadRepliesQueue = [];
-  holdUsersBatch = false;
+  holdUsersBatch = config.mock?.startWithUsersBatchHeld ?? false;
   heldUsersBatchReleases = [];
   cancelledMediaUploadIds = new Set<string>();
   for (const controller of mockMediaFetchControllers.values()) {
@@ -11364,6 +11456,7 @@ export function maybeInstallE2eTauriMocks() {
   resetMockPersonas(config);
   resetMockTeams(config);
   seedMockSearchProfiles(config);
+  seedMockUsersBatchOnlyPubkeys(config);
   resetMockWorkflows();
   resetMockMesh();
   resetMockUserStatuses();
@@ -14396,45 +14489,10 @@ export function maybeInstallE2eTauriMocks() {
           },
           activeConfig,
         );
-      case "fetch_media_bytes": {
-        // The real command fetches relay media through Rust reqwest and
-        // replies with raw bytes (`tauri::ipc::Response` → ArrayBuffer). In
-        // E2E the browser fetch suffices — specs serve the URL via page.route.
-        const input = payload as { requestId?: string; url: string };
-        const requestId = input.requestId ?? crypto.randomUUID();
-        const controller = new AbortController();
-        mockMediaFetchControllers.set(requestId, controller);
-        if (cancelledMediaFetchIds.has(requestId)) controller.abort();
-        if (!window.__BUZZ_E2E_MEDIA_FETCH_STATE__) {
-          window.__BUZZ_E2E_MEDIA_FETCH_STATE__ = { active: 0, peak: 0 };
-        }
-        const stats = window.__BUZZ_E2E_MEDIA_FETCH_STATE__;
-        stats.active += 1;
-        stats.peak = Math.max(stats.peak, stats.active);
-        try {
-          if (window.__BUZZ_E2E_HOLD_MEDIA_FETCHES__) {
-            await new Promise<never>((_resolve, reject) => {
-              const rejectCancelled = () =>
-                reject(new DOMException("fetch cancelled", "AbortError"));
-              if (controller.signal.aborted) {
-                rejectCancelled();
-                return;
-              }
-              controller.signal.addEventListener("abort", rejectCancelled, {
-                once: true,
-              });
-            });
-          }
-          const response = await fetch(input.url, {
-            signal: controller.signal,
-          });
-          if (!response.ok) throw new Error(`fetch failed: ${response.status}`);
-          return await response.arrayBuffer();
-        } finally {
-          stats.active -= 1;
-          mockMediaFetchControllers.delete(requestId);
-        }
-      }
+      case "fetch_media_bytes":
+        return runCancellableMediaFetch(
+          payload as { requestId?: string; url: string },
+        );
       case "cancel_media_fetch": {
         const requestId = (payload as { requestId?: string }).requestId;
         if (requestId) {
@@ -14451,6 +14509,16 @@ export function maybeInstallE2eTauriMocks() {
         }
         return null;
       }
+      case "fetch_markdown_doc_bytes":
+        // Shares `fetch_media_bytes`' cancellation registry (real Rust side
+        // shares the same `request_id`-keyed registry too) and additionally
+        // mirrors the real command's native 2 MiB viewer cap (enforced in
+        // Rust during the streamed fetch) so specs can prove the oversized
+        // fallback: the refusal message must match the Rust cap error shape.
+        return runCancellableMediaFetch(
+          payload as { requestId?: string; url: string },
+          { maxBytes: 2 * 1024 * 1024 },
+        );
       case "fetch_snapshot_bytes": {
         // The real command fetches + validates a snapshot attachment in memory
         // (size cap, SHA-256, decode). In E2E the bridge returns a minimal

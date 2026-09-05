@@ -28,6 +28,23 @@ const tokenCache = new Map<string, ThemedToken[][]>();
 const MAX_CACHE_ENTRIES = 100;
 const MAX_LOADED_LANGUAGES = 30;
 const MAX_HIGHLIGHT_LINES = 150;
+/**
+ * Above this many characters, synchronous Shiki tokenization is skipped
+ * regardless of line count. A document can stay under `MAX_HIGHLIGHT_LINES`
+ * while still being huge — the markdown-doc-viewer's own fixture is 506,681
+ * bytes across only 122 lines — and `codeToTokens` on a payload that size is
+ * measured at 204ms, over this app's 200ms main-thread task budget, plus a
+ * multi-MB `tokenCache` key per distinct document. 200 KiB keeps that call
+ * comfortably under budget by the same measured ratio.
+ */
+const MAX_HIGHLIGHT_BYTES = 200 * 1024;
+/**
+ * Above this many lines, the plain-text (no-highlight) fallback below stops
+ * rendering more `<span>` elements rather than emitting one per line —
+ * unbounded at a document's full line count, an adversarial flat list at the
+ * viewer's 2 MiB cap would mean 524,288 DOM nodes for this fallback alone.
+ */
+const MAX_PLAIN_TEXT_LINES = 2000;
 export const CODE_BLOCK_CLASS =
   "code-block-lines block min-w-full whitespace-pre font-mono text-sm font-medium text-foreground";
 const DIFF_ADD_RE = /\s*\/\/\s*\[!code\s*\+\+\]\s*$/;
@@ -194,6 +211,7 @@ export function SyntaxHighlightedCode({
       !loadedThemes.has(shikiTheme)
     )
       return null;
+    if (code.length > MAX_HIGHLIGHT_BYTES) return null;
     if ((code.match(/\n/g) || []).length > MAX_HIGHLIGHT_LINES) return null;
     const cacheKey = `${language}:${shikiTheme}:${code}`;
     const cached = tokenCache.get(cacheKey);
@@ -217,7 +235,9 @@ export function SyntaxHighlightedCode({
   const codeClassName = cn(CODE_BLOCK_CLASS, className);
 
   if (!tokens) {
-    const lines = code.split("\n");
+    const allLines = code.split("\n");
+    const lines = allLines.slice(0, MAX_PLAIN_TEXT_LINES);
+    const hiddenCount = allLines.length - lines.length;
     return (
       <code {...props} className={codeClassName}>
         {lines.map((line, i) => (
@@ -226,6 +246,15 @@ export function SyntaxHighlightedCode({
             {line}
           </span>
         ))}
+        {hiddenCount > 0 ? (
+          <span
+            className="text-muted-foreground/70"
+            data-line=""
+            data-testid="code-block-truncated-notice"
+          >
+            {`… ${hiddenCount} more line${hiddenCount === 1 ? "" : "s"} not shown (too large to display in full).`}
+          </span>
+        ) : null}
       </code>
     );
   }
