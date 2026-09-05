@@ -42,6 +42,18 @@ pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
     "BUZZ_ACP_AGENT_ARGS",
     "BUZZ_ACP_MCP_COMMAND",
     "BUZZ_ACP_EXTRA_MCP_COMMANDS",
+    // MCP registry handover file. `buzz-acp` spawns every command the file
+    // names, so a user-supplied path is a code-execution surface exactly like
+    // BUZZ_ACP_EXTRA_MCP_COMMANDS. The spawn strips it before the user env
+    // layer and re-applies only what this spawn's plan holds, but an empty
+    // plan — every spawn with no registry servers — sets nothing, so without
+    // this entry a saved value would survive to the child.
+    "BUZZ_ACP_MCP_REGISTRY",
+    // MCP registry capability. A bearer token for every `mcp:` secret bound to
+    // one agent and configuration generation; it is minted at spawn and must
+    // come only from there. A saved value would hand an operator-declared
+    // server a token for the agent's whole credential set.
+    "BUZZ_MCP_CAPABILITY",
     // Control-plane parallelism: the Desktop resolves the effective
     // worker-pool size (applying any per-harness cap) and writes it into
     // launch.policy_env. A user-supplied BUZZ_ACP_AGENTS would bypass the

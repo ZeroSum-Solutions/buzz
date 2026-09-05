@@ -3,24 +3,45 @@
 //! `BUZZ_ACP_EXTRA_MCP_COMMANDS` can only carry a server's credentials in its
 //! argv, where `ps` and any crash dump can read them, so the registry hands
 //! servers over as a file instead: a bounded JSON document naming each
-//! server's command, args and `env` block. The values in that block are
-//! `mcp:` references, not secrets — `buzz-mcp-launch`, which is the command on
-//! every generated entry, is the side that resolves them — so no resolved
-//! value ever enters this process's address space or the ACP wire.
+//! server's command and args. Every generated command is `buzz-mcp-launch`,
+//! which resolves the `mcp:` references in its own argv, so no resolved value
+//! ever enters this process's address space or the ACP wire.
 //!
-//! This module only reads and bounds the document. It resolves nothing, and it
-//! is deliberately separate from the extras parser: both produce `McpServer`
-//! entries and both are appended by [`crate::build_mcp_servers`], so an
-//! operator can keep using `BUZZ_ACP_EXTRA_MCP_COMMANDS` while the desktop
-//! writes this file.
+//! Three things make the document trustworthy rather than merely well-formed,
+//! because the marker this module sets is what makes `buzz-agent` hand a child
+//! the capability that authorizes every one of the agent's secrets:
+//!
+//! 1. **The path is confined.** It must sit at the tail the desktop writes
+//!    inside the adopted generation — `generations/<generation>/agents/<agent>/`
+//!    — with the generation and the agent taken from the capability in this
+//!    process's own environment, which only the spawn seam sets.
+//! 2. **The open does not follow a symlink** and the result must be a regular
+//!    file, so nothing can swap the confined path for a link elsewhere.
+//! 3. **Every entry's command is the bundled launcher**, resolved beside this
+//!    binary. An entry naming anything else refuses startup rather than losing
+//!    the marker silently.
+//!
+//! No entry may declare an `env` block. `buzz-agent` applies `McpServer.env` to
+//! the **launcher's** own `Command`, so a declared `DYLD_INSERT_LIBRARIES` or
+//! `LD_PRELOAD` would run inside the launcher, before `main`, while the
+//! capability is in its environment. The desktop carries every declared
+//! variable in the launcher's `--set`/`--secret` argv instead, and the launcher
+//! applies those to the child after it strips the capability.
+//!
+//! This module only reads, confines and bounds the document. It resolves
+//! nothing, and it is deliberately separate from the extras parser: both
+//! produce `McpServer` entries and both are appended by
+//! [`crate::build_mcp_servers`], so an operator can keep using
+//! `BUZZ_ACP_EXTRA_MCP_COMMANDS` while the desktop writes this file.
 
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
+use buzz_secret_store::AgentCapability;
 use serde::Deserialize;
 
-use crate::acp::{EnvVar, McpServer};
+use crate::acp::McpServer;
 use crate::{ConfigError, MAX_MCP_NAME_LEN, MAX_MCP_SERVERS};
 
 /// Variable naming the registry file the desktop generated for this agent.
@@ -37,15 +58,6 @@ pub const REGISTRY_FILE_VERSION: u32 = 1;
 /// generated bound, not a copy of the source one.
 pub const MAX_REGISTRY_FILE_BYTES: usize = 1024 * 1024;
 
-/// Largest accepted number of `env` entries on one server.
-pub const MAX_REGISTRY_ENV_ENTRIES: usize = 32;
-
-/// Largest accepted `env` variable name, in bytes.
-pub const MAX_REGISTRY_ENV_NAME_LEN: usize = 128;
-
-/// Largest accepted `env` value, in bytes.
-pub const MAX_REGISTRY_ENV_VALUE_LEN: usize = 4 * 1024;
-
 /// Largest accepted number of arguments on one server.
 pub const MAX_REGISTRY_ARGS: usize = 64;
 
@@ -54,6 +66,129 @@ pub const MAX_REGISTRY_ARG_LEN: usize = 1024;
 
 /// Largest accepted command, in bytes.
 pub const MAX_REGISTRY_COMMAND_LEN: usize = 4 * 1024;
+
+/// File name the desktop gives the handover document.
+pub const REGISTRY_FILE_NAME: &str = "buzz-acp-registry.json";
+
+/// Staging-tree directory holding one directory per generation.
+///
+/// The desktop's `GenerationStore::generation_dir` writes
+/// `generations/<generation>`; the confinement check below requires the same
+/// spelling, so a layout change on one side fails the other's tests rather
+/// than widening what this side accepts.
+pub const GENERATIONS_DIR: &str = "generations";
+
+/// Directory holding one directory per agent inside a generation.
+///
+/// The desktop's `RegistryPaths::agent_dir` writes `agents/<agent id>`.
+pub const AGENTS_DIR: &str = "agents";
+
+/// Name of the bundled launcher, resolved beside this binary.
+#[cfg(windows)]
+pub const LAUNCHER_FILE_NAME: &str = "buzz-mcp-launch.exe";
+
+/// Name of the bundled launcher, resolved beside this binary.
+#[cfg(not(windows))]
+pub const LAUNCHER_FILE_NAME: &str = "buzz-mcp-launch";
+
+/// The bundled launcher's absolute path: the sibling of the running binary.
+///
+/// `buzz-acp` and `buzz-mcp-launch` are bundled into one directory
+/// (`scripts/bundle-sidecars.sh`, `tauri.conf.json`) and built into one
+/// `target/<profile>` in development, so the running binary's own directory is
+/// the launcher's directory on every build. Deriving it here rather than
+/// reading it from the environment is the point: an environment value could be
+/// supplied by whatever supplied a hostile registry file.
+///
+/// # Errors
+/// A message when the running binary's path or its parent cannot be resolved.
+pub fn bundled_launcher() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("this harness cannot resolve its own path, so it cannot verify that a registry entry names the bundled launcher: {e}"))?;
+    let dir = exe.parent().ok_or_else(|| {
+        format!(
+            "this harness's path {} has no parent directory, so it cannot resolve the bundled launcher",
+            exe.display()
+        )
+    })?;
+    Ok(dir.join(LAUNCHER_FILE_NAME))
+}
+
+/// Whether `declared` and `expected` name the same file.
+///
+/// Both sides are canonicalized so a bundle symlink, a `//` or a relative
+/// prefix does not read as a different binary. A side that cannot be
+/// canonicalized — most often a path that does not exist — falls back to the
+/// literal comparison, which is the conservative answer: it refuses rather
+/// than accepts.
+fn same_file(declared: &str, expected: &Path) -> bool {
+    match (
+        std::fs::canonicalize(declared),
+        std::fs::canonicalize(expected),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => Path::new(declared) == expected,
+    }
+}
+
+/// Refuse a registry path that is not the one the adopted generation wrote.
+///
+/// The desktop stages the document at
+/// `<base>/mcp/generations/<generation>/agents/<agent id>/buzz-acp-registry.json`
+/// and names that exact path in the spawn environment. Requiring the last five
+/// components pins the file to **this** agent's directory inside **this**
+/// generation: the generation and the agent id come from the capability, which
+/// only the spawn seam sets and which the desktop strips from every user env
+/// layer.
+///
+/// # Errors
+/// A message naming the path when it is relative, holds a `.` or `..`
+/// component, or does not end in the required five components.
+pub fn confine_registry_path(path: &Path, capability: &AgentCapability) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "{MCP_REGISTRY_ENV_VAR} names {}, which is not an absolute path",
+            path.display()
+        ));
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Err(format!(
+            "{MCP_REGISTRY_ENV_VAR} names {}, which holds a `.` or `..` component",
+            path.display()
+        ));
+    }
+    let expected_tail = [
+        GENERATIONS_DIR.to_string(),
+        capability.generation().to_string(),
+        AGENTS_DIR.to_string(),
+        capability.agent_id().to_string(),
+        REGISTRY_FILE_NAME.to_string(),
+    ];
+    let tail: Vec<String> = path
+        .components()
+        .rev()
+        .take(expected_tail.len())
+        .filter_map(|c| match c {
+            Component::Normal(part) => part.to_str().map(str::to_string),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if tail != expected_tail {
+        return Err(format!(
+            "{MCP_REGISTRY_ENV_VAR} names {}, which is outside this agent's directory in the \
+             adopted configuration generation; the desktop writes {}",
+            path.display(),
+            expected_tail.join("/")
+        ));
+    }
+    Ok(())
+}
 
 /// The document as the desktop writes it.
 #[derive(Debug, Deserialize)]
@@ -74,29 +209,54 @@ struct RegistryFileServer {
     env: Vec<RegistryFileEnv>,
 }
 
-/// One declared environment entry. `value` is a reference, not a secret.
+/// One declared environment entry.
+///
+/// The desktop writes none, and [`parse_registry_file`] refuses a document
+/// that declares one. The shape is still deserialized so that refusal can name
+/// how many were declared instead of failing as a parse error the operator
+/// cannot act on.
 #[derive(Debug, Deserialize)]
 struct RegistryFileEnv {
+    #[allow(dead_code)]
     name: String,
+    #[allow(dead_code)]
     value: String,
 }
 
 /// Read the registry file at `path`, bounded at [`MAX_REGISTRY_FILE_BYTES`].
 ///
-/// The read is bounded before any UTF-8 decoding or parsing, so a file grown
-/// past the cap — by a bug in the writer or by anything else that can write
-/// the app data directory — is refused rather than allocated.
+/// The final component is opened without following a symlink and the open file
+/// must be a regular one, so nothing can swap the confined path for a link to
+/// another file, a FIFO whose read never returns, or a device. The read is
+/// bounded before any UTF-8 decoding or parsing, so a file grown past the cap —
+/// by a bug in the writer or by anything else that can write the app data
+/// directory — is refused rather than allocated.
 ///
 /// # Errors
-/// A message naming the path when the file cannot be opened or read, or when
-/// it is over the cap.
+/// A message naming the path when the file cannot be opened, is a symlink or
+/// not a regular file, cannot be read, or is over the cap.
 pub fn read_registry_file(path: &Path) -> Result<Vec<u8>, String> {
-    let file = File::open(path).map_err(|e| {
+    let file = open_no_follow(path).map_err(|e| {
         format!(
             "{MCP_REGISTRY_ENV_VAR} names {}, which cannot be opened: {e}",
             path.display()
         )
     })?;
+    let kind = file
+        .metadata()
+        .map_err(|e| {
+            format!(
+                "{MCP_REGISTRY_ENV_VAR} names {}, whose type cannot be read: {e}",
+                path.display()
+            )
+        })?
+        .file_type();
+    if !kind.is_file() {
+        return Err(format!(
+            "{MCP_REGISTRY_ENV_VAR} names {}, which is not a regular file",
+            path.display()
+        ));
+    }
     // One byte past the cap, so a file that exactly fills it is accepted and
     // one byte more is reported: the exhausted limit is what detects the
     // overflow, which widening the bound cannot leave unreported.
@@ -117,6 +277,33 @@ pub fn read_registry_file(path: &Path) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// Open `path` for reading without following a symlink at its final component.
+///
+/// On Unix this is `O_NOFOLLOW`, which fails the open itself, so there is no
+/// window between the check and the read. Windows has no equivalent open flag
+/// here, so the link check is a `symlink_metadata` call before the open; the
+/// caller's regular-file check on the opened handle still holds either way.
+fn open_no_follow(path: &Path) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the path is a symbolic link",
+            ));
+        }
+        File::open(path)
+    }
+}
+
 /// Parse `bytes` into MCP servers, refusing anything past a bound.
 ///
 /// `max_servers` is the caller's remaining budget: the whole `session/new`
@@ -127,12 +314,22 @@ pub fn read_registry_file(path: &Path) -> Result<Vec<u8>, String> {
 /// through a launcher, so they receive no Buzz identity variable and never run
 /// a hook, exactly like an extras entry.
 ///
+/// `launcher` is the bundled launcher's absolute path ([`bundled_launcher`]).
+/// Every entry's command must be that file: the `registry_launched` marker is
+/// what makes `buzz-agent` hand a child the capability, so an entry naming
+/// anything else refuses startup rather than losing the marker silently.
+///
 /// # Errors
 /// A message naming the failing entry by index — never by content, since an
-/// argument or an `env` value may be operator-supplied — when the document
-/// does not parse, declares an unsupported version, holds more servers than
-/// `max_servers`, repeats a name, or breaches a per-entry bound.
-pub fn parse_registry_file(bytes: &[u8], max_servers: usize) -> Result<Vec<McpServer>, String> {
+/// argument may be operator-supplied — when the document does not parse,
+/// declares an unsupported version, holds more servers than `max_servers`,
+/// repeats a name, declares an `env` block, names a command other than
+/// `launcher`, or breaches a per-entry bound.
+pub fn parse_registry_file(
+    bytes: &[u8],
+    max_servers: usize,
+    launcher: &Path,
+) -> Result<Vec<McpServer>, String> {
     let document: RegistryFile = serde_json::from_slice(bytes)
         .map_err(|e| format!("the mcp registry file is not a valid registry document: {e}"))?;
     if document.version != REGISTRY_FILE_VERSION {
@@ -193,31 +390,25 @@ pub fn parse_registry_file(bytes: &[u8], max_servers: usize) -> Result<Vec<McpSe
                 MAX_REGISTRY_ARG_LEN,
             ));
         }
-        if server.env.len() > MAX_REGISTRY_ENV_ENTRIES {
-            return Err(bound(
-                "environment entries",
-                server.env.len(),
-                MAX_REGISTRY_ENV_ENTRIES,
+        if !server.env.is_empty() {
+            // `buzz-agent` applies this block to the launcher's own `Command`,
+            // where a loader variable would run attacker code inside the
+            // process that holds the capability. The desktop never writes one:
+            // a declared variable rides the launcher's `--set`/`--secret` argv
+            // and reaches the child only.
+            return Err(format!(
+                "mcp registry entry {entry} declares {} environment variables; the desktop \
+                 carries them in the launcher's arguments and writes no `env` block, so this \
+                 document was not generated by this desktop",
+                server.env.len()
             ));
         }
-        for variable in &server.env {
-            if variable.name.is_empty()
-                || variable.name.len() > MAX_REGISTRY_ENV_NAME_LEN
-                || variable.name.contains('=')
-                || variable.name.contains('\0')
-            {
-                return Err(format!(
-                    "mcp registry entry {entry} declares an environment variable whose name is \
-                     empty, over {MAX_REGISTRY_ENV_NAME_LEN} bytes, or holds `=` or a NUL"
-                ));
-            }
-            if variable.value.len() > MAX_REGISTRY_ENV_VALUE_LEN {
-                return Err(bound(
-                    "bytes in one environment value",
-                    variable.value.len(),
-                    MAX_REGISTRY_ENV_VALUE_LEN,
-                ));
-            }
+        if !same_file(&server.command, launcher) {
+            return Err(format!(
+                "mcp registry entry {entry} names a command that is not the bundled launcher \
+                 {}; only the launcher may run with this agent's capability",
+                launcher.display()
+            ));
         }
         if let Some(first) = servers.iter().position(|s| s.name == server.name) {
             return Err(format!(
@@ -231,23 +422,72 @@ pub fn parse_registry_file(bytes: &[u8], max_servers: usize) -> Result<Vec<McpSe
             name: server.name.clone(),
             command: server.command.clone(),
             args: server.args.clone(),
-            env: server
-                .env
-                .iter()
-                .map(|variable| EnvVar {
-                    name: variable.name.clone(),
-                    value: variable.value.clone(),
-                })
-                .collect(),
+            // Never an `env` block: the check above refused any document that
+            // declared one, and this is what `buzz-agent` applies to the
+            // launcher's own process.
+            env: Vec::new(),
             trusted: false,
-            // The desktop wrote this file, and every entry in it names the
-            // bundled launcher. The marker is what makes `buzz-agent` hand the
-            // child `BUZZ_MCP_CAPABILITY`; without it every credential-backed
-            // registry server exits 1 before it runs.
+            // The file sits in this agent's directory inside the adopted
+            // generation, was opened without following a link, and this entry
+            // names the bundled launcher. The marker is what makes
+            // `buzz-agent` hand the child `BUZZ_MCP_CAPABILITY`; without it
+            // every credential-backed registry server exits 1 before it runs.
             registry_launched: true,
         });
     }
     Ok(servers)
+}
+
+/// What this process itself contributes to reading a registry file: the
+/// capability the spawn seam minted for it, and the launcher bundled beside
+/// this binary.
+///
+/// Both are deliberately taken from the process rather than from the config,
+/// because the config's `mcp_registry` path is the input being checked.
+#[derive(Debug, Clone)]
+pub struct RegistrySource {
+    capability: AgentCapability,
+    launcher: PathBuf,
+}
+
+impl RegistrySource {
+    /// Resolve both from this process.
+    ///
+    /// # Errors
+    /// A message when [`crate::mcp_registry::MCP_REGISTRY_ENV_VAR`]'s companion
+    /// capability is absent or unusable, or when the bundled launcher's path
+    /// cannot be resolved.
+    pub fn from_process() -> Result<Self, String> {
+        // The capability names the agent and the generation this spawn
+        // adopted. Both come from the desktop's spawn seam, which strips the
+        // variable from every user env layer before it writes its own — so it
+        // is the one input here that a saved persona or an imported agent
+        // definition cannot supply.
+        let capability =
+            AgentCapability::from_env(|name| std::env::var(name).ok()).map_err(|e| {
+                format!(
+                "{MCP_REGISTRY_ENV_VAR} is set, but this process holds no usable MCP capability \
+                 ({e}), so its registry servers could not resolve a single credential; restart \
+                 the agent from the desktop"
+            )
+            })?;
+        Ok(Self {
+            capability,
+            launcher: bundled_launcher()?,
+        })
+    }
+
+    /// Build one explicitly.
+    ///
+    /// Test-only: production must take both from the process, or the checks
+    /// they drive would be satisfied by the same side that supplied the path.
+    #[cfg(test)]
+    pub(crate) fn for_test(capability: AgentCapability, launcher: PathBuf) -> Self {
+        Self {
+            capability,
+            launcher,
+        }
+    }
 }
 
 /// Append the desktop's generated registry servers to `servers`.
@@ -259,12 +499,15 @@ pub fn parse_registry_file(bytes: &[u8], max_servers: usize) -> Result<Vec<McpSe
 /// [`ConfigError::ConfigFile`] when the file cannot be read or does not
 /// satisfy a bound (see [`read_registry_file`] and [`parse_registry_file`]),
 /// when the agent command is not the one adapter that honours the `trusted`
-/// marker, or when a generated name collides with a server already built. Every
-/// one fails startup rather than the first session: a harness that started here
-/// would announce itself online and then fail every `session/new`.
+/// marker, when this process holds no usable capability, when the path is
+/// outside this agent's directory in the adopted generation, or when a
+/// generated name collides with a server already built. Every one fails
+/// startup rather than the first session: a harness that started here would
+/// announce itself online and then fail every `session/new`.
 pub fn append_registry_mcp_servers(
     config: &crate::config::Config,
     servers: &mut Vec<McpServer>,
+    source: Option<&RegistrySource>,
 ) -> Result<(), ConfigError> {
     let Some(path) = config
         .mcp_registry
@@ -292,9 +535,20 @@ pub fn append_registry_mcp_servers(
         )));
     }
 
+    let resolved;
+    let source = match source {
+        Some(source) => source,
+        None => {
+            resolved = RegistrySource::from_process().map_err(ConfigError::ConfigFile)?;
+            &resolved
+        }
+    };
+    confine_registry_path(Path::new(path), &source.capability).map_err(ConfigError::ConfigFile)?;
+
     let budget = MAX_MCP_SERVERS.saturating_sub(servers.len());
     let bytes = read_registry_file(Path::new(path)).map_err(ConfigError::ConfigFile)?;
-    let generated = parse_registry_file(&bytes, budget).map_err(ConfigError::ConfigFile)?;
+    let generated =
+        parse_registry_file(&bytes, budget, &source.launcher).map_err(ConfigError::ConfigFile)?;
 
     for server in generated {
         if servers.iter().any(|existing| existing.name == server.name) {
@@ -314,37 +568,199 @@ mod tests {
     use super::*;
     use crate::acp::{wire_log_line, REDACTED_ENV_VALUE};
 
-    /// A document holding one server with the `env` block a registry entry
-    /// carries: reference values, never secrets.
+    /// A directory holding a file that stands in for the bundled launcher, so
+    /// the command check canonicalizes a real path on both sides.
+    struct Launcher {
+        dir: tempfile::TempDir,
+    }
+
+    impl Launcher {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(dir.path().join(LAUNCHER_FILE_NAME), b"#!/bin/sh\n")
+                .expect("write the stand-in launcher");
+            Self { dir }
+        }
+
+        fn path(&self) -> PathBuf {
+            self.dir.path().join(LAUNCHER_FILE_NAME)
+        }
+
+        fn command(&self) -> String {
+            self.path().display().to_string()
+        }
+    }
+
+    /// A document holding one server as the desktop generates it: the launcher
+    /// command, its argv, and no `env` block.
     fn document(servers: &str) -> String {
         format!("{{\"version\":1,\"servers\":[{servers}]}}")
     }
 
-    fn stdio(name: &str) -> String {
+    fn stdio(launcher: &Launcher, name: &str) -> String {
         format!(
-            "{{\"name\":\"{name}\",\"command\":\"/opt/buzz/bin/buzz-mcp-launch\",\
-             \"args\":[\"launch\",\"--server\",\"{name}\",\"--\",\"/usr/local/bin/{name}\"],\
-             \"env\":[{{\"name\":\"TOKEN\",\"value\":\"mcp:{name}-token\"}}]}}"
+            "{{\"name\":\"{name}\",\"command\":\"{}\",\
+             \"args\":[\"launch\",\"--server\",\"{name}\",\"--secret\",\"TOKEN=mcp:{name}-token\",\
+             \"--\",\"/usr/local/bin/{name}\"]}}",
+            launcher.command()
         )
     }
 
+    /// A capability for `agent` at `generation`, built the way the desktop
+    /// builds one from a binding record.
+    fn capability(agent: &str, generation: u64) -> AgentCapability {
+        AgentCapability::bind(agent, generation, &"ab".repeat(16)).expect("a valid capability")
+    }
+
+    /// The path the desktop writes for `agent` at `generation` under `base`.
+    fn staged_path(base: &Path, agent: &str, generation: u64) -> PathBuf {
+        base.join(GENERATIONS_DIR)
+            .join(generation.to_string())
+            .join(AGENTS_DIR)
+            .join(agent)
+            .join(REGISTRY_FILE_NAME)
+    }
+
     #[test]
-    fn registry_file_becomes_untrusted_servers_with_their_env_block() {
-        let servers = parse_registry_file(document(&stdio("github")).as_bytes(), MAX_MCP_SERVERS)
-            .expect("a well-formed document loads");
+    fn registry_file_becomes_untrusted_servers_with_no_env_block() {
+        let launcher = Launcher::new();
+        let servers = parse_registry_file(
+            document(&stdio(&launcher, "github")).as_bytes(),
+            MAX_MCP_SERVERS,
+            &launcher.path(),
+        )
+        .expect("a well-formed document loads");
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "github");
-        assert_eq!(servers[0].command, "/opt/buzz/bin/buzz-mcp-launch");
-        // The `env` block is the whole point of the file: the extras path
-        // hardcodes an empty one, so a credential could only travel in argv.
-        assert_eq!(servers[0].env.len(), 1);
-        assert_eq!(servers[0].env[0].name, "TOKEN");
-        assert_eq!(servers[0].env[0].value, "mcp:github-token");
+        assert_eq!(servers[0].command, launcher.command());
+        // The credential rides the launcher's own argv as a reference, so the
+        // wire entry carries no environment at all — `buzz-agent` would apply
+        // one to the launcher's process, not the server's.
+        assert!(servers[0].env.is_empty());
+        assert!(servers[0]
+            .args
+            .iter()
+            .any(|arg| arg == "TOKEN=mcp:github-token"));
         // Untrusted: no Buzz identity variable, no hooks.
         assert!(!servers[0].trusted);
         // Registry-launched: this entry runs the bundled launcher, so
         // buzz-agent forwards BUZZ_MCP_CAPABILITY to it.
         assert!(servers[0].registry_launched);
+    }
+
+    /// A declared `env` block is refused, loader variables included.
+    ///
+    /// `buzz-agent` applies `McpServer.env` to the launcher's own `Command`
+    /// (`crates/buzz-agent/src/mcp.rs`), so an accepted `DYLD_INSERT_LIBRARIES`
+    /// would run attacker code inside the process holding the capability.
+    /// Deleting the refusal makes this test fail with the marker still set.
+    #[test]
+    fn registry_file_refuses_a_declared_env_block() {
+        let launcher = Launcher::new();
+        for name in ["DYLD_INSERT_LIBRARIES", "LD_PRELOAD", "TOKEN"] {
+            let entry = format!(
+                "{{\"name\":\"a\",\"command\":\"{}\",\"args\":[],\
+                 \"env\":[{{\"name\":\"{name}\",\"value\":\"/tmp/evil.dylib\"}}]}}",
+                launcher.command()
+            );
+            let error = parse_registry_file(
+                document(&entry).as_bytes(),
+                MAX_MCP_SERVERS,
+                &launcher.path(),
+            )
+            .expect_err("a declared env block is refused");
+            assert!(error.contains("environment variables"), "{error}");
+        }
+    }
+
+    /// Only the bundled launcher may carry the marker.
+    ///
+    /// The marker is what makes `buzz-agent` hand a child the capability that
+    /// authorizes every `mcp:` record bound to this agent, so an entry naming
+    /// another command refuses startup instead of running with it.
+    #[test]
+    fn registry_file_refuses_a_command_that_is_not_the_bundled_launcher() {
+        let launcher = Launcher::new();
+        let entry = format!(
+            "{{\"name\":\"a\",\"command\":\"{}\",\"args\":[]}}",
+            launcher.dir.path().join("not-the-launcher").display()
+        );
+        let error = parse_registry_file(
+            document(&entry).as_bytes(),
+            MAX_MCP_SERVERS,
+            &launcher.path(),
+        )
+        .expect_err("a foreign command is refused");
+        assert!(error.contains("bundled launcher"), "{error}");
+    }
+
+    /// The accepted path is this agent's directory in the adopted generation.
+    ///
+    /// Every rejected shape here is one a hostile `BUZZ_ACP_MCP_REGISTRY` would
+    /// take. Deleting the confinement accepts all four.
+    #[test]
+    fn registry_path_is_confined_to_the_adopted_generation() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let capability = capability("agent-a", 7);
+        let good = staged_path(base.path(), "agent-a", 7);
+        confine_registry_path(&good, &capability).expect("the staged path is accepted");
+
+        for (path, why) in [
+            (
+                staged_path(base.path(), "agent-b", 7),
+                "another agent's directory",
+            ),
+            (
+                staged_path(base.path(), "agent-a", 6),
+                "a superseded generation",
+            ),
+            (
+                base.path().join("elsewhere").join(REGISTRY_FILE_NAME),
+                "a path outside the staging tree",
+            ),
+            (
+                base.path()
+                    .join(GENERATIONS_DIR)
+                    .join("7")
+                    .join(AGENTS_DIR)
+                    .join("agent-a")
+                    .join("..")
+                    .join("agent-b")
+                    .join(REGISTRY_FILE_NAME),
+                "a `..` traversal",
+            ),
+        ] {
+            assert!(
+                confine_registry_path(&path, &capability).is_err(),
+                "{why} was accepted: {}",
+                path.display()
+            );
+        }
+
+        assert!(
+            confine_registry_path(Path::new("relative/registry.json"), &capability).is_err(),
+            "a relative path was accepted"
+        );
+    }
+
+    /// The open refuses a symlink and anything that is not a regular file.
+    #[test]
+    #[cfg(unix)]
+    fn registry_file_open_refuses_a_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real.json");
+        std::fs::write(&real, "{}").expect("write");
+        let link = dir.path().join("link.json");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let error = read_registry_file(&link).expect_err("a symlink is refused");
+        assert!(error.contains("cannot be opened"), "{error}");
+
+        let error = read_registry_file(dir.path()).expect_err("a directory is refused");
+        assert!(
+            error.contains("not a regular file") || error.contains("cannot be read"),
+            "{error}"
+        );
     }
 
     /// The marker crosses the wire under the name `buzz-agent` deserializes,
@@ -358,6 +774,7 @@ mod tests {
     /// serialized JSON, which is what the two crates actually agree on.
     #[test]
     fn registry_file_marks_only_its_own_servers_registry_launched() {
+        let launcher = Launcher::new();
         let mut servers = vec![McpServer {
             name: "extra".to_string(),
             command: "/opt/extra".to_string(),
@@ -366,8 +783,12 @@ mod tests {
             trusted: false,
             registry_launched: false,
         }];
-        let generated = parse_registry_file(document(&stdio("github")).as_bytes(), MAX_MCP_SERVERS)
-            .expect("a well-formed document loads");
+        let generated = parse_registry_file(
+            document(&stdio(&launcher, "github")).as_bytes(),
+            MAX_MCP_SERVERS,
+            &launcher.path(),
+        )
+        .expect("a well-formed document loads");
         servers.extend(generated);
 
         let wire = serde_json::to_value(&servers).expect("serializes");
@@ -385,64 +806,87 @@ mod tests {
 
     #[test]
     fn registry_file_bounds_are_enforced_per_entry() {
+        let launcher = Launcher::new();
+        let command = launcher.command();
         let over_version = "{\"version\":2,\"servers\":[]}";
         assert!(
-            parse_registry_file(over_version.as_bytes(), MAX_MCP_SERVERS)
+            parse_registry_file(over_version.as_bytes(), MAX_MCP_SERVERS, &launcher.path())
                 .expect_err("an unknown version is refused")
                 .contains("version 2")
         );
 
         let long_name = "a".repeat(MAX_MCP_NAME_LEN + 1);
         let doc = document(&format!(
-            "{{\"name\":\"{long_name}\",\"command\":\"/x\",\"args\":[],\"env\":[]}}"
+            "{{\"name\":\"{long_name}\",\"command\":\"{command}\",\"args\":[]}}"
         ));
-        assert!(parse_registry_file(doc.as_bytes(), MAX_MCP_SERVERS)
-            .expect_err("an over-long name is refused")
-            .contains("bytes"));
+        assert!(
+            parse_registry_file(doc.as_bytes(), MAX_MCP_SERVERS, &launcher.path())
+                .expect_err("an over-long name is refused")
+                .contains("bytes")
+        );
 
-        let bad_name = document("{\"name\":\"a/b\",\"command\":\"/x\",\"args\":[],\"env\":[]}");
-        assert!(parse_registry_file(bad_name.as_bytes(), MAX_MCP_SERVERS).is_err());
+        let bad_name = document(&format!(
+            "{{\"name\":\"a/b\",\"command\":\"{command}\",\"args\":[]}}"
+        ));
+        assert!(
+            parse_registry_file(bad_name.as_bytes(), MAX_MCP_SERVERS, &launcher.path()).is_err()
+        );
 
         let args: Vec<String> = (0..=MAX_REGISTRY_ARGS)
             .map(|i| format!("\"{i}\""))
             .collect();
         let many_args = document(&format!(
-            "{{\"name\":\"a\",\"command\":\"/x\",\"args\":[{}],\"env\":[]}}",
+            "{{\"name\":\"a\",\"command\":\"{command}\",\"args\":[{}]}}",
             args.join(",")
         ));
-        assert!(parse_registry_file(many_args.as_bytes(), MAX_MCP_SERVERS)
-            .expect_err("too many arguments is refused")
-            .contains("over the cap"));
+        assert!(
+            parse_registry_file(many_args.as_bytes(), MAX_MCP_SERVERS, &launcher.path())
+                .expect_err("too many arguments is refused")
+                .contains("over the cap")
+        );
 
-        let long_value = "v".repeat(MAX_REGISTRY_ENV_VALUE_LEN + 1);
-        let big_env = document(&format!(
-            "{{\"name\":\"a\",\"command\":\"/x\",\"args\":[],\
-             \"env\":[{{\"name\":\"T\",\"value\":\"{long_value}\"}}]}}"
+        let long_arg = "v".repeat(MAX_REGISTRY_ARG_LEN + 1);
+        let big_arg = document(&format!(
+            "{{\"name\":\"a\",\"command\":\"{command}\",\"args\":[\"{long_arg}\"]}}"
         ));
-        assert!(parse_registry_file(big_env.as_bytes(), MAX_MCP_SERVERS)
-            .expect_err("an over-long env value is refused")
-            .contains("over the cap"));
+        assert!(
+            parse_registry_file(big_arg.as_bytes(), MAX_MCP_SERVERS, &launcher.path())
+                .expect_err("an over-long argument is refused")
+                .contains("over the cap")
+        );
 
         // The budget is the caller's remaining share of one session's array,
         // not the file's own size: the primary server and any extras have
         // already taken theirs.
-        let two = document(&format!("{},{}", stdio("a"), stdio("b")));
-        assert!(parse_registry_file(two.as_bytes(), 1)
+        let two = document(&format!(
+            "{},{}",
+            stdio(&launcher, "a"),
+            stdio(&launcher, "b")
+        ));
+        assert!(parse_registry_file(two.as_bytes(), 1, &launcher.path())
             .expect_err("more servers than the remaining budget is refused")
             .contains("only 1 more"));
-        assert!(parse_registry_file(two.as_bytes(), 2).is_ok());
+        assert!(parse_registry_file(two.as_bytes(), 2, &launcher.path()).is_ok());
     }
 
     #[test]
     fn registry_file_refuses_two_entries_with_one_name() {
-        let doc = document(&format!("{},{}", stdio("github"), stdio("github")));
-        assert!(parse_registry_file(doc.as_bytes(), MAX_MCP_SERVERS)
-            .expect_err("a repeated name is refused")
-            .contains("same server name"));
+        let launcher = Launcher::new();
+        let doc = document(&format!(
+            "{},{}",
+            stdio(&launcher, "github"),
+            stdio(&launcher, "github")
+        ));
+        assert!(
+            parse_registry_file(doc.as_bytes(), MAX_MCP_SERVERS, &launcher.path())
+                .expect_err("a repeated name is refused")
+                .contains("same server name")
+        );
     }
 
     #[test]
     fn registry_file_read_is_bounded_and_missing_files_are_surfaced() {
+        let launcher = Launcher::new();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("registry.json");
 
@@ -453,10 +897,10 @@ mod tests {
         let error = read_registry_file(&path).expect_err("an oversized file is refused");
         assert!(error.contains("cap"), "{error}");
 
-        std::fs::write(&path, document(&stdio("github"))).expect("write");
+        std::fs::write(&path, document(&stdio(&launcher, "github"))).expect("write");
         let bytes = read_registry_file(&path).expect("a file under the cap reads");
         assert_eq!(
-            parse_registry_file(&bytes, MAX_MCP_SERVERS)
+            parse_registry_file(&bytes, MAX_MCP_SERVERS, &launcher.path())
                 .expect("parses")
                 .len(),
             1
@@ -497,10 +941,23 @@ mod tests {
     /// is not skipped by its `Serialize`. The redaction is structural, so the
     /// guarantee does not depend on the log level staying below `debug`.
     /// Restoring `serde_json::to_string(&msg)` at the log site fails this.
+    ///
+    /// The server is built here rather than parsed: a registry entry now
+    /// carries no `env` block at all, and the servers that still can — the
+    /// primary one this harness declares — are the ones the redaction protects.
     #[test]
     fn wire_log_redacts_env_values() {
-        let servers = parse_registry_file(document(&stdio("github")).as_bytes(), MAX_MCP_SERVERS)
-            .expect("loads");
+        let servers = vec![McpServer {
+            name: "github".to_string(),
+            command: "/opt/buzz/bin/buzz-mcp-launch".to_string(),
+            args: vec!["launch".to_string()],
+            env: vec![crate::acp::EnvVar {
+                name: "TOKEN".to_string(),
+                value: "mcp:github-token".to_string(),
+            }],
+            trusted: false,
+            registry_launched: false,
+        }];
         // The exact `params` shape `session_new_full` builds.
         let message = serde_json::json!({
             "jsonrpc": "2.0",

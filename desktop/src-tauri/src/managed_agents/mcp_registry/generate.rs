@@ -6,20 +6,23 @@
 //! entry pointing at the same binary in proxy mode, because no launcher can
 //! inject an environment into a remote server.
 //!
-//! No generated file holds a secret **value**. A credential travels as an
-//! `mcp:` reference, in two places written from one source: the entry's `env`
-//! block, which is what the runtime hands the launcher process, and the
-//! launcher's own `--secret` flags, which is the channel the launcher reads
-//! (it builds its child environment from empty and so ignores what it
-//! inherits). `generated_env_block_and_launcher_flags_agree` binds the two.
-
-use std::collections::BTreeMap;
+//! No generated file holds a secret **value**, and no generated entry holds an
+//! `env` block at all. A declared variable travels in one channel only: the
+//! launcher's own `--set` and `--secret` argv, which the launcher applies to
+//! the child it starts after it strips its own capability. Duplicating it into
+//! a wire `env` block would put it on the **launcher's** process environment
+//! instead — `buzz-agent` applies `McpServer.env` to the launcher's `Command`
+//! — where a loader variable (`DYLD_INSERT_LIBRARIES`, `LD_PRELOAD`) would run
+//! attacker code inside the launcher before `main`, while the capability that
+//! authorizes every one of that agent's secrets is in its environment. The
+//! launcher process holds platform essentials and the capability, nothing
+//! else. `generated_entries_carry_no_env_block` binds that.
 
 use buzz_secret_store_pkg::looks_like_reference;
 
 use super::schema::{RegistryEntry, RegistryTransport};
 
-/// One generated server: the command line and the env block for it.
+/// One generated server: the launcher command line, and nothing else.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedServer {
     /// The registry name, which becomes the config key.
@@ -27,9 +30,10 @@ pub struct GeneratedServer {
     /// Absolute path of the bundled launcher.
     pub command: String,
     /// Launcher arguments, references included.
+    ///
+    /// This is the only channel a declared environment variable travels in:
+    /// the launcher reads `--set`/`--secret` and applies them to its child.
     pub args: Vec<String>,
-    /// Reference-valued environment. Never a secret value.
-    pub env: BTreeMap<String, String>,
 }
 
 /// Build the launcher invocation for one registry entry.
@@ -47,7 +51,6 @@ pub fn generate_server(
     entry: &RegistryEntry,
 ) -> GeneratedServer {
     let mut args = vec!["--service".to_string(), keychain_service.to_string()];
-    let mut env = BTreeMap::new();
 
     match &entry.transport {
         RegistryTransport::Stdio {
@@ -64,7 +67,6 @@ pub fn generate_server(
                     args.push("--set".to_string());
                 }
                 args.push(format!("{name}={value}"));
-                env.insert(name.clone(), value.clone());
             }
             args.push("--".to_string());
             args.push(command.clone());
@@ -80,8 +82,8 @@ pub fn generate_server(
                 args.push("--secret".to_string());
                 args.push(auth.secret.clone());
             }
-            // An http upstream gets no child environment: there is no child
-            // process to hand variables to.
+            // An http upstream declares no variables: there is no child
+            // process to hand them to.
         }
     }
 
@@ -89,16 +91,16 @@ pub fn generate_server(
         name: entry.name.clone(),
         command: launcher.to_string(),
         args,
-        env,
     }
 }
 
 /// The buzz-acp registry file named by `BUZZ_ACP_MCP_REGISTRY`.
 ///
-/// Carries references only. The capability of memo decision 5 never appears in
-/// it — it reaches the launcher through the inherited spawn environment — so
-/// buzz-acp resolves nothing and no resolved value enters its address space or
-/// the ACP wire.
+/// Carries the launcher command and its argv only. The capability of memo
+/// decision 5 never appears in it — it reaches the launcher through the
+/// inherited spawn environment — so buzz-acp resolves nothing and no resolved
+/// value enters its address space or the ACP wire. No entry carries an `env`
+/// block, and `buzz-acp` refuses a document that declares one.
 pub const BUZZ_ACP_REGISTRY_ENV_VAR: &str = "BUZZ_ACP_MCP_REGISTRY";
 
 /// Render the buzz-acp registry file.
@@ -114,11 +116,6 @@ pub fn render_buzz_acp_registry(servers: &[GeneratedServer]) -> Result<String, S
                 "name": server.name,
                 "command": server.command,
                 "args": server.args,
-                "env": server
-                    .env
-                    .iter()
-                    .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
-                    .collect::<Vec<_>>(),
             }))
             .collect::<Vec<_>>(),
     });
@@ -126,6 +123,8 @@ pub fn render_buzz_acp_registry(servers: &[GeneratedServer]) -> Result<String, S
 }
 
 /// Render Claude's project `.mcp.json`.
+///
+/// No entry carries an `env` block; see the module header.
 ///
 /// # Errors
 /// Only if serialization fails.
@@ -137,7 +136,6 @@ pub fn render_claude_project_config(servers: &[GeneratedServer]) -> Result<Strin
             serde_json::json!({
                 "command": server.command,
                 "args": server.args,
-                "env": server.env,
             }),
         );
     }
@@ -146,6 +144,8 @@ pub fn render_claude_project_config(servers: &[GeneratedServer]) -> Result<Strin
 }
 
 /// Render Codex's `config.toml` MCP section.
+///
+/// No entry carries an `env` block; see the module header.
 ///
 /// # Errors
 /// Only if serialization fails.
@@ -168,13 +168,6 @@ pub fn render_codex_config(servers: &[GeneratedServer]) -> Result<String, String
                     .collect(),
             ),
         );
-        if !server.env.is_empty() {
-            let mut env = toml::map::Map::new();
-            for (name, value) in &server.env {
-                env.insert(name.clone(), toml::Value::String(value.clone()));
-            }
-            entry.insert("env".to_string(), toml::Value::Table(env));
-        }
         table.insert(server.name.clone(), toml::Value::Table(entry));
     }
     root.insert("mcp_servers".to_string(), toml::Value::Table(table));

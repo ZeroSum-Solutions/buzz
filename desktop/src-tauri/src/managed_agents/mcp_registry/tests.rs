@@ -381,8 +381,6 @@ fn mcp_registry_generated_config_names_the_launcher_and_carries_no_value() {
     let claude: serde_json::Value = serde_json::from_str(&claude).expect("valid json");
     let github = &claude["mcpServers"]["github"];
     assert_eq!(github["command"], LAUNCHER);
-    assert_eq!(github["env"]["GITHUB_TOKEN"], "mcp:github-token");
-    assert_eq!(github["env"]["GITHUB_HOST"], "github.example");
     let codex: toml::Value = toml::from_str(&codex).expect("valid toml");
     assert_eq!(
         codex["mcp_servers"]["linear"]["command"].as_str(),
@@ -390,13 +388,19 @@ fn mcp_registry_generated_config_names_the_launcher_and_carries_no_value() {
     );
 }
 
+/// A declared variable travels in the launcher's argv and in no `env` block.
+///
+/// `buzz-agent` applies `McpServer.env` to the **launcher's** own `Command`
+/// (`crates/buzz-agent/src/mcp.rs`), so a duplicated block would put a
+/// declared `DYLD_INSERT_LIBRARIES` or `LD_PRELOAD` into the process that
+/// holds the agent's capability — before `main`, and before the launcher can
+/// clear anything. The launcher applies `--set`/`--secret` to its child
+/// instead, after it strips the capability.
+///
+/// Restoring the duplication fails this in all three artefacts.
 #[test]
-fn mcp_registry_generated_env_block_and_launcher_flags_agree() {
-    // The reference appears twice by design — the `env` block is what the
-    // runtime hands the launcher process, the `--secret` flag is the channel
-    // the launcher actually reads, because it builds its environment from
-    // empty. Both come from one source, and this binds them.
-    let entry = "{\"id\":\"a\",\"name\":\"github\",\"transport\":\"stdio\",\"command\":\"/usr/local/bin/x\",\"env\":{\"GITHUB_TOKEN\":\"mcp:github-token\",\"GITHUB_HOST\":\"github.example\"}}";
+fn mcp_registry_generated_entries_carry_no_env_block() {
+    let entry = "{\"id\":\"a\",\"name\":\"github\",\"transport\":\"stdio\",\"command\":\"/usr/local/bin/x\",\"env\":{\"DYLD_INSERT_LIBRARIES\":\"/tmp/evil.dylib\",\"GITHUB_TOKEN\":\"mcp:github-token\",\"GITHUB_HOST\":\"github.example\"}}";
     let registry = parse_registry(document(entry).as_bytes()).expect("loads");
     let generated = generate_server(
         LAUNCHER,
@@ -404,6 +408,7 @@ fn mcp_registry_generated_env_block_and_launcher_flags_agree() {
         &registry.by_id("a").expect("present").entry,
     );
 
+    // Every declared pair reaches the launcher, and only through argv.
     let mut from_args = BTreeMap::new();
     let mut arguments = generated.args.iter();
     while let Some(argument) = arguments.next() {
@@ -413,9 +418,47 @@ fn mcp_registry_generated_env_block_and_launcher_flags_agree() {
             from_args.insert(name.to_string(), value.to_string());
         }
     }
-    assert_eq!(from_args, generated.env);
+    assert_eq!(
+        from_args,
+        BTreeMap::from([
+            (
+                "DYLD_INSERT_LIBRARIES".to_string(),
+                "/tmp/evil.dylib".to_string()
+            ),
+            ("GITHUB_TOKEN".to_string(), "mcp:github-token".to_string()),
+            ("GITHUB_HOST".to_string(), "github.example".to_string()),
+        ])
+    );
     assert!(generated.args.contains(&"--secret".to_string()));
     assert!(generated.args.contains(&"--set".to_string()));
+
+    // No artefact declares an environment for the launcher process.
+    let servers = [generated];
+    let acp: serde_json::Value =
+        serde_json::from_str(&render_buzz_acp_registry(&servers).expect("renders"))
+            .expect("valid json");
+    assert_eq!(
+        acp["servers"][0].get("env"),
+        None,
+        "the buzz-acp handover file declared an env block: {acp}"
+    );
+    let claude: serde_json::Value =
+        serde_json::from_str(&render_claude_project_config(&servers).expect("renders"))
+            .expect("valid json");
+    assert_eq!(
+        claude["mcpServers"]["github"].get("env"),
+        None,
+        "the claude config declared an env block: {claude}"
+    );
+    let codex: toml::Value =
+        toml::from_str(&render_codex_config(&servers).expect("renders")).expect("valid toml");
+    assert!(
+        codex["mcp_servers"]["github"].get("env").is_none(),
+        "the codex config declared an env block: {codex}"
+    );
+    // And the loader variable is nowhere but the launcher's own argument list.
+    let claude_args = claude["mcpServers"]["github"]["args"].to_string();
+    assert!(claude_args.contains("DYLD_INSERT_LIBRARIES=/tmp/evil.dylib"));
 }
 
 // ── The staged generation and its journal ─────────────────────────────────

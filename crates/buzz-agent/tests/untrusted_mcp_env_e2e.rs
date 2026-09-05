@@ -232,31 +232,67 @@ fn mcp_server_cap_mirrors_buzz_agent() {
 /// shape, the real `McpServerSet::from_config`, the real wire JSON, a real
 /// buzz-agent child, a real `session/new`, and a real MCP subprocess reporting
 /// the names of the variables it was spawned with.
+///
+/// The launcher stand-in is `fake-mcp` copied to the name and directory
+/// `buzz-acp` resolves the bundled launcher at, because `buzz-acp` now refuses
+/// any entry naming a different command: the `registry_launched` marker is
+/// what hands a child the capability, so it may only ride the launcher.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn registry_file_capability_reaches_the_spawned_server() {
     let fake_mcp = env!("CARGO_BIN_EXE_fake-mcp");
     let dir = tempfile::tempdir().expect("tempdir");
-    let registry_path = dir.path().join("mcp-registry.json");
-    // The shape `render_buzz_acp_registry` writes: a bounded document of
-    // launcher invocations whose `env` blocks carry references, never values.
+
+    // The launcher stand-in, beside this test binary — the directory
+    // `buzz_acp::mcp_registry::bundled_launcher` resolves. Written through a
+    // rename so a concurrent test binary never observes a partial copy.
+    let exe = std::env::current_exe().expect("test binary path");
+    let bin_dir = exe.parent().expect("test binary directory").to_path_buf();
+    let launcher = bin_dir.join(buzz_acp::mcp_registry::LAUNCHER_FILE_NAME);
+    let staging = bin_dir.join(format!("buzz-mcp-launch.{}.tmp", std::process::id()));
+    std::fs::copy(fake_mcp, &staging).expect("copy the launcher stand-in");
+    std::fs::rename(&staging, &launcher).expect("install the launcher stand-in");
+
+    // The path the desktop stages, which is the only one buzz-acp accepts:
+    // this agent's directory inside the adopted generation.
+    const AGENT: &str = "a1b2";
+    const GENERATION: u64 = 7;
+    let nonce = "ab".repeat(16);
+    let staged = dir
+        .path()
+        .join(buzz_acp::mcp_registry::GENERATIONS_DIR)
+        .join(GENERATION.to_string())
+        .join(buzz_acp::mcp_registry::AGENTS_DIR)
+        .join(AGENT);
+    std::fs::create_dir_all(&staged).expect("staged directory");
+    let registry_path = staged.join(buzz_acp::mcp_registry::REGISTRY_FILE_NAME);
+    // The shape `render_buzz_acp_registry` writes: launcher invocations whose
+    // declared variables ride argv as references, and no `env` block at all —
+    // a block would land on the launcher's own process, which is where the
+    // capability lives.
     std::fs::write(
         &registry_path,
         serde_json::to_string(&json!({
             "version": 1,
             "servers": [{
                 "name": "registry",
-                "command": fake_mcp,
-                "args": [],
-                "env": [
-                    { "name": "FAKE_MCP_TOOL_COUNT", "value": "1" },
-                    { "name": "FAKE_MCP_ENV_REPORT", "value": "1" },
-                    { "name": "TOKEN", "value": "mcp:registry-token" },
+                "command": launcher.to_str().expect("utf-8 path"),
+                "args": [
+                    "--env-report",
+                    "--secret", "TOKEN=mcp:registry-token",
+                    "--set", "DYLD_INSERT_LIBRARIES=/tmp/evil.dylib",
                 ],
             }],
         }))
         .expect("serializes"),
     )
     .expect("registry file written");
+
+    // The desktop's half of the capability chain, in this process because
+    // `build_mcp_servers` reads it from the process and nowhere else.
+    std::env::set_var(
+        "BUZZ_MCP_CAPABILITY",
+        format!("v1.{AGENT}.{GENERATION}.{nonce}"),
+    );
 
     let args = buzz_acp::CliArgs::try_parse_from([
         "buzz-acp",
@@ -298,7 +334,8 @@ async fn registry_file_capability_reaches_the_spawned_server() {
     .await;
     // The desktop's half: the capability is in the harness's environment, and
     // buzz-acp passes its own environment to the agent it spawns.
-    let mut h = Harness::spawn_with_env(&llm.url, &[("BUZZ_MCP_CAPABILITY", "v1.a1b2.7.00")]).await;
+    let capability = format!("v1.{AGENT}.{GENERATION}.{nonce}");
+    let mut h = Harness::spawn_with_env(&llm.url, &[("BUZZ_MCP_CAPABILITY", &capability)]).await;
     h.send(
         "initialize",
         json!({"protocolVersion":1,"clientCapabilities":{}}),
@@ -350,10 +387,18 @@ async fn registry_file_capability_reaches_the_spawned_server() {
         "the registry server was spawned without the capability, so the real \
          launcher would have exited 1: {names:?}"
     );
-    assert!(
-        names.contains(&"TOKEN"),
-        "the registry entry's declared env block did not reach the child: {names:?}"
-    );
+    // The other half of memo decision 5's boundary: a declared variable rides
+    // the launcher's argv and never its environment. `buzz-agent` applies
+    // `McpServer.env` to this very process, so a duplicated block would put a
+    // loader variable here — inside the process holding the capability, before
+    // `main`. Restoring that duplication in the desktop's generator, or
+    // accepting an `env` block in `buzz-acp`, fails these two assertions.
+    for var in ["TOKEN", "DYLD_INSERT_LIBRARIES"] {
+        assert!(
+            !names.contains(&var),
+            "a declared variable reached the launcher's own environment: {var} in {names:?}"
+        );
+    }
     for var in ["BUZZ_PRIVATE_KEY", "NOSTR_PRIVATE_KEY", "BUZZ_AUTH_TAG"] {
         assert!(
             !names.contains(&var),

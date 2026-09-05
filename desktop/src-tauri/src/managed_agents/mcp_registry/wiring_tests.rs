@@ -1084,3 +1084,66 @@ fn mcp_registry_the_spawn_seam_strips_before_it_sets() {
     // buzz-agent's placement leaves the shared nest as the working directory.
     assert_eq!(command.get_current_dir(), None);
 }
+
+/// A saved user env layer cannot supply either registry variable.
+///
+/// The strip runs before the `descriptor.env` loop and the apply runs after it,
+/// but the apply writes only what this spawn's plan holds — and an empty plan
+/// is every spawn with no registry servers, which is every spawn today. So a
+/// saved `BUZZ_ACP_MCP_REGISTRY` (a code-execution surface: `buzz-acp` spawns
+/// every command the file names) or `BUZZ_MCP_CAPABILITY` (a bearer token for
+/// every `mcp:` record bound to the agent) would otherwise survive the seam.
+/// Both names are in `RESERVED_ENV_KEYS`, so `merged_user_env` — the producer
+/// of every user-settable layer of `descriptor.env` — drops them first.
+///
+/// Removing either entry from `RESERVED_ENV_KEYS` fails this test at the merge,
+/// and emptying the plan's apply cannot rescue it.
+#[test]
+fn mcp_registry_a_user_env_layer_cannot_reach_the_spawned_command() {
+    use std::ffi::OsStr;
+
+    let managed = [BUZZ_ACP_REGISTRY_ENV_VAR, CAPABILITY_ENV_VAR];
+    let mut saved = BTreeMap::new();
+    for key in managed {
+        saved.insert(key.to_string(), "SAVED-BY-THE-USER".to_string());
+    }
+
+    // The `descriptor.env` the spawn loop iterates: persona env under the
+    // record's own overrides, through the production merge.
+    let descriptor_env = crate::managed_agents::env_vars::merged_user_env(&saved, &saved);
+    for key in managed {
+        assert!(
+            !descriptor_env.contains_key(key),
+            "{key} survived the user env layer"
+        );
+    }
+
+    // The seam itself, with the empty plan every non-registry spawn has.
+    let mut command = std::process::Command::new("true");
+    let stripped = crate::managed_agents::strip_mcp_registry_env(&mut command);
+    for (key, value) in &descriptor_env {
+        command.env(key, value);
+    }
+    let _applied = crate::managed_agents::apply_mcp_registry_env(
+        &mut command,
+        &McpSpawnPlan::default(),
+        stripped,
+    );
+
+    let overrides: BTreeMap<String, Option<String>> = command
+        .get_envs()
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                value.map(OsStr::to_string_lossy).map(|v| v.into_owned()),
+            )
+        })
+        .collect();
+    for key in managed {
+        assert_eq!(
+            overrides.get(key),
+            Some(&None),
+            "{key} reached the spawned command"
+        );
+    }
+}

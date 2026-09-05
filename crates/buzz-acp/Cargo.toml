@@ -27,6 +27,9 @@ delivery-seam-test-api = []
 buzz-core = { workspace = true }
 buzz-sdk = { workspace = true }
 buzz-persona = { path = "../buzz-persona" }
+# Capability parsing only: the registry handover file is confined to the
+# adopted generation named by BUZZ_MCP_CAPABILITY. No secret is resolved here.
+buzz-secret-store = { workspace = true }
 
 # Nostr
 nostr = { workspace = true }
@@ -85,6 +88,9 @@ evalexpr = { workspace = true }
 # has a #[cfg(not(unix))] fallback in acp.rs.
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["signal"] }
+# O_NOFOLLOW for the registry handover file's open. Unix-only; the Windows path
+# checks `symlink_metadata` instead (see `mcp_registry::open_no_follow`).
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
