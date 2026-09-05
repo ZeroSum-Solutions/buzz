@@ -525,6 +525,12 @@ DRIVER_ARGS=(
   --prompt "List the names of the skills available to you, one per line. Do not use any of them."
   --expect "$EXPECTED_TOOL"
   --expect "$SKILL_NAME"
+  # The ONLY tool this run may approve. Claude qualifies an MCP tool as
+  # mcp__<server>__<tool>; the driver approves that name with `allow_once` and
+  # rejects every other permission request, so a model that asks for a shell or
+  # a file write fails the run instead of being granted it under the operator's
+  # account.
+  --allow-tool "mcp__${SERVER_NAME}__${EXPECTED_TOOL}"
   --env "PATH=$CHILD_PATH"
   --env "HOME=$HOME"
   # USER is not cosmetic here: the Claude Agent SDK looks its subscription
@@ -554,7 +560,7 @@ if [ ! -s "$CALL_LOG" ]; then
   echo "      a transcript alone does not prove the discovery path works." >&2
   exit 1
 fi
-if ! grep -qx "$EXPECTED_TOOL" "$CALL_LOG"; then
+if ! grep -qxF -- "$EXPECTED_TOOL" "$CALL_LOG"; then
   echo "FAIL: the fake MCP server logged a call, but never to $EXPECTED_TOOL:" >&2
   sed 's/^/        /' "$CALL_LOG" >&2
   exit 1

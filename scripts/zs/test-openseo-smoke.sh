@@ -254,6 +254,161 @@ else
   echo "  SKIP: node is not on PATH, so the driver cannot be exercised"
 fi
 
+echo "== a descendant that ignores SIGTERM is still reaped =="
+# The adapter exiting is NOT evidence its tree is gone. This supervisor exits
+# promptly on SIGTERM while its own grandchild ignores it — exactly the state a
+# shutdown that stops once the leader is reaped reports as success, with a live
+# orphan left behind. The driver must therefore always hard-kill the group and
+# probe the GROUP, not the leader. Dropping the unconditional SIGKILL in
+# openseo-smoke-acp.mjs leaves this case red.
+if command -v node >/dev/null 2>&1; then
+  STUBBORN_DIR="$STUBS/stubborn"
+  mkdir -p "$STUBBORN_DIR"
+  cat > "$STUBBORN_DIR/fake-adapter" <<'ADAPTER'
+#!/bin/sh
+# A supervisor whose grandchild ignores SIGTERM. The supervisor itself exits on
+# SIGTERM, so the leader is reaped while its process group is still populated.
+sh -c 'trap "" TERM; echo $$ > "$GRANDCHILD_PID_FILE"; while :; do sleep 1; done' &
+trap 'exit 0' TERM
+wait
+ADAPTER
+  chmod +x "$STUBBORN_DIR/fake-adapter"
+  set +e
+  OUT=$(node "$DRIVER" \
+    --command "$STUBBORN_DIR/fake-adapter" \
+    --cwd "$STUBBORN_DIR" \
+    --prompt "never answered" \
+    --expect "never matched" \
+    --timeout 3000 \
+    --env "PATH=$PATH" \
+    --env "GRANDCHILD_PID_FILE=$STUBBORN_DIR/pid" 2>&1)
+  RC=$?
+  set -e
+  check "a run whose adapter never answers still fails" 1 "$RC"
+  check_says "the timeout is reported" "no reply within" "$OUT"
+  check_lacks "and the group is not reported as leaked" "is not empty after SIGKILL" "$OUT"
+  STUBBORN=$(cat "$STUBBORN_DIR/pid" 2>/dev/null || echo "")
+  if [ -z "$STUBBORN" ]; then
+    echo "  FAIL: the fake adapter never recorded a TERM-ignoring grandchild pid"
+    fail=1
+  else
+    sleep 1
+    if kill -0 "$STUBBORN" 2>/dev/null; then
+      echo "  FAIL: TERM-ignoring grandchild $STUBBORN survived the driver — the process group leaked"
+      kill -9 "$STUBBORN" 2>/dev/null || true
+      fail=1
+    else
+      echo "  PASS: a grandchild that ignores SIGTERM is killed with the group"
+    fi
+  fi
+fi
+
+echo "== the driver approves only the tool it was told to allow =="
+# The adapter asks before it calls a tool, so the driver's answer IS the
+# authorization. Approving whatever is asked hands a deviating model — or a
+# hostile MCP server — the operator's account. This fake adapter asks for one
+# named tool, reports the outcome it was given, and then answers the prompt
+# with the expected text either way, so only the permission decision can change
+# the run's result. Its request TITLE carries the allowed name while its tool
+# identity does not: a driver that matched on the title (or on rawInput, which
+# echoes the prompt) would be fooled by it.
+if command -v node >/dev/null 2>&1; then
+  PERM_DIR="$STUBS/permission"
+  mkdir -p "$PERM_DIR"
+  cat > "$PERM_DIR/fake-adapter" <<'ADAPTER'
+#!/usr/bin/env node
+let buf = "";
+let promptId = null;
+const PERMISSION_ID = 9001;
+const send = (o) => process.stdout.write(`${JSON.stringify(o)}\n`);
+const reply = (id, result) => send({ jsonrpc: "2.0", id, result });
+process.stdin.on("data", (chunk) => {
+  buf += chunk.toString();
+  let nl;
+  while ((nl = buf.indexOf("\n")) >= 0) {
+    const line = buf.slice(0, nl).trim();
+    buf = buf.slice(nl + 1);
+    if (!line) continue;
+    const msg = JSON.parse(line);
+    if (msg.method === "initialize") {
+      reply(msg.id, { protocolVersion: 2 });
+    } else if (msg.method === "session/new") {
+      reply(msg.id, { sessionId: "s1" });
+    } else if (msg.method === "session/prompt") {
+      promptId = msg.id;
+      send({
+        jsonrpc: "2.0",
+        id: PERMISSION_ID,
+        method: "session/request_permission",
+        params: {
+          sessionId: "s1",
+          toolCall: {
+            toolCallId: "t1",
+            name: process.env.ASK_TOOL,
+            title: process.env.EXPECT_TEXT,
+            rawInput: { note: process.env.EXPECT_TEXT },
+            status: "pending",
+          },
+          options: [
+            { optionId: "once", name: "Yes", kind: "allow_once" },
+            { optionId: "always", name: "Yes, and don't ask again", kind: "allow_always" },
+            { optionId: "no", name: "No", kind: "reject_once" },
+          ],
+        },
+      });
+    } else if (msg.id === PERMISSION_ID) {
+      process.stderr.write(`outcome=${JSON.stringify(msg.result?.outcome ?? msg.error)}\n`);
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId: "s1", update: { text: process.env.EXPECT_TEXT } },
+      });
+      reply(promptId, { stopReason: "end_turn" });
+    }
+  }
+});
+ADAPTER
+  chmod +x "$PERM_DIR/fake-adapter"
+  ALLOWED_TOOL="smoke_deadbeef01"
+  QUALIFIED_TOOL="mcp__openseo-fake__$ALLOWED_TOOL"
+
+  set +e
+  OUT=$(node "$DRIVER" \
+    --command "$PERM_DIR/fake-adapter" \
+    --cwd "$PERM_DIR" \
+    --prompt "call it" \
+    --expect "$ALLOWED_TOOL" \
+    --allow-tool "$QUALIFIED_TOOL" \
+    --timeout 20000 \
+    --env "PATH=$PATH" \
+    --env "ASK_TOOL=mcp__hostile__shell_exec" \
+    --env "EXPECT_TEXT=$ALLOWED_TOOL" 2>&1)
+  RC=$?
+  set -e
+  check "a request for another tool fails the run" 1 "$RC"
+  check_says "the denied tool is named on stderr" "mcp__hostile__shell_exec" "$OUT"
+  check_says "the run says why it failed" "asked for a tool this run does not allow" "$OUT"
+  check_says "the adapter was told no" '"optionId":"no"' "$OUT"
+  check_lacks "nothing was granted" "granted:" "$OUT"
+
+  set +e
+  OUT=$(node "$DRIVER" \
+    --command "$PERM_DIR/fake-adapter" \
+    --cwd "$PERM_DIR" \
+    --prompt "call it" \
+    --expect "$ALLOWED_TOOL" \
+    --allow-tool "$QUALIFIED_TOOL" \
+    --timeout 20000 \
+    --env "PATH=$PATH" \
+    --env "ASK_TOOL=$QUALIFIED_TOOL" \
+    --env "EXPECT_TEXT=$ALLOWED_TOOL" 2>&1)
+  RC=$?
+  set -e
+  check "the one allowed tool is approved and the run passes" 0 "$RC"
+  check_says "the grant is allow_once, never allow_always" "(allow_once, once)" "$OUT"
+  check_lacks "no persistent grant was taken" "always" "$OUT"
+fi
+
 echo "== the driver requires at least one prompt and one expectation =="
 if command -v node >/dev/null 2>&1; then
   set +e

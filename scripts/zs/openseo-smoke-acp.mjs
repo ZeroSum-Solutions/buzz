@@ -33,8 +33,21 @@
 //       tree, which is the equivalent reach.
 //
 //   Every exit path — assertion failure, timeout, spawn error, success — goes
-//   through shutdown(): SIGTERM the group, wait out a grace period, SIGKILL
-//   what is left, and await the child's `exit` before this process exits.
+//   through shutdown(): SIGTERM the group, wait out a grace period, then
+//   ALWAYS SIGKILL the group, then probe the GROUP — not the leader — until it
+//   is empty. The adapter exiting proves nothing: a descendant that ignores
+//   SIGTERM outlives it, and a shutdown that stopped once the leader was reaped
+//   would return success over a live orphan. A group that is still populated
+//   after SIGKILL is reported and exits non-zero.
+//
+// TOOL PERMISSION
+//
+//   The adapter asks before it calls a tool. This driver approves exactly one:
+//   the per-run fake tool named by --allow-tool, with `allow_once` — never
+//   `allow_always`, which would leave a persistent grant behind. Every other
+//   request is rejected and its tool name printed to stderr, and any rejection
+//   fails the run: a smoke run that had to deny a tool is not a run whose pass
+//   means anything.
 
 import { spawn, spawnSync } from "node:child_process";
 
@@ -65,6 +78,10 @@ function parseArgs(argv) {
         break;
       case "--expect":
         out.expects.push(value);
+        break;
+      case "--allowTool":
+      case "--allow-tool":
+        out.allowTool = value;
         break;
       case "--timeout":
         out.timeout = Number.parseInt(value, 10);
@@ -138,9 +155,15 @@ async function main() {
     childExited = true;
   });
 
-  // Signal the whole tree, not just the supervisor.
-  const signalTree = (signal) => {
-    if (childExited || child.pid === undefined) return;
+  // `detached` makes the child the leader of a new group whose id is its pid.
+  // This process is NOT in that group, so signalling it cannot reach us.
+  const pgid = IS_WINDOWS ? undefined : child.pid;
+
+  // Signal the whole GROUP, not just the supervisor. Deliberately not
+  // short-circuited on `childExited`: the leader exiting is exactly the case
+  // where a TERM-ignoring descendant is still running under its group id.
+  const signalGroup = (signal) => {
+    if (child.pid === undefined) return;
     if (IS_WINDOWS) {
       // No process groups to signal; /T walks the child tree, /F is the
       // SIGKILL equivalent. taskkill has no graceful mode for a console-less
@@ -152,16 +175,52 @@ async function main() {
       }
       return;
     }
+    let groupSignalled = false;
     try {
-      process.kill(-child.pid, signal);
+      process.kill(-pgid, signal);
+      groupSignalled = true;
     } catch {
-      // ESRCH: the group is already gone. Fall back to the child alone in
-      // case the group id was never established.
+      // ESRCH: the group is empty (or was never established).
+    }
+    if (!groupSignalled) {
+      // Fall back to the child alone, for a platform or a spawn where the
+      // group id was never established.
       try {
         child.kill(signal);
       } catch {
         // Already reaped.
       }
+    }
+  };
+
+  // Is any process still in the child's group? `kill(-pgid, 0)` succeeds while
+  // the group has a member and raises ESRCH once it is empty; EPERM means it
+  // exists but is not ours to signal, which is still "not empty".
+  const groupAlive = () => {
+    if (IS_WINDOWS || pgid === undefined) return !childExited;
+    try {
+      process.kill(-pgid, 0);
+      return true;
+    } catch (e) {
+      return e.code === "EPERM";
+    }
+  };
+
+  // Best-effort names for whatever is left, for the failure report only.
+  const groupSurvivors = () => {
+    if (IS_WINDOWS || pgid === undefined) return "";
+    const ps = spawnSync("ps", ["-o", "pid=,ppid=,command=", "-g", String(pgid)], {
+      encoding: "utf8",
+    });
+    return (ps.stdout ?? "").trim();
+  };
+
+  const waitForGroupGone = async (limitMs) => {
+    const deadline = Date.now() + limitMs;
+    for (;;) {
+      if (!groupAlive()) return true;
+      if (Date.now() >= deadline) return false;
+      await sleep(50);
     }
   };
 
@@ -173,7 +232,7 @@ async function main() {
     return childExited;
   };
 
-  // The single exit path. Terminates the tree, waits for it, then exits.
+  // The single exit path. Terminates the group, proves it is empty, then exits.
   const shutdown = async (code, message) => {
     if (shuttingDown) return;
     shuttingDown = true;
@@ -183,16 +242,22 @@ async function main() {
         process.stderr.write(`--- adapter stderr ---\n${stderr.slice(-4000)}\n`);
       }
     }
-    signalTree("SIGTERM");
-    if (!(await waitForExit(TERM_GRACE_MS))) {
-      signalTree("SIGKILL");
-      if (!(await waitForExit(KILL_GRACE_MS))) {
-        // Reaping failed: say so rather than exiting 0 over a leaked tree.
-        process.stderr.write(
-          `FAIL: the adapter process tree (pid ${child.pid}) did not exit after SIGKILL\n`,
-        );
-        process.exit(code === 0 ? 1 : code);
-      }
+    signalGroup("SIGTERM");
+    await waitForGroupGone(TERM_GRACE_MS);
+    // Unconditional. The graceful pass may have taken the supervisor and left
+    // a descendant that ignores SIGTERM; the supervisor's exit is not evidence
+    // the group is empty, so the hard kill is never skipped.
+    signalGroup("SIGKILL");
+    const reaped = await waitForGroupGone(KILL_GRACE_MS);
+    await waitForExit(100);
+    if (!reaped) {
+      // Say so rather than exiting 0 over a leaked tree.
+      const survivors = groupSurvivors();
+      process.stderr.write(
+        `FAIL: the adapter process group (pgid ${pgid}) is not empty after SIGKILL\n` +
+          (survivors ? `--- survivors ---\n${survivors}\n` : ""),
+      );
+      process.exit(code === 0 ? 1 : code);
     }
     process.exit(code);
   };
@@ -209,6 +274,67 @@ async function main() {
   child.stderr.on("data", (chunk) => {
     stderr = (stderr + chunk.toString()).slice(-MAX_REPLY_CHARS);
   });
+
+  // ── tool permission ─────────────────────────────────────────────────────────
+  // Exactly one tool may be approved: the per-run fake tool named by
+  // --allow-tool. Its name is drawn from /dev/urandom by the caller, so a match
+  // on it is unforgeable — but only when the match is made against the
+  // request's tool IDENTITY. `title` and `rawInput` are deliberately not
+  // identity: the prompt names the tool, so a shell tool call whose title is
+  // its command line would echo the allowed name straight back and be approved.
+  const bareTool = args.allowTool ? args.allowTool.split("__").pop() : "";
+  const namesAllowedTool = (value) => {
+    if (typeof value !== "string" || !args.allowTool) return false;
+    const v = value.trim();
+    if (v === args.allowTool) return true;
+    // Claude qualifies an MCP tool as mcp__<server>__<tool>. Accept that shape
+    // around the per-run name — the server prefix is the runtime's to choose —
+    // and nothing else.
+    return bareTool !== "" && v.startsWith("mcp__") && v.endsWith(`__${bareTool}`);
+  };
+  const toolIdentity = (toolCall) => {
+    const parts = [];
+    for (const field of ["name", "toolName"]) {
+      if (typeof toolCall?.[field] === "string") parts.push(toolCall[field]);
+    }
+    const meta = toolCall?._meta?.claudeCode?.toolName;
+    if (typeof meta === "string") parts.push(meta);
+    return parts;
+  };
+  // Every request this driver refused. A run that had to deny a tool is not a
+  // run whose PASS means anything, so this fails the run at the end even when
+  // every expectation matched.
+  const denied = new Set();
+  const answerPermission = (msg) => {
+    const toolCall = msg.params?.toolCall ?? {};
+    const identity = toolIdentity(toolCall);
+    const label = identity[0] ?? toolCall.title ?? "<unnamed tool>";
+    const options = msg.params?.options ?? [];
+    const reply = (result) =>
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: msg.id, result })}\n`);
+    if (identity.some(namesAllowedTool)) {
+      // allow_once, never allow_always: a persistent grant would outlive the
+      // run and approve the same tool for whatever asks next.
+      const allow = options.find((o) => o.kind === "allow_once");
+      if (allow?.optionId) {
+        process.stdout.write(`  granted: ${label} (allow_once, ${allow.optionId})\n`);
+        reply({ outcome: { outcome: "selected", optionId: allow.optionId } });
+        return;
+      }
+      denied.add(`${label} (no allow_once option was offered)`);
+    } else {
+      denied.add(label);
+    }
+    process.stderr.write(
+      `DENIED: ${label} asked for permission; this run allows only ${args.allowTool ?? "<no --allow-tool>"}\n`,
+    );
+    const reject = options.find((o) => o.kind === "reject_once");
+    if (reject?.optionId) {
+      reply({ outcome: { outcome: "selected", optionId: reject.optionId } });
+    } else {
+      reply({ outcome: { outcome: "cancelled" } });
+    }
+  };
 
   const send = (method, params) =>
     new Promise((resolve, reject) => {
@@ -249,35 +375,7 @@ async function main() {
         continue;
       }
       if (msg.method === "session/request_permission") {
-        // The run has to be able to actually call the fixture's tool, and the
-        // adapter asks before it does. Approve the request the caller made —
-        // the sandbox holds one fake MCP server and nothing else — and record
-        // it so the caller can see the grant in the log.
-        const options = msg.params?.options ?? [];
-        const allow =
-          options.find((o) => o.kind === "allow_always") ??
-          options.find((o) => o.kind === "allow_once") ??
-          options[0];
-        if (allow?.optionId) {
-          process.stdout.write(
-            `  granted: ${msg.params?.toolCall?.title ?? "tool call"} (${allow.optionId})\n`,
-          );
-          child.stdin.write(
-            `${JSON.stringify({
-              jsonrpc: "2.0",
-              id: msg.id,
-              result: { outcome: { outcome: "selected", optionId: allow.optionId } },
-            })}\n`,
-          );
-        } else {
-          child.stdin.write(
-            `${JSON.stringify({
-              jsonrpc: "2.0",
-              id: msg.id,
-              result: { outcome: { outcome: "cancelled" } },
-            })}\n`,
-          );
-        }
+        answerPermission(msg);
         continue;
       }
       if (msg.id !== undefined) {
@@ -322,6 +420,14 @@ async function main() {
       noteMatches(replies);
     }
     clearTimeout(deadline);
+    if (denied.size > 0) {
+      await shutdown(
+        1,
+        `FAIL: the session asked for a tool this run does not allow: ${[...denied].join(", ")}\n` +
+          `      allowed: ${args.allowTool ?? "<no --allow-tool>"}`,
+      );
+      return;
+    }
     if (remaining.size > 0) {
       await shutdown(
         1,
