@@ -4,6 +4,7 @@ mod acp;
 mod config;
 mod engram_fetch;
 mod filter;
+mod mcp_registry;
 mod observer;
 mod pool;
 mod pool_lifecycle;
@@ -5904,7 +5905,7 @@ const MCP_TOOL_NAME_RESERVE: usize = 32;
 /// [`MAX_MCP_QNAME_LEN`], so a name cut to 128 bytes leaves no room for the
 /// tools the server exists to offer. Budgeting against the qualified name is
 /// what makes a generated name usable.
-const MAX_MCP_NAME_LEN: usize = MAX_MCP_QNAME_LEN - MCP_TOOL_NAME_RESERVE;
+pub(crate) const MAX_MCP_NAME_LEN: usize = MAX_MCP_QNAME_LEN - MCP_TOOL_NAME_RESERVE;
 
 /// `buzz-agent`'s cap on how many MCP servers one `session/new` may carry,
 /// mirrored from `buzz_agent::MAX_MCP_SERVERS`.
@@ -5925,7 +5926,7 @@ pub const MAX_MCP_SERVERS: usize = 16;
 /// process that inherited this one's environment — including
 /// `BUZZ_PRIVATE_KEY`. Extras are therefore refused at startup under any other
 /// adapter (see [`append_extra_mcp_servers`]).
-const EXTRA_MCP_ADAPTER: &str = "buzz-agent";
+pub(crate) const EXTRA_MCP_ADAPTER: &str = "buzz-agent";
 
 fn build_mcp_servers(config: &Config) -> Result<Vec<McpServer>, ConfigError> {
     let mut servers: Vec<McpServer> = Vec::new();
@@ -5990,6 +5991,11 @@ fn build_mcp_servers(config: &Config) -> Result<Vec<McpServer>, ConfigError> {
     }
 
     append_extra_mcp_servers(config, &mut servers)?;
+    // The registry file lands after the extras array, so an operator's own
+    // `BUZZ_ACP_EXTRA_MCP_COMMANDS` entries keep the names they had before the
+    // desktop wrote a registry, and a registry entry that would collide with
+    // one is refused rather than silently renamed.
+    mcp_registry::append_registry_mcp_servers(config, &mut servers)?;
     Ok(servers)
 }
 
@@ -9382,6 +9388,7 @@ mod build_mcp_servers_tests {
             agent_args: vec!["acp".into()],
             mcp_command: "test-mcp-server".into(),
             extra_mcp_commands: vec![],
+            mcp_registry: None,
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
@@ -9433,6 +9440,78 @@ mod build_mcp_servers_tests {
         let mut config = test_config();
         config.agent_command = "buzz-agent".into();
         config
+    }
+
+    /// A registry file declaring one server named `name`, with a
+    /// reference-valued `env` block, written under `dir`.
+    fn registry_file(dir: &std::path::Path, name: &str) -> String {
+        let path = dir.join(format!("{name}-registry.json"));
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"version\":1,\"servers\":[{{\"name\":\"{name}\",\
+                 \"command\":\"/opt/buzz/bin/buzz-mcp-launch\",\
+                 \"args\":[\"launch\",\"--server\",\"{name}\"],\
+                 \"env\":[{{\"name\":\"TOKEN\",\"value\":\"mcp:{name}-token\"}}]}}]}}"
+            ),
+        )
+        .expect("write registry file");
+        path.display().to_string()
+    }
+
+    /// The T4 mechanism keeps working beside the registry file: both paths
+    /// append to one array, and the extras entries keep the names they had.
+    #[test]
+    fn mcp_registry_file_and_extra_commands_coexist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = extras_config();
+        config.extra_mcp_commands = vec!["memory=memory-mcp --db /tmp/m".into()];
+        config.mcp_registry = Some(registry_file(dir.path(), "github"));
+
+        let servers = build_mcp_servers(&config).expect("both paths load");
+        let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["test-mcp-server", "memory", "github"]);
+
+        // The extras entry still carries no env block at all — that is the
+        // limitation the registry file exists to lift, not a regression.
+        let memory = &servers[1];
+        assert!(memory.env.is_empty());
+        assert!(!memory.trusted);
+
+        // The registry entry carries its declared references, and stays
+        // untrusted like any third-party server.
+        let github = &servers[2];
+        assert_eq!(github.command, "/opt/buzz/bin/buzz-mcp-launch");
+        assert_eq!(github.env.len(), 1);
+        assert_eq!(github.env[0].value, "mcp:github-token");
+        assert!(!github.trusted);
+    }
+
+    /// The registry file draws the same adapter boundary the extras path does.
+    /// Every other adapter ignores `trusted` and spawns the declared servers
+    /// from a process holding BUZZ_PRIVATE_KEY.
+    #[test]
+    fn mcp_registry_file_refused_under_another_adapter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config();
+        config.mcp_registry = Some(registry_file(dir.path(), "github"));
+        let error = build_mcp_servers(&config).expect_err("goose must be refused");
+        assert!(
+            format!("{error}").contains("BUZZ_ACP_MCP_REGISTRY"),
+            "{error}"
+        );
+    }
+
+    /// Both native config formats key servers by name, so a collision would
+    /// leave one command silently holding the other's credential.
+    #[test]
+    fn mcp_registry_file_name_colliding_with_an_extra_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = extras_config();
+        config.extra_mcp_commands = vec!["github=github-mcp".into()];
+        config.mcp_registry = Some(registry_file(dir.path(), "github"));
+        let error = build_mcp_servers(&config).expect_err("a collision must be refused");
+        assert!(format!("{error}").contains("same name"), "{error}");
     }
 
     #[test]
@@ -10122,6 +10201,7 @@ mod error_outcome_emission_tests {
             agent_args: vec![],
             mcp_command: "test-mcp-server".into(),
             extra_mcp_commands: vec![],
+            mcp_registry: None,
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,

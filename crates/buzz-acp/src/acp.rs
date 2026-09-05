@@ -50,6 +50,44 @@ fn is_false(b: &bool) -> bool {
     !b
 }
 
+/// Placeholder every `mcpServers[].env[].value` is logged as.
+pub(crate) const REDACTED_ENV_VALUE: &str = "<redacted>";
+
+/// Serialize an outbound JSON-RPC message for the `acp::wire` log, with every
+/// declared MCP environment value replaced by [`REDACTED_ENV_VALUE`].
+///
+/// `session/new` carries `params.mcpServers[].env[]`, and a registry entry's
+/// `env` block is where a credential would live if one ever reached this
+/// process. The redaction is structural rather than a filter on the log level:
+/// a seam that is safe only while `acp::wire` stays below `debug` is one
+/// `RUST_LOG` change away from writing a secret to the agent log file.
+///
+/// Every other field is logged unchanged — the point is to keep the wire log
+/// useful, not to blank it.
+pub(crate) fn wire_log_line(message: &serde_json::Value) -> String {
+    let mut redacted = message.clone();
+    if let Some(servers) = redacted
+        .get_mut("params")
+        .and_then(|params| params.get_mut("mcpServers"))
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for server in servers.iter_mut() {
+            let Some(variables) = server
+                .get_mut("env")
+                .and_then(serde_json::Value::as_array_mut)
+            else {
+                continue;
+            };
+            for variable in variables.iter_mut() {
+                if let Some(value) = variable.get_mut("value") {
+                    *value = serde_json::Value::String(REDACTED_ENV_VALUE.to_string());
+                }
+            }
+        }
+    }
+    serde_json::to_string(&redacted).unwrap_or_default()
+}
+
 /// A single environment variable for an MCP server.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EnvVar {
@@ -818,7 +856,7 @@ impl AcpClient {
             "params": params,
         });
 
-        tracing::debug!(target: "acp::wire", "→ {}", &serde_json::to_string(&msg).unwrap_or_default());
+        tracing::debug!(target: "acp::wire", "→ {}", wire_log_line(&msg));
         if let Err(e) = self.write_ndjson(&msg).await {
             self.last_prompt_id = None;
             self.current_hard_deadline = None;
@@ -1124,7 +1162,7 @@ impl AcpClient {
             "params": params,
         });
 
-        tracing::debug!(target: "acp::wire", "→ {}", &serde_json::to_string(&msg).unwrap_or_default());
+        tracing::debug!(target: "acp::wire", "→ {}", wire_log_line(&msg));
 
         // Wrap write + read in a single timeout so a hung agent can't block forever.
         // We cannot use an async block that borrows `self` mutably across two awaits
@@ -1189,7 +1227,7 @@ impl AcpClient {
             "params": params,
         });
 
-        tracing::debug!(target: "acp::wire", "→ (notification) {}", &serde_json::to_string(&msg).unwrap_or_default());
+        tracing::debug!(target: "acp::wire", "→ (notification) {}", wire_log_line(&msg));
         self.write_ndjson(&msg).await?;
         Ok(())
     }
