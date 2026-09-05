@@ -74,6 +74,61 @@ pub use lifecycle::{kill_stale_tracked_processes, sync_managed_agent_processes};
 mod spawn_key; // production spawn-key derivation + its regressions
 pub(crate) use spawn_key::bound_runtime_key;
 
+/// The environment variable a spawn hands the harness the effective system
+/// prompt in.
+///
+/// `buzz-acp` reads the same name into `CliArgs::system_prompt`
+/// (`crates/buzz-acp/src/config.rs`), so the two sides of the delivery seam are
+/// pinned to one spelling and a rename on either side fails the end-to-end
+/// prompt-source test rather than silently dropping the prompt.
+pub(crate) const SYSTEM_PROMPT_ENV: &str = "BUZZ_ACP_SYSTEM_PROMPT";
+
+/// Proof token for the system-prompt write, the same shape as
+/// [`EffortApplied`]. `#[must_use]`; `spawn_with_effort_proof` consumes it by
+/// value, so deleting the `apply_system_prompt_env` call from
+/// `spawn_agent_child` leaves `prompt_applied` undefined at the spawn site — a
+/// compile error, not a silently-green test suite.
+///
+/// The delivery seam needs this more than effort does. A test can drive
+/// `apply_system_prompt_env` and read the variable back off its own command,
+/// which proves the helper composes and the harness parses — but not that the
+/// production spawn ever calls it. Only the token binds that call, and the
+/// end-to-end prompt-source test's claim ("the prompt the adapter receives is
+/// the file's bytes") is worth nothing without it.
+///
+/// The private field keeps `apply_system_prompt_env` the only way to obtain
+/// one.
+#[must_use]
+pub(crate) struct SystemPromptApplied(());
+
+/// Export the resolved system prompt on a spawn command, or remove it.
+///
+/// This one line is the desktop half of the delivery seam: everything upstream
+/// of it decides *what* the agent's instructions are, and everything downstream
+/// — the harness's own env parse, its standing-prompt composition, the
+/// `session/new` request — reads them from this variable. It is a named
+/// function so a test can drive the real write and read the value back off the
+/// command, instead of setting the variable itself and proving only that the
+/// name is spelled the same in two test lines.
+///
+/// `None` removes the variable rather than exporting an empty one: a spawned
+/// child inherits the parent environment, so a stale value left over from an
+/// earlier configuration would otherwise become this agent's instructions.
+///
+/// Returns [`SystemPromptApplied`], which the spawn consumes: that is what
+/// binds the seam to the production path rather than to the test's own
+/// command.
+pub(crate) fn apply_system_prompt_env(
+    command: &mut std::process::Command,
+    prompt: Option<&str>,
+) -> SystemPromptApplied {
+    match prompt {
+        Some(prompt) => command.env(SYSTEM_PROMPT_ENV, prompt),
+        None => command.env_remove(SYSTEM_PROMPT_ENV),
+    };
+    SystemPromptApplied(())
+}
+
 /// Classify an agent's persona against the live catalog for the Agents-menu
 /// drift indicator. Returns `(out_of_date, orphaned)`.
 ///
@@ -422,12 +477,15 @@ pub(crate) fn apply_effort_to_spawn_command(
     EffortApplied(())
 }
 
-/// Spawn the agent command, consuming the `EffortApplied` proof token.
-/// Deleting `apply_effort_to_spawn_command` from `spawn_agent_child` leaves
-/// `effort` undefined here — a compile error CI catches before any test runs.
+/// Spawn the agent command, consuming the `EffortApplied` and
+/// `SystemPromptApplied` proof tokens.
+/// Deleting `apply_effort_to_spawn_command` or `apply_system_prompt_env` from
+/// `spawn_agent_child` leaves `effort` / `prompt_applied` undefined here — a
+/// compile error CI catches before any test runs.
 pub(crate) fn spawn_with_effort_proof(
     cmd: &mut std::process::Command,
     _effort: EffortApplied,
+    _prompt: SystemPromptApplied,
 ) -> std::io::Result<std::process::Child> {
     cmd.spawn()
 }
@@ -659,11 +717,11 @@ pub fn spawn_agent_child(
     let effective_model = effective_cfg.model.value;
     let effective_provider = effective_cfg.provider.value;
 
-    if let Some(prompt) = &effective_prompt {
-        command.env("BUZZ_ACP_SYSTEM_PROMPT", prompt);
-    } else {
-        command.env_remove("BUZZ_ACP_SYSTEM_PROMPT");
-    }
+    // The desktop half of the delivery seam. The returned SystemPromptApplied
+    // token is consumed by spawn_with_effort_proof below; deleting this call
+    // is a compile error, which is what makes the end-to-end prompt-source
+    // test's claim about the spawn path falsifiable.
+    let prompt_applied = apply_system_prompt_env(&mut command, effective_prompt.as_deref());
     // Shared compute stores `auto`, but the wire name is MeshLLM's virtual
     // `mesh` model. Translate here too, so the harness and the LLM client are
     // told the same thing: `BUZZ_ACP_MODEL=auto` would name a model the mesh
@@ -840,7 +898,7 @@ pub fn spawn_agent_child(
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let child = spawn_with_effort_proof(&mut command, effort).map_err(|error| {
+    let child = spawn_with_effort_proof(&mut command, effort, prompt_applied).map_err(|error| {
         format!(
             "failed to spawn `{}` for agent {}: {error}",
             resolved_acp_command.display(),

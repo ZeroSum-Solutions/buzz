@@ -15,6 +15,13 @@ path = "src/lib.rs"
 name = "buzz-acp"
 path = "src/main.rs"
 
+[features]
+# Re-exports the `session/new` delivery seam as `buzz_acp::delivery_seam` so the
+# desktop crate's end-to-end prompt-source test can drive the real harness path
+# instead of restating it. Enabled only by that dev-dependency; off in every
+# shipped build of this crate.
+delivery-seam-test-api = []
+
 [dependencies]
 # Internal
 buzz-core = { workspace = true }

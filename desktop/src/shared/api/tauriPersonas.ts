@@ -167,6 +167,7 @@ type RawPersonaSharePublicationResult = {
   persona: RawPersona;
   publicationStatus: "published" | "queued";
   relayMessage?: string;
+  bookkeepingError?: string;
 };
 
 function fromRawPublicationResult(
@@ -176,6 +177,7 @@ function fromRawPublicationResult(
     persona: fromRawPersona(raw.persona),
     publicationStatus: raw.publicationStatus,
     relayMessage: raw.relayMessage ?? null,
+    bookkeepingError: raw.bookkeepingError ?? null,
   };
 }
 
@@ -208,7 +210,119 @@ export type PersonaSharePublicationResult = {
   persona: AgentPersona;
   publicationStatus: "published" | "queued";
   relayMessage: string | null;
+  /**
+   * Why the local "this head is synced" record did not update after the relay
+   * accepted the event, or `null`.
+   *
+   * The backend stopped raising this as an error, because the publish and the
+   * local save both landed and reporting `Err` would tell the user nothing was
+   * applied. Dropping it here instead would make it invisible: the retained row
+   * stays `pending_sync` and the flush loop republishes the head, which the
+   * user sees as a change that publishes itself twice with no explanation.
+   */
+  bookkeepingError: string | null;
 };
+
+/**
+ * Outcome of `set_prompt_source_and_reload`.
+ *
+ * `publish` is a string, not the two-state publication status, because a
+ * reload has a third outcome: the local record can be saved while the durable
+ * enqueue fails (`failed:<reason>`). It is `null` when nothing was submitted —
+ * the clear path. `path` is machine-local and is never published; it is set
+ * exactly when a binding was stored, so it is `null` both after a clear and
+ * after a reload whose sidecar write failed — `mappingError` says which.
+ */
+/**
+ * A stored prompt-file binding, resolved against the definition's current
+ * instructions.
+ *
+ * `inSync` is `false` when the agent's instructions are no longer the text this
+ * file was read into — someone typed over them, another device replaced the
+ * definition, or the definition is gone. The dialog renders that as an explicit
+ * out-of-sync state rather than repeating the claim as fact.
+ */
+export type PromptSourceBinding = {
+  path: string;
+  inSync: boolean;
+};
+
+export type PromptSourceResult = {
+  localUpdated: boolean;
+  publish: string | null;
+  relayMessage: string | null;
+  /** The binding stored after the attempt — on a failed write, the one that survived. */
+  binding: PromptSourceBinding | null;
+  mappingError: string | null;
+  /** Why the local sync record did not update after the relay accepted the head. */
+  bookkeepingError: string | null;
+  prompt: string | null;
+};
+
+type RawPromptSourceResult = {
+  localUpdated: boolean;
+  publish?: string;
+  relayMessage?: string;
+  binding?: PromptSourceBinding;
+  mappingError?: string;
+  bookkeepingError?: string;
+  prompt?: string;
+};
+
+/**
+ * Bind an agent definition to a prompt file on this machine and reload it.
+ *
+ * `path` `null` clears the binding and leaves the stored instructions alone.
+ */
+export async function setPromptSourceAndReload(
+  definitionId: string,
+  path: string | null,
+): Promise<PromptSourceResult> {
+  const raw = await invokeTauri<RawPromptSourceResult>(
+    "set_prompt_source_and_reload",
+    { definitionId, path },
+  );
+  return {
+    localUpdated: raw.localUpdated,
+    publish: raw.publish ?? null,
+    relayMessage: raw.relayMessage ?? null,
+    binding: raw.binding ?? null,
+    mappingError: raw.mappingError ?? null,
+    bookkeepingError: raw.bookkeepingError ?? null,
+    prompt: raw.prompt ?? null,
+  };
+}
+
+/**
+ * The prompt file bound to `definitionId` on this machine, or `null`.
+ *
+ * The read half of {@link setPromptSourceAndReload}. The dialog seeds its path
+ * field from this on open, so a binding survives a re-open instead of forcing
+ * the operator to retype the absolute path. A corrupt sidecar rejects rather
+ * than answering `null`, so "nothing is bound" is never a disguised failure.
+ */
+export async function getPromptSource(
+  definitionId: string,
+): Promise<PromptSourceBinding | null> {
+  const stored = await invokeTauri<PromptSourceBinding | null>(
+    "get_prompt_source",
+    { definitionId },
+  );
+  return stored ?? null;
+}
+
+/**
+ * Move an unreadable prompt-sources sidecar aside and report where it went.
+ *
+ * The recovery path for a corrupt sidecar, which every other control refuses:
+ * Clear has to read the file before it can remove one entry, so it fails
+ * exactly where the seed did. **Every agent's binding is affected** — the whole
+ * file moves — so the UI warns before offering it. Refused when the file is
+ * readable, so it cannot be used to drop working bindings.
+ */
+export async function resetPromptSources(): Promise<string> {
+  return invokeTauri<string>("reset_prompt_sources", {});
+}
 
 export type SnapshotMemoryLevel = "none" | "core" | "everything";
 export type SnapshotFormat = "json" | "png";

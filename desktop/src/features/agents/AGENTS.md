@@ -345,6 +345,82 @@ buzz messages send --channel <channel-id> --reply-to <thread-root-id> \
   --mention <agent-pubkey> --content '!cancel'
 ```
 
+## Instructions from a file (prompt source)
+
+An agent's instructions can be bound to a file on the operator's machine and
+reloaded into the definition. Three facts about this feature are load-bearing:
+
+1. **It is a desktop feature, not a harness capability.** No harness advertises
+   or receives anything about it, so `KnownAcpRuntime` is unchanged and nothing
+   is projected through the agent config core. The binding is stored in a
+   machine-local sidecar (`<app-data>/agents/prompt-sources.json`, definition id
+   to absolute path) that never reaches the relay; only the prompt *text* is
+   published, in the ordinary kind:30175 head.
+2. **Reload is an ordinary definition save.** `set_prompt_source_and_reload`
+   submits the file's text through the same persona update path a typed edit
+   takes (`update_persona_with_precondition`), so definition-text validation,
+   the kind:30175 publish, and `persona_content_hash` all behave identically.
+   Do not add a second write path for it. The order inside the command is
+   validate, read, persona save, **then** the sidecar mapping: the mapping is a
+   claim that the file's text is what the agent uses, so a failure at any
+   earlier boundary must leave no mapping. Because the definition is read in one
+   store-lock hold and saved in another, the read pass captures `updated_at` and
+   the save refuses if it moved — a concurrent dialog edit is reported, never
+   clobbered by the request's replace-everything fields.
+3. **`publish` has three outcomes, not two.** `published`, `queued`, and
+   `failed:<reason>` — the local save can land while the durable enqueue does
+   not, and reporting that as `queued` would claim a retry that was never
+   recorded. `publish` is absent on the clear path, where nothing is submitted.
+   Past the relay's acceptance nothing may raise: `publish_prepared_persona`
+   reports a failed mark-synced as `bookkeepingError` beside a `published`
+   outcome, because by then the persona, the mapping and the relay head have all
+   landed and an `Err` would tell the user nothing was applied. The retained row
+   simply stays pending, which is the durable retry the flush loop already acts
+   on.
+
+4. **The binding is verified on read, not maintained on write.** A sidecar entry
+   stores the file path *and* the SHA-256 of the prompt it was read into, and
+   `get_prompt_source` compares that digest against the definition's current
+   instructions. Any number of other paths write those instructions — a typed
+   edit, an inbound kind:30175 replacement, a snapshot import — and none of them
+   knows the sidecar exists; chasing them with invalidation hooks would leave the
+   next new path stale. A binding that no longer matches reads back
+   `inSync: false` and the field says so instead of repeating the claim. Removing
+   a claim is always safe, adding one is not: that asymmetry is why
+   `delete_persona` drops the entry before it destroys anything, and why a reload
+   writes the entry only after the prompt is durable.
+5. **A reload invalidates the same caches a typed edit does.** It runs through
+   `useSetPromptSourceMutation`, which invalidates `personasQueryKey` and
+   `managedAgentsQueryKey` on settle. The command emits no `agents-data-changed`,
+   so nothing else will; without it the cached persona keeps the pre-reload
+   prompt for its `staleTime`, the next `openEdit` seeds the dialog from that
+   stale copy, and saving any unrelated field resubmits the old instructions.
+
+The binding is read back as well as written. `get_prompt_source` answers which
+file is bound to a definition and whether it still matches, and the field seeds
+itself from it on open, so a re-opened dialog shows the path instead of making
+the operator retype an absolute path on every reload.
+
+**Every answer that arrives late is fenced**, the seed and the reload alike, by
+generation, by definition id and by mount. The dialog is persistent: it keeps
+the field mounted across agents and re-mounts it on the next open while a
+request is still in flight, and `onPromptReloaded` writes straight into the
+dialog's shared instructions textarea. An unfenced answer therefore puts one
+agent's prompt into another agent's unsaved draft, where Save persists it.
+
+A sidecar that cannot be read is reported in the status line, never answered as
+"nothing is bound" — and it arms `reset_prompt_sources`, which moves the
+unreadable file aside (renamed, never deleted) and is refused when the file
+parses. That is the only control that can recover the state, because Clear has
+to read the whole sidecar before it can remove one entry and so fails exactly
+where the seed did. It is machine-wide, so the UI warns before offering it.
+
+The field is edit-mode only (a reload writes to a stored definition, so it
+needs an id). Reload stays disabled until a path is typed. Clear stays offered
+whenever the field is usable and is deliberately **not** gated on the seed: the
+seed can be out of date because another window bound a file since this dialog
+opened. Unbinding what is already unbound is a no-op.
+
 ## The tests that enforce this
 
 - `lib/agentConfigCore.test.mjs` — field model per harness × scope, clearing
@@ -388,6 +464,45 @@ buzz messages send --channel <channel-id> --reply-to <thread-root-id> \
 - `lib/agentDescription.test.mjs` — authored-description resolution: trim,
   blank/missing → null.
 - Rust: `runtime_metadata_env_vars` tests pin spawn-time key application.
+- `ui/promptSourceActions.test.mjs` — Reload disabled with no path (and while a
+  reload is in flight), Clear offered regardless of a seen binding, the
+  out-of-sync hint, the reset's gating and its machine-wide warning, and the
+  `queued` / `failed:` / mapping-error messages staying distinguishable.
+- `ui/PromptSourceField.test.mjs` — the field mounted in JSDOM: button gating,
+  one command per click with the typed path, the resolved path replacing what
+  was typed, a refused path surfaced in the status line, Clear sending
+  `path: null`, the stored binding seeding the field on open, both halves of
+  the seed fence, and an unreadable sidecar reported rather than read as
+  unbound.
+- `ui/agentDefinitionDialogPromptSource.test.mjs` — the field inside the real
+  dialog: edit-mode only, a reload replacing the text in the dialog's own
+  "Agent instructions" textarea, and a re-open seeding the bound path without
+  arming a catalog publish.
+- `ui/promptSourceStaleWrites.test.mjs` — the two ways a reload left the wrong
+  instructions behind, both through the real dialog and a real query client: a
+  reload answered after the dialog moved to another agent must be dropped, and a
+  reload must refresh the cache the next `openEdit` seeds the dialog from, so
+  saving an unrelated field cannot resubmit the replaced prompt.
+- Rust: `managed_agents::prompt_source` tests pin the path rules (missing file,
+  symlink out of home, over the 64 KiB cap, non-UTF-8, relative, directory),
+  that preparation writes nothing until the mapping is committed, that clearing
+  removes only the named mapping, that a reload moves `persona_content_hash`
+  while the published kind:30175 content carries the prompt text and never the
+  file path, and that the reloaded bytes are what a restart resolves into
+  `BUZZ_ACP_SYSTEM_PROMPT`.
+- Rust: `commands::personas::prompt_source` tests drive the command itself over
+  a mock runtime — the result schema, and one injected failure per boundary
+  (validate, read, persona save, mapping write) each asserting the stored
+  mapping and the effective prompt still agree; a failed mapping write reporting
+  the binding that survived it, out of sync; the lost-update guard driven with a
+  real concurrent `save_personas` inside the command's own read→save window (a
+  `#[cfg(test)]` barrier, so removing the precondition fails a test); the three
+  other-write paths (typed edit, inbound replacement, deletion) each leaving the
+  binding out of sync or gone; and the reset recovering a sidecar no other
+  command can read.
+- Rust: `buzz-acp`'s `session_new_delivers_reloaded_prompt_source_file_bytes`
+  closes the delivery seam: the same bytes reach the ACP `session/new` request
+  in both the bare-field and Claude `_meta` framings.
 - Rust: persona sharing/retention tests pin relay+owner scoping, durable
   enqueue errors, relay rejection/unavailability, and accepted publication.
 - Rust: `definition_validation` and inbound persona tests pin the shared
