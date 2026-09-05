@@ -408,6 +408,23 @@ Created on the fork only when Devin asks. Titles:
   PR #10); apt mirror dropouts during the Playwright `install-deps` step (now retried, PR #10);
   `inbox-live-update.spec.ts` scroll baseline (fixed in PR #12); `persistent-agent-audience.spec.ts`
   and shard-3 five-second timeouts (still flaky; rerun and say so in the PR).
+- Merge-gate audit (2026-09-05, 15 queue runs, 3 ejections): both 01:30 and 02:00 ejections were
+  the apt dropout above, before PR #10 landed; the 05:42 ejection was the hermit bootstrap download
+  hanging 13 minutes and then `curl: (56)` (no retry, no cache) plus a hard
+  `persistent-agent-audience.spec.ts:537` failure. Post-merge push runs also failed on
+  `cancelled_turn_with_usage_emits_notification_before_response` (now retried in nextest),
+  `huddle-transcription.spec.ts` (voice menu, 15 s) and `messaging.spec.ts:2439` (root-thread link),
+  each three of three attempts. The wall clock per queue entry was 17 to 28 minutes with Desktop
+  Core (28 min, of which the compiled-flag verification was 15) and the four smoke shards (15 to
+  21 min on one worker) as the long poles; the macOS and Windows jobs were never on the critical
+  path, so they stay. PR `ci/merge-gate-time` caches the hermit packages, lifts the compiled-flag
+  verification into its own job, and runs eight smoke shards. See
+  `docs/plans/2026-09-05-ci-merge-gate-and-runner.md` for the measurement gate and the next step.
+- Heavy local gates go through `scripts/zs/with-gate-lock.sh` (one machine-wide lock, waits up
+  to 45 minutes): `scripts/zs/with-gate-lock.sh just desktop-test`, likewise for
+  `just desktop-tauri-test`, `just desktop-tauri-test-compiled-flags` and every `cargo test`
+  or `cargo nextest run`. Three worktrees running those at once is what made `buzz-agent`'s
+  cancellation test flake locally. Fast gates (fmt, clippy, checks) do not take the lock.
 - A header-box change moved `chromeWrapperRef` and shifted the channel column by 42 px without
   failing any existing test, until the file-drop overlay no longer lined up with the drop zone.
   The geometry test in `channel-files-tab.spec.ts` now binds the measured chrome height to the
