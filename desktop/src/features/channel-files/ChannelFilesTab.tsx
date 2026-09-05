@@ -55,8 +55,9 @@ const SORT_OPTIONS: { value: FileSort; label: string }[] = [
 export type ChannelFilesTabProps = {
   files: ChannelFile[];
   /**
-   * True when a row cap or an index retention cap dropped older attachments,
-   * so the list is the newest ones rather than the whole set.
+   * True when a row cap or one of the index retention caps dropped an older
+   * entry — an attachment, or the edit or deletion that describes one — so
+   * what the list shows may not be the whole channel or its latest state.
    */
   truncated?: boolean;
   isLoading: boolean;
@@ -746,9 +747,9 @@ export function ChannelFilesTab({
 
       {truncated ? (
         <p className="shrink-0 border-b border-border px-4 py-1.5 text-xs text-muted-foreground">
-          Showing the most recent attachments only — this channel has more
-          attachments than the Files tab keeps, and the older ones are not
-          listed here.
+          This channel has more history than the Files tab keeps, so the oldest
+          entries are dropped: some older attachments, or the latest change to
+          one, may be missing here.
         </p>
       ) : null}
 

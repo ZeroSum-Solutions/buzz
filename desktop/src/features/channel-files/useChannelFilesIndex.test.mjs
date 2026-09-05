@@ -718,6 +718,102 @@ test("a deletion with an unusable timestamp sorts oldest and never displaces one
   );
 });
 
+test("a deletion that hides a retained attachment is never the eviction victim", () => {
+  // The failure this guards: the deletion entry is the ONLY thing hiding a
+  // deleted row, so evicting it while the message is still indexed puts the
+  // file back on screen — and the banner never says a deleted file returned.
+  const secret = fileEvent({ index: 1 });
+  const hidden = ingestIndexEvents(emptyFilesIndex(), [
+    secret,
+    // The oldest deletion of the lot, so pure recency would pick it.
+    deletionEvent(secret.id, { id: hexId(590_000), created_at: 9_000 }),
+    ...Array.from({ length: MAX_INDEXED_DELETIONS - 1 }, (_unused, i) =>
+      deletionEvent(hexId(340_000 + i + 1), {
+        id: hexId(591_000 + i),
+        created_at: 9_001 + i,
+      }),
+    ),
+  ]);
+  assert.equal(hidden.deletions.size, MAX_INDEXED_DELETIONS);
+  assert.equal(
+    selectIndexedFiles(hidden).files.length,
+    0,
+    "the deleted attachment is hidden",
+  );
+
+  const after = ingestIndexEvents(hidden, [
+    deletionEvent(hexId(345_000), {
+      id: hexId(596_000),
+      created_at: 9_000 + MAX_INDEXED_DELETIONS + 10,
+    }),
+  ]);
+
+  assert.ok(
+    after.deletions.has(secret.id),
+    "an unrelated newer deletion evicts an orphan, not the one doing work",
+  );
+  assert.equal(
+    selectIndexedFiles(after).files.length,
+    0,
+    "so the deleted attachment does not come back",
+  );
+});
+
+test("an edit for a visible row outranks edits for messages the index never saw", () => {
+  // Otherwise a burst of edits for unrelated messages fills the cap and the
+  // genuine edit of a row on screen is refused for good.
+  const visible = fileEvent({ index: 1 });
+  const index = ingestIndexEvents(emptyFilesIndex(), [
+    visible,
+    ...Array.from({ length: MAX_INDEXED_EDITS }, (_unused, i) =>
+      editEvent(hexId(210_000 + i + 1), {
+        id: hexId(630_000 + i),
+        created_at: 20_000 + i,
+      }),
+    ),
+  ]);
+  assert.equal(index.edits.size, MAX_INDEXED_EDITS);
+  assert.deepEqual(
+    selectIndexedFiles(index).files.map((file) => file.filename),
+    ["file-1.png"],
+  );
+
+  // Older than every one of them, and admitted anyway: it is the only edit in
+  // the map that can change anything the tab shows.
+  const after = ingestIndexEvents(index, [
+    editEvent(visible.id, { id: hexId(640_000), created_at: 8_000 }),
+  ]);
+
+  assert.equal(after.edits.size, MAX_INDEXED_EDITS);
+  assert.deepEqual(
+    selectIndexedFiles(after).files.map((file) => file.filename),
+    ["edited.png"],
+    "the visible row takes its edit",
+  );
+});
+
+test("evicting an attachment drops a deletion keyed by its edit as well", () => {
+  // The projection honours a deletion of the EDIT (a deleted edit stops
+  // rewriting its message), so that entry describes the evicted row too.
+  const edit = editEvent(hexId(1), { id: hexId(650_000) });
+  const full = ingestIndexEvents(sourcesAtCap(), [
+    edit,
+    deletionEvent(edit.id, { id: hexId(660_000) }),
+  ]);
+  assert.ok(full.deletions.has(edit.id));
+
+  const after = ingestIndexEvents(full, [
+    fileEvent({ index: MAX_INDEXED_ATTACHMENT_EVENTS + 1 }),
+  ]);
+
+  assert.equal(after.sources.has(hexId(1)), false);
+  assert.equal(
+    after.deletions.has(edit.id),
+    false,
+    "the marker for the evicted message's edit goes with it",
+  );
+});
+
 test("at equal timestamps the retention order breaks ties on the entry id", () => {
   // Ties resolve the way the projection sorts them. Without that, two entries
   // sharing one timestamp make eviction, refusal and page order disagree, and

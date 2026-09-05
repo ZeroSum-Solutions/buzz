@@ -18,9 +18,10 @@
  * kept here would cost unbounded work and memory for as long as the tab is
  * open, not just for one render.
  *
- * The retention caps evict rather than refuse ({@link admitNewest}): a channel
- * past a cap keeps the newest entries and drops the oldest, so live arrivals
- * keep landing in a tab whose banner promises the most recent attachments.
+ * The retention caps evict rather than refuse ({@link admitRetained}): past a
+ * cap the index gives up its least useful entry — one describing no retained
+ * message first, the oldest otherwise — so live arrivals keep landing and a
+ * deleted attachment never reappears because its deletion was dropped.
  */
 
 import { applyEditTagOverlay } from "@/features/messages/lib/applyEditTagOverlay.mjs";
@@ -45,18 +46,20 @@ import { type ChannelFile, parseChannelFiles } from "./useChannelFiles";
  * is the memory ceiling for a channel whose whole history is attachments.
  *
  * The cap keeps the newest entries: past it a newer event evicts the oldest
- * retained one (see {@link admitNewest}), so a channel with more attachments
+ * retained one (see {@link admitRetained}), so a channel with more attachments
  * than this still shows the recent ones the tab claims to show.
  */
 export const MAX_INDEXED_ATTACHMENT_EVENTS = 5_000;
 /**
  * Deletion targets retained. Deletions are ids only, but still unbounded input.
- * Retained newest-first on the deletion event's own timestamp.
+ * A deletion that hides a retained attachment is kept over one that hides
+ * nothing; within a class, the newer over the older.
  */
 export const MAX_INDEXED_DELETIONS = 5_000;
 /**
  * Edited messages tracked. One entry per edited message, newest edit wins, and
- * the cap retains the newest edits.
+ * the cap keeps the edits that can still change a retained row over the ones
+ * that cannot.
  */
 export const MAX_INDEXED_EDITS = 5_000;
 /** Pubkeys are 64 hex characters; the cap is headroom, not a format check. */
@@ -237,11 +240,12 @@ type IndexDraft = {
 type RetentionKey = { key: string; created_at: number };
 
 /**
- * The total order the caps retain by: oldest first, map key breaking ties.
+ * The recency half of the retention order: oldest first, map key breaking ties.
  *
- * It is the same order {@link selectIndexedFiles} sorts rows into, so the entry
- * a cap evicts is always the one that sorts off the old end of the list, and
- * the page a caller is looking at cannot shuffle because of an eviction.
+ * It is the same order {@link selectIndexedFiles} sorts rows into, so the
+ * attachment a full source cap gives up is always the one that sorts off the
+ * old end of the list, and the page a caller is reading cannot shuffle because
+ * of an eviction.
  */
 function isOlderRetained(left: RetentionKey, right: RetentionKey): boolean {
   if (left.created_at !== right.created_at) {
@@ -251,26 +255,54 @@ function isOlderRetained(left: RetentionKey, right: RetentionKey): boolean {
 }
 
 /**
- * The oldest retained entry of a capped map — the retention floor — or `null`
- * when the map is empty.
+ * Whether a retained entry still describes a message the index holds.
  *
- * Linear in the map, and only ever walked when a cap is already full and the
- * arriving entry is not a duplicate. A backfill runs newest-first, so it fills
- * a cap once and then has every older page refused by the floor without a
- * scan; the scan is the live path's cost, one arrival at a time.
+ * A deletion or edit keyed by a message the index never saw, or has already
+ * evicted, changes nothing the tab can show, so it is the cap's first victim.
+ * Sources are their own rows, so their cap uses {@link ALWAYS_RELEVANT}.
  */
-function oldestRetained<V>(
+type IsRelevant = (key: string) => boolean;
+
+const ALWAYS_RELEVANT: IsRelevant = () => true;
+
+/**
+ * The eviction order: an entry that still describes a retained message
+ * outranks one that does not, and inside a class the newer outranks the older.
+ * `true` when a full cap should keep `candidate` over `victim`.
+ */
+function outranksForRetention(
+  candidate: RetentionKey,
+  victim: RetentionKey,
+  isRelevant: IsRelevant,
+): boolean {
+  const candidateRelevant = isRelevant(candidate.key);
+  if (candidateRelevant !== isRelevant(victim.key)) return candidateRelevant;
+  return isOlderRetained(victim, candidate);
+}
+
+/**
+ * The entry every other retained entry outranks — what a full cap gives up —
+ * or `null` when the map is empty.
+ *
+ * Linear in the map, walked on every non-duplicate arrival once the cap is
+ * full, refusals included: a refusal has to know what it is being compared
+ * against. The history walk is bounded (`MAX_BACKFILL_PAGES` pages of
+ * `BACKFILL_PAGE_LIMIT`), which bounds the total cost; an ordered index would
+ * make it O(log n) and is a follow-up, not a correctness question.
+ */
+function lowestRanked<V>(
   map: ReadonlyMap<string, V>,
   createdAtOf: (value: V) => number,
+  isRelevant: IsRelevant,
 ): RetentionKey | null {
-  let oldest: RetentionKey | null = null;
+  let lowest: RetentionKey | null = null;
   for (const [key, value] of map) {
-    const candidate = { key, created_at: createdAtOf(value) };
-    if (oldest === null || isOlderRetained(candidate, oldest)) {
-      oldest = candidate;
+    const entry = { key, created_at: createdAtOf(value) };
+    if (lowest === null || outranksForRetention(lowest, entry, isRelevant)) {
+      lowest = entry;
     }
   }
-  return oldest;
+  return lowest;
 }
 
 function markTruncated(draft: IndexDraft): void {
@@ -280,42 +312,61 @@ function markTruncated(draft: IndexDraft): void {
 }
 
 /**
- * Make room for one entry in a capped retention map, keeping the newest.
+ * Make room for one entry in a capped retention map.
  *
  * A cap that only refused arrivals would freeze the index on whichever entries
  * it happened to see first: a channel past the cap would stop showing new
  * files entirely while the tab said it was showing the most recent ones. So
- * the cap evicts by recency instead — an entry newer than the floor takes the
- * floor's place, and only an entry older than the floor is refused, which is
- * exactly the entry a "keep the newest N" cap exists to leave out. `onEvict`
- * removes whatever else the evicted key owned.
+ * the cap gives up its lowest-ranked entry instead — an entry describing no
+ * retained message before one that does, and the older before the newer — and
+ * refuses the arrival only when the arrival is the lowest-ranked of all, which
+ * is exactly what a bounded index exists to leave out. `onEvict` forgets
+ * whatever else the evicted key stood for.
  *
- * Either outcome means something is missing from the list, so both set
- * `truncated`; the caps still bound the entries retained, which is the memory
- * the index actually costs.
+ * Either outcome means something is missing, so both set `truncated`; the caps
+ * still bound the entries retained, which is the memory the index costs.
  *
  * Returns true when the caller may store the entry.
  */
-function admitNewest<V>(
+function admitRetained<V>(
   map: Map<string, V>,
   createdAtOf: (value: V) => number,
   candidate: RetentionKey,
   cap: number,
   draft: IndexDraft,
+  isRelevant: IsRelevant,
   onEvict?: (evictedKey: string) => void,
 ): boolean {
   if (map.size < cap) return true;
-  const floor = oldestRetained(map, createdAtOf);
+  const victim = lowestRanked(map, createdAtOf, isRelevant);
   markTruncated(draft);
-  if (floor === null || !isOlderRetained(floor, candidate)) return false;
-  map.delete(floor.key);
-  onEvict?.(floor.key);
+  if (victim === null || !outranksForRetention(candidate, victim, isRelevant)) {
+    return false;
+  }
+  map.delete(victim.key);
+  onEvict?.(victim.key);
   return true;
 }
 
 const editCreatedAt = (edit: IndexedEdit) => edit.created_at;
 const sourceCreatedAt = (source: IndexedSource) => source.created_at;
 const deletionCreatedAt = (createdAt: number) => createdAt;
+
+/**
+ * Forget a message and everything the index kept only to describe it.
+ *
+ * The projection honours a deletion keyed by the message id *and* one keyed by
+ * the id of the edit that rewrote it, so both go. Anything left behind is a
+ * capped slot spent on a row that is gone, and a later message reusing an id
+ * would inherit a stranger's marker.
+ */
+function forgetSource(draft: IndexDraft, sourceId: string): void {
+  const edit = draft.edits.get(sourceId);
+  draft.sources.delete(sourceId);
+  draft.edits.delete(sourceId);
+  draft.deletions.delete(sourceId);
+  if (edit) draft.deletions.delete(edit.id);
+}
 
 /**
  * A relay-supplied timestamp, or `0` when it is unusable.
@@ -332,15 +383,30 @@ function boundEventTimestamp(value: unknown): number {
 
 function ingestDeletion(event: RelayEvent, draft: IndexDraft): void {
   const createdAt = boundEventTimestamp(event.created_at);
+  // A deletion entry is the only thing hiding a deleted row. Giving one up
+  // while the index still holds its message would put the file back on screen
+  // — the opposite of what its author asked for, and a change no banner
+  // announces. So a deletion covering a retained source outranks one covering
+  // nothing, whatever their timestamps, and the orphans go first. When only
+  // covering deletions are left, `forgetSource` takes the message away with
+  // its deletion, so the pair is dropped rather than the file revealed.
+  const coversRetainedSource: IsRelevant = (key) => draft.sources.has(key);
   for (const targetId of referencedEventIds(event.tags)) {
     if (draft.deletions.has(targetId)) continue;
     if (
-      !admitNewest(
+      !admitRetained(
         draft.deletions,
         deletionCreatedAt,
         { key: targetId, created_at: createdAt },
         MAX_INDEXED_DELETIONS,
         draft,
+        coversRetainedSource,
+        (evictedKey) => {
+          // Reached only when no orphan deletion was left to give up. An
+          // orphan eviction frees a slot and hides nothing, so it cascades to
+          // nothing either.
+          if (draft.sources.has(evictedKey)) forgetSource(draft, evictedKey);
+        },
       )
     ) {
       continue;
@@ -362,14 +428,20 @@ function ingestEdit(event: RelayEvent, draft: IndexDraft): void {
   if (target && !isAuthorizedFileEdit(target, edit)) return;
   const existing = draft.edits.get(targetId);
   if (existing && existing.created_at >= edit.created_at) return;
+  // An edit for a message the index holds can change a row the tab shows; one
+  // for a message it never saw, or has already evicted, can change nothing. So
+  // the cap bounds the edits that can matter and drops the rest first —
+  // otherwise a burst of edits for unrelated messages would refuse a visible
+  // row's genuine edit for good.
   if (
     !existing &&
-    !admitNewest(
+    !admitRetained(
       draft.edits,
       editCreatedAt,
       { key: targetId, created_at: edit.created_at },
       MAX_INDEXED_EDITS,
       draft,
+      (key) => draft.sources.has(key),
     )
   ) {
     return;
@@ -382,19 +454,15 @@ function ingestSource(event: RelayEvent, draft: IndexDraft): void {
   const source = boundIndexSource(event);
   if (!source || draft.sources.has(source.id)) return;
   if (
-    !admitNewest(
+    !admitRetained(
       draft.sources,
       sourceCreatedAt,
       { key: source.id, created_at: source.created_at },
       MAX_INDEXED_ATTACHMENT_EVENTS,
       draft,
-      (evictedId) => {
-        // The evicted message's overlay entries describe a row that is gone.
-        // Left behind they would be retention the caps no longer bound, and a
-        // later message reusing the id would inherit a stranger's deletion.
-        draft.edits.delete(evictedId);
-        draft.deletions.delete(evictedId);
-      },
+      // Every source is its own row, so recency alone ranks this cap.
+      ALWAYS_RELEVANT,
+      (evictedId) => forgetSource(draft, evictedId),
     )
   ) {
     return;

@@ -530,12 +530,18 @@ test("a truncated index tells the user the list is partial", async () => {
   });
   try {
     const banner = partial.screen.getByText(
-      /Showing the most recent attachments only/,
+      /more history than the Files tab keeps/,
     );
     // It must name what is missing, not just that something is: the index
-    // drops the OLDEST attachments, and a reader who is not told that reads a
-    // partial list as the whole channel.
-    assert.match(banner.textContent, /older ones are not listed/);
+    // drops its OLDEST entries, and a reader who is not told that reads a
+    // partial list as the whole channel. The three retention caps drop
+    // attachments, edits and deletions, so the copy has to be true of all
+    // three — it may not promise that only whole attachments went.
+    assert.match(banner.textContent, /oldest entries are dropped/);
+    assert.match(
+      banner.textContent,
+      /or the latest change to one, may be missing/,
+    );
   } finally {
     partial.cleanup();
   }
@@ -546,7 +552,7 @@ test("a truncated index tells the user the list is partial", async () => {
   });
   try {
     assert.equal(
-      whole.screen.queryByText(/Showing the most recent attachments only/),
+      whole.screen.queryByText(/more history than the Files tab keeps/),
       null,
       "a complete list carries no partial-list notice",
     );
