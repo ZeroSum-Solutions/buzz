@@ -1,6 +1,14 @@
 import type * as React from "react";
 import type { Components } from "react-markdown";
 
+import {
+  exceedsMarkdownDocParseWorkBudget,
+  measureMarkdownDocParseWork,
+} from "./markdownDocFile";
+import {
+  MAX_MARKDOWN_DOC_NODES,
+  isMarkdownTooComplexError,
+} from "./markdownParseBudget";
 import { renderCachedMarkdown } from "./nodeCache";
 
 /**
@@ -70,8 +78,46 @@ export function markdownDocumentElement(content: string): React.ReactElement {
     // Documents follow markdown's own paragraph rules; the chat surface's
     // newline-is-a-break behaviour would double every wrapped line.
     hardLineBreaks: false,
+    nodeBudget: MAX_MARKDOWN_DOC_NODES,
     variant: DOCUMENT_MODE_VARIANT,
   });
+}
+
+/**
+ * Whether `content` is too complex to render, by the same two bounds the
+ * Preview and the Export share.
+ *
+ * The cheap source-side work model runs first and bounds micromark's own
+ * tokenizers, whose cost is spent before any mdast node exists. What it
+ * admits is then parsed with the node budget enforced inside
+ * `processor.parse()`, so the answer comes from the parsed syntax tree and
+ * not from a guess about the source text. A refusal from the first bound is
+ * sub-millisecond; a refusal from the second costs the parse, which the first
+ * bound is what keeps finite.
+ *
+ * That parse is skipped when the source-side node estimate is under half the
+ * budget. Measured over every document the scan admits — the 2,462 real
+ * markdown files reachable from this repository and every adversarial shape
+ * in `markdownDocFile.ts` — the estimate never came in below the real node
+ * count (highest ratio 1.00), so under half the budget it already proves the
+ * tree fits with a factor of two to spare. Paying a whole extra parse to
+ * learn the same thing would put the panel's open over its 200 ms
+ * main-thread budget on documents nowhere near the cap: the 507 KB
+ * long-document fixture is 117 nodes against an estimate of 411, and the
+ * extra parse measured 296 ms against a 200 ms budget in
+ * `markdown-doc-viewer.spec.ts`.
+ */
+export function isMarkdownDocumentTooComplex(content: string): boolean {
+  const work = measureMarkdownDocParseWork(content);
+  if (exceedsMarkdownDocParseWorkBudget(work)) return true;
+  if (2 * work.estimatedNodes <= MAX_MARKDOWN_DOC_NODES) return false;
+  try {
+    markdownDocumentElement(content);
+    return false;
+  } catch (error) {
+    if (isMarkdownTooComplexError(error)) return true;
+    throw error;
+  }
 }
 
 /**

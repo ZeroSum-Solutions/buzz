@@ -3,13 +3,14 @@ import { test } from "node:test";
 
 import {
   decodeMarkdownDocBytes,
+  exceedsMarkdownDocParseBudget,
   isMarkdownDocFilename,
-  isMarkdownDocTooComplexForPreview,
   MAX_MARKDOWN_DOC_BYTES,
-  MAX_MARKDOWN_DOC_PREVIEW_LINES,
-  MAX_MARKDOWN_DOC_PREVIEW_LINK_MARKERS,
-  MAX_MARKDOWN_DOC_PREVIEW_NESTING_DEPTH,
-  MAX_MARKDOWN_DOC_PREVIEW_TABLE_CELL_MARKERS,
+  MAX_MARKDOWN_DOC_DELIMITER_WORK,
+  MAX_MARKDOWN_DOC_DESCENT_WORK,
+  MAX_MARKDOWN_DOC_ESTIMATED_NODES,
+  MAX_MARKDOWN_DOC_TABLE_CELL_MARKERS,
+  measureMarkdownDocParseWork,
 } from "./markdownDocFile.ts";
 
 // ── isMarkdownDocFilename ─────────────────────────────────────────────────
@@ -66,91 +67,18 @@ test("decodeMarkdownDocBytes: strict decode reports binary content", () => {
   assert.deepEqual(decodeMarkdownDocBytes(bytes), { kind: "binary" });
 });
 
-// ── isMarkdownDocTooComplexForPreview ─────────────────────────────────────
+// ── parse-work pre-filter ─────────────────────────────────────────────────
 //
-// Node-count proxy for the mdast/micromark parse cost (Sol audit finding 1,
-// port/6731): a document well under the 2 MiB byte cap can still carry
-// hundreds of thousands of block nodes if it is mostly one-line list items,
-// and that shape parses at superlinear cost on the pinned parser — measured
-// 854ms at 16,384 items climbing to 35,923ms at 131,072, before any React
-// element exists. These bind the line-count gate that keeps the expensive
-// parse off documents shaped like that fixture.
-
-test("isMarkdownDocTooComplexForPreview: false for a short document", () => {
-  assert.equal(
-    isMarkdownDocTooComplexForPreview("# Title\n\nSome text."),
-    false,
-  );
-});
-
-test("isMarkdownDocTooComplexForPreview: false at exactly the line cap", () => {
-  // MAX_MARKDOWN_DOC_PREVIEW_LINES - 1 newline-terminated lines plus one
-  // final line with no trailing newline is exactly MAX_MARKDOWN_DOC_PREVIEW_LINES lines.
-  const text = `${"- a\n".repeat(MAX_MARKDOWN_DOC_PREVIEW_LINES - 1)}- a`;
-  assert.equal(isMarkdownDocTooComplexForPreview(text), false);
-});
-
-test("isMarkdownDocTooComplexForPreview: true one line past the cap", () => {
-  const text = "- a\n".repeat(MAX_MARKDOWN_DOC_PREVIEW_LINES + 1);
-  assert.equal(isMarkdownDocTooComplexForPreview(text), true);
-});
-
-test("isMarkdownDocTooComplexForPreview: true for a near-limit adversarial list (hundreds of thousands of blocks, well under the 2 MiB byte cap)", () => {
-  // Mirrors the Sol audit's own reproduction shape ("- a\n" repeated);
-  // 500,000 items is 2,000,000 bytes — under MAX_MARKDOWN_DOC_BYTES, so the
-  // byte gate alone would admit it to the parser without this line-count
-  // gate catching it first.
-  const text = "- a\n".repeat(500_000);
-  assert.ok(text.length < MAX_MARKDOWN_DOC_BYTES);
-  assert.equal(isMarkdownDocTooComplexForPreview(text), true);
-});
-
-test("isMarkdownDocTooComplexForPreview: a legitimate long-but-simple document (few lines, large paragraphs) stays under the cap", () => {
-  // Shaped like the branch's own long-doc.md fixture: large byte count,
-  // very few lines. The line-count proxy must not penalize prose shape.
-  const text = `# Heading\n\n${"word ".repeat(120_000)}\n`;
-  assert.ok(text.length > 500_000);
-  assert.equal(isMarkdownDocTooComplexForPreview(text), false);
-});
-
-// ── inline-construct (link marker) density (Sol audit finding 1, round 2,
-// port/6731) ─────────────────────────────────────────────────────────────
+// The cheap half of the render gate. It does not try to guess how many nodes
+// a document has — `MAX_MARKDOWN_DOC_NODES` counts those on the parsed tree
+// (see markdownParseBudget.test.mjs). What it bounds is the work micromark's
+// own tokenizers do *before* any mdast node exists, on the two axes where
+// that work is superlinear, plus a node estimate whose only job is to keep
+// the parse the node budget has to run finite.
 //
-// The line-count gate above only bounds block count. A single line densely
-// packed with inline link syntax passes it outright (1 line) while still
-// driving the mdast/micromark *inline* tokenizer into superlinear cost — the
-// audit's own reproduction: "[a](http://e.co) " repeated on one line.
-
-test("isMarkdownDocTooComplexForPreview: false at exactly the link-marker cap", () => {
-  const text = `[a](http://e.co) `.repeat(
-    MAX_MARKDOWN_DOC_PREVIEW_LINK_MARKERS,
-  );
-  assert.equal(isMarkdownDocTooComplexForPreview(text), false);
-});
-
-test("isMarkdownDocTooComplexForPreview: true one link marker past the cap", () => {
-  const text = `[a](http://e.co) `.repeat(
-    MAX_MARKDOWN_DOC_PREVIEW_LINK_MARKERS + 1,
-  );
-  assert.equal(isMarkdownDocTooComplexForPreview(text), true);
-});
-
-test("isMarkdownDocTooComplexForPreview: true for a one-line link-dense document (audit reproduction shape)", () => {
-  // Mirrors the audit's own reproduction exactly: a single line, no
-  // newlines at all, so the line-count gate alone would admit it.
-  const text = "[a](http://e.co) ".repeat(12_336);
-  assert.ok(!text.includes("\n"));
-  assert.ok(text.length < MAX_MARKDOWN_DOC_BYTES);
-  assert.equal(isMarkdownDocTooComplexForPreview(text), true);
-});
-
-// ── table-cell density (T9 round-3 critic finding F1) ─────────────────────
-//
-// The two gates above bound block count and inline-link density. A wide GFM
-// table passes both — few lines, not one `[` — while every cell is its own
-// mdast node: a 300-column, 100-row table is 62,194 bytes over 102 lines and
-// renders in 8,643 ms through the export's own path. The `|` count is the
-// quantity that tracks that cost.
+// Every number below is a measurement through the production entry
+// `renderMarkdownDocumentHtml`; the reproduction shapes are the ones the
+// round-3 blind critic filed as F4 and F5.
 
 /** A GFM table with `cols` columns and `rows` body rows. */
 function gfmTable(cols, rows) {
@@ -160,53 +88,6 @@ function gfmTable(cols, rows) {
   return header + separator + row.repeat(rows);
 }
 
-/** The `|` characters the gate counts. */
-function cellMarkers(text) {
-  return text.split("|").length - 1;
-}
-
-test("isMarkdownDocTooComplexForPreview: false at exactly the table-cell cap", () => {
-  // 12 columns × 228 rows: 2,990 markers, the widest table still admitted,
-  // measured at 163ms through renderMarkdownDocumentHtml.
-  const text = gfmTable(12, 228);
-  assert.ok(cellMarkers(text) <= MAX_MARKDOWN_DOC_PREVIEW_TABLE_CELL_MARKERS);
-  assert.equal(isMarkdownDocTooComplexForPreview(text), false);
-});
-
-test("isMarkdownDocTooComplexForPreview: true one table-cell marker past the cap", () => {
-  const text = `|${"x|".repeat(MAX_MARKDOWN_DOC_PREVIEW_TABLE_CELL_MARKERS)}`;
-  assert.equal(
-    cellMarkers(text),
-    MAX_MARKDOWN_DOC_PREVIEW_TABLE_CELL_MARKERS + 1,
-  );
-  assert.equal(isMarkdownDocTooComplexForPreview(text), true);
-});
-
-test("isMarkdownDocTooComplexForPreview: true for a wide table (critic F1 reproduction shape)", () => {
-  // The critic's own reproduction: 300 columns, 100 rows. Under the 2 MiB
-  // byte cap, 102 lines (under the line gate), no `[` at all (under the link
-  // gate) — and 8,643ms of synchronous parse.
-  const text = gfmTable(300, 100);
-  assert.ok(text.length < MAX_MARKDOWN_DOC_BYTES);
-  assert.ok(text.split("\n").length < MAX_MARKDOWN_DOC_PREVIEW_LINES);
-  assert.ok(!text.includes("["));
-  assert.equal(isMarkdownDocTooComplexForPreview(text), true);
-});
-
-test("isMarkdownDocTooComplexForPreview: a document with prose-scale pipes is not penalized", () => {
-  // Tables the size a document actually carries, plus pipes in running text,
-  // stay far under the cap.
-  const text = `# Report\n\n${gfmTable(4, 40)}\n\nUse \`a || b\` when either matches.\n`;
-  assert.equal(isMarkdownDocTooComplexForPreview(text), false);
-});
-
-// ── container nesting depth (T9 round-3 critic finding F1) ────────────────
-//
-// The parser re-enters the whole container stack on every line, so cost grows
-// with depth, not with line count: a list nested one level per line is
-// 801 lines and 647,890 bytes at depth 800 — under every gate above — and
-// renders in 11,066 ms.
-
 /** A list nested one level deeper on each line. */
 function nestedList(depth) {
   let out = "";
@@ -214,40 +95,228 @@ function nestedList(depth) {
   return out;
 }
 
-test("isMarkdownDocTooComplexForPreview: false at exactly the nesting-depth cap", () => {
-  // The deepest line is indented MAX * 2 columns, which is exactly MAX levels.
-  const text = nestedList(MAX_MARKDOWN_DOC_PREVIEW_NESTING_DEPTH + 1);
-  assert.equal(isMarkdownDocTooComplexForPreview(text), false);
+/** `lines` lines of prose, each held at block-quote depth `depth`. */
+function quotedAtDepth(depth, lines) {
+  return Array.from({ length: lines }, () => `${"> ".repeat(depth)}x`).join(
+    "\n",
+  );
+}
+
+test("parse work: a short document costs nothing on any axis", () => {
+  const work = measureMarkdownDocParseWork("# Title\n\nSome text.\n");
+  assert.equal(work.descentWork, 0);
+  assert.ok(work.delimiterWork < 100);
+  assert.ok(work.estimatedNodes < 100);
+  assert.equal(exceedsMarkdownDocParseBudget("# Title\n\nSome text."), false);
 });
 
-test("isMarkdownDocTooComplexForPreview: true one nesting level past the cap", () => {
-  const text = nestedList(MAX_MARKDOWN_DOC_PREVIEW_NESTING_DEPTH + 2);
-  assert.equal(isMarkdownDocTooComplexForPreview(text), true);
+// ── delimiter work (text and table tokenizers) ────────────────────────────
+
+test("delimiter work: false at exactly the cap", () => {
+  // 4,096 `*` in one block is exactly 2^24 of delimiter work: 57 ms measured.
+  const text = "*a*".repeat(2048);
+  assert.equal(
+    measureMarkdownDocParseWork(text).delimiterWork,
+    MAX_MARKDOWN_DOC_DELIMITER_WORK,
+  );
+  assert.equal(exceedsMarkdownDocParseBudget(text), false);
 });
 
-test("isMarkdownDocTooComplexForPreview: true for a deeply nested list (critic F1 reproduction shape)", () => {
-  const text = nestedList(800);
+test("delimiter work: true one delimiter past the cap", () => {
+  // 4,097 delimiters in one block: (2^12 + 1)^2, one unit over.
+  const text = `${"*a*".repeat(2048)}*`;
+  assert.equal(measureMarkdownDocParseWork(text).delimiterWork, 4097 ** 2);
+  assert.ok(4097 ** 2 > MAX_MARKDOWN_DOC_DELIMITER_WORK);
+  assert.equal(exceedsMarkdownDocParseBudget(text), true);
+});
+
+test("delimiter work: refuses the critic's F4 emphasis one-liner", () => {
+  // `"*a*"` × 20,000: 60,000 bytes, ONE line, no `[`, no `|`, depth 0 — every
+  // counter the round-3 gate had said this was cheap, and it rendered in
+  // 3,458 ms through renderMarkdownDocumentHtml with Export offered.
+  const text = "*a*".repeat(20000);
   assert.ok(text.length < MAX_MARKDOWN_DOC_BYTES);
-  assert.ok(text.split("\n").length < MAX_MARKDOWN_DOC_PREVIEW_LINES);
+  assert.equal(text.split("\n").length, 1);
   assert.ok(!text.includes("["));
-  assert.equal(isMarkdownDocTooComplexForPreview(text), true);
+  assert.ok(!text.includes("|"));
+  assert.equal(measureMarkdownDocParseWork(text).descentWork, 0);
+  assert.equal(exceedsMarkdownDocParseBudget(text), true);
 });
 
-test("isMarkdownDocTooComplexForPreview: counts `>` markers as nesting too", () => {
-  const shallow = `${"> ".repeat(MAX_MARKDOWN_DOC_PREVIEW_NESTING_DEPTH)}quoted\n`;
-  const deep = `${"> ".repeat(MAX_MARKDOWN_DOC_PREVIEW_NESTING_DEPTH + 1)}quoted\n`;
-  assert.equal(isMarkdownDocTooComplexForPreview(shallow), false);
-  assert.equal(isMarkdownDocTooComplexForPreview(deep), true);
+test("delimiter work: refuses code-span and raw-angle density too", () => {
+  // The same axis, reached with different characters — the counter is the
+  // whole CommonMark + GFM delimiter alphabet, not one construct.
+  assert.equal(exceedsMarkdownDocParseBudget("`a` ".repeat(40000)), true);
+  assert.equal(exceedsMarkdownDocParseBudget("<a> ".repeat(40000)), true);
+  assert.equal(exceedsMarkdownDocParseBudget("~a~ ".repeat(40000)), true);
 });
 
-test("isMarkdownDocTooComplexForPreview: a tab counts as four indent columns", () => {
-  // A tab-indented document must not slip past the depth gate by using one
-  // character per level.
-  const tabs = "\t".repeat(MAX_MARKDOWN_DOC_PREVIEW_NESTING_DEPTH);
-  assert.equal(isMarkdownDocTooComplexForPreview(`${tabs}- deep\n`), true);
+test("delimiter work: a blank line ends a block, so cost is per block", () => {
+  // The same 8,192 delimiters cost 2^26 in one block and 2^24 across four —
+  // which is why the counter is a sum of squares and not a total.
+  const oneBlock = "*a*".repeat(4096);
+  const fourBlocks = Array.from({ length: 4 }, () => "*a*".repeat(1024)).join(
+    "\n\n",
+  );
+  assert.equal(measureMarkdownDocParseWork(oneBlock).delimiterWork, 8192 ** 2);
+  assert.equal(
+    measureMarkdownDocParseWork(fourBlocks).delimiterWork,
+    4 * 2048 ** 2,
+  );
+  assert.equal(exceedsMarkdownDocParseBudget(oneBlock), true);
+  assert.equal(exceedsMarkdownDocParseBudget(fourBlocks), false);
 });
 
-test("isMarkdownDocTooComplexForPreview: an ordinary indented document stays under the depth cap", () => {
+test("delimiter work: real documents keep their tables and prose", () => {
+  const text = `# Report\n\n${gfmTable(12, 228)}\n\nUse \`a || b\` when either matches.\n`;
+  assert.equal(exceedsMarkdownDocParseBudget(text), false);
+});
+
+// ── table cell markers (GFM table tokenizer) ──────────────────────────────
+//
+// Tables are the one construct whose cost is *not* per block: measured, it
+// tracks the document-wide `|` count and nothing else, quadratically, whether
+// those markers sit in one table or thirty-two.
+
+test("table markers: false at exactly the cap", () => {
+  // 12 columns × 235 rows is 3,081 markers, 133 ms measured — the widest
+  // table still admitted. (One marker over the cap on a 12-column table is
+  // a whole row, so the exact-cap shape is the narrower one below.)
+  const text = gfmTable(2, 1022);
+  assert.equal(
+    measureMarkdownDocParseWork(text).tableCellMarkers,
+    MAX_MARKDOWN_DOC_TABLE_CELL_MARKERS,
+  );
+  assert.equal(exceedsMarkdownDocParseBudget(text), false);
+});
+
+test("table markers: true one marker past the cap", () => {
+  const text = `${gfmTable(2, 1022)}|`;
+  assert.equal(
+    measureMarkdownDocParseWork(text).tableCellMarkers,
+    MAX_MARKDOWN_DOC_TABLE_CELL_MARKERS + 1,
+  );
+  assert.equal(exceedsMarkdownDocParseBudget(text), true);
+});
+
+test("table markers: refuses a wide table (round-3 F1 reproduction shape)", () => {
+  // 300 columns × 100 rows: 62,194 bytes, 102 lines, no `[`, 6,902 ms.
+  const text = gfmTable(300, 100);
+  assert.ok(text.length < MAX_MARKDOWN_DOC_BYTES);
+  assert.ok(!text.includes("["));
+  assert.equal(exceedsMarkdownDocParseBudget(text), true);
+});
+
+test("table markers: are counted document-wide, not per block", () => {
+  // 32 separate tables of 50 rows cost the same 5,720 ms as one table of
+  // 1,600 rows, so splitting them must not buy a document past the cap.
+  const text = `${gfmTable(12, 50)}\n`.repeat(32);
+  assert.ok(
+    measureMarkdownDocParseWork(text).tableCellMarkers >
+      MAX_MARKDOWN_DOC_TABLE_CELL_MARKERS,
+  );
+  assert.equal(exceedsMarkdownDocParseBudget(text), true);
+});
+
+test("table markers: a document with prose-scale pipes is not penalized", () => {
+  const text = `# Report\n\n${gfmTable(4, 40)}\n\nUse \`a || b\` when either matches.\n`;
+  assert.equal(exceedsMarkdownDocParseBudget(text), false);
+});
+
+// ── descent work (document tokenizer) ─────────────────────────────────────
+
+test("descent work: false at exactly the cap", () => {
+  // Depth 22 held across 2,978 lines is 65,516 units: 155 ms measured.
+  const text = quotedAtDepth(22, 2978);
+  const work = measureMarkdownDocParseWork(text);
+  assert.equal(work.descentWork, 22 * 2978);
+  assert.ok(work.descentWork <= MAX_MARKDOWN_DOC_DESCENT_WORK);
+  assert.equal(exceedsMarkdownDocParseBudget(text), false);
+});
+
+test("descent work: true one unit past the cap", () => {
+  const lines = MAX_MARKDOWN_DOC_DESCENT_WORK + 1;
+  const text = quotedAtDepth(1, lines);
+  assert.equal(measureMarkdownDocParseWork(text).descentWork, lines);
+  assert.equal(exceedsMarkdownDocParseBudget(text), true);
+});
+
+test("descent work: refuses the critic's F5 held-depth block quote", () => {
+  // Depth 127 across 3,000 lines: 767,999 bytes, 130 mdast nodes — so no
+  // node budget can see it — and 903 ms. The round-3 gate bounded the
+  // deepest *line* (128) and admitted this outright.
+  const text = quotedAtDepth(127, 3000);
+  assert.ok(text.length < MAX_MARKDOWN_DOC_BYTES);
+  assert.ok(!text.includes("["));
+  assert.ok(!text.includes("|"));
+  assert.equal(exceedsMarkdownDocParseBudget(text), true);
+});
+
+test("descent work: refuses a deeply nested list (round-3 F1 shape)", () => {
+  const text = nestedList(800);
+  assert.equal(measureMarkdownDocParseWork(text).descentWork, (799 * 800) / 2);
+  assert.equal(exceedsMarkdownDocParseBudget(text), true);
+});
+
+test("descent work: a tab counts as four indent columns", () => {
+  // A tab-indented document must not buy depth at one character per level.
+  const text = `${"\t".repeat(200)}- deep\n`.repeat(200);
+  assert.equal(measureMarkdownDocParseWork(text).descentWork, 200 * 400);
+  assert.equal(exceedsMarkdownDocParseBudget(text), true);
+});
+
+test("descent work: an ordinary indented document stays under the cap", () => {
   const text = `# Title\n\n- one\n  - two\n    - three\n\n\`\`\`js\n${" ".repeat(40)}const x = 1;\n\`\`\`\n`;
-  assert.equal(isMarkdownDocTooComplexForPreview(text), false);
+  assert.equal(exceedsMarkdownDocParseBudget(text), false);
+});
+
+// ── node estimate (keeps the node budget's own parse finite) ──────────────
+
+test("node estimate: false at exactly the cap", () => {
+  const lines = MAX_MARKDOWN_DOC_ESTIMATED_NODES / 3;
+  const text = Array.from({ length: lines }, () => "a").join("\n");
+  assert.equal(
+    measureMarkdownDocParseWork(text).estimatedNodes,
+    MAX_MARKDOWN_DOC_ESTIMATED_NODES,
+  );
+  assert.equal(exceedsMarkdownDocParseBudget(text), false);
+});
+
+test("node estimate: true one line past the cap", () => {
+  const lines = MAX_MARKDOWN_DOC_ESTIMATED_NODES / 3 + 1;
+  const text = Array.from({ length: lines }, () => "a").join("\n");
+  assert.equal(exceedsMarkdownDocParseBudget(text), true);
+});
+
+test("node estimate: refuses a flat list that would exhaust the heap", () => {
+  // `"- a\n"` repeated to the 2 MiB byte cap has no delimiters and no
+  // descent; parsing it to the tree the node budget would reject exhausts a
+  // 4 GB Node heap outright. This is the counter that keeps the node
+  // budget's own parse finite.
+  const text = "- a\n".repeat(524288);
+  assert.equal(text.length, MAX_MARKDOWN_DOC_BYTES);
+  assert.equal(measureMarkdownDocParseWork(text).delimiterWork, 0);
+  assert.equal(measureMarkdownDocParseWork(text).descentWork, 0);
+  assert.equal(exceedsMarkdownDocParseBudget(text), true);
+});
+
+test("node estimate: counts GFM literal autolinks, which have no delimiter", () => {
+  // `www.`, `://` and `@` are the only inline constructs that start on
+  // ordinary word characters, so the delimiter counter cannot see them.
+  // 60,000 of them is 960,000 bytes, one line, 180,001 mdast nodes and
+  // 6,752 ms — admitted by every round-3 counter.
+  for (const unit of ["www.example.com ", "http://e.co ", "a@b.co "]) {
+    const text = unit.repeat(60000);
+    assert.ok(text.length < MAX_MARKDOWN_DOC_BYTES);
+    assert.equal(measureMarkdownDocParseWork(text).delimiterWork, 0);
+    assert.equal(exceedsMarkdownDocParseBudget(text), true);
+  }
+});
+
+test("node estimate: a long line-count document is no longer refused for its lines", () => {
+  // The round-3 gate refused any document over 3,000 lines, which refused
+  // real 9,600-line READMEs. Lines are only a third of the estimate now.
+  const text = "prose line\n".repeat(9600);
+  assert.ok(text.split("\n").length > 9000);
+  assert.equal(exceedsMarkdownDocParseBudget(text), false);
 });

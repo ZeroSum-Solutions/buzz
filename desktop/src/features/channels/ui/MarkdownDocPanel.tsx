@@ -25,9 +25,9 @@ import {
 } from "@/shared/layout/AuxiliaryPanel";
 import { Button } from "@/shared/ui/button";
 import { Markdown, SyntaxHighlightedCode } from "@/shared/ui/markdown";
+import { isMarkdownDocumentTooComplex } from "@/shared/ui/markdown/documentMode";
 import {
   decodeMarkdownDocBytes,
-  isMarkdownDocTooComplexForPreview,
   type MarkdownDocDecodeResult,
 } from "@/shared/ui/markdown/markdownDocFile";
 import { SegmentedControl } from "@/shared/ui/segmented-control";
@@ -58,7 +58,7 @@ function decodeErrorMessage(kind: "too-large" | "binary"): string {
 }
 
 const PREVIEW_TOO_COMPLEX_MESSAGE =
-  "This document has too many lines to render a formatted preview. Switch to Code view, or download it.";
+  "This document has too many elements to render a formatted preview. Switch to Code view, or download it.";
 
 /**
  * Right auxiliary panel rendering a shared markdown attachment in-app.
@@ -124,15 +124,20 @@ export function MarkdownDocPanel({
   const decoded = docQuery.data;
   const [isExportingPdf, setIsExportingPdf] = React.useState(false);
 
-  // Bounds the mdast/micromark parse by node count, independent of the byte
-  // cap above: a flat list of one-line items, or one line packed with links,
-  // still parses at superlinear cost well under 2 MiB (see markdownDocFile.ts).
-  // Preview and Export run that same parse, so one predicate gates both — a
-  // document too complex to preview is too complex to print. Code view is safe
-  // without this gate — SyntaxHighlightedCode bounds its own highlighting and
-  // plain-text fallback independently, so it stays available here.
-  const previewTooComplex =
-    decoded?.kind === "ok" && isMarkdownDocTooComplexForPreview(decoded.text);
+  // Bounds the render by the parser's own work and then by the parsed tree's
+  // node count, independent of the byte cap above: a flat list of one-line
+  // items, one line packed with delimiters, or a shallow-looking document held
+  // at depth across thousands of lines all cost far more than their size
+  // suggests (see markdownDocFile.ts and markdownParseBudget.ts). Preview and
+  // Export run the same parse, so one predicate gates both — a document too
+  // complex to preview is too complex to print. Memoized because the second
+  // half of that predicate *is* a parse; it must not run on every render.
+  // Code view is safe without this gate — SyntaxHighlightedCode bounds its own
+  // highlighting and plain-text fallback independently, so it stays available.
+  const previewTooComplex = React.useMemo(
+    () => decoded?.kind === "ok" && isMarkdownDocumentTooComplex(decoded.text),
+    [decoded],
+  );
 
   // Exportable only when the document both decoded and is inside that bound,
   // so the button is never offered for a document the panel itself refuses to

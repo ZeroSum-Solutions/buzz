@@ -37,9 +37,12 @@ const DOC_MARKDOWN = [
   "",
 ].join("\n");
 
-// Above `MAX_MARKDOWN_DOC_PREVIEW_LINES` (3,000) and far under the 2 MiB byte
-// cap: the shape the panel refuses to preview, and so must not offer to print.
-const COMPLEX_MARKDOWN = "- entry\n".repeat(3200);
+// The round-3 blind critic's F4 shape: `"*a*"` × 20,000 is 60,000 bytes on one
+// line, far under the 2 MiB byte cap, with no `[`, no `|` and no nesting — and
+// 40,000 inline delimiters in a single block, which is 1.6 × 10^9 units of
+// parse work and 3,458 ms rendered. The panel refuses to preview it, and so
+// must not offer to print it.
+const COMPLEX_MARKDOWN = "*a*".repeat(20000);
 
 type PdfExportMode = "saved" | "cancelled" | "failed";
 
@@ -180,10 +183,10 @@ test("a document too complex to preview offers no Export PDF action", async ({
   page,
 }) => {
   // The Export action and the Preview body are gated by one predicate
-  // (`isMarkdownDocTooComplexForPreview`), so the affordance and the panel
-  // agree. Before that gate the button was live on exactly these documents,
-  // and clicking it ran the parse the panel had just refused. This test fails
-  // if the button is offered again.
+  // (`isMarkdownDocumentTooComplex`), so the affordance and the panel agree.
+  // Before that gate the button was live on exactly these documents, and
+  // clicking it ran the parse the panel had just refused. This test fails if
+  // the button is offered again.
   await page.route(`**/media/${DOC_SHA}.bin`, (route) =>
     route.fulfill({
       body: COMPLEX_MARKDOWN,

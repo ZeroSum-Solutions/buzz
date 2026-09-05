@@ -1,6 +1,7 @@
 import { invokeTauri } from "@/shared/api/tauri";
 import { renderMarkdownDocumentHtml } from "@/shared/ui/markdown/documentMode";
-import { isMarkdownDocTooComplexForPreview } from "@/shared/ui/markdown/markdownDocFile";
+import { exceedsMarkdownDocParseBudget } from "@/shared/ui/markdown/markdownDocFile";
+import { isMarkdownTooComplexError } from "@/shared/ui/markdown/markdownParseBudget";
 
 /**
  * Mirror of `MAX_DOCUMENT_HTML_BYTES` in
@@ -17,13 +18,14 @@ export const MAX_PDF_DOCUMENT_HTML_BYTES = 8 * 1024 * 1024;
  * have loaded.
  *
  * Bytes are *not* the quantity the render costs, and this cap alone does not
- * bound it: the export runs the same mdast/micromark parse the Preview does,
- * whose cost tracks parsed-node count. `"[a](http://e.co) "` repeated on one
- * line is 17 bytes per link, so 111,025 links — measured at 9,379 ms and
- * 1,105 MB on this project's pinned parser
- * (`shared/ui/markdown/markdownDocFile.ts`) — is 1.80 MiB and passes this cap
- * outright. The bound that matters is
- * `isMarkdownDocTooComplexForPreview`, applied below.
+ * bound it: the export runs the same micromark/mdast parse the Preview does,
+ * whose cost tracks the parser's own work — delimiter density per block,
+ * container descent per line, and the parsed node count — none of which bytes
+ * predict. Measured on this branch's pipeline, node density across the 2,456
+ * real markdown files in this repository and the adversarial shapes ranges
+ * from 1.3 to 4,300 bytes per node, so no byte cap separates them. The bounds
+ * that matter are `exceedsMarkdownDocParseBudget` (the parse) and
+ * `MAX_MARKDOWN_DOC_NODES` (the tree), both applied below.
  */
 export const MAX_PDF_DOCUMENT_SOURCE_BYTES = 2 * 1024 * 1024;
 
@@ -80,16 +82,29 @@ export async function exportMarkdownDocumentToPdf({
   if (utf8ByteLength(content) > MAX_PDF_DOCUMENT_SOURCE_BYTES) {
     throw new Error(PDF_DOCUMENT_TOO_LARGE_MESSAGE);
   }
-  // The same predicate the panel gates Preview on, applied to the same parse.
-  // Export runs `renderMarkdownDocumentHtml`, which is `renderCachedMarkdown`
-  // with a different component map — the identical remark/micromark pipeline —
-  // so a document the panel refuses to preview would cost exactly as much
-  // here, on the same main thread, with a save dialog yet to appear. The panel
-  // hides the Export action for these documents; this is the enforcing check.
-  if (isMarkdownDocTooComplexForPreview(content)) {
+  // The cheap half of the gate the panel applies to Preview, on the identical
+  // parse: `renderMarkdownDocumentHtml` is `renderCachedMarkdown` with a
+  // different component map, so a document the panel refuses to preview would
+  // cost exactly as much here, on the same main thread, with a save dialog yet
+  // to appear. The panel hides the Export action for these documents; this is
+  // the enforcing check.
+  if (exceedsMarkdownDocParseBudget(content)) {
     throw new Error(PDF_DOCUMENT_TOO_COMPLEX_MESSAGE);
   }
-  const bodyHtml = await renderMarkdownDocumentHtml(content);
+  // The other half is enforced inside the parse itself: document mode carries
+  // the node budget, so an over-budget document aborts in
+  // `processor.parse()` — before the hast conversion, before any React
+  // element, and before the save dialog — and is reported as the same bounded
+  // refusal rather than as a render failure.
+  let bodyHtml: string;
+  try {
+    bodyHtml = await renderMarkdownDocumentHtml(content);
+  } catch (error) {
+    if (isMarkdownTooComplexError(error)) {
+      throw new Error(PDF_DOCUMENT_TOO_COMPLEX_MESSAGE);
+    }
+    throw error;
+  }
   if (utf8ByteLength(bodyHtml) > MAX_PDF_DOCUMENT_HTML_BYTES) {
     throw new Error(PDF_DOCUMENT_TOO_LARGE_MESSAGE);
   }

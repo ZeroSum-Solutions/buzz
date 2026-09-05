@@ -16,6 +16,7 @@ import remarkCustomEmoji, {
 import remarkMentions from "@/shared/lib/remarkMentions";
 import remarkSpoilers from "@/shared/lib/remarkSpoilers";
 
+import { remarkMarkdownDocNodeBudget } from "./markdownParseBudget";
 import { buzzDeepLinkUrlTransform } from "./utils";
 
 /**
@@ -73,6 +74,14 @@ export type MarkdownParseInputs = {
   /** Inserts the runtime-provided leading content marker during parsing. */
   leadingInlineContent?: boolean;
   mentionNames?: string[];
+  /**
+   * Abort the parse with a `MarkdownTooComplexError` once the mdast tree
+   * passes this many nodes. Document surfaces (the viewer panel and the PDF
+   * export) set it; the chat timeline does not — its messages are bounded by
+   * the relay's own event size and a throw there would take out the whole
+   * timeline rather than one attachment.
+   */
+  nodeBudget?: number;
   searchQuery?: string;
   variant: string;
 };
@@ -91,6 +100,13 @@ function buildMarkdownElement(input: MarkdownParseInputs): React.ReactElement {
   markdownParseCount += 1;
   // biome-ignore lint/suspicious/noExplicitAny: PluggableList type not directly importable
   const rehypePlugins: any[] = [rehypeImageGallery];
+  // First in the chain so the budget aborts inside `processor.parse()`,
+  // before any other plugin, the hast conversion, or a React element.
+  // biome-ignore lint/suspicious/noExplicitAny: PluggableList type not directly importable
+  const remarkPlugins: any[] =
+    input.nodeBudget === undefined
+      ? []
+      : [[remarkMarkdownDocNodeBudget, { budget: input.nodeBudget }]];
   if (input.leadingInlineContent) {
     rehypePlugins.push(rehypeLeadingInlineContent);
   }
@@ -105,6 +121,7 @@ function buildMarkdownElement(input: MarkdownParseInputs): React.ReactElement {
     children: input.content,
     components: input.components,
     remarkPlugins: [
+      ...remarkPlugins,
       remarkGfm,
       ...(input.hardLineBreaks === false ? [] : [remarkBreaks]),
       remarkSpoilers,
@@ -145,6 +162,7 @@ export function renderCachedMarkdown(
     segment(input.hardLineBreaks === false ? "soft" : "hard") +
     segment(input.variant) +
     segment(input.leadingInlineContent ? "leading" : "") +
+    segment(input.nodeBudget === undefined ? "" : String(input.nodeBudget)) +
     listSegment(input.mentionNames) +
     listSegment(input.channelNames) +
     listSegment(
