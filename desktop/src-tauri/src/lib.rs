@@ -674,6 +674,7 @@ pub fn run() {
             release_media_upload,
             download_image,
             save_png_data_url,
+            export_document_pdf,
             download_file,
             fetch_media_bytes,
             cancel_media_fetch,

@@ -145,6 +145,9 @@ earshot = "1.0"
 rubato = "3.0"
 audioadapter-buffers = "3.0"
 tempfile = "3"
+# Drives a locally installed Chrome/Chromium over the DevTools protocol for
+# PDF export (`Page.printToPDF`). Route picked in docs/plans/2026-09-04-pdf-route.md.
+headless_chrome = "1.0.22"
 strip-ansi-escapes = "0.2"
 tracing = "0.1"
 

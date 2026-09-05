@@ -1,0 +1,146 @@
+/* Print stylesheet for the PDF export document (see pdf_export.rs).
+   The exported HTML carries no application classes, so every rule here is
+   tag-scoped: the document must look right with this file as its only CSS. */
+
+@page {
+  size: Letter;
+  margin: 0.75in;
+}
+
+html {
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+}
+
+body {
+  margin: 0;
+  color: #111827;
+  background: #ffffff;
+  font-family: "Times New Roman", Times, Georgia, serif;
+  font-size: 11pt;
+  line-height: 1.45;
+}
+
+article {
+  max-width: 100%;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-family: Helvetica, Arial, sans-serif;
+  color: #0f172a;
+  line-height: 1.2;
+  margin: 1.1em 0 0.4em;
+  break-after: avoid;
+  page-break-after: avoid;
+}
+
+h1 {
+  font-size: 20pt;
+  margin-top: 0;
+}
+h2 {
+  font-size: 16pt;
+}
+h3 {
+  font-size: 13pt;
+}
+h4,
+h5,
+h6 {
+  font-size: 11.5pt;
+}
+
+p {
+  margin: 0 0 0.7em;
+  orphans: 3;
+  widows: 3;
+}
+
+ul,
+ol {
+  margin: 0 0 0.7em;
+  padding-left: 1.4em;
+}
+
+li {
+  margin-bottom: 0.2em;
+}
+
+blockquote {
+  margin: 0 0 0.8em;
+  padding: 0.1em 0 0.1em 0.9em;
+  border-left: 3px solid #cbd5e1;
+  color: #334155;
+}
+
+a {
+  color: #1d4ed8;
+  text-decoration: underline;
+  word-break: break-word;
+}
+
+hr {
+  border: 0;
+  border-top: 1px solid #cbd5e1;
+  margin: 1.2em 0;
+}
+
+img {
+  max-width: 100%;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0 0 0.9em;
+  font-size: 10pt;
+}
+
+th,
+td {
+  border: 1px solid #94a3b8;
+  padding: 0.28em 0.5em;
+  text-align: left;
+  vertical-align: top;
+}
+
+th {
+  background: #e2e8f0;
+  font-family: Helvetica, Arial, sans-serif;
+}
+
+tr {
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+code {
+  font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 9.5pt;
+}
+
+/* Code is never collapsed in a printed document: no height cap, no scroll
+   container, no clipping. Long blocks wrap and flow across pages instead. */
+pre {
+  margin: 0 0 0.9em;
+  padding: 0.6em 0.8em;
+  background: #f1f5f9;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  max-height: none;
+  overflow: visible;
+  white-space: pre-wrap;
+  word-break: break-word;
+  break-inside: auto;
+  page-break-inside: auto;
+}
+
+pre code {
+  white-space: inherit;
+  word-break: inherit;
+}
