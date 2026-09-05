@@ -795,3 +795,97 @@ fn mcp_registry_no_generated_file_carries_a_secret() {
 fn reference(id: &str) -> McpSecretRef {
     McpSecretRef::parse(&format!("mcp:{id}")).expect("valid reference")
 }
+
+// ── The spawn seam in `runtime.rs` ────────────────────────────────────────
+
+/// The strip and the apply, driven through the production functions
+/// `spawn_agent_child` calls.
+///
+/// `std::process::Command` records explicit overrides, so a removal is
+/// observable as `(key, None)` and a set as `(key, Some(value))` without
+/// spawning anything. Emptying `MANAGED_ENV_VARS`, or dropping either loop
+/// body, fails this — and deleting either *call* from `spawn_agent_child` is a
+/// compile error, because the strip's token is consumed by the apply and the
+/// apply's by `spawn_with_effort_proof`.
+#[test]
+fn mcp_registry_the_spawn_seam_strips_before_it_sets() {
+    use std::ffi::OsStr;
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let paths = paths(root.path());
+    let store = FakeStore::default();
+    converge(
+        &paths,
+        &registry(&stdio("gh", "github")),
+        &[selection(AGENT_A, McpConfigPlacement::Unsupported, &["gh"])],
+        LAUNCHER,
+        &store,
+        &CountingNonces::default(),
+    )
+    .expect("converges");
+    let plan = plan_for_spawn(
+        &paths,
+        AGENT_A,
+        McpConfigPlacement::Unsupported,
+        binding_reader(&store),
+    )
+    .expect("resolves");
+
+    // An ambient value for every managed variable, as a harness environment
+    // carrying a stale generation's capability would have.
+    let mut command = std::process::Command::new("true");
+    for key in MANAGED_ENV_VARS {
+        command.env(key, "AMBIENT");
+    }
+    let stripped = crate::managed_agents::strip_mcp_registry_env(&mut command);
+    let overrides: Vec<(String, Option<String>)> = command
+        .get_envs()
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                value.map(OsStr::to_string_lossy).map(|v| v.into_owned()),
+            )
+        })
+        .collect();
+    for key in MANAGED_ENV_VARS {
+        assert_eq!(
+            overrides
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone()),
+            Some(None),
+            "{key} was not stripped before the user env layer"
+        );
+    }
+
+    // The user env layer runs between the two, so a saved value would land
+    // here — and the apply below has to win.
+    command.env(CAPABILITY_ENV_VAR, "SAVED-BY-THE-USER");
+    // The token is what `spawn_with_effort_proof` consumes in production;
+    // this test's job ends at the command it produced.
+    let _applied = crate::managed_agents::apply_mcp_registry_env(&mut command, &plan, stripped);
+
+    let applied: BTreeMap<String, Option<String>> = command
+        .get_envs()
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                value.map(OsStr::to_string_lossy).map(|v| v.into_owned()),
+            )
+        })
+        .collect();
+    for (key, value) in &plan.set {
+        assert_eq!(
+            applied.get(key),
+            Some(&Some(value.clone())),
+            "{key} did not reach the spawn command"
+        );
+    }
+    assert_ne!(
+        applied.get(CAPABILITY_ENV_VAR),
+        Some(&Some("SAVED-BY-THE-USER".to_string())),
+        "a saved user value shadowed this spawn's capability"
+    );
+    // buzz-agent's placement leaves the shared nest as the working directory.
+    assert_eq!(command.get_current_dir(), None);
+}

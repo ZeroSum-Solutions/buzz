@@ -477,6 +477,54 @@ pub(crate) fn apply_effort_to_spawn_command(
     EffortApplied(())
 }
 
+/// Proof token for the MCP-registry variable strip. `#[must_use]`; the only
+/// way to obtain one is [`strip_mcp_registry_env`], and
+/// [`apply_mcp_registry_env`] consumes it, so the strip cannot be deleted
+/// without the apply failing to compile.
+#[must_use]
+pub(crate) struct McpEnvStripped(());
+
+/// Proof token for the MCP-registry plan application, consumed by
+/// `spawn_with_effort_proof`. Deleting the apply from `spawn_agent_child`
+/// leaves the spawn site without it, which is a compile error.
+#[must_use]
+pub(crate) struct McpEnvApplied(());
+
+/// Strip every variable an MCP-registry plan can set.
+///
+/// Runs BEFORE the user env layer, so an ambient value inherited from the
+/// desktop's own environment can never stand in for one this spawn's plan did
+/// not set. A stale `BUZZ_MCP_CAPABILITY` is the case that matters: it names a
+/// generation that no longer exists, and a child holding one would fail every
+/// secret read with an authorization error instead of starting without
+/// servers.
+pub(crate) fn strip_mcp_registry_env(cmd: &mut std::process::Command) -> McpEnvStripped {
+    for key in super::mcp_registry::spawn::MANAGED_ENV_VARS {
+        cmd.env_remove(key);
+    }
+    McpEnvStripped(())
+}
+
+/// Apply an MCP-registry plan, consuming the strip's proof token.
+///
+/// Runs AFTER the user env layer, for the same reason the replay floor does:
+/// the capability and the generated config path are this spawn's own authority
+/// and a saved user value must not shadow either. The working directory moves
+/// only for a placement that reads a cwd-relative file.
+pub(crate) fn apply_mcp_registry_env(
+    cmd: &mut std::process::Command,
+    plan: &super::mcp_registry::spawn::McpSpawnPlan,
+    _stripped: McpEnvStripped,
+) -> McpEnvApplied {
+    for (key, value) in &plan.set {
+        cmd.env(key, value);
+    }
+    if let Some(workdir) = &plan.workdir {
+        cmd.current_dir(workdir);
+    }
+    McpEnvApplied(())
+}
+
 /// Spawn the agent command, consuming the `EffortApplied` and
 /// `SystemPromptApplied` proof tokens.
 /// Deleting `apply_effort_to_spawn_command` or `apply_system_prompt_env` from
@@ -486,6 +534,7 @@ pub(crate) fn spawn_with_effort_proof(
     cmd: &mut std::process::Command,
     _effort: EffortApplied,
     _prompt: SystemPromptApplied,
+    _mcp: McpEnvApplied,
 ) -> std::io::Result<std::process::Child> {
     cmd.spawn()
 }
@@ -850,13 +899,9 @@ pub fn spawn_agent_child(
     command.env_remove("BUZZ_ACP_PRIVATE_KEY");
     command.env_remove("BUZZ_ACP_API_TOKEN");
     command.env_remove("BUZZ_API_TOKEN");
-    // The registry variables are stripped here, before the user env layer, so
-    // an ambient value from the desktop's own environment cannot stand in for
-    // one this spawn's plan did not set. A stale capability is the case that
-    // matters: it names a generation that no longer exists.
-    for key in super::mcp_registry::spawn::MANAGED_ENV_VARS {
-        command.env_remove(key);
-    }
+    // Stripped before the user env layer; the returned token is consumed by
+    // `apply_mcp_registry_env` below, so deleting this call is a compile error.
+    let mcp_stripped = strip_mcp_registry_env(&mut command);
 
     if let Some(ref auth_tag) = record.auth_tag {
         command.env("BUZZ_AUTH_TAG", auth_tag);
@@ -920,16 +965,10 @@ pub fn spawn_agent_child(
     // provider payload's `launch.env` tier for the same reason.
     apply_replay_floor_env(&mut command, replay_floor_unix);
 
-    // Written AFTER the `descriptor.env` loop for the same reason the replay
-    // floor is: the capability and the generated config path are this spawn's
-    // own authority and a saved user value must not shadow either. The working
-    // directory moves only for a placement that needs a cwd-relative file.
-    for (key, value) in &mcp_plan.set {
-        command.env(key, value);
-    }
-    if let Some(workdir) = &mcp_plan.workdir {
-        command.current_dir(workdir);
-    }
+    // Applied AFTER the `descriptor.env` loop, the same post-loop authority
+    // ordering the replay floor uses. The returned token is consumed by
+    // `spawn_with_effort_proof` below; deleting this call is a compile error.
+    let mcp_applied = apply_mcp_registry_env(&mut command, &mcp_plan, mcp_stripped);
 
     // A1: for local claude agents, ANTHROPIC_MODEL is the single startup model authority.
     // BUZZ_ACP_MODEL is removed (live ACP switches only; two authorities in the same env
@@ -992,13 +1031,14 @@ pub fn spawn_agent_child(
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let child = spawn_with_effort_proof(&mut command, effort, prompt_applied).map_err(|error| {
-        format!(
-            "failed to spawn `{}` for agent {}: {error}",
-            resolved_acp_command.display(),
-            record.name
-        )
-    })?;
+    let child = spawn_with_effort_proof(&mut command, effort, prompt_applied, mcp_applied)
+        .map_err(|error| {
+            format!(
+                "failed to spawn `{}` for agent {}: {error}",
+                resolved_acp_command.display(),
+                record.name
+            )
+        })?;
 
     // Codex: stamp adapter availability for the Phase-2 badge drift check.
     // Cold cache returns `None` → drift check skipped until discovery warms it.
