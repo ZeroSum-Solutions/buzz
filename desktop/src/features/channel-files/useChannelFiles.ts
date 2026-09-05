@@ -1,16 +1,16 @@
 import { useMemo } from "react";
 import { useChannelMessagesQuery } from "@/features/messages/hooks";
-import { parseImetaTags } from "@/shared/ui/markdown/parseImeta";
 import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
 import type { Channel, RelayEvent } from "@/shared/api/types";
-import type { ParsedImetaEntry } from "@/shared/ui/markdown/parseImeta";
+import { extractCaption, parseBoundedImeta } from "./boundedImeta";
+import { fileKeyFor } from "./folderStore";
 
 export type ChannelFile = {
-  /** Unique key (event id + url). */
+  /** Stable per-attachment identity: message id + a digest of the URL. */
   key: string;
   /** The relay-rewritten media URL for download/display. */
   url: string;
-  /** Raw media URL from imeta. */
+  /** Raw media URL from imeta (validated http(s), length-capped). */
   rawUrl: string;
   /** MIME type (e.g. "image/png", "application/pdf"). */
   mimeType: string;
@@ -34,22 +34,15 @@ export type ChannelFile = {
   eventId: string;
   /** First line of the message body (caption/description). */
   caption: string | undefined;
-  /** All parsed imeta fields. */
-  imeta: ParsedImetaEntry;
 };
 
-// Relay-sourced string/count caps applied at the DTO boundary — a hostile
-// or buggy event must not be able to hand the UI an unbounded string to
-// render or an unbounded number of attachments to parse from one message.
-const MAX_FILENAME_LENGTH = 300;
-const MAX_CAPTION_LENGTH = 500;
-const MAX_MIME_TYPE_LENGTH = 100;
-/** A real message carries at most a handful of attachments; this is generous headroom, not a product limit. */
-const MAX_IMETA_ENTRIES_PER_EVENT = 20;
-
-function capString(value: string, maxLength: number): string {
-  return value.length > maxLength ? value.slice(0, maxLength) : value;
-}
+/**
+ * Total attachments the Files tab will hold for one channel. The projection
+ * runs over the whole loaded message window, which grows as the user pages
+ * back, so the bound has to sit on the thing that costs — rows produced —
+ * rather than on any single event.
+ */
+export const MAX_CHANNEL_FILES = 2_000;
 
 /** File type categories for filtering. */
 export type FileCategory = "all" | "image" | "video" | "document" | "other";
@@ -96,90 +89,95 @@ export function sortFiles(files: ChannelFile[], sort: FileSort): ChannelFile[] {
 }
 
 /**
- * Extract all file-bearing events from a list of channel message events and
- * parse their imeta tags into a flat list of {@link ChannelFile} objects,
- * ordered newest-first. Pure — exported so the parsing rules (caption
- * extraction, filename-over-".bin" labeling, imeta field mapping) are
- * testable directly against the production code path {@link useChannelFiles}
- * calls, not a test-only reimplementation.
+ * Project a list of channel message events into a flat, newest-first list of
+ * {@link ChannelFile} rows. Pure, bounded, and exported so the parsing rules
+ * (caption extraction, filename-over-".bin" labelling, field caps, the total
+ * row cap) are tested against the code path {@link useChannelFiles} calls.
+ *
+ * Returns `truncated: true` when the row cap stopped the projection, so the
+ * UI can say the list is partial instead of presenting it as the whole set.
  */
-export function parseChannelFiles(events: RelayEvent[]): ChannelFile[] {
-  const result: ChannelFile[] = [];
+export function parseChannelFiles(events: RelayEvent[]): {
+  files: ChannelFile[];
+  truncated: boolean;
+} {
+  const files: ChannelFile[] = [];
 
   for (let i = events.length - 1; i >= 0; i--) {
+    if (files.length >= MAX_CHANNEL_FILES) {
+      return { files, truncated: true };
+    }
     const event = events[i];
     const tags = event.tags;
     if (!tags || tags.length === 0) continue;
 
-    const entries = parseImetaTags(tags as string[][]);
-    if (entries.size === 0) continue;
+    const attachments = parseBoundedImeta(tags as string[][]);
+    if (attachments.length === 0) continue;
 
-    // Extract first non-empty line of content as caption
-    let caption: string | undefined;
-    const content = event.content;
-    if (content != null) {
-      const firstLine = content.trim().split("\n")[0];
-      if (firstLine) {
-        caption =
-          firstLine.replace(/!\[(?:image|video)\]\([^)]+\)/g, "").trim() ||
-          undefined;
+    const caption = extractCaption(event.content ?? null);
+
+    for (const attachment of attachments) {
+      if (files.length >= MAX_CHANNEL_FILES) {
+        return { files, truncated: true };
       }
-    }
-    if (caption != null) caption = capString(caption, MAX_CAPTION_LENGTH);
-
-    // Cap the number of attachments pulled from a single event, not just
-    // their string fields — an event with an unrealistic imeta-tag count
-    // must not translate into an unbounded render list.
-    let entryCount = 0;
-    for (const [, entry] of entries) {
-      if (entryCount >= MAX_IMETA_ENTRIES_PER_EVENT) break;
-      entryCount += 1;
-      result.push({
-        key: `${event.id}-${entry.url}`,
-        url: rewriteRelayUrl(entry.url),
-        rawUrl: entry.url,
-        mimeType: capString(
-          entry.m ?? "application/octet-stream",
-          MAX_MIME_TYPE_LENGTH,
-        ),
-        size: entry.size != null && entry.size > 0 ? entry.size : undefined,
-        filename:
-          entry.filename != null
-            ? capString(entry.filename, MAX_FILENAME_LENGTH)
-            : undefined,
-        sha256: entry.x,
-        thumb: entry.thumb ? rewriteRelayUrl(entry.thumb) : undefined,
-        dim: entry.dim,
-        blurhash: entry.blurhash,
+      files.push({
+        key: fileKeyFor(event.id, attachment.url),
+        url: rewriteRelayUrl(attachment.url),
+        rawUrl: attachment.url,
+        mimeType: attachment.mimeType,
+        size: attachment.size,
+        filename: attachment.filename,
+        sha256: attachment.sha256,
+        thumb: attachment.thumb ? rewriteRelayUrl(attachment.thumb) : undefined,
+        dim: attachment.dim,
+        blurhash: attachment.blurhash,
         pubkey: event.pubkey,
         createdAt: event.created_at,
         eventId: event.id,
-        caption: caption || undefined,
-        imeta: entry,
+        caption,
       });
     }
   }
 
-  return result;
+  return { files, truncated: false };
 }
 
 /**
- * Extract all file-bearing events from a channel and parse their imeta tags
- * into a flat list of {@link ChannelFile} objects, ordered newest-first.
+ * Attachments in the currently loaded window of a channel, newest first.
+ *
+ * `enabled` gates the projection: it is only ever run for a channel whose
+ * Files tab has been opened, so a Chat-only session never re-parses the whole
+ * loaded window on every incoming live message.
  */
-export function useChannelFiles(activeChannel: Channel | null): {
+export function useChannelFiles(
+  activeChannel: Channel | null,
+  enabled = true,
+): {
   files: ChannelFile[];
+  truncated: boolean;
   isLoading: boolean;
+  isError: boolean;
+  error: unknown;
+  refetch: () => void;
 } {
   const messagesQuery = useChannelMessagesQuery(activeChannel);
 
-  const files = useMemo(
-    () => parseChannelFiles(messagesQuery.data ?? []),
-    [messagesQuery.data],
+  const projection = useMemo(
+    () =>
+      enabled
+        ? parseChannelFiles(messagesQuery.data ?? [])
+        : { files: [], truncated: false },
+    [enabled, messagesQuery.data],
   );
 
   return {
-    files,
+    files: projection.files,
+    truncated: projection.truncated,
     isLoading: messagesQuery.isPending,
+    isError: messagesQuery.isError,
+    error: messagesQuery.error,
+    refetch: () => {
+      void messagesQuery.refetch();
+    },
   };
 }
