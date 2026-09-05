@@ -53,12 +53,15 @@ test("provenance context follows exact local inventory and rejects failed cached
     { wrapper },
   );
   assert.deepEqual(result.current, [true, false, true]);
-  await act(async () =>
+  await act(async () => {
     client.setQueryData(
       ["managed-agents"],
       [{ pubkey: remote, status: "deployed" }],
-    ),
-  );
+    );
+    // TanStack's notifyManager delivers observer updates on a macrotask, so
+    // a timer queued after the write is guaranteed to run after the notify.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
   assert.deepEqual(result.current, [false, true, true]);
   await act(async () => {
     client

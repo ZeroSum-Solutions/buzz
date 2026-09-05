@@ -9,6 +9,7 @@ const OWNER_PUBKEY =
 const summary = (over = {}) => ({
   displayName: "Ada",
   avatarUrl: "https://x/a.png",
+  about: "Loves lace and lockets",
   nip05Handle: "ada@x",
   ownerPubkey: null,
   isAgent: false,
@@ -59,6 +60,7 @@ test("profileLookupsEqual: a changed field is not equal", () => {
   for (const field of [
     "displayName",
     "avatarUrl",
+    "about",
     "nip05Handle",
     "ownerPubkey",
     "isAgent",

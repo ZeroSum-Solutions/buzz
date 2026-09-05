@@ -4691,6 +4691,43 @@ test("agent profile popover falls back to the owner's pubkey", async ({
   ).toHaveText("managed by 11111111…1111");
 });
 
+test("agent profile popover shows the about bio", async ({ page }) => {
+  await installMockBridge(page, {
+    searchProfiles: [
+      {
+        pubkey: OWNED_AGENT_PROFILE_PUBKEY,
+        displayName: "Pollen",
+        ownerPubkey: MOCK_VIEWER_PUBKEY,
+        about: "Pollinates the garden channel and tracks bloom schedules",
+        isAgent: true,
+      },
+    ],
+  });
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+  await waitForMockLiveSubscription(page, "general");
+
+  await emitMockMessage(page, "general", "Pollen checking in.", {
+    pubkey: OWNED_AGENT_PROFILE_PUBKEY,
+  });
+  await waitForTimelineSettled(page);
+
+  const pollenMessage = page
+    .getByTestId("message-row")
+    .filter({ hasText: "Pollen checking in." })
+    .first();
+  await pollenMessage.locator("button").first().hover();
+
+  const profilePopover = page.locator(
+    '[data-testid="user-profile-popover"][data-state="open"]',
+  );
+  await expect(profilePopover).toBeVisible();
+  await expect(
+    profilePopover.getByTestId("user-profile-description"),
+  ).toHaveText("Pollinates the garden channel and tracks bloom schedules");
+});
+
 test("human profile popover does not show an owner", async ({ page }) => {
   await page.goto("/");
   await page.getByTestId("channel-general").click();
