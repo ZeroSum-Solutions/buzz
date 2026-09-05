@@ -1,8 +1,7 @@
 # Calendar event model and view design (T12a)
 
-Date: 2026-09-04. T12a `docs/calendar-view-design`, implemented by T12, bound by the accepted T11 contract (`docs/plans/2026-09-04-calendar-authorization.md`, cited below by line).
-`shared/ui/calendar.tsx` is a `react-day-picker` wrapper with no event layer, used only by a single-date picker (`desktop/src/features/user-status/ui/SetStatusDialog.tsx:18`). Authorization, caching
-and failure states stay T11's.
+Date: 2026-09-04. T12a `docs/calendar-view-design`, implemented by T12 under the accepted T11 contract (`docs/plans/2026-09-04-calendar-authorization.md`, cited by line). `shared/ui/calendar.tsx` is
+a `react-day-picker` wrapper with no event layer, used only by a date picker (`desktop/src/features/user-status/ui/SetStatusDialog.tsx:18`). Authorization, caching and failure states stay T11's.
 
 ## Decisions
 
@@ -39,9 +38,9 @@ calendar) partition (T11:49-50): 5,000 event rows, 120 day headers and decision 
 virtual window (`:133`) and emits no roles, so T12 adds `role="list"` on the inner spacer (`:149`) and `role="listitem"` with `aria-posinset`/`aria-setsize` on each row div (`:155`); day headers are
 rows and count in the set. Reason: one row per cached event ties the maximum to T11's bound, and `aria-posinset` needs a set role a list owns.
 
-**8. Paging.** Decision: month and agenda stay inside T11 decision 6's fixed 120-day horizon; the month pages one month at a time and at the edge renders an end-of-window state — a named boundary
-row, not an empty month — with no further fetch. Widening the horizon needs T11 amended. Reason: paging past the window renders an empty month indistinguishable from an empty calendar, a swallowed
-boundary.
+**8. Paging.** Decision: month and agenda stay inside T11 decision 6's fixed 120-day horizon; the month pages one month at a time and at the edge renders a named end-of-window state — decision 10's
+`Footer` line in the month, a boundary row in decision 7's agenda — not an empty month, and fetches no further. Widening the horizon needs T11 amended. Reason: paging past the window renders an
+empty month indistinguishable from an empty calendar, a swallowed boundary.
 
 **9. Keyboard operation.** Decision: the month grid is one composite widget, one tab stop, roving focus — arrows by day, PageUp/PageDown by month, Home/End in the week, Enter opening the day's
 agenda (also the path to "+N more"), `n` create, Escape out. The agenda is a second composite widget, one tab stop; its arrows set the active row index, `scrollToIndex` through `onVirtualizer`
@@ -49,10 +48,12 @@ agenda (also the path to "+N more"), `n` create, Escape out. The agenda is a sec
 the date, decision 8's boundary row one named "end of the fetched window". Enter opens the row. Reason: Tab cannot reach an unmounted row, and a row with nothing focusable strands focus where the list
 scrolled from.
 
-**10. Screen-reader semantics.** Decision: keep the grid semantics `DayPicker` emits and name each day through `labels.labelDayButton`, composed rather than replaced — call the library default for
-the date and its `today` and `selected` state, then append ", N events" — since an interactive picker labels the button, not the `<td>`. Decision 6's overlay is `aria-hidden` decoration, decision
-7's agenda is the authoritative reading order, and month and boundary changes announce through `DayPicker`'s own `role="status"` region, fed by the wrapper, not a second announcer. Reason: an
-exact-string override deletes the picker's only "today" and "selected" announcement, and two live regions announce every change twice.
+**10. Screen-reader semantics.** Decision: keep `DayPicker`'s grid semantics and name each day through `labels.labelDayButton`, composing the library default (the date, `today`, `selected`) with ",
+N events", since an interactive picker labels the button, not the `<td>`. Decision 6's overlay is `aria-hidden`; decision 7's agenda is the authoritative reading order. `react-day-picker@10.0.1` has
+two `role="status"` regions, each taking one message: the caption, always rendered (`dist/esm/DayPicker.js:293`, `:282` under a dropdown), keeps month changes, and `Footer` — mounted only while
+`props.footer` is truthy (`:341`; a `<div>` at `components/Footer.js:9`), so the wrapper feeds it a non-empty line from first render — carries decision 8's boundary and decision 13's `truncated`
+text. Reason: an exact-string override deletes the picker's only "today" and "selected" announcement, a region mounted with its first text is not reliably announced, and two regions carrying one
+change read it twice.
 
 **11. Create and edit conflict handling.** Decision: `events.patch` sends only changed fields, and a field whose decision 1 `truncated` flag is set is read-only, so a prefix never overwrites Google's
 copy. `events.insert` carries a client-generated event id — a UUID's 32 hex digits, lowercase and unhyphenated, inside Google's base32hex 5-1024 alphabet — so a lost response is retryable with the
@@ -63,21 +64,21 @@ read-only view on the stale snapshot until `stale_after`. Reason: last-write-win
 **12. Component and library chosen.** Decision: no calendar-widget dependency — decisions 4, 6 and 7's pieces plus the existing dialog primitive. Reason: they are already in the tree and gated, and
 a widget adds its own DOM, styling and date stack for a view with no time-grid.
 
-**13. Truncated coverage and the interval a batch proves.** Decision: a batch carries the interval it reached plus `complete` or `truncated(reason)`, and that interval is proven, not inferred. The
-invariant: decision 5's walk sets `orderBy=startTime`, so pages arrive ordered by start under T11 decision 6's caps (T11:51), and a page cut mid-stream by a cap is discarded whole, so the proven
-interval ends at the last complete page — [window start, min(window end, that page's maximum end)]. Beyond it the batch is never authoritative: those dates render "unknown, more…", never empty,
-the month marks the range partial with one retry, the agenda ends in decision 8's boundary row, and none is editable. The marker sits outside the evictable rows, and T11's eviction (T11:50) downgrades
-each interval it touches to `truncated(evicted)` in the dropping transaction, so `complete` holds only while every substantiating row is retained — a T11-side write T12a requires. Reason: undefined,
-"the interval it reached" closes at the last returned event and paints a half-read day complete — the defect `AGENTS.md` Review-Proven Rule 1 names — and neither cap exhaustion (200s) nor eviction
-has a branch in T11 decision 8's matrices.
+**13. Truncated coverage and the interval a batch proves.** Decision: a batch carries the interval it reached plus `complete` or `truncated(reason)`, proven not inferred. The invariant: decision 5's
+walk sets `orderBy=startTime` under T11 decision 6's 10-page, 8 MiB and 30-second caps (T11:51); a page cut mid-stream is discarded whole, and a complete page orders start alone: every event not yet
+returned starts at or after that page's maximum start. So the interval is half-open: [window start, min(window end, the last complete page's maximum start)); zero complete pages prove nothing, the
+window wholly `truncated`. Never maximum end: a received event running past the bound renders as known, the days after it do not. Past it nothing is authoritative: those dates render "unknown,
+more…", never empty, the month marks the range partial with a retry, the agenda ends in decision 8's boundary row, and none is editable. The marker sits outside the evictable rows; eviction (T11:50)
+downgrades every interval it touches to `truncated(evicted)` in the dropping transaction — a T11-side write T12a requires — so `complete` holds only while its rows survive. Reason: closing at a
+returned event's end paints days holding unfetched meetings complete and editable — `AGENTS.md` Rule 1's defect — and neither cap exhaustion nor eviction branches in T11 decision 8's matrices.
 
 ## Open verifications
 
 - The ARIA roles `react-day-picker@^10.0.1` emits for grid and day cells, and that a `MonthGrid` override spreading every prop keeps them, off T12's DOM.
-- That composing `labels.labelDayButton` keeps `today` and `selected` in the name, and that feeding `DayPicker`'s status region announces each change once.
+- That composing `labels.labelDayButton` keeps `today` and `selected` in the name, and that a `Footer` line present from first render announces each boundary change once.
 - Lane and "+N more" thresholds on T12's 250-event fixture, and agenda focus traversal at decision 7's derived 5,121-row maximum.
 - That Google honours `If-Match` (412 on a stale etag) and a client-supplied `events.insert` id on replay — T12's mock server first, the live checklist once.
-- That `events.list` keeps equal-start events on one side of a page boundary, so decision 13's discarded page hides none inside the proven interval.
+- That `events.list` keeps equal-start events on one side of a page boundary — defence in depth only, since decision 13's bound is half-open and excludes them.
 
 ## Risks accepted
 
