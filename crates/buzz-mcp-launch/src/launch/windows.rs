@@ -14,9 +14,18 @@
 //! process behind. `crates/buzz-dev-mcp/src/shell.rs:763-790` is the shape of
 //! the calls, deliberately not of its error handling: it discards the return
 //! value of `SetInformationJobObject` and of `AssignProcessToJobObject`.
+//!
+//! Because the launcher is in the job, the job handle is held for the whole
+//! life of the process and never closed by this module: closing it kills every
+//! member, the supervisor included, which would lose the server's exit code on
+//! a clean exit and swallow the error on a failed spawn. Process exit closes
+//! the last handle, and that is precisely when any survivor must die.
+//! `tests/launcher_windows.rs` drives the shipped binary through each
+//! fault-injection value and asserts a checked failure leaves nothing behind.
 
 use tokio::process::Command;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -36,6 +45,9 @@ const FAULT_ENV: &str = "BUZZ_MCP_LAUNCH_FAULT";
 pub struct Contained {
     /// The server process.
     pub child: tokio::process::Child,
+    /// The job handle. Held for the life of the process and never closed by
+    /// this module — see the module docs — so it is stored rather than read.
+    #[allow(dead_code)]
     job: HANDLE,
 }
 
@@ -48,23 +60,21 @@ unsafe impl Send for Contained {}
 unsafe impl Sync for Contained {}
 
 impl Contained {
-    /// Close the job handle, which kills every process still inside it.
-    pub fn terminate(&mut self) {
-        if self.job.is_null() {
-            return;
-        }
-        // SAFETY: `job` is a handle this process created and has not closed.
-        #[allow(unsafe_code)]
-        unsafe {
-            CloseHandle(self.job);
-        }
-        self.job = std::ptr::null_mut();
-    }
-}
-
-impl Drop for Contained {
-    fn drop(&mut self) {
-        self.terminate();
+    /// Tear the scope down.
+    ///
+    /// The launcher is itself in this kill-on-close job, so closing the last
+    /// handle would kill the supervisor before it could report the server's
+    /// exit code — and, on the spawn-failure path, before it could report the
+    /// error at all. The handle is therefore held for the life of the process
+    /// and closed by the kernel at exit, which is exactly when every survivor
+    /// in the job must die. There is nothing to do here and nothing that can
+    /// fail; the `Result` matches the Unix signature so `launch::run` handles
+    /// one shape.
+    ///
+    /// # Errors
+    /// Never. The job's teardown is the kernel's, at process exit.
+    pub fn terminate(&mut self) -> Result<(), LaunchError> {
+        Ok(())
     }
 }
 
@@ -80,11 +90,10 @@ pub fn spawn_contained(command: &mut Command, program: &str) -> Result<Contained
     let child = match command.spawn() {
         Ok(child) => child,
         Err(source) => {
-            // SAFETY: `job` was created above and not yet closed.
-            #[allow(unsafe_code)]
-            unsafe {
-                CloseHandle(job);
-            }
+            // The handle is deliberately not closed here: this process is in
+            // the job, so closing it would kill the launcher before the caller
+            // could report why the spawn failed. No server started, so the job
+            // holds only us, and process exit closes it harmlessly.
             return Err(LaunchError::Spawn {
                 command: program.to_string(),
                 source,

@@ -491,20 +491,22 @@ fn mcp_registry_generation_flip_is_atomic() {
             "{error:?}"
         );
 
-        let a = read_current(&store, "a.json");
-        let b = read_current(&store, "b.json");
-        match step {
+        let expected = match step {
             // Before the rename: generation 1 is still adopted, whole.
-            FlipStep::JournalPrepared | FlipStep::FileWritten(_) => {
-                assert_eq!(a.as_deref(), Some("one-a"), "{step:?}");
-                assert_eq!(b.as_deref(), Some("one-b"), "{step:?}");
-            }
+            FlipStep::JournalPrepared | FlipStep::FileWritten(_) => ("one-a", "one-b"),
             // After it: generation 2 is adopted, whole. Never a mixture.
-            _ => {
-                assert_eq!(a.as_deref(), Some("two-a"), "{step:?}");
-                assert_eq!(b.as_deref(), Some("two-b"), "{step:?}");
-            }
-        }
+            _ => ("two-a", "two-b"),
+        };
+        assert_eq!(
+            read_current(&store, "a.json").as_deref(),
+            Some(expected.0),
+            "{step:?}"
+        );
+        assert_eq!(
+            read_current(&store, "b.json").as_deref(),
+            Some(expected.1),
+            "{step:?}"
+        );
 
         // And whatever the crash left behind, the next start reconciles it.
         store
@@ -514,7 +516,175 @@ fn mcp_registry_generation_flip_is_atomic() {
             store.journal().expect("journal readable").is_none(),
             "the journal is cleared only once nothing is owed"
         );
+        // Re-read through the pointer against the *same* expectation. Without
+        // this, a reconcile that deleted the adopted generation — the state a
+        // crash between the pointer rename and the FLIPPED journal write
+        // leaves — would still leave this test green.
+        assert_eq!(
+            read_current(&store, "a.json").as_deref(),
+            Some(expected.0),
+            "reconcile changed the adopted configuration after {step:?}"
+        );
+        assert_eq!(
+            read_current(&store, "b.json").as_deref(),
+            Some(expected.1),
+            "reconcile changed the adopted configuration after {step:?}"
+        );
     }
+}
+
+/// A staging tree that cannot be removed must fail the reconcile that tries,
+/// and must keep its journal entry until the directory is actually gone.
+///
+/// The removal is the only thing standing between a stale generation directory
+/// and the next commit, which recomputes the same generation number: a
+/// discarded error there ships obsolete generated files to agents. Deleting the
+/// `?` on either `remove_tree` call fails this test.
+#[cfg(unix)]
+#[test]
+fn mcp_registry_a_failed_discard_is_surfaced_and_keeps_the_journal() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = GenerationStore::open(dir.path()).expect("opens");
+    store
+        .commit(
+            |_, _| Ok(plan(&[("a.json", "one")], vec![])),
+            &NoSecrets,
+            &NoHooks,
+        )
+        .expect("generation 1 lands");
+
+    // Generation 2 staged and never adopted: the pointer still names 1, so a
+    // reconcile discards the half-staged tree.
+    let staged = store.generation_dir(2);
+    assert!(store
+        .commit(
+            |_, _| Ok(plan(&[("a.json", "two")], vec![])),
+            &NoSecrets,
+            &FailAt::new(FlipStep::FileWritten(0)),
+        )
+        .is_err());
+    assert!(staged.is_dir(), "generation 2 was staged");
+
+    // Take write permission off the parent, so removing the staged directory
+    // itself fails after its contents are gone — the half-removed tree.
+    let generations = staged.parent().expect("a parent").to_path_buf();
+    let original = std::fs::metadata(&generations)
+        .expect("readable")
+        .permissions();
+    std::fs::set_permissions(&generations, std::fs::Permissions::from_mode(0o555))
+        .expect("drop write permission");
+    // Root ignores the mode, so this machine cannot run the assertion.
+    let writable_anyway = std::fs::File::create(generations.join("probe")).is_ok();
+    if writable_anyway {
+        let _ = std::fs::remove_file(generations.join("probe"));
+        std::fs::set_permissions(&generations, original).expect("restore");
+        return;
+    }
+
+    let error = store
+        .reconcile(&NoSecrets, &NoHooks)
+        .expect_err("a failed discard must be surfaced, not swallowed");
+    assert!(
+        matches!(
+            error,
+            GenerationError::Io {
+                operation: "remove",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    let journal = store.journal().expect("readable").expect("still recorded");
+    assert_eq!(journal.generation, 2);
+    assert_eq!(journal.phase, JournalPhase::Prepared);
+    // A mutation attempted while the discard is owed is refused too, because
+    // commit finishes the outstanding journal before it stages anything.
+    assert!(store
+        .commit(
+            |_, _| Ok(plan(&[("a.json", "three")], vec![])),
+            &NoSecrets,
+            &NoHooks,
+        )
+        .is_err());
+
+    // Once the directory can be removed, the discard completes and the journal
+    // is cleared — and generation 1 was the adopted one throughout.
+    std::fs::set_permissions(&generations, original).expect("restore");
+    assert!(matches!(
+        store
+            .reconcile(&NoSecrets, &NoHooks)
+            .expect("the discard completes"),
+        Reconciled::DiscardedStaging { generation: 2 }
+    ));
+    assert!(store.journal().expect("readable").is_none());
+    assert_eq!(read_current(&store, "a.json").as_deref(), Some("one"));
+}
+
+#[test]
+fn mcp_registry_commit_refuses_while_a_deletion_is_owed() {
+    // A keychain delete that failed is a credential the operator has already
+    // been told is revoked. The next Settings change must not write its own
+    // journal over that debt: it retries it first, and refuses if it still
+    // cannot be paid.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = GenerationStore::open(dir.path()).expect("opens");
+    let secrets = FakeSecrets::default();
+    *secrets.failing.lock().expect("lock") = true;
+
+    let owed = Deletion::Secret {
+        key: "mcp:agent-a:1:token".to_string(),
+    };
+    assert!(store
+        .commit(
+            |_, _| Ok(plan(&[("a.json", "one")], vec![owed.clone()])),
+            &secrets,
+            &NoHooks,
+        )
+        .is_err());
+
+    // A second change while the debt stands: refused with the pending reason,
+    // and the journal still holds exactly what is owed.
+    let error = store
+        .commit(
+            |_, _| Ok(plan(&[("a.json", "two")], vec![])),
+            &secrets,
+            &NoHooks,
+        )
+        .expect_err("a mutation must not be applied over an owed deletion");
+    assert!(
+        matches!(
+            error,
+            GenerationError::CleanupPending { outstanding: 1, .. }
+        ),
+        "{error:?}"
+    );
+    let journal = store.journal().expect("readable").expect("still owed");
+    assert_eq!(journal.deletions, vec![owed.clone()]);
+    assert_eq!(
+        read_current(&store, "a.json").as_deref(),
+        Some("one"),
+        "the refused mutation must not have been adopted"
+    );
+
+    // Restart with a reachable store: the debt is paid, and only then does a
+    // new change go through.
+    *secrets.failing.lock().expect("lock") = false;
+    store
+        .commit(
+            |_, _| Ok(plan(&[("a.json", "two")], vec![])),
+            &secrets,
+            &NoHooks,
+        )
+        .expect("the change lands once the debt is paid");
+    assert_eq!(read_current(&store, "a.json").as_deref(), Some("two"));
+    assert!(store.journal().expect("readable").is_none());
+    assert_eq!(
+        secrets.removed.lock().expect("lock").as_slice(),
+        ["mcp:agent-a:1:token"],
+        "the owed keychain delete ran exactly once"
+    );
 }
 
 #[test]

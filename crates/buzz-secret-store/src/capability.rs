@@ -7,6 +7,20 @@
 //! environment before it starts a server. A raw `mcp:` id authorizes nothing —
 //! the agent and the generation a lookup reads come only from the capability, so
 //! no reference can address another agent's key.
+//!
+//! The agent id and the generation are both guessable, so they cannot be the
+//! authorization on their own: the nonce is. The minting side persists it in
+//! the agent's binding record ([`crate::lookup::binding_key`]) and
+//! [`crate::lookup::McpSecretLookup::resolve`] compares it in constant time
+//! before it derives any blob key, so a forged `BUZZ_MCP_CAPABILITY` carrying
+//! another agent's id resolves nothing.
+//!
+//! Nothing in this slice mints a capability: the desktop writes generated
+//! configuration but does not yet spawn through it, so no binding record is
+//! written either. The check is therefore fail-closed today — every resolve
+//! ends in [`crate::LookupError::NotBound`] — and the spawn wiring that mints
+//! a capability writes [`Self::binding_value`] to [`crate::binding_key`] in the
+//! same commit that stages the generation.
 
 use std::fmt;
 
@@ -161,6 +175,38 @@ impl AgentCapability {
         self.generation
     }
 
+    /// The nonce, for the one caller that must persist it: the minting side
+    /// writes it into the agent's binding record so a lookup can verify it.
+    ///
+    /// This is the secret half of the capability. Write it to the secret store
+    /// and nowhere else — never to a log line, a generated config, or argv.
+    pub fn binding_value(&self) -> &str {
+        &self.nonce
+    }
+
+    /// Whether `stored` is this capability's nonce, compared in constant time.
+    ///
+    /// A forged capability carries the right agent id and generation (both are
+    /// guessable) and a wrong nonce, so this comparison is the whole
+    /// authorization check. It runs in time independent of how many leading
+    /// characters match, so a caller cannot search the nonce one byte at a
+    /// time.
+    pub fn nonce_matches(&self, stored: &str) -> bool {
+        let mine = self.nonce.as_bytes();
+        let theirs = stored.as_bytes();
+        // The length is not a secret (it is a compile-time constant), so
+        // comparing it up front leaks nothing; the byte fold below is what
+        // must not short-circuit.
+        if mine.len() != theirs.len() {
+            return false;
+        }
+        let mut difference = 0u8;
+        for (a, b) in mine.iter().zip(theirs) {
+            difference |= a ^ b;
+        }
+        difference == 0
+    }
+
     /// Render the wire spelling. The only place the nonce is emitted.
     pub fn to_env_value(&self) -> String {
         format!(
@@ -246,6 +292,18 @@ mod tests {
         assert!(
             AgentCapability::mint(&"a".repeat(MAX_AGENT_ID_LEN + 1), 1, [0u8; NONCE_LEN]).is_err()
         );
+    }
+
+    #[test]
+    fn nonce_matching_is_exact_and_length_checked() {
+        let minted = cap("agent-a", 1);
+        assert!(minted.nonce_matches(minted.binding_value()));
+        // One character different, and every length that is not the nonce's.
+        let mut forged = minted.binding_value().to_string();
+        forged.replace_range(0..1, "8");
+        assert!(!minted.nonce_matches(&forged));
+        assert!(!minted.nonce_matches(""));
+        assert!(!minted.nonce_matches(&"07".repeat(NONCE_LEN + 1)));
     }
 
     #[test]

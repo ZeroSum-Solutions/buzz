@@ -16,6 +16,7 @@ use std::sync::Arc;
 use buzz_secret_store::{AgentCapability, McpSecretLookup, McpSecretRef, SecretBlobSource};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, OnceCell, Semaphore};
+use tokio::task::{JoinError, JoinSet};
 use url::Url;
 
 use codec::{FrameDecoder, FrameError};
@@ -54,9 +55,14 @@ pub enum ProxyError {
     /// The stdio transport failed or breached its frame bound.
     #[error("stdio transport: {0}")]
     Transport(#[from] FrameError),
-    /// Writing a response back to the client failed.
+    /// Writing a response back to the client failed. Terminal: the proxy can
+    /// no longer deliver a reply, so it stops rather than keep calling
+    /// upstream.
     #[error("stdio write: {0}")]
     Write(String),
+    /// A reply task panicked or was cancelled.
+    #[error("reply task did not complete: {0}")]
+    Task(String),
 }
 
 /// Everything one proxy process needs.
@@ -217,12 +223,19 @@ impl<S: SecretBlobSource> Proxy<S> {
     ///
     /// Reads pause once the aggregate buffer ceiling is reached rather than
     /// queueing behind it, because the permit for the next frame is acquired
-    /// before the frame is read.
+    /// before the frame is read. Finished replies are reaped on every
+    /// iteration, so the task set holds only the work actually in flight —
+    /// one handle per frame ever received would grow with the length of the
+    /// session, not with its concurrency.
     ///
     /// # Errors
     /// Any transport failure, including a frame over the inbound bound. The
     /// transport is not resynchronized after one: a decoder that skipped an
-    /// oversized frame would resume on attacker-chosen boundaries.
+    /// oversized frame would resume on attacker-chosen boundaries. A failure
+    /// to write a reply is terminal in the same way: the read loop stops and
+    /// everything still in flight is cancelled, because a proxy that cannot
+    /// deliver a single reply must not keep issuing authenticated — possibly
+    /// mutating — upstream calls, and must not report success.
     pub async fn run<R, W>(self: Arc<Self>, mut input: R, output: W) -> Result<(), ProxyError>
     where
         R: AsyncRead + Unpin,
@@ -231,9 +244,23 @@ impl<S: SecretBlobSource> Proxy<S> {
     {
         let mut decoder = FrameDecoder::with_cap(self.limits.max_inbound_frame_bytes);
         let output = Arc::new(Mutex::new(output));
-        let mut tasks = Vec::new();
+        let mut tasks: JoinSet<Result<(), ProxyError>> = JoinSet::new();
+        let mut failure: Option<ProxyError> = None;
 
-        while let Some(frame) = decoder.next_frame(&mut input).await? {
+        loop {
+            if let Some(error) = reap_finished(&mut tasks) {
+                failure = Some(error);
+                break;
+            }
+
+            let frame = match decoder.next_frame(&mut input).await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break,
+                Err(error) => {
+                    failure = Some(ProxyError::Transport(error));
+                    break;
+                }
+            };
             if frame.is_empty() {
                 continue;
             }
@@ -253,10 +280,17 @@ impl<S: SecretBlobSource> Proxy<S> {
             let Ok(slot) = self.in_flight.clone().acquire_owned().await else {
                 break;
             };
+            // Reap again now that a slot has come free: a reply that failed
+            // while this loop was waiting for its permit must stop the *next*
+            // upstream call, not the one after it.
+            if let Some(error) = reap_finished(&mut tasks) {
+                failure = Some(error);
+                break;
+            }
 
             let proxy = Arc::clone(&self);
             let output = Arc::clone(&output);
-            tasks.push(tokio::spawn(async move {
+            tasks.spawn(async move {
                 let _budget = budget;
                 let _slot = slot;
                 let outcome = proxy.forward(&frame).await;
@@ -274,23 +308,55 @@ impl<S: SecretBlobSource> Proxy<S> {
                 if let Some(mut body) = reply {
                     body.push(b'\n');
                     let mut guard = output.lock().await;
-                    if let Err(e) = guard.write_all(&body).await {
-                        tracing::error!(error = %e, "mcp proxy could not write a response");
-                        return;
-                    }
-                    if let Err(e) = guard.flush().await {
-                        tracing::error!(error = %e, "mcp proxy could not flush a response");
-                    }
+                    guard
+                        .write_all(&body)
+                        .await
+                        .map_err(|e| ProxyError::Write(e.to_string()))?;
+                    guard
+                        .flush()
+                        .await
+                        .map_err(|e| ProxyError::Write(e.to_string()))?;
                 }
-            }));
+                Ok(())
+            });
         }
 
-        for task in tasks {
-            if let Err(e) = task.await {
-                tracing::error!(error = %e, "mcp proxy task did not complete");
+        if failure.is_none() {
+            while let Some(joined) = tasks.join_next().await {
+                if let Some(error) = outcome_error(joined) {
+                    failure = Some(error);
+                    break;
+                }
             }
         }
-        Ok(())
+        // Cancels whatever is still running. On the clean path the set is
+        // already empty, so this is a no-op.
+        tasks.shutdown().await;
+
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Drain every reply task that has already finished, returning the first
+/// failure among them.
+fn reap_finished(tasks: &mut JoinSet<Result<(), ProxyError>>) -> Option<ProxyError> {
+    while let Some(joined) = tasks.try_join_next() {
+        if let Some(error) = outcome_error(joined) {
+            return Some(error);
+        }
+    }
+    None
+}
+
+/// Flatten a joined reply task into the error it failed with, if any.
+fn outcome_error(joined: Result<Result<(), ProxyError>, JoinError>) -> Option<ProxyError> {
+    match joined {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error),
+        Err(join) => Some(ProxyError::Task(join.to_string())),
     }
 }
 

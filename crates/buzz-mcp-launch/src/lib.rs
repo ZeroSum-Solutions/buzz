@@ -140,6 +140,11 @@ mod tests {
     #[test]
     fn declared_references_resolve_through_the_capability() {
         let source = MemoryBlobSource::default();
+        let bound = AgentCapability::mint("agent-a", 3, [2u8; NONCE_LEN]).expect("valid");
+        source.insert(
+            &buzz_secret_store::binding_key(&bound),
+            bound.binding_value(),
+        );
         source.insert("mcp:agent-a:3:token", "A-SECRET");
         let lookup = McpSecretLookup::new(source);
         let mut references = BTreeMap::new();

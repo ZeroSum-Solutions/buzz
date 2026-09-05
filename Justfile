@@ -442,6 +442,17 @@ test-unit:
         # relay events and agent prompts. They are infra-free; ignored lifecycle
         # tests remain excluded and run in their dedicated integration lanes.
         cargo nextest run -p buzz-acp --lib
+        # MCP registry launcher and secret store. All targets, not --lib: the
+        # guards these crates exist for — the child environment built from
+        # empty, the capability strip and its nonce binding, the stdio frame
+        # cap, the redirect refusal, the upstream scheme check, containment
+        # teardown — are asserted in tests/launcher.rs and tests/proxy.rs
+        # through the shipped binary and the shipped transport, and a --lib
+        # run would execute none of them. Both crates are infra-free: the
+        # proxy fixtures bind loopback and the secret store's tests use the
+        # in-memory blob source, never the system keyring. Without this step
+        # nothing in CI runs a single test from either crate.
+        cargo nextest run -p buzz-secret-store -p buzz-mcp-launch
     else
         ./scripts/run-tests.sh unit
     fi

@@ -105,6 +105,11 @@ async fn start_upstream() -> (Arc<Upstream>, SocketAddr) {
 
 fn store() -> MemoryBlobSource {
     let source = MemoryBlobSource::default();
+    let bound = capability();
+    source.insert(
+        &buzz_secret_store::binding_key(&bound),
+        bound.binding_value(),
+    );
     source.insert("mcp:agent-a:1:api-token", "S3CRET-VALUE");
     source
 }
@@ -314,4 +319,75 @@ impl tokio::io::AsyncWrite for SharedSink {
     ) -> std::task::Poll<std::io::Result<()>> {
         std::task::Poll::Ready(Ok(()))
     }
+}
+
+/// An `AsyncWrite` that fails every write, standing in for a model whose stdio
+/// has gone away.
+struct FailingSink;
+
+impl tokio::io::AsyncWrite for FailingSink {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "the model is gone",
+        )))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_failure_stops_the_proxy_before_it_calls_upstream_again() {
+    // A proxy that can no longer deliver a reply must not keep issuing
+    // authenticated — possibly mutating — upstream calls, and must not report
+    // success. The in-flight cap of one makes the first failure observable to
+    // the read loop before it can spawn much more work; the reaping in `run`
+    // is what carries it there.
+    const FRAMES: usize = 64;
+
+    let (state, address) = start_upstream().await;
+    let limits = ProxyLimits {
+        max_in_flight: 1,
+        ..ProxyLimits::default()
+    };
+    let proxy = Arc::new(proxy_with(address, limits));
+
+    let mut input = Vec::new();
+    for id in 0..FRAMES {
+        input.extend_from_slice(
+            format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"ping\"}}\n").as_bytes(),
+        );
+    }
+
+    let error = Arc::clone(&proxy)
+        .run(&input[..], FailingSink)
+        .await
+        .expect_err("a proxy that cannot answer must not report success");
+    assert!(matches!(error, ProxyError::Write(_)), "{error:?}");
+
+    let requests = state.requests.load(Ordering::SeqCst);
+    assert!(
+        requests < FRAMES,
+        "every one of the {FRAMES} frames still reached the upstream after the write failed"
+    );
+    assert!(
+        requests <= 4,
+        "{requests} upstream calls were issued after the proxy lost its writer"
+    );
 }

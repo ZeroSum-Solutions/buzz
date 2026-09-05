@@ -11,17 +11,25 @@
 //! What the containment scope guarantees is platform-specific and this module
 //! claims no more than it delivers:
 //!
-//! * **Windows** — a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`,
-//!   assigned while the process is still `CREATE_SUSPENDED`. Every step is
-//!   checked; any failure terminates the still-suspended child, so no server
-//!   ever executes outside the job.
-//! * **Linux with cgroup v2** — a dedicated leaf cgroup killed through
-//!   `cgroup.kill`, which no `setsid()` can leave.
-//! * **Everywhere else on Unix** — the server's own process group, killed with
-//!   `killpg`. A server that double-forks and calls `setsid()` enters a new
-//!   session, leaves that group, and survives. That residue is documented, and
+//! * **Windows** — a kill-on-close Job Object the launcher joins *before* it
+//!   spawns anything, so every process it creates is in the job from its first
+//!   instruction. Every Win32 call is checked; any failure aborts the launch
+//!   before a server exists.
+//! * **Linux with a writable cgroup v2 hierarchy** — a dedicated leaf cgroup
+//!   killed through `cgroup.kill`, which no `setsid()` can leave. The launcher
+//!   joins the leaf before it forks the server and steps out again straight
+//!   after, so nothing the server forks can be created outside the scope, and
+//!   a leaf that exists but cannot be joined or left is a
+//!   [`LaunchError::Containment`], never a downgrade.
+//! * **Everywhere else on Unix** — macOS, and any Linux whose session cgroup
+//!   is not delegated — the server's own process group, killed with `killpg`.
+//!   A server that double-forks and calls `setsid()` enters a new session,
+//!   leaves that group, and survives. That residue is documented, and
 //!   `grandchild_dies_with_adapter` asserts it exactly, so a silent change in
 //!   either direction fails the test.
+//!
+//! Teardown failures on any of these paths are returned from
+//! [`Contained::terminate`] and out of [`run`]; none is logged and swallowed.
 
 #[cfg(unix)]
 mod unix;
@@ -166,9 +174,14 @@ pub async fn run(spec: LaunchSpec) -> Result<i32, LaunchError> {
     let _ = tokio::time::timeout(RELAY_DRAIN, upstream).await;
 
     // Teardown runs on every exit path, including the error one, so a failed
-    // wait can never leave the tree running.
-    contained.terminate();
-    status
+    // wait can never leave the tree running. Its own failure is the
+    // containment guarantee failing, so it is returned, not logged: the
+    // relay's status is reported first when it already failed, and otherwise
+    // the teardown decides the result.
+    let teardown = contained.terminate();
+    let code = status?;
+    teardown?;
+    Ok(code)
 }
 
 /// How long a server may take to exit after its stdin closes.

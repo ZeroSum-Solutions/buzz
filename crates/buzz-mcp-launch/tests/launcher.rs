@@ -162,17 +162,25 @@ fn the_server_environment_is_built_from_empty() {
 
 #[test]
 fn the_capability_is_stripped_before_the_server_starts() {
+    const FORGED: &str = "v1.agent-a.1.0102030405060708090a0b0c0d0e0f10";
+
+    // Declared as an approved `--set` pair, which is the only way the name can
+    // reach the child map at all: it is not on `BASE_ALLOWLIST`, so an
+    // inherited one never enters it and a test that only sets it on the
+    // harness would still pass with `build_child_env`'s unconditional
+    // `child.remove(CAPABILITY_ENV_VAR)` deleted. With the pair declared, that
+    // one line is the whole guard and its removal fails this test.
     let env = child_environment(
-        &[(
-            "BUZZ_MCP_CAPABILITY",
-            "v1.agent-a.1.0102030405060708090a0b0c0d0e0f10",
-        )],
-        &[],
+        &[("BUZZ_MCP_CAPABILITY", FORGED)],
+        &[("BUZZ_MCP_CAPABILITY", FORGED)],
     );
     assert!(
         !env.contains_key("BUZZ_MCP_CAPABILITY"),
         "the capability authorizes every secret bound to the agent and must never reach a server"
     );
+    // The run is otherwise ordinary, so the assertion above is about the strip
+    // and not about a launch that failed before the server ran.
+    assert!(env.contains_key("PATH"), "the server did start");
 }
 
 #[test]

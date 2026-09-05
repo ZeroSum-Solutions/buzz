@@ -16,7 +16,16 @@
 //!
 //! One mutation lock is held from the base-generation read through cleanup, so
 //! two concurrent Settings actions cannot both stage from generation N: the
-//! loser waits, re-reads the new base, and restages.
+//! loser waits, re-reads the new base, and restages. Inside that lock, a
+//! commit first finishes whatever the previous one left owed, or refuses —
+//! writing a fresh journal over an outstanding one would discard a keychain
+//! delete the operator has already been told happened.
+//!
+//! Recovery reads the durable pointer, not the journal phase alone. The rename
+//! and the FLIPPED journal write are two writes, so a crash between them leaves
+//! a PREPARED journal naming the generation `current` already resolves to; that
+//! is an adopted change one write short of its record, not a half-staged tree,
+//! and discarding it would delete the live configuration.
 
 use std::fs::File;
 use std::io::Write;
@@ -256,8 +265,10 @@ impl GenerationStore {
     /// [`GenerationError`]. A failure before the pointer rename leaves the
     /// previous generation adopted and a `PREPARED` journal the next
     /// [`GenerationStore::reconcile`] discards; a failure after it leaves the
-    /// new generation adopted and a `FLIPPED` journal that keeps every deletion
-    /// still owed.
+    /// new generation adopted and a journal that keeps every deletion still
+    /// owed. [`GenerationError::CleanupPending`] before anything is staged
+    /// means a previous change still owes a deletion: this mutation was
+    /// refused, not applied, and the next attempt retries the debt first.
     pub fn commit<F>(
         &self,
         build: F,
@@ -268,6 +279,15 @@ impl GenerationStore {
         F: FnOnce(Option<u64>, Option<&Path>) -> Result<GenerationPlan, GenerationError>,
     {
         let _lock = MutationLock::acquire(&self.lock_path())?;
+
+        // An outstanding journal is finished before anything is staged. A
+        // FLIPPED entry owes a keychain delete for a credential the operator
+        // already revoked; overwriting it with a fresh PREPARED entry would
+        // destroy the only record of that debt and leave the secret in the
+        // keychain with nothing left to retry it. When it cannot be finished,
+        // the mutation is refused with the pending reason rather than applied
+        // over it.
+        self.reconcile_locked(secrets, hooks)?;
 
         let base = self.current()?;
         let base_dir = base.map(|number| self.generation_dir(number));
@@ -292,8 +312,13 @@ impl GenerationStore {
 
         let staged = self.generation_dir(next);
         // A leftover directory from a discarded PREPARED generation must not
-        // contribute stale files to this one.
-        let _ = std::fs::remove_dir_all(&staged);
+        // contribute stale files to this one. A discarded PREPARED generation
+        // leaves the pointer where it was, so the next commit recomputes this
+        // same number: this removal is the only thing standing between a stale
+        // tree and the adopted configuration, and a half-failed one would ship
+        // obsolete files to agents. It is therefore propagated, never
+        // discarded.
+        remove_tree(&staged)?;
         for (index, (relative, contents)) in plan.files.iter().enumerate() {
             write_file_synced(&staged.join(relative), contents)?;
             self.inject(hooks, FlipStep::FileWritten(index))?;
@@ -325,20 +350,43 @@ impl GenerationStore {
         hooks: &dyn FlipHooks,
     ) -> Result<Reconciled, GenerationError> {
         let _lock = MutationLock::acquire(&self.lock_path())?;
+        self.reconcile_locked(secrets, hooks)
+    }
+
+    /// The body of [`GenerationStore::reconcile`], with the mutation lock
+    /// already held. [`GenerationStore::commit`] runs it inside its own lock,
+    /// so the two paths cannot take the lock twice and deadlock.
+    fn reconcile_locked(
+        &self,
+        secrets: &dyn SecretRemover,
+        hooks: &dyn FlipHooks,
+    ) -> Result<Reconciled, GenerationError> {
         let Some(journal) = self.journal()? else {
             return Ok(Reconciled::Nothing);
         };
+        // The durable pointer, not the journal phase, says whether the change
+        // was adopted. A crash between the pointer rename and the FLIPPED
+        // journal write leaves a PREPARED journal naming the generation the
+        // pointer already resolves to; discarding that tree would delete the
+        // adopted configuration and leave `current` naming a path that does
+        // not exist.
+        let adopted = self.current()? == Some(journal.generation);
         match journal.phase {
-            JournalPhase::Prepared => {
+            JournalPhase::Prepared if !adopted => {
                 // Staged but never adopted: the previous generation is still
                 // the current one, so the half-staged tree is discarded whole.
-                let _ = std::fs::remove_dir_all(self.generation_dir(journal.generation));
+                // The journal is cleared only once the tree is actually gone,
+                // so a failed discard is retried rather than forgotten.
+                remove_tree(&self.generation_dir(journal.generation))?;
                 self.clear_journal()?;
                 Ok(Reconciled::DiscardedStaging {
                     generation: journal.generation,
                 })
             }
-            JournalPhase::Flipped => {
+            // Either the journal says FLIPPED, or it says PREPARED and the
+            // pointer already names this generation — the same state, reached
+            // by a crash one write earlier. Both owe the post-flip deletions.
+            JournalPhase::Prepared | JournalPhase::Flipped => {
                 let owed = journal.deletions.len();
                 self.run_deletions(journal.deletions, secrets, hooks)?;
                 Ok(Reconciled::CompletedCleanup {
@@ -362,11 +410,7 @@ impl GenerationStore {
             let outcome = match deletion {
                 Deletion::Secret { key } => secrets.remove(key),
                 Deletion::Generation { number } => {
-                    match std::fs::remove_dir_all(self.generation_dir(*number)) {
-                        Ok(()) => Ok(()),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                        Err(e) => Err(e.to_string()),
-                    }
+                    remove_tree(&self.generation_dir(*number)).map_err(|e| e.to_string())
                 }
             };
             match outcome {
@@ -462,6 +506,23 @@ pub enum Reconciled {
         /// How many deletions were retried.
         deletions: usize,
     },
+}
+
+/// Remove a directory tree, treating "already absent" as success and every
+/// other failure as an error the caller must handle.
+///
+/// A discarded removal is a swallowed failure: a partially removed generation
+/// directory leaves stale generated files that a later commit would adopt.
+fn remove_tree(path: &Path) -> Result<(), GenerationError> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(GenerationError::Io {
+            operation: "remove",
+            path: path.display().to_string(),
+            reason: e.to_string(),
+        }),
+    }
 }
 
 fn write_file_synced(path: &Path, contents: &str) -> Result<(), GenerationError> {
