@@ -419,6 +419,34 @@ mod tests {
         );
     }
 
+    /// The redaction is only worth anything if the log site uses it.
+    ///
+    /// `wire_log_redacts_env_values` drives the serializer, which a revert of
+    /// the log site back to `serde_json::to_string(&msg)` would leave green —
+    /// a guard whose removal fails no test. This reads `acp.rs` and asserts
+    /// every outbound `acp::wire` line goes through `wire_log_line`, so that
+    /// revert fails here.
+    #[test]
+    fn every_outbound_wire_log_serializes_through_the_redacting_writer() {
+        let source = include_str!("acp.rs");
+        let outbound: Vec<&str> = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.contains("target: \"acp::wire\"") && line.contains("\"\u{2192}"))
+            .collect();
+        assert!(
+            outbound.len() >= 3,
+            "expected every outbound wire log site; found {}",
+            outbound.len()
+        );
+        for line in outbound {
+            assert!(
+                line.contains("wire_log_line(&msg)"),
+                "an outbound acp::wire log does not redact declared env values: {line}"
+            );
+        }
+    }
+
     /// Memo decision 10's logging clause, at the seam `acp::wire` uses.
     ///
     /// `send_request` logs the whole serialized `session/new`, and `McpServer.env`

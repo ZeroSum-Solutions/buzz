@@ -104,7 +104,7 @@ fn desktop_standalone_copies_the_real_launcher() {
         "the desktop-standalone recipe does not build {BINARY}, so the copy below \
          it has nothing to copy"
     );
-    let copy_loop = section(&recipe, "Justfile", "for bin in ", ";");
+    let copy_loop = section(recipe, "Justfile", "for bin in ", ";");
     assert!(
         copy_loop.contains(BINARY),
         "the desktop-standalone recipe leaves the {BINARY} sidecar as the 0-byte \

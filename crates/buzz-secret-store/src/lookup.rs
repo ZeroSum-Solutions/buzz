@@ -36,6 +36,16 @@ pub trait SecretBlobSource {
     fn read_blob(&self) -> Result<Option<Vec<u8>>, String>;
 }
 
+/// A borrowed source is a source, so a caller that keeps ownership of its
+/// store — a test asserting the store's contents alongside the lookup, or a
+/// process holding one handle for several readers — can still build a lookup
+/// without cloning the backend.
+impl<T: SecretBlobSource + ?Sized> SecretBlobSource for &T {
+    fn read_blob(&self) -> Result<Option<Vec<u8>>, String> {
+        (**self).read_blob()
+    }
+}
+
 /// Why a secret could not be resolved.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LookupError {
@@ -102,11 +112,18 @@ pub const BINDING_KEY_SUFFIX: &str = "#binding";
 /// [`AgentCapability::binding_value`] here when it stages a generation; every
 /// resolve for that agent and generation verifies against it.
 pub fn binding_key(capability: &AgentCapability) -> String {
-    format!(
-        "{MCP_NAMESPACE_PREFIX}{}:{}:{BINDING_KEY_SUFFIX}",
-        capability.agent_id(),
-        capability.generation()
-    )
+    binding_key_for(capability.agent_id(), capability.generation())
+}
+
+/// Blob key of the binding record for `agent_id` at `generation`.
+///
+/// The spawn side needs this key *before* it holds a capability — the nonce it
+/// reads here is what makes one — so the key is derivable from the pair alone.
+/// Knowing the key authorizes nothing: reading the record is how a caller
+/// proves it may act for that agent, and the record is only readable by a
+/// process that can already read the whole store.
+pub fn binding_key_for(agent_id: &str, generation: u64) -> String {
+    format!("{MCP_NAMESPACE_PREFIX}{agent_id}:{generation}:{BINDING_KEY_SUFFIX}")
 }
 
 /// The typed, MCP-only read side of the secret store.
