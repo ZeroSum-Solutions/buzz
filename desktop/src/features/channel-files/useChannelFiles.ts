@@ -143,6 +143,19 @@ export function parseChannelFiles(events: RelayEvent[]): {
 }
 
 /**
+ * The projection the Files tab consumes, with the "has the tab ever been
+ * opened for this channel" gate applied. Exported and pure so the gate is
+ * bound by a test: without it, a Chat-only session re-parses the whole loaded
+ * message window on every incoming live message.
+ */
+export function projectChannelFiles(
+  events: RelayEvent[],
+  enabled: boolean,
+): { files: ChannelFile[]; truncated: boolean } {
+  return enabled ? parseChannelFiles(events) : { files: [], truncated: false };
+}
+
+/**
  * Attachments in the currently loaded window of a channel, newest first.
  *
  * `enabled` gates the projection: it is only ever run for a channel whose
@@ -163,10 +176,7 @@ export function useChannelFiles(
   const messagesQuery = useChannelMessagesQuery(activeChannel);
 
   const projection = useMemo(
-    () =>
-      enabled
-        ? parseChannelFiles(messagesQuery.data ?? [])
-        : { files: [], truncated: false },
+    () => projectChannelFiles(messagesQuery.data ?? [], enabled),
     [enabled, messagesQuery.data],
   );
 

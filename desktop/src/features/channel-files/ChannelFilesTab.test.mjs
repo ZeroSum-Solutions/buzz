@@ -61,6 +61,7 @@ async function renderTab(props = {}) {
       React.createElement(ChannelFilesTab, {
         canMutateFolders: true,
         isLoading: false,
+        onJumpToMessage: () => {},
         ...props,
         files,
       }),
@@ -172,6 +173,61 @@ test("a folder mutation in flight disables its control instead of stacking write
       resolveAssign(undefined);
     });
     assert.equal(button.hasAttribute("disabled"), false);
+  } finally {
+    cleanup();
+  }
+});
+
+test("a long list virtualizes instead of mounting every row", async () => {
+  const many = Array.from({ length: 200 }, (_, index) => ({
+    url: `https://media.example/f-${index}.png`,
+    filename: `f-${index}.png`,
+    eventId: index.toString(16).padStart(64, "0"),
+  }));
+  const { cleanup, screen } = await renderTab({ files: many });
+  try {
+    const mounted = screen
+      .getByTestId("channel-files-list")
+      .querySelectorAll("a[title]").length;
+    assert.ok(
+      mounted < many.length,
+      `expected a virtualized window, got ${mounted} of ${many.length} rows mounted`,
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("a short list mounts every row so find-in-page still works", async () => {
+  const few = Array.from({ length: 5 }, (_, index) => ({
+    url: `https://media.example/s-${index}.png`,
+    filename: `s-${index}.png`,
+    eventId: index.toString(16).padStart(64, "0"),
+  }));
+  const { cleanup, screen } = await renderTab({ files: few });
+  try {
+    assert.equal(
+      screen.getByTestId("channel-files-list").querySelectorAll("a[title]")
+        .length,
+      few.length,
+      "every row's filename link is in the document",
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("row actions reveal on keyboard focus, not only on hover", async () => {
+  const { cleanup, screen } = await renderTab({
+    files: [{ url: "https://media.example/a.png", filename: "a.png" }],
+  });
+  try {
+    const jump = screen.getByRole("button", { name: "Jump to message" });
+    const cluster = jump.parentElement;
+    assert.ok(
+      cluster.className.includes("group-focus-within:opacity-100"),
+      "an opacity-0 cluster focus can reach but the eye cannot find is unreachable",
+    );
   } finally {
     cleanup();
   }
