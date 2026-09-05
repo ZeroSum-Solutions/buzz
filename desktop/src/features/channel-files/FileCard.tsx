@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import type { ChannelFile } from "./useChannelFiles";
+import { truncatePubkey } from "@/shared/lib/pubkey";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
 
 function formatSize(bytes: number | undefined): string {
@@ -226,7 +227,7 @@ export function FileRow({
           <UserAvatar
             avatarUrl={senderAvatarUrl ?? null}
             className="h-5 w-5"
-            displayName={senderName ?? file.pubkey.slice(0, 8)}
+            displayName={senderName ?? truncatePubkey(file.pubkey)}
             size="xs"
           />
           {senderName ? (
