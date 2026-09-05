@@ -453,7 +453,13 @@ process.stdin.on("data", (chunk) => {
         params: permissionParams(),
       });
     } else if (msg.id === PERMISSION_ID) {
-      process.stderr.write(`outcome=${JSON.stringify(msg.result?.outcome ?? msg.error)}\n`);
+      const outcome = JSON.stringify(msg.result?.outcome ?? msg.error);
+      // To a file, not just stderr: the driver forwards a failing run's stderr
+      // tail on a best-effort basis, so asserting the outcome from its output
+      // races the pipe. This file is written before the prompt is answered, and
+      // the driver cannot exit before that answer arrives.
+      require("node:fs").writeFileSync(process.env.OUTCOME_FILE, `${outcome}\n`);
+      process.stderr.write(`outcome=${outcome}\n`);
       send({
         jsonrpc: "2.0",
         method: "session/update",
@@ -468,7 +474,8 @@ ADAPTER
   ALLOWED_TOOL="smoke_deadbeef01"
   QUALIFIED_TOOL="mcp__openseo-fake__$ALLOWED_TOOL"
 
-  permission_run() { # permission_run <shape> <asked tool> -> sets OUT, RC
+  permission_run() { # permission_run <shape> <asked tool> -> sets OUT, RC, OUTCOME
+    rm -f "$PERM_DIR/outcome"
     set +e
     OUT=$(node "$DRIVER" \
       --command "$PERM_DIR/fake-adapter" \
@@ -480,22 +487,25 @@ ADAPTER
       --env "PATH=$PATH" \
       --env "REQUEST_SHAPE=$1" \
       --env "ASK_TOOL=$2" \
+      --env "OUTCOME_FILE=$PERM_DIR/outcome" \
       --env "EXPECT_TEXT=$ALLOWED_TOOL" 2>&1)
     RC=$?
     set -e
+    OUTCOME=$(cat "$PERM_DIR/outcome" 2>/dev/null || echo "<no outcome recorded>")
   }
 
   for SHAPE in v2 v1; do
     permission_run "$SHAPE" "$QUALIFIED_TOOL"
     check "[$SHAPE] the one allowed tool is approved and the run passes" 0 "$RC"
     check_says "[$SHAPE] the grant is allow_once, never allow_always" "(allow_once, once)" "$OUT"
+    check_says "[$SHAPE] the adapter was given the allow_once option" '"optionId":"once"' "$OUTCOME"
     check_lacks "[$SHAPE] no persistent grant was taken" "always" "$OUT"
 
     permission_run "$SHAPE" "mcp__hostile__shell_exec"
     check "[$SHAPE] a request for another tool fails the run" 1 "$RC"
     check_says "[$SHAPE] the denied tool is named on stderr" "mcp__hostile__shell_exec" "$OUT"
     check_says "[$SHAPE] the run says why it failed" "asked for a tool this run does not allow" "$OUT"
-    check_says "[$SHAPE] the adapter was told no" '"optionId":"no"' "$OUT"
+    check_says "[$SHAPE] the adapter was told no" '"optionId":"no"' "$OUTCOME"
     check_lacks "[$SHAPE] nothing was granted" "granted:" "$OUT"
 
     # The same BARE tool under a different server is a different program. A
@@ -504,6 +514,7 @@ ADAPTER
     permission_run "$SHAPE" "mcp__hostile__$ALLOWED_TOOL"
     check "[$SHAPE] the same bare tool under another server is refused" 1 "$RC"
     check_says "[$SHAPE] the impostor is named on stderr" "mcp__hostile__$ALLOWED_TOOL" "$OUT"
+    check_says "[$SHAPE] the impostor was told no" '"optionId":"no"' "$OUTCOME"
     check_lacks "[$SHAPE] the impostor was not granted" "granted:" "$OUT"
   done
 fi
