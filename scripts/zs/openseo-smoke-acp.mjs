@@ -28,26 +28,42 @@
 //   class. So this driver owns the tree instead:
 //
 //     * POSIX: the child is spawned `detached`, which makes it the leader of a
-//       new process group, and every signal goes to the group (`-pid`).
+//       new process group. Before the first signal, shutdown() SNAPSHOTS the
+//       adapter's whole descendant set — `ps -axo pid=,ppid=` walked
+//       transitively from the adapter's pid — and unions it with that group's
+//       members. Both the group (`-pgid`) and every snapshotted pid are then
+//       signalled. The snapshot is what reaches a descendant that called
+//       `setsid`: such a process leaves the group, so a group-only kill never
+//       touches it, while its ppid chain still led back to the adapter when the
+//       snapshot was taken.
 //     * Windows has no process groups to signal; `taskkill /T` walks the child
 //       tree, which is the equivalent reach.
 //
 //   Every exit path — assertion failure, timeout, spawn error, success — goes
-//   through shutdown(): SIGTERM the group, wait out a grace period, then
-//   ALWAYS SIGKILL the group, then probe the GROUP — not the leader — until it
-//   is empty. The adapter exiting proves nothing: a descendant that ignores
-//   SIGTERM outlives it, and a shutdown that stopped once the leader was reaped
-//   would return success over a live orphan. A group that is still populated
-//   after SIGKILL is reported and exits non-zero.
+//   through shutdown(): snapshot, SIGTERM the group and every snapshotted pid,
+//   wait out a grace period, then ALWAYS SIGKILL both, then probe both — not
+//   the leader — until nothing is left. The adapter exiting proves nothing: a
+//   descendant that ignores SIGTERM outlives it, and a shutdown that stopped
+//   once the leader was reaped would return success over a live orphan. Any
+//   survivor after SIGKILL is reported and exits non-zero.
+//
+//   RESIDUE, stated plainly: a descendant that has ALREADY double-forked and
+//   reparented to PID 1 before the snapshot is taken is outside this driver's
+//   reach. macOS has no cgroup — no kernel object naming "every process this
+//   adapter ever started" — so the ppid tree is the only evidence available,
+//   and reparenting erases it. This harness is a test driver, not shipped
+//   containment; the shipped design (the T7 memo) declares the same macOS
+//   residue, for the same reason.
 //
 // TOOL PERMISSION
 //
 //   The adapter asks before it calls a tool. This driver approves exactly one:
-//   the per-run fake tool named by --allow-tool, with `allow_once` — never
-//   `allow_always`, which would leave a persistent grant behind. Every other
-//   request is rejected and its tool name printed to stderr, and any rejection
-//   fails the run: a smoke run that had to deny a tool is not a run whose pass
-//   means anything.
+//   the per-run fake tool named by --allow-tool, matched byte-for-byte against
+//   the qualified name in the request's structured identity fields, and granted
+//   with `allow_once` — never `allow_always`, which would leave a persistent
+//   grant behind. Every other request is rejected and its tool name printed to
+//   stderr, and any rejection fails the run: a smoke run that had to deny a
+//   tool is not a run whose pass means anything.
 
 import { spawn, spawnSync } from "node:child_process";
 
@@ -206,19 +222,115 @@ async function main() {
     }
   };
 
-  // Best-effort names for whatever is left, for the failure report only.
-  const groupSurvivors = () => {
-    if (IS_WINDOWS || pgid === undefined) return "";
-    const ps = spawnSync("ps", ["-o", "pid=,ppid=,command=", "-g", String(pgid)], {
-      encoding: "utf8",
-    });
-    return (ps.stdout ?? "").trim();
+  const pidAlive = (pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (e) {
+      return e.code === "EPERM"; // exists, not ours to signal
+    }
   };
 
-  const waitForGroupGone = async (limitMs) => {
+  const parsePids = (text) =>
+    text
+      .split("\n")
+      .map((line) => Number.parseInt(line.trim(), 10))
+      .filter((pid) => Number.isInteger(pid) && pid > 1 && pid !== process.pid);
+
+  // Every pid currently in the adapter's process group.
+  const groupMemberPids = () => {
+    if (IS_WINDOWS || pgid === undefined) return [];
+    const ps = spawnSync("ps", ["-o", "pid=", "-g", String(pgid)], { encoding: "utf8" });
+    return parsePids(ps.stdout ?? "");
+  };
+
+  // Every descendant of the adapter, transitively, from the process table.
+  // A descendant that calls `setsid` leaves the adapter's process group, so
+  // signalling the group alone can never reach it — but its ppid chain still
+  // leads back to the adapter for as long as its parent is alive, which is what
+  // this walk follows. (A process that already reparented to PID 1 is gone from
+  // this evidence; see RESIDUE in the header.)
+  const descendantPids = (rootPid) => {
+    if (IS_WINDOWS || rootPid === undefined) return [];
+    const ps = spawnSync("ps", ["-axo", "pid=,ppid="], { encoding: "utf8" });
+    const kids = new Map();
+    for (const line of (ps.stdout ?? "").split("\n")) {
+      const m = line.trim().match(/^(\d+)\s+(\d+)$/);
+      if (!m) continue;
+      const pid = Number.parseInt(m[1], 10);
+      const ppid = Number.parseInt(m[2], 10);
+      if (!kids.has(ppid)) kids.set(ppid, []);
+      kids.get(ppid).push(pid);
+    }
+    const found = new Set();
+    const stack = [rootPid];
+    while (stack.length > 0) {
+      for (const kid of kids.get(stack.pop()) ?? []) {
+        if (kid === process.pid || found.has(kid)) continue;
+        found.add(kid);
+        stack.push(kid);
+      }
+    }
+    return [...found];
+  };
+
+  // The pids shutdown is accountable for. Filled in by snapshotTree() BEFORE
+  // the first signal: once the adapter dies, its descendants reparent to PID 1
+  // and the ppid evidence that names them is gone.
+  let tracked = new Set();
+  const snapshotTree = () => {
+    if (IS_WINDOWS || child.pid === undefined) return;
+    tracked = new Set([child.pid, ...groupMemberPids(), ...descendantPids(child.pid)]);
+    tracked.delete(process.pid);
+  };
+
+  const signalTracked = (signal) => {
+    if (IS_WINDOWS) return;
+    for (const pid of tracked) {
+      try {
+        process.kill(pid, signal);
+      } catch {
+        // Already gone, or never ours.
+      }
+    }
+  };
+
+  // Both reaches, always: the group catches anything that joined it after the
+  // snapshot, the snapshot catches anything that has since left the group.
+  const signalTree = (signal) => {
+    signalGroup(signal);
+    signalTracked(signal);
+  };
+
+  const treeAlive = () => groupAlive() || [...tracked].some(pidAlive);
+
+  // Best-effort names for whatever is left, for the failure report only.
+  const treeSurvivors = () => {
+    if (IS_WINDOWS || pgid === undefined) return "";
+    const lines = new Set();
+    const collect = (out) => {
+      for (const line of (out ?? "").split("\n")) {
+        if (line.trim()) lines.add(line.trimEnd());
+      }
+    };
+    collect(
+      spawnSync("ps", ["-o", "pid=,ppid=,command=", "-g", String(pgid)], {
+        encoding: "utf8",
+      }).stdout,
+    );
+    const live = [...tracked].filter(pidAlive);
+    if (live.length > 0) {
+      const argv = ["-o", "pid=,ppid=,command="];
+      for (const pid of live) argv.push("-p", String(pid));
+      collect(spawnSync("ps", argv, { encoding: "utf8" }).stdout);
+    }
+    return [...lines].join("\n");
+  };
+
+  const waitForTreeGone = async (limitMs) => {
     const deadline = Date.now() + limitMs;
     for (;;) {
-      if (!groupAlive()) return true;
+      if (!treeAlive()) return true;
       if (Date.now() >= deadline) return false;
       await sleep(50);
     }
@@ -242,19 +354,22 @@ async function main() {
         process.stderr.write(`--- adapter stderr ---\n${stderr.slice(-4000)}\n`);
       }
     }
-    signalGroup("SIGTERM");
-    await waitForGroupGone(TERM_GRACE_MS);
+    // Snapshot first: this is the last moment the process table still names
+    // every descendant, including any that has left the process group.
+    snapshotTree();
+    signalTree("SIGTERM");
+    await waitForTreeGone(TERM_GRACE_MS);
     // Unconditional. The graceful pass may have taken the supervisor and left
     // a descendant that ignores SIGTERM; the supervisor's exit is not evidence
-    // the group is empty, so the hard kill is never skipped.
-    signalGroup("SIGKILL");
-    const reaped = await waitForGroupGone(KILL_GRACE_MS);
+    // the tree is empty, so the hard kill is never skipped.
+    signalTree("SIGKILL");
+    const reaped = await waitForTreeGone(KILL_GRACE_MS);
     await waitForExit(100);
     if (!reaped) {
       // Say so rather than exiting 0 over a leaked tree.
-      const survivors = groupSurvivors();
+      const survivors = treeSurvivors();
       process.stderr.write(
-        `FAIL: the adapter process group (pgid ${pgid}) is not empty after SIGKILL\n` +
+        `FAIL: the adapter process tree (pgid ${pgid}) is not empty after SIGKILL\n` +
           (survivors ? `--- survivors ---\n${survivors}\n` : ""),
       );
       process.exit(code === 0 ? 1 : code);
@@ -282,37 +397,49 @@ async function main() {
   // request's tool IDENTITY. `title` and `rawInput` are deliberately not
   // identity: the prompt names the tool, so a shell tool call whose title is
   // its command line would echo the allowed name straight back and be approved.
-  const bareTool = args.allowTool ? args.allowTool.split("__").pop() : "";
-  const namesAllowedTool = (value) => {
-    if (typeof value !== "string" || !args.allowTool) return false;
-    const v = value.trim();
-    if (v === args.allowTool) return true;
-    // Claude qualifies an MCP tool as mcp__<server>__<tool>. Accept that shape
-    // around the per-run name — the server prefix is the runtime's to choose —
-    // and nothing else.
-    return bareTool !== "" && v.startsWith("mcp__") && v.endsWith(`__${bareTool}`);
-  };
+  //
+  // The match is byte-for-byte against the FULLY QUALIFIED name --allow-tool
+  // gives: no trimming, no bare-name fallback, no `mcp__<any server>__<tool>`
+  // suffix match. A suffix match authorizes the same bare tool under any
+  // server, so allowing `mcp__openseo-fake__smoke_beef` would also allow
+  // `mcp__hostile__smoke_beef` — a different server, a different program.
+  const namesAllowedTool = (value) =>
+    typeof value === "string" && typeof args.allowTool === "string" && value === args.allowTool;
+
+  // The request's structured identity: the qualified tool name, and nothing
+  // else. When more than one structured field is present they must agree —
+  // a request whose `name` and `_meta.claudeCode.toolName` differ is telling
+  // two stories about what it is about to run, so it is refused rather than
+  // resolved in the request's favour.
   const toolIdentity = (toolCall) => {
-    const parts = [];
+    const names = [];
     for (const field of ["name", "toolName"]) {
-      if (typeof toolCall?.[field] === "string") parts.push(toolCall[field]);
+      if (typeof toolCall?.[field] === "string") names.push(toolCall[field]);
     }
     const meta = toolCall?._meta?.claudeCode?.toolName;
-    if (typeof meta === "string") parts.push(meta);
-    return parts;
+    if (typeof meta === "string") names.push(meta);
+    if (names.length === 0) return { name: null, conflict: false };
+    return { name: names[0], conflict: new Set(names).size > 1 };
   };
   // Every request this driver refused. A run that had to deny a tool is not a
   // run whose PASS means anything, so this fails the run at the end even when
   // every expectation matched.
   const denied = new Set();
   const answerPermission = (msg) => {
-    const toolCall = msg.params?.toolCall ?? {};
-    const identity = toolIdentity(toolCall);
-    const label = identity[0] ?? toolCall.title ?? "<unnamed tool>";
+    // ACP v2 — the version this driver negotiates at initialize — carries the
+    // tool call under `params.subject.toolCall` (crates/buzz-agent/src/wire.rs
+    // :176). The installed claude-agent-acp was observed sending the v1
+    // top-level `params.toolCall` while answering a v2 initialize, so both
+    // shapes are read, v2 first.
+    const toolCall = msg.params?.subject?.toolCall ?? msg.params?.toolCall ?? {};
+    const { name, conflict } = toolIdentity(toolCall);
+    const label = name ?? "<unnamed tool>";
     const options = msg.params?.options ?? [];
     const reply = (result) =>
       child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: msg.id, result })}\n`);
-    if (identity.some(namesAllowedTool)) {
+    if (conflict) {
+      denied.add(`${label} (its identity fields disagree)`);
+    } else if (namesAllowedTool(name)) {
       // allow_once, never allow_always: a persistent grant would outlive the
       // run and approve the same tool for whatever asks next.
       const allow = options.find((o) => o.kind === "allow_once");

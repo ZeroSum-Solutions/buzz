@@ -303,6 +303,84 @@ ADAPTER
   fi
 fi
 
+echo "== a descendant that LEAVES the process group is still reaped =="
+# `setsid` puts a process in a new session and a new process group, so the
+# adapter's group id no longer names it: `kill(-pgid, …)` never reaches it and
+# `kill(-pgid, 0)` reports the group empty while the escapee runs on. Its ppid
+# still leads back to the adapter while the adapter lives, which is the only
+# evidence macOS offers — there is no cgroup — so the driver must snapshot the
+# descendant tree from the process table BEFORE signalling and kill those pids
+# too. Dropping the snapshotted-pid kill in openseo-smoke-acp.mjs leaves this
+# case red.
+if command -v node >/dev/null 2>&1; then
+  ESCAPE_DIR="$STUBS/escaped"
+  mkdir -p "$ESCAPE_DIR"
+  # The escapee records its OWN pid after the escape, so the pid checked below
+  # is the one that actually left the group, whatever forking happened on the
+  # way. macOS ships no setsid(1); perl's POSIX::setsid is the same call.
+  ESCAPEE=""
+  if command -v setsid >/dev/null 2>&1; then
+    ESCAPEE="$ESCAPE_DIR/escape"
+    cat > "$ESCAPEE" <<'ESC'
+#!/bin/sh
+exec setsid sh -c 'echo $$ > "$ESCAPED_PID_FILE"; exec sleep 600'
+ESC
+  elif command -v perl >/dev/null 2>&1; then
+    ESCAPEE="$ESCAPE_DIR/escape"
+    cat > "$ESCAPEE" <<'ESC'
+#!/usr/bin/env perl
+use POSIX ();
+POSIX::setsid() or die "setsid: $!";
+open(my $fh, '>', $ENV{ESCAPED_PID_FILE}) or die "open: $!";
+print $fh "$$\n";
+close $fh;
+exec('sleep', '600') or die "exec: $!";
+ESC
+  fi
+  if [ -z "$ESCAPEE" ]; then
+    echo "  SKIP: neither setsid nor perl is available to build an escaped descendant"
+  else
+    chmod +x "$ESCAPEE"
+    cat > "$ESCAPE_DIR/fake-adapter" <<'ADAPTER'
+#!/bin/sh
+# A supervisor that never answers, holding one grandchild that leaves the
+# adapter's process group outright.
+"$ESCAPEE_PATH" &
+wait
+ADAPTER
+    chmod +x "$ESCAPE_DIR/fake-adapter"
+    rm -f "$ESCAPE_DIR/pid"
+    set +e
+    OUT=$(node "$DRIVER" \
+      --command "$ESCAPE_DIR/fake-adapter" \
+      --cwd "$ESCAPE_DIR" \
+      --prompt "never answered" \
+      --expect "never matched" \
+      --timeout 3000 \
+      --env "PATH=$PATH" \
+      --env "ESCAPEE_PATH=$ESCAPEE" \
+      --env "ESCAPED_PID_FILE=$ESCAPE_DIR/pid" 2>&1)
+    RC=$?
+    set -e
+    check "a run whose adapter never answers still fails" 1 "$RC"
+    check_lacks "and no survivor is reported" "is not empty after SIGKILL" "$OUT"
+    ESCAPED=$(cat "$ESCAPE_DIR/pid" 2>/dev/null || echo "")
+    if [ -z "$ESCAPED" ]; then
+      echo "  FAIL: the fake adapter never recorded an escaped grandchild pid"
+      fail=1
+    else
+      sleep 1
+      if kill -0 "$ESCAPED" 2>/dev/null; then
+        echo "  FAIL: escaped grandchild $ESCAPED survived the driver — a setsid descendant leaked"
+        kill -9 "$ESCAPED" 2>/dev/null || true
+        fail=1
+      else
+        echo "  PASS: a descendant that left the process group is killed from the snapshot"
+      fi
+    fi
+  fi
+fi
+
 echo "== the driver approves only the tool it was told to allow =="
 # The adapter asks before it calls a tool, so the driver's answer IS the
 # authorization. Approving whatever is asked hands a deviating model — or a
@@ -312,6 +390,14 @@ echo "== the driver approves only the tool it was told to allow =="
 # the run's result. Its request TITLE carries the allowed name while its tool
 # identity does not: a driver that matched on the title (or on rawInput, which
 # echoes the prompt) would be fooled by it.
+#
+# REQUEST_SHAPE picks the wire shape of session/request_permission. The driver
+# negotiates protocol 2, whose tool call lives under params.subject.toolCall
+# (crates/buzz-agent/src/wire.rs:176); the installed claude-agent-acp was
+# observed answering the same initialize with the legacy top-level
+# params.toolCall. Both shapes are exercised below, and the driver must reach
+# the same decision on each — a driver that reads only one shape sees the other
+# as an unnamed tool and denies the tool the run depends on.
 if command -v node >/dev/null 2>&1; then
   PERM_DIR="$STUBS/permission"
   mkdir -p "$PERM_DIR"
@@ -322,6 +408,30 @@ let promptId = null;
 const PERMISSION_ID = 9001;
 const send = (o) => process.stdout.write(`${JSON.stringify(o)}\n`);
 const reply = (id, result) => send({ jsonrpc: "2.0", id, result });
+const permissionParams = () => {
+  const toolCall = {
+    toolCallId: "t1",
+    name: process.env.ASK_TOOL,
+    title: process.env.EXPECT_TEXT,
+    rawInput: { note: process.env.EXPECT_TEXT },
+    status: "pending",
+  };
+  const options = [
+    { optionId: "once", name: "Yes", kind: "allow_once" },
+    { optionId: "always", name: "Yes, and don't ask again", kind: "allow_always" },
+    { optionId: "no", name: "No", kind: "reject_once" },
+  ];
+  if (process.env.REQUEST_SHAPE === "v1") {
+    return { sessionId: "s1", toolCall, options };
+  }
+  // ACP v2: the tool call hangs off `subject`, with the title at the top level.
+  return {
+    sessionId: "s1",
+    title: process.env.EXPECT_TEXT,
+    subject: { type: "tool_call", toolCall },
+    options,
+  };
+};
 process.stdin.on("data", (chunk) => {
   buf += chunk.toString();
   let nl;
@@ -340,21 +450,7 @@ process.stdin.on("data", (chunk) => {
         jsonrpc: "2.0",
         id: PERMISSION_ID,
         method: "session/request_permission",
-        params: {
-          sessionId: "s1",
-          toolCall: {
-            toolCallId: "t1",
-            name: process.env.ASK_TOOL,
-            title: process.env.EXPECT_TEXT,
-            rawInput: { note: process.env.EXPECT_TEXT },
-            status: "pending",
-          },
-          options: [
-            { optionId: "once", name: "Yes", kind: "allow_once" },
-            { optionId: "always", name: "Yes, and don't ask again", kind: "allow_always" },
-            { optionId: "no", name: "No", kind: "reject_once" },
-          ],
-        },
+        params: permissionParams(),
       });
     } else if (msg.id === PERMISSION_ID) {
       process.stderr.write(`outcome=${JSON.stringify(msg.result?.outcome ?? msg.error)}\n`);
@@ -372,41 +468,44 @@ ADAPTER
   ALLOWED_TOOL="smoke_deadbeef01"
   QUALIFIED_TOOL="mcp__openseo-fake__$ALLOWED_TOOL"
 
-  set +e
-  OUT=$(node "$DRIVER" \
-    --command "$PERM_DIR/fake-adapter" \
-    --cwd "$PERM_DIR" \
-    --prompt "call it" \
-    --expect "$ALLOWED_TOOL" \
-    --allow-tool "$QUALIFIED_TOOL" \
-    --timeout 20000 \
-    --env "PATH=$PATH" \
-    --env "ASK_TOOL=mcp__hostile__shell_exec" \
-    --env "EXPECT_TEXT=$ALLOWED_TOOL" 2>&1)
-  RC=$?
-  set -e
-  check "a request for another tool fails the run" 1 "$RC"
-  check_says "the denied tool is named on stderr" "mcp__hostile__shell_exec" "$OUT"
-  check_says "the run says why it failed" "asked for a tool this run does not allow" "$OUT"
-  check_says "the adapter was told no" '"optionId":"no"' "$OUT"
-  check_lacks "nothing was granted" "granted:" "$OUT"
+  permission_run() { # permission_run <shape> <asked tool> -> sets OUT, RC
+    set +e
+    OUT=$(node "$DRIVER" \
+      --command "$PERM_DIR/fake-adapter" \
+      --cwd "$PERM_DIR" \
+      --prompt "call it" \
+      --expect "$ALLOWED_TOOL" \
+      --allow-tool "$QUALIFIED_TOOL" \
+      --timeout 20000 \
+      --env "PATH=$PATH" \
+      --env "REQUEST_SHAPE=$1" \
+      --env "ASK_TOOL=$2" \
+      --env "EXPECT_TEXT=$ALLOWED_TOOL" 2>&1)
+    RC=$?
+    set -e
+  }
 
-  set +e
-  OUT=$(node "$DRIVER" \
-    --command "$PERM_DIR/fake-adapter" \
-    --cwd "$PERM_DIR" \
-    --prompt "call it" \
-    --expect "$ALLOWED_TOOL" \
-    --allow-tool "$QUALIFIED_TOOL" \
-    --timeout 20000 \
-    --env "PATH=$PATH" \
-    --env "ASK_TOOL=$QUALIFIED_TOOL" \
-    --env "EXPECT_TEXT=$ALLOWED_TOOL" 2>&1)
-  RC=$?
-  set -e
-  check "the one allowed tool is approved and the run passes" 0 "$RC"
-  check_says "the grant is allow_once, never allow_always" "(allow_once, once)" "$OUT"
-  check_lacks "no persistent grant was taken" "always" "$OUT"
+  for SHAPE in v2 v1; do
+    permission_run "$SHAPE" "$QUALIFIED_TOOL"
+    check "[$SHAPE] the one allowed tool is approved and the run passes" 0 "$RC"
+    check_says "[$SHAPE] the grant is allow_once, never allow_always" "(allow_once, once)" "$OUT"
+    check_lacks "[$SHAPE] no persistent grant was taken" "always" "$OUT"
+
+    permission_run "$SHAPE" "mcp__hostile__shell_exec"
+    check "[$SHAPE] a request for another tool fails the run" 1 "$RC"
+    check_says "[$SHAPE] the denied tool is named on stderr" "mcp__hostile__shell_exec" "$OUT"
+    check_says "[$SHAPE] the run says why it failed" "asked for a tool this run does not allow" "$OUT"
+    check_says "[$SHAPE] the adapter was told no" '"optionId":"no"' "$OUT"
+    check_lacks "[$SHAPE] nothing was granted" "granted:" "$OUT"
+
+    # The same BARE tool under a different server is a different program. A
+    # matcher that strips the server prefix — or accepts any `mcp__*__<tool>`
+    # suffix — approves this one, so it must be denied byte-for-byte.
+    permission_run "$SHAPE" "mcp__hostile__$ALLOWED_TOOL"
+    check "[$SHAPE] the same bare tool under another server is refused" 1 "$RC"
+    check_says "[$SHAPE] the impostor is named on stderr" "mcp__hostile__$ALLOWED_TOOL" "$OUT"
+    check_lacks "[$SHAPE] the impostor was not granted" "granted:" "$OUT"
+  done
 fi
 
 echo "== the driver requires at least one prompt and one expectation =="
