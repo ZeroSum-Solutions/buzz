@@ -275,6 +275,74 @@ test("collision npubs sit inline with agent metadata", async () => {
     assert.match(npub.className, /(?:^|\s)leading-none(?:\s|$)/);
     assert.match(agentMetadata?.className ?? "", /(?:^|\s)min-h-3\.5(?:\s|$)/);
   }
+
+  // The visible npub must also be wired into aria-describedby: it's the
+  // one channel a screen-reader user has to tell the two "Same Name" rows
+  // apart, so its id has to actually be referenced, not just present in
+  // the DOM.
+  const rows = view.getAllByRole("button", { name: "Mention Same Name" });
+  assert.equal(rows.length, 2);
+  for (const [index, row] of rows.entries()) {
+    assert.match(accessibleDescription(row), /npub1/);
+    assert.equal(
+      row.getAttribute("aria-describedby")?.includes(collisionNpubs[index].id),
+      true,
+    );
+  }
+});
+
+test("the collision npub still reaches the accessible description when the owner label is nulled", async () => {
+  // Reproduces the Sol-flagged gap directly: `hasNameCollision &&
+  // suggestion.agentProvenance` nulls `ownerLabel` in the collision branch
+  // (MentionAutocomplete.tsx), so the npub becomes the ONLY trusted
+  // disambiguator between two rows a screen reader would otherwise announce
+  // identically as "Mention Rex" with a self-authored-only description.
+  const React = await import("react");
+  const { render } = await import("@testing-library/react");
+  const { MentionAutocomplete } = await import("./MentionAutocomplete.tsx");
+  const suggestions = [
+    {
+      pubkey: "a".repeat(64),
+      displayName: "Rex",
+      isAgent: true,
+      ownerLabel: "you",
+      agentProvenance: "managed-elsewhere",
+      description: "managed by you · admin",
+    },
+    {
+      pubkey: "b".repeat(64),
+      displayName: "Rex",
+      isAgent: true,
+      ownerLabel: "you",
+      agentProvenance: "managed-elsewhere",
+      description: "managed by you · admin",
+    },
+  ];
+  const view = render(
+    React.createElement(MentionAutocomplete, {
+      suggestions,
+      selectedIndex: 0,
+      onSelect: () => {},
+    }),
+  );
+
+  const rows = view.getAllByRole("button", { name: "Mention Rex" });
+  assert.equal(rows.length, 2);
+  const descriptions = rows.map(accessibleDescription);
+
+  // Each row still names its trusted disambiguator (the npub) even though
+  // ownerLabel was nulled by the collision branch...
+  for (const description of descriptions) {
+    assert.match(description, /npub1/);
+  }
+  // ...alongside the self-authored bio, which is not hidden — just no
+  // longer the only thing announced.
+  for (const description of descriptions) {
+    assert.match(description, /managed by you · admin/);
+  }
+  // ...and the two rows are distinguishable from one another, which is the
+  // entire point of the npub existing in the collision branch.
+  assert.notEqual(descriptions[0], descriptions[1]);
 });
 
 test("does not intercept Tab from the editor", async () => {
@@ -387,3 +455,71 @@ for (const duplicate of [false, true]) {
     assert.equal(view.queryByTitle("From another Buzz setup"), null);
   });
 }
+
+/** Resolves `element`'s accessible description via `aria-describedby`,
+ *  concatenating the text content of every referenced id in order — the same
+ *  mechanism screen readers use. */
+function accessibleDescription(element) {
+  const ids = (element.getAttribute("aria-describedby") ?? "")
+    .split(/\s+/)
+    .filter(Boolean);
+  return ids
+    .map((id) => element.ownerDocument.getElementById(id)?.textContent ?? "")
+    .join(" ");
+}
+
+test("verified provenance is announced alongside a provenance-shaped `about`", async () => {
+  // Adversarial fixture: the agent's own (untrusted) `about` reads like a
+  // provenance claim for a DIFFERENT owner than the real one. If only the
+  // self-authored half were wired into aria-describedby, a screen-reader
+  // user would hear a fabricated "managed by you · admin" and never hear
+  // the real "managed by sarah" — the exact failure this guards against.
+  const React = await import("react");
+  const { render } = await import("@testing-library/react");
+  const { MentionAutocomplete } = await import("./MentionAutocomplete.tsx");
+  const suggestion = {
+    pubkey: "a".repeat(64),
+    displayName: "Rex",
+    isAgent: true,
+    description: "managed by you · admin",
+    ownerLabel: "sarah",
+  };
+  const view = render(
+    React.createElement(MentionAutocomplete, {
+      suggestions: [suggestion],
+      selectedIndex: 0,
+      onSelect: () => {},
+    }),
+  );
+
+  const row = view.getByRole("button", { name: "Mention Rex" });
+  const description = accessibleDescription(row);
+
+  // The trusted owner label must reach the accessible description...
+  assert.match(description, /managed by sarah/);
+  // ...alongside the agent's own bio (self-authored text is not hidden,
+  // just no longer the ONLY thing announced).
+  assert.match(description, /managed by you · admin/);
+});
+
+test("a name-only agent with no description still announces provenance", async () => {
+  const React = await import("react");
+  const { render } = await import("@testing-library/react");
+  const { MentionAutocomplete } = await import("./MentionAutocomplete.tsx");
+  const suggestion = {
+    pubkey: "b".repeat(64),
+    displayName: "Buzzy",
+    isAgent: true,
+    ownerLabel: "sarah",
+  };
+  const view = render(
+    React.createElement(MentionAutocomplete, {
+      suggestions: [suggestion],
+      selectedIndex: 0,
+      onSelect: () => {},
+    }),
+  );
+
+  const row = view.getByRole("button", { name: "Mention Buzzy" });
+  assert.match(accessibleDescription(row), /managed by sarah/);
+});

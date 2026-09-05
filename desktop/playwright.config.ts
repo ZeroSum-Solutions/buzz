@@ -68,6 +68,7 @@ export default defineConfig({
         "**/doctor-cta-screenshots.spec.ts",
         "**/pubkey-display-screenshots.spec.ts",
         "**/file-attachment.spec.ts",
+        "**/markdown-doc-viewer.spec.ts",
         "**/image-attachment-gallery.spec.ts",
         "**/composer-image-draw.spec.ts",
         "**/video-attachment.spec.ts",
@@ -79,6 +80,7 @@ export default defineConfig({
         "**/mentions.spec.ts",
         "**/mention-spacing.spec.ts",
         "**/mention-clipboard.spec.ts",
+        "**/mention-descriptions-screenshots.spec.ts",
         "**/cloud-provenance.spec.ts",
         "**/team-mentions.spec.ts",
         "**/persistent-agent-audience.spec.ts",
@@ -173,6 +175,12 @@ export default defineConfig({
         "**/needs-restart-screenshots.spec.ts",
         "**/team-catalog-screenshots.spec.ts",
       ],
+      // zs fork: the fork's GitHub runners are slower than upstream's and the smoke
+      // shards fail unrelated specs on Playwright's 5 s default expect budget. Match
+      // the CI budget the integration project already uses; local runs keep the default.
+      expect: {
+        timeout: process.env.CI ? 15_000 : 5_000,
+      },
       use: {
         ...devices["Desktop Chrome"],
       },

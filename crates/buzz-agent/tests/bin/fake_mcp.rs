@@ -45,6 +45,11 @@
 //!                              `command` string. Lets a test drive the
 //!                              reply guard's recognition of a real,
 //!                              registered shell tool.
+//!   FAKE_MCP_ENV_REPORT=1    — `tools/call` returns the sorted names of the
+//!                              environment variables this process was spawned
+//!                              with, one per line, as its text result. Names
+//!                              only, never values, so a test can assert on the
+//!                              spawn boundary without echoing a secret.
 //!   FAKE_MCP_NAMED_TOOLS=a,b — expose one no-arg tool per comma-separated bare
 //!                              name (each registered as `<server>__<name>`), in
 //!                              addition to any `FAKE_MCP_TOOL_COUNT` tools. Lets
@@ -174,6 +179,7 @@ fn main() {
     let mut stop_calls_seen: usize = 0;
     let post_compact_hook = env_flag("FAKE_MCP_POSTCOMPACT_HOOK");
     let shell_tool = env_flag("FAKE_MCP_SHELL_TOOL");
+    let env_report = env_flag("FAKE_MCP_ENV_REPORT");
     let post_compact_text = std::env::var("FAKE_MCP_POSTCOMPACT_TEXT").unwrap_or_default();
     // One extra no-arg tool per comma-separated bare name.
     let named_tools: Vec<String> = std::env::var("FAKE_MCP_NAMED_TOOLS")
@@ -331,6 +337,22 @@ fn main() {
                         id,
                         json!({
                             "content": [{ "type": "text", "text": post_compact_text }],
+                            "isError": false,
+                        }),
+                    );
+                    continue;
+                }
+                // Report the environment this server was spawned with, so a
+                // test can prove the spawn boundary withheld (or kept) a
+                // specific variable. Names only — a value is never echoed,
+                // so a leaking secret cannot end up in test output.
+                if env_report {
+                    let mut names: Vec<String> = std::env::vars().map(|(k, _)| k).collect();
+                    names.sort();
+                    write_response(
+                        id,
+                        json!({
+                            "content": [{ "type": "text", "text": names.join("\n") }],
                             "isError": false,
                         }),
                     );

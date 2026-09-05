@@ -16,19 +16,28 @@ through. Revision 3 folds in Sol's passes 1 and 2 on this plan (log at the end).
 - Port tickets carry upstream parity only. Fork deviations on a ported feature are their own
   ticket, so an upstream merge can retire the port without losing fork work (range-diff the
   upstream merge against the port, then drop the port commit).
-- Landing is serialized, one ticket at a time:
-  1. `git fetch origin && git rebase --signoff origin/zs/main`; record `BASE=$(git rev-parse origin/zs/main)`.
-  2. Rerun the ticket's gates and the Sol audit on the rebased branch.
-  3. Open the PR ourselves with the full body (`gh pr create --base zs/main --body-file`):
+- Landing goes through GitHub's merge queue on `zs/main` (ruleset "zs/main merge queue",
+  squash, one entry built at a time, CI on the `merge_group` event). The queue tests each pull
+  request against the merged result in order, so the base cannot drift under a tested change and
+  nobody re-merges by hand.
+  1. Before enqueueing, run the ticket's gates and the Sol audit on the branch as it stands.
+  2. Open the PR ourselves with the full body (`gh pr create --base zs/main --body-file`):
      gates run and their results, the tested base OID, the Gemini verdict, the Sol verdict.
-  4. Immediately before `~/bin/zs-land`: `git fetch origin && test "$(git rev-parse origin/zs/main)" = "$BASE"`;
-     if it fails, go back to step 1. `zs-land` reuses the open PR, requires green CI, squash-merges
-     and syncs `zs/main`. It checks the base branch name, not the base SHA, so landings are
-     strictly one at a time from this session and nothing else pushes to `zs/main` meanwhile.
-     After a PR is open, updates from `zs/main` come in by `git merge -s origin/zs/main`, never
-     by rebase, because force-push is blocked on this machine.
+  3. Overlap rule instead of blanket re-testing: if `origin/zs/main` moved since the branch's
+     base, compute `git diff --name-only <base>..origin/zs/main` and intersect it with the
+     branch's own file list. Empty intersection: enqueue as is. Non-empty: `git merge --signoff
+     origin/zs/main`, rerun the gates that cover the overlapping files, then enqueue.
+  4. Enqueue with `gh pr merge <n> --squash --auto`. The queue runs CI on the merge group and
+     merges on green; the repository deletes the head branch on merge. `zs-land` is not used in
+     this repository because it expects an immediate merge, which a queue does not give. The
+     enqueue command is on this machine's guarded list, so it runs only with Devin's go-ahead.
   5. If a CI job fails on the fork for a reason outside the diff (missing secret, upstream-only
-     runner), the fix is a fork-only edit to that job on `zs/main`. Never `--allow-no-ci`.
+     runner, a flake on the recorded list), re-run only the failed jobs once; if it fails the same
+     way, fix the job on `zs/main` as a fork-only edit. Never `--allow-no-ci`.
+  6. Direct pushes to `zs/main` are for fork-only CI and docs commits by the repository admin
+     (the ruleset's bypass actor); feature work always goes through the queue.
+- Linux CI jobs run on Blacksmith (`runs-on: blacksmith-4vcpu-ubuntu-2404`, fork-only label swap
+  on `ci.yml`, `_ci-*.yml`, `mesh-lifecycle.yml`); macOS and Windows jobs stay on GitHub's runners.
 - Hooks and differential lanes compare against `origin/main` (`AGENTS.md:128`,
   `scripts/check-file-sizes-core.mjs:44`), so on the fork they see the cumulative fork delta.
   That is stricter, not wrong. If a lane flags an upstream-ported file, the PR notes it and the
@@ -38,49 +47,56 @@ through. Revision 3 folds in Sol's passes 1 and 2 on this plan (log at the end).
 
 ## The loop every ticket runs
 
-1. **Builder** (Claude subagent; Sonnet 5 for ports and UI, Opus 5 for Rust plumbing and the
-   MCP registry) implements on the branch in its own worktree. Test first where the ticket
-   names a test.
-2. **Fast gates** on the branch, all must pass before anyone else looks:
+Revised 2026-09-05 per `2026-09-05-zs-throughput-plan.md` (accepted by Devin). The original
+serial loop and its measurements are in that document.
+
+1. **Builder** (Claude subagent; Sonnet 5 for ports and UI, Opus 5 for Rust plumbing) in its
+   own worktree, with the defect checklist: cap every relay-sourced string at the DTO; order
+   writes so every prefix is consistent; give every child process or external server an
+   explicit environment; bound every gate by the quantity that costs (nodes, not bytes); write
+   the test that fails when the guard is removed. Tests first where the ticket names a test.
+   Local gates are the fast set only, in a shell that ran `. ./bin/activate-hermit`:
    ```
    just fmt-check clippy desktop-check desktop-tauri-fmt-check desktop-tauri-clippy file-size-check
-   just desktop-test
-   just desktop-tauri-test
    ```
-   plus the ticket's own eval commands, always in a shell that ran `. ./bin/activate-hermit`
-   first (same invocation, since shell state does not persist). Every Rust filter is run
-   twice: once with `-- --list` and an enforced count, then for real:
-   ```
-   n=$(cargo test <filter> -- --list 2>/dev/null | grep -c ': test'); test "$n" -ge <N> || { echo "only $n tests match"; exit 1; }
-   ```
-   Desktop test names are crate-root qualified (`managed_agents::discovery::tests::…`), and
-   a filter that matches nothing is a failed gate, not a pass.
-3. **Tester** (Gemini 3.8 Flash): a disposable worktree of the branch, run as
-   `agy -p --model gemini-3.8-flash-high --mode accept-edits --sandbox "<ticket brief>"` from
-   the worktree root. It reads the diff and the acceptance checks, runs the fast gates itself,
-   tries to break the feature (wrong input, empty state, missing file, hostile filename,
-   concurrent arrival), and returns PASS or FAIL with a repro, plus any acceptance check that
-   has no test. After it returns, `git status --porcelain` in that worktree must be empty; any
-   change it made is discarded and reported. A FAIL or a missing test goes back to the builder.
-4. **Critic** (fresh-context Claude subagent, Opus 5, high effort) does the gauntlet
-   comparison against the ticket's bar with labels stripped and reports one of: ours is better,
-   the bar is better with the single biggest gap named, or parity. The exit checklist is finite:
-   source parity with the bar (for ports: the PR's tests pass on our branch), every fork
-   deviation named in the PR body, every acceptance check measurable and met, nothing above NIT
-   open. Parity with an upstream PR counts as passing for a port. Otherwise back to the builder.
-5. **Full gate** `just ci` on the rebased branch (it adds `test-unit`, `desktop-build`,
-   `desktop-tauri-check`, `web-build`, `mobile-test`). Integration tests (`just test`) when
-   relay, auth or db code changed.
-6. **Audit** (GPT-5.6 Sol): from the worktree,
-   `codex exec -s read-only -c model="gpt-5.6-sol" -c model_reasoning_effort="xhigh" -o <report> "<adversarial prompt naming the scope git diff origin/zs/main...HEAD>"`
-   (the `review --base` form cannot take a custom prompt, so the scope lives in the prompt).
-   Every BLOCK and WARN is verified against the code by the driver before it is fixed or
-   discarded with a written reason. Re-run until nothing above NIT.
-7. **Land** as above.
+   plus the ticket's own test files with enforced counts (`n=$(cargo test <filter> -- --list | grep -c ': test'); test "$n" -ge <N>`).
+   No local `just ci`; CI on Blacksmith is the full gate. At most four builders at once, on a
+   heavy-command semaphore of two for `cargo test`, `desktop-test` and E2E runs.
+2. **In parallel after the build**, on the auditor semaphore of two external processes:
+   - **Tester** (Gemini 3.8 Flash, `agy -p --model gemini-3.8-flash-high --mode accept-edits`,
+     disposable worktree, clean-tree assertion after): reads the diff and acceptance checks,
+     runs the fast gates, tries to break the feature. Returns PASS or FAIL with a repro. A
+     missing-test note that describes an untested crash or race is a FAIL; other notes are
+     follow-ups.
+   - **Sol full pass** (`codex exec -s read-only -c model="gpt-5.6-sol" -c model_reasoning_effort=<effort> -o <report> "<adversarial prompt naming the scope git diff origin/zs/main...HEAD>"`).
+     Effort is `xhigh` when the diff touches `crates/buzz-agent/src/mcp.rs`, `crates/buzz-acp/`,
+     `managed_agents/runtime.rs`, spawn or env code, `secret_store`, keychain, relay crates, or a
+     DTO carrying relay-sourced data; `high` otherwise. The driver verifies every BLOCK and WARN
+     against the code.
+   - **Critic** (in-process Claude agent, features only, once): blind comparison against the
+     bar plus the checklist. Ports get a single non-blind check instead: PR tests present and
+     passing, eval counts met, every deviation named against the port diff. Memos get neither.
+3. **Severity rubric.** BLOCK: unbounded untrusted input, missing containment or credential
+   exposure, an unbounded resource, loop or process tree, a swallowed failure, torn multi-write
+   state, a guard whose removal fails no test, a complexity or resource gate that bounds the
+   wrong quantity. Verified WARNs outside that list are follow-ups in the PR body and issues on
+   the fork; they do not loop.
+4. **One consolidated fix round** for every BLOCK, every FAIL, and every failed checklist item.
+   A fix agent that needs more than 90 minutes stops, commits what passes, and reports; only
+   WARN and out-of-scope work may be parked, and an unfixed BLOCK keeps the ticket open (the
+   driver splits the ticket, never the BLOCK).
+5. **Sol delta pass** on the fix diff, the prior findings, and a re-scan of every
+   untrusted-input surface in the whole diff. It may raise new BLOCKs; if it does, one more fix
+   and one more delta, then the driver. Gemini retests once if it had FAILed. Three Sol runs at
+   most.
+6. **PR.** Opened as a draft with the full body (gates and exit codes, tested base OID, Gemini
+   verdict, critic result, Sol rounds and final state, follow-ups, test plan); marked ready when
+   the loop is done, which runs CI once; then enqueued. A ticket with an open verified BLOCK is
+   never enqueued.
 
-Concurrency: builders and critics are in-process agents (cap 10). Gemini and Sol are external
-processes (cap 4, shared with anything else on the machine); at most two tickets sit in the
-tester or audit stage at once. Fan out is by ticket, never by file inside a ticket.
+Memos: hard length in the builder prompt (one page), one Sol pass, the driver decides which
+findings change a decision and lists the rest as risks. Tickets that cross the Rust and UI
+boundary are split into a backend half and a UI half, each with its own loop.
 
 ## Bars (what "better" means)
 
@@ -199,6 +215,7 @@ the root workspace excludes that manifest (`Cargo.toml:35`).
 
 - Branch `feat/mcp-registry`, after T4. Depends on the T4 fake-server fixture and a fake HTTP MCP fixture (a tiny Streamable HTTP server in the test tree). OpenSEO is not a dependency; the T6 post-approval run is a separate integration check.
 - Design memo first, `docs/plans/2026-09-xx-mcp-registry-design.md`, one page, reviewed by Sol before code. It must answer: the two server classes and the env each receives; the runtime capability matrix (buzz-agent: stdio only, since `McpServer` is the ACP `McpServerStdio` shape at `buzz-acp/src/acp.rs:25` and `buzz-agent/src/types.rs:536`; Claude and Codex: stdio and HTTP through native config); the process boundary for stdio servers under Claude and Codex, where the adapter inherits the whole harness environment including provider keys and user-defined values (`runtime.rs:563, 692-701, 753-757`, `buzz-acp/src/acp.rs:454-517`), solved by a launcher `buzz-mcp-launch` that builds the child environment from empty with only platform essentials and the server's approved values, following the `env_clear` plus allow-list pattern in `buzz-agent/src/mcp.rs:733-754`, and on Windows supervises the child rather than exec; HTTP credentials, which no launcher can inject, handled by a local credential-resolving stdio proxy in front of Streamable HTTP upstreams (the same binary in proxy mode), so no secret is ever written to JSON or TOML; where secrets live (a shared read-only secret-store crate extracted from `desktop/src-tauri/src/secret_store.rs`, since a workspace binary cannot call the private Tauri module); the launcher's crate path, workspace membership (`Cargo.toml:2-34`), sidecar stubs (`justfile:167-180`), release build list (`justfile:306-309`), `scripts/bundle-sidecars.sh` and `tauri.conf.json:52-62` plus the Windows manifest, with generated config naming the bundled launcher by absolute path; name collision rule with built-ins; per-agent toggle storage; config roots per agent with the login caveat from T6.
+- Per-server environment, carried over from T4's Sol audit: `BUZZ_ACP_EXTRA_MCP_COMMANDS` can only carry a server's key in its argv, where `ps` and any crash dump can read it, so the T4 docs tell operators not to put one there and the registry has to give them somewhere else — a per-server `env` block whose values are keychain references resolved at spawn, which the design memo above already owns for Claude and Codex. Extend it to the buzz-agent path.
 - Capability facts added to `KnownAcpRuntime` (`mcp_transports`, `mcp_config_root_env`) and projected through core to the UI per `desktop/src/features/agents/AGENTS.md:13, 34`; the guide is updated in the same PR.
 - Then: `mcp_servers.json` schema and loader with `custom_harnesses`-style structure validation; Settings panel to add stdio and HTTP servers with an approve step that shows the exact command or URL; per-agent toggles in the definition dialog; generation of `BUZZ_ACP_EXTRA_MCP_COMMANDS` for buzz-acp and of native config for Claude and Codex under per-agent `CLAUDE_CONFIG_DIR` and `CODEX_HOME`.
 - Tests first (Rust, module `managed_agents::mcp_registry`, and the launcher crate): loader rejects a server named like a built-in, rejects an inline secret value, resolves a keychain reference; HTTP entry is refused for buzz-agent and accepted for Claude and Codex; generated Claude and Codex config is asserted structurally (command, args, URL, env references) by parsing the written files, because the config bridge readers keep only name, kind and enabled (`config_bridge/types.rs:226-233`) and cannot detect a wrong command; launcher end-to-end: spawned with the identity variables and two unrelated sentinel secrets set, the fake server it starts reports none of them; proxy end-to-end: a fake authenticated HTTP MCP fixture is invoked through Claude and Codex via the proxy and the credential appears in no generated file; the toggle changes only the named agent's generated config. Frontend test: approve step required before save.
@@ -305,6 +322,41 @@ Created on the fork only when Devin asks. Titles:
 15. feat: Google Calendar scoped integration
 16. fix: harness discovery prefers the app bundle
 17. runbook: descriptions on the nine Broken English agents (operational)
+
+## Operational notes from wave 1 (2026-09-04)
+
+- The fork had Actions disabled (GitHub disables workflows on a fork that carried them). Enabled
+  once through the repository's Actions page; PR CI runs from then on.
+- Image and release workflows (`docker.yml`, `sprig-image.yml`, both helm charts,
+  `auto-tag-on-release-pr-merge.yml`, `desktop-release-candidate.yml`, `benchmark-harbor.yml`)
+  push to Block's registries and fail on the fork with `permission_denied`. They are disabled as a
+  repository setting, not by editing the files, so the fork keeps upstream parity.
+- `ci.yml` runs push CI on `zs/main` (fork-only edit) because the relay artifact cache is written
+  only on push events; without it every PR built the relay cold. The relay job's own limit is 75
+  minutes on the fork for the same reason.
+- Two flaky specs seen under load and green on rerun: `desktop/tests/e2e/empty-edit-delete.spec.ts`
+  and the buzz-agent `cancelled_turn_with_usage_emits_notification_before_response` test
+  (15 of 15 locally on both the branch and the baseline). Rerun before treating either as a
+  regression, and say so in the PR.
+- Desktop Smoke E2E shard 3 is chronically red on the fork's runners, with a rotating cast of
+  specs, and it is not a port regression. Same shard, same 4 workflows, different casualties each
+  run: run 33902000903 (push, `zs/main`, e56a75f - no port code) failed
+  `messaging.spec.ts` "sends a thread message to its parent channel with a root-thread link" on all
+  three attempts plus five flakes; run 33878282349 (`spike/pdf`) failed the same spec plus three
+  flakes; runs 33909701431 and its rerun (`port/6731`) failed that spec, then
+  `profile-custom-emoji-status.spec.ts:196`, with `navigation.spec.ts:448` flaky in every one of
+  them. Almost every failure is a 5 s `expect` timeout on an untouched spec. The `smoke` project
+  takes Playwright's 5 s default while the `integration` project already raises its own to 15 s on
+  CI (`desktop/playwright.config.ts`), so the fork-only fix for this - on `zs/main`, per rule 5
+  above, never inside a port branch - is to give `smoke` the same CI-only expect budget. A full
+  local `just desktop-e2e-smoke` on `port/6731` shows the same shape: 1344 of 1354 passed, the 9
+  failures were a ninth different set in untouched specs, 7 of them that same 5 s timeout, and all
+  four of the run's CI casualties passed. Until the budget changes, rerun the shard and say so in
+  the PR.
+- `zs-land` can report "PR MERGED, but cleanup incomplete". The merge is done; finish by hand and
+  do not re-run it.
+- Scratch import branches from ports (`pr-<N>`) are left in place; deleting a branch needs Devin's
+  explicit go-ahead on this machine.
 
 ## Review log
 
