@@ -396,6 +396,44 @@ impl SecretStore {
     where
         F: FnOnce(&mut HashMap<String, String>),
     {
+        self.mutate_blob_checked(|map| {
+            f(map);
+            Ok(())
+        })
+    }
+
+    /// Store-wide read-modify-write whose mutation may refuse.
+    ///
+    /// Identical to `mutate_blob` except that `f` returns a `Result`: an `Err`
+    /// leaves the durable blob and the cache exactly as they were and is
+    /// returned to the caller. This is what makes a compare-and-set possible —
+    /// the predicate runs on the freshly-read durable state *inside* the
+    /// interprocess lock, so no concurrent writer can slip between a check and
+    /// its write.
+    ///
+    /// # Errors
+    /// Returns `f`'s error when the mutation refuses, or the backend's error
+    /// when the keyring is unavailable or the write fails.
+    pub fn mutate_checked<F>(&self, f: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut HashMap<String, String>) -> Result<(), String>,
+    {
+        #[cfg(feature = "system-keyring")]
+        {
+            self.mutate_blob_checked(f)
+        }
+        #[cfg(not(feature = "system-keyring"))]
+        {
+            let _ = f;
+            Err("system-keyring feature disabled".to_string())
+        }
+    }
+
+    #[cfg(feature = "system-keyring")]
+    fn mutate_blob_checked<F>(&self, f: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut HashMap<String, String>) -> Result<(), String>,
+    {
         // Acquire the interprocess advisory lock first. All Buzz processes
         // using the same service name contend on the same lockfile at
         // /tmp/buzz-keychain-<uid>-<service>.lock (a deterministic per-user
@@ -416,7 +454,9 @@ impl SecretStore {
         // Build the candidate state in a separate allocation so that a write
         // failure below cannot leave the cache ahead of durable storage.
         let mut next = current.clone();
-        f(&mut next);
+        // A refusing mutation returns before anything is written, so the
+        // durable blob and the cache both stay on `current`.
+        f(&mut next)?;
 
         // Skip the keychain write when the candidate equals the freshly-read
         // durable state — no I/O needed and no keychain ACL prompt on macOS.
