@@ -231,6 +231,12 @@ fn an_endpoint_url_must_be_a_usable_secure_endpoint() {
         // no host at all
         "http:///mcp",
         "http://",
+        // the same, over https: `url` normalizes this to `https://mcp/`, so the
+        // raw authority is what refuses it
+        "https:///mcp",
+        // an empty userinfo, which parsing drops entirely
+        "https://@app.openseo.so/mcp",
+        "https://:@app.openseo.so/mcp",
         // a fragment the server never receives
         "https://app.openseo.so/mcp#anchor",
         // not a URL at all
@@ -485,9 +491,13 @@ fn skill_directories_come_from_the_runtime_catalog() {
 /// is one) would otherwise compare `None` against `$HOME` and fail on the
 /// fallback rather than on anything this generator does.
 ///
-/// So the binding is asserted on the rule, through the `buzz_owned_root` seam,
-/// against a nest this test owns — both branches, on any machine — and the
-/// end-to-end agreement is asserted where a real nest makes it well defined.
+/// So the PUBLIC resolver is asserted directly, on both branches, against a
+/// nest this test owns: the nest lookup it consults is injected for the length
+/// of each closure (`with_test_nest`, a `#[cfg(test)]` seam — production
+/// compiles only the real lookup). Both branches run in this one process, and
+/// neither reads or writes the operator's home. Making
+/// `claude_project_config_root` return `None` unconditionally leaves the first
+/// assertion red.
 #[test]
 fn claude_project_root_is_the_spawn_working_directory() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -497,25 +507,39 @@ fn claude_project_root_is_the_spawn_working_directory() {
     // A nest that exists is the root, unchanged: the spawn path's working
     // directory is the nest itself, so this generator writes into that exact
     // directory and never a parent, a child or a resolved target.
-    assert_eq!(
-        buzz_owned_root(Some(nest.clone())),
-        Some(nest.clone()),
-        "an existing nest is the write root, verbatim"
-    );
+    with_test_nest(Some(nest.clone()), || {
+        assert_eq!(
+            claude_project_config_root(),
+            Some(nest.clone()),
+            "an existing nest is the write root, verbatim"
+        );
+    });
 
     // A nest that is absent yields nothing. `default_agent_workdir` falls back
     // to `$HOME` in this branch; this generator must not, or a generation on a
     // machine with no nest would write the agent's config — and its skills —
     // into the operator's own home directory.
     std::fs::remove_dir(&nest).expect("rmdir");
-    assert_eq!(
-        buzz_owned_root(Some(nest)),
-        None,
-        "a missing nest is not a reason to fall back to $HOME"
-    );
+    with_test_nest(Some(nest.clone()), || {
+        assert_eq!(
+            claude_project_config_root(),
+            None,
+            "a missing nest is not a reason to fall back to $HOME"
+        );
+    });
+
+    // And a machine that names no nest at all resolves to nothing either.
+    with_test_nest(None, || {
+        assert_eq!(
+            claude_project_config_root(),
+            None,
+            "no nest candidate is no write root"
+        );
+    });
 
     // Where the machine running this does have a nest, the two resolvers must
-    // name the same directory.
+    // name the same directory. This is the end-to-end agreement, on top of the
+    // branch assertions above rather than instead of them.
     if let Some(root) = claude_project_config_root() {
         assert_eq!(
             Some(root),
@@ -1163,6 +1187,52 @@ fn an_unparseable_settings_file_is_reported_not_clobbered() {
     assert_eq!(
         std::fs::read_to_string(root.join(".claude/settings.local.json")).expect("read"),
         "not json"
+    );
+    assert!(!root.join(".mcp.json").exists(), "and nothing is activated");
+}
+
+/// An empty or truncated settings file is not an empty object: it is a file
+/// whose content this module cannot account for. Treating whitespace as `{}`
+/// silently replaces whatever the file used to hold.
+#[test]
+fn a_whitespace_only_settings_file_is_reported_not_clobbered() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(".claude")).expect("mkdir");
+    std::fs::write(root.join(".claude/settings.local.json"), b"   \n\t\n").expect("seed");
+    let err = write_claude_project_config(root, &spec_with(vec![stdio_server()], Vec::new()))
+        .expect_err("must refuse");
+    assert!(
+        matches!(&err, ConfigGenError::Io { source, .. } if source.contains("not valid JSON")),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join(".claude/settings.local.json")).expect("read"),
+        "   \n\t\n",
+        "the file is left exactly as it was"
+    );
+    assert!(!root.join(".mcp.json").exists(), "and nothing is activated");
+}
+
+/// A settings path that cannot be read is an error, never "no settings file
+/// here". Reading the failure as absence would skip the approval rewrite and
+/// generate anyway. A directory standing where the file belongs is the cheapest
+/// portable way to make both the metadata and the read disagree with the
+/// expected shape.
+#[test]
+fn an_unreadable_settings_path_fails_closed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(".claude/settings.local.json")).expect("mkdir");
+    let err = write_claude_project_config(root, &spec_with(vec![stdio_server()], Vec::new()))
+        .expect_err("must refuse");
+    assert!(
+        matches!(&err, ConfigGenError::Io { path, .. } if path.contains("settings.local.json")),
+        "{err}"
+    );
+    assert!(
+        root.join(".claude/settings.local.json").is_dir(),
+        "the path is untouched"
     );
     assert!(!root.join(".mcp.json").exists(), "and nothing is activated");
 }

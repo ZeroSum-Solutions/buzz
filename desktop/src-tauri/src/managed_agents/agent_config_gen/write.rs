@@ -176,7 +176,7 @@ fn claude_plan(
     // replaced with one that has none. `symlink_metadata` rather than `exists`
     // so a planted symlink is seen here and refused by the write, not skipped.
     // Nothing is created where no settings file exists.
-    if !spec.servers().is_empty() || settings.symlink_metadata().is_ok() {
+    if !spec.servers().is_empty() || settings_present(&settings)? {
         let contents = render_claude_local_settings(&settings, spec)?;
         plan.push(PlannedWrite {
             base: root.to_path_buf(),
@@ -192,14 +192,33 @@ fn claude_plan(
     Ok(plan)
 }
 
+/// Whether a settings file is there to be rewritten.
+///
+/// Only [`std::io::ErrorKind::NotFound`] means "absent". Every other metadata
+/// error — a permission failure, a path component that is not a directory, an
+/// I/O error — is propagated: reading one as "no file here" would skip the
+/// approval rewrite and generate anyway, leaving a live `enabledMcpjsonServers`
+/// approving servers this spec does not declare.
+fn settings_present(path: &Path) -> Result<bool, ConfigGenError> {
+    match path.symlink_metadata() {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(io_err(path, &e)),
+    }
+}
+
 /// The `settings.local.json` document that approves exactly this spec's
 /// servers, preserving every other key an existing file holds.
+///
+/// Every existing file is parsed, including an empty or whitespace-only one: an
+/// empty file is not a JSON object, and a truncated write is exactly the state
+/// where silently replacing the file loses whatever it used to hold. Only a
+/// file that is genuinely absent starts from an empty document.
 fn render_claude_local_settings(
     path: &Path,
     spec: &AgentRuntimeConfigSpec,
 ) -> Result<String, ConfigGenError> {
     let mut doc = match std::fs::read_to_string(path) {
-        Ok(raw) if raw.trim().is_empty() => serde_json::Map::new(),
         Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
             Ok(serde_json::Value::Object(map)) => map,
             Ok(_) => {

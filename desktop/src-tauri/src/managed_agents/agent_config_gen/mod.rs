@@ -483,7 +483,43 @@ impl AgentRuntimeConfigSpec {
 /// be spawned there.
 #[must_use]
 pub fn claude_project_config_root() -> Option<std::path::PathBuf> {
-    buzz_owned_root(super::nest_dir())
+    buzz_owned_root(nest_candidate())
+}
+
+/// The nest candidate [`claude_project_config_root`] resolves: the production
+/// lookup, and in test builds whatever [`with_test_nest`] has injected.
+///
+/// The seam exists so the PUBLIC resolver — not a helper standing in for it —
+/// can be asserted on both branches on any machine, without a real `~/.buzz`
+/// and without touching the operator's home. Production builds compile only the
+/// `super::nest_dir()` call below, so the shipped resolver is unchanged.
+fn nest_candidate() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    {
+        if let Some(injected) = TEST_NEST.with(|n| n.borrow().clone()) {
+            return injected;
+        }
+    }
+    super::nest_dir()
+}
+
+// Test-only injection of the nest lookup, thread-local so tests running in
+// parallel cannot see each other's value.
+#[cfg(test)]
+thread_local! {
+    static TEST_NEST: std::cell::RefCell<Option<Option<std::path::PathBuf>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` with `nest` standing in for this machine's nest lookup, so
+/// [`claude_project_config_root`] itself can be asserted on both branches
+/// without a real `~/.buzz` and without reading the operator's home.
+#[cfg(test)]
+pub(super) fn with_test_nest<T>(nest: Option<std::path::PathBuf>, f: impl FnOnce() -> T) -> T {
+    TEST_NEST.with(|n| *n.borrow_mut() = Some(nest));
+    let out = f();
+    TEST_NEST.with(|n| *n.borrow_mut() = None);
+    out
 }
 
 /// Keeps a candidate root only when it exists as a real directory.
@@ -597,12 +633,35 @@ fn check_env_name(field: &'static str, index: usize, value: &str) -> Result<(), 
 /// smuggles a credential into a generated file, and the third is a fragment the
 /// server never sees. Plaintext `http` is confined to loopback so a generated
 /// config cannot put MCP traffic on the network in the clear.
+///
+/// The RAW authority is checked before parsing, because parsing normalizes some
+/// malformed inputs into valid-looking ones: `url` turns `https:///mcp` into
+/// `https://mcp/`, and drops an empty userinfo, so `https://@host/mcp` and
+/// `https://:@host/mcp` reach the parsed-value checks with no username and no
+/// password. The parsed result therefore cannot refuse them; the text can.
 fn check_http_url(url: &str) -> Result<(), ConfigGenError> {
     let invalid = |expected: &'static str| ConfigGenError::Invalid {
         field: "server.url",
         index: 0,
         expected,
     };
+    // The substring between `scheme://` and the first `/`, `?` or `#`: what the
+    // author actually wrote as the authority, before any normalization.
+    let lowered = url.to_ascii_lowercase();
+    if let Some(rest) = lowered
+        .strip_prefix("http://")
+        .or_else(|| lowered.strip_prefix("https://"))
+    {
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        if authority.is_empty() {
+            return Err(invalid("a URL with a host"));
+        }
+        if authority.contains('@') {
+            return Err(invalid(
+                "a URL with no userinfo; a credential must not be stored in a config file",
+            ));
+        }
+    }
     let parsed = url::Url::parse(url).map_err(|_| invalid("a parseable absolute URL"))?;
     let scheme = parsed.scheme();
     if scheme != "http" && scheme != "https" {
