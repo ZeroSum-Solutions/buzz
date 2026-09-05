@@ -19,6 +19,9 @@ pub fn user_search_result_from_event(ev: &Event) -> UserSearchResultInfo {
             .or_else(|| v.get("name").and_then(Value::as_str))
             .map(str::to_string),
         avatar_url: v.get("picture").and_then(Value::as_str).map(str::to_string),
+        about: super::truncate_mention_about(
+            v.get("about").and_then(Value::as_str).map(str::to_string),
+        ),
         nip05_handle: v.get("nip05").and_then(Value::as_str).map(str::to_string),
         is_agent: owner_pubkey.is_some(),
         owner_pubkey,
@@ -236,6 +239,37 @@ mod tests {
         assert_eq!(r.users.len(), 2);
         assert_eq!(r.users[0].display_name.as_deref(), Some("a"));
         assert_eq!(r.users[1].display_name.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn user_search_result_carries_about_when_present() {
+        let with_about = ev(0, r#"{"name":"honey","about":"Writer bee"}"#, vec![]);
+        let without_about = ev(0, r#"{"name":"fizz"}"#, vec![]);
+
+        assert_eq!(
+            user_search_result_from_event(&with_about).about.as_deref(),
+            Some("Writer bee")
+        );
+        assert_eq!(user_search_result_from_event(&without_about).about, None);
+    }
+
+    #[test]
+    fn user_search_result_truncates_oversized_about_at_the_seam() {
+        // `search_users` is bounded to 500 rows (not unbounded like the batch
+        // command) but each row's `about` was still uncapped before crossing
+        // the IPC boundary — cap it here too, matching `users_batch`.
+        let oversized_about = "a".repeat(super::super::MENTION_ABOUT_MAX_BYTES * 4);
+        let event = ev(
+            0,
+            &format!(r#"{{"name":"honey","about":"{oversized_about}"}}"#),
+            vec![],
+        );
+
+        let capped = user_search_result_from_event(&event)
+            .about
+            .expect("about present");
+        assert!(capped.len() <= super::super::MENTION_ABOUT_MAX_BYTES);
+        assert!(capped.len() < oversized_about.len());
     }
 
     #[test]
