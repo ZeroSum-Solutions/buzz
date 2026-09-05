@@ -82,7 +82,10 @@ build with `just desktop-build` and a full `cargo build --workspace --all-target
 desktop crate, so the first real run is not a cold compile.
 
 `remote-ci.sh` starts the instance, waits for `running` and then for SSH (5-minute cap), checks
-the branch out on the box (`git fetch origin && git checkout --detach origin/<branch>`), runs
+the branch out on the box (`git fetch origin && git checkout --detach origin/<branch>`),
+**reinstalls the branch's dependencies** (`just desktop-install-ci` plus the branch's Playwright
+Chromium — the box was bootstrapped from `zs/main` and `just ci` installs nothing, so without
+this a branch that touches `pnpm-lock.yaml` would be gated against the wrong packages), runs
 `just <targets>` under `script -q` so the log streams to the terminal and to
 `~/Inbox/notes/remote-ci-<branch>-<ts>.log`, copies `desktop/playwright-report` back to
 `~/Inbox/misc/remote-ci-report-<branch>-<ts>/` when it exists, and stops the instance from an
@@ -90,31 +93,74 @@ EXIT trap whatever happened. It exits with the gate's own exit code, which the r
 back through a sentinel line because `script` does not pass a remote status through portably.
 `--push-local` sends a not-yet-pushed branch's **committed** tree as a `git bundle` over ssh
 (incremental against `origin/zs/main` when it can, full history otherwise). `--keep` skips the
-stop. `--status` prints the state and uptime and touches nothing. `--help` documents all of it.
+stop. `--status` prints the state, uptime and current lock holder and touches nothing.
+`--help` documents all of it.
+
+**One box, one run.** The box is a single mutable working tree, so two runs would check out
+different commits into it and one EXIT trap would stop the box under the other. Every run takes
+`flock -n` on `/home/ci/.remote-ci.lock` for its whole duration and records the caller's
+hostname, pid, branch and start time there. A run that finds the box already `running` or
+`pending` refuses and prints that lock holder, unless `--join` is passed; a run that cannot take
+the lock does nothing and leaves the box alone. Only the run that owned the lock (or that
+started the box itself) stops it. A box in `stopping` is waited out, bounded at 5 minutes,
+before `StartInstances` — AWS rejects a start during `stopping`, and that state is the normal
+one right after the previous run.
 
 ### Cost guardrails as implemented
 
 - The instance is created stopped and every run stops it again from an EXIT trap, so `--keep`
-  or a killed terminal is the only way it stays up.
+  or a killed terminal is the only way it stays up. `provision.sh` arms its own stop trap
+  **before** `run-instances`, so an interruption between launch and the final stop still stops
+  the box; the launch carries a stable `--client-token`, so a retry adopts that instance rather
+  than launching a second $1.20-per-hour box.
 - CloudWatch alarm `buzz-ci-box-idle`: `CPUUtilization` average `< 5%` over six 5-minute periods
   (30 minutes) fires `arn:aws:automate:<region>:ec2:stop`. Created by `provision.sh` in the same
   run as the instance, so it exists before the first gate.
 - `/etc/cron.d/buzz-ci-uptime-stop` runs `/usr/local/sbin/buzz-ci-uptime-guard` every minute; at
   90 minutes of uptime it runs `shutdown -h now`. The instance is launched with
-  `--instance-initiated-shutdown-behavior stop`, so that stops rather than terminates.
+  `--instance-initiated-shutdown-behavior stop`, so that stops rather than terminates. Bootstrap
+  **fails** unless the cron service is active: a hung high-CPU process never trips the idle
+  alarm, so this guard is the only one that bounds the bill in that case.
 - Least privilege on both sides. The box's own instance role may call `ec2:StopInstances` on its
   own instance ARN and nothing else. The `buzz-ci-runner` IAM user may call `StartInstances` and
   `StopInstances` on that one instance ARN, plus `DescribeInstances`/`DescribeInstanceStatus` on
   `*` — AWS does not let `Describe*` be resource-scoped, and that is called out in the policy's
   own `Sid`. No self-hosted GitHub runner is registered on this box.
+- The `ci` user has **no sudo**. Branch code runs as `ci`, and root on that box could disable
+  the uptime guard, poison the persistent caches, or read instance metadata. The one privileged
+  step, `playwright install-deps`, runs as root during bootstrap only.
 - Expected cost unchanged from the estimate: about $1.20 per hour running, about $16 per month
   for the stopped volume, so about $1 per full gate run.
 
+### Failing closed
+
+`provision.sh` never turns a failure into a successful provision:
+
+- A `describe` that errors (denied, throttled) is an error, never "the resource does not exist".
+  IAM's `NoSuchEntity` is the one "missing" signal it accepts, and only that one.
+- The instance is found by **both** `Name=buzz-ci-box` and `zs:owner=buzz-remote-ci`. EC2 tags
+  are not unique, so more than one match aborts instead of picking one.
+- An existing role, instance profile or runner user is adopted only if it carries the owner tag
+  and holds no policy, group or profile membership this script did not create. Anything else
+  aborts: a colliding role would otherwise hand branch code whatever that role can do.
+- A box whose `/var/lib/buzz-ci-bootstrap-done` marker is missing is never adopted silently. On
+  a fresh launch a missing marker stops the box and exits non-zero; on a re-run the script
+  starts the box, re-runs `bootstrap.sh` over ssh, and fails if the marker still does not
+  appear. `--no-verify` skips that check when you only want to refresh metadata.
+- `bootstrap.sh` removes any old marker first and writes the new one only after every step has
+  succeeded, so a failed repair cannot leave a stale "this box is fine" marker behind.
+
 ### Runbook
 
-1. **Create the admin profile** (once, by Devin). `aws configure --profile zs-admin` — region
-   `us-east-1`, output `json`. This admin key is used only by `provision.sh` and is deliberately
-   **not** stored in ZS Vault.
+1. **Put the admin credential in ZS Vault** (once, by Devin). Two entries, so the script can map
+   them into its own `aws` child processes without writing anything to `~/.aws`:
+   ```
+   zsvault add aws_admin_access_key_id     --type api_key --env-name AWS_ADMIN_ACCESS_KEY_ID
+   zsvault add aws_admin_secret_access_key --type api_key --env-name AWS_ADMIN_SECRET_ACCESS_KEY
+   ```
+   `provision.sh` reads those two env names and passes them to `aws` as child-process
+   environment only — never exported, never printed, never written to disk. If they are unset it
+   falls back to `AWS_PROFILE` (default `zs-admin`), so an SSO or assume-role profile also works.
 2. **Dry-run, then provision.**
    ```
    scripts/zs/remote-ci/provision.sh --dry-run    # prints every aws call, changes nothing
@@ -122,30 +168,46 @@ stop. `--status` prints the state and uptime and touches nothing. `--help` docum
    ```
    It writes `~/.ssh/buzz-ci-box.pem` (0600), `scripts/zs/remote-ci/box.env`, and one access-key
    file under `~/Backups/aws/` (0600). The secret is written to that file once and never printed.
-3. **Store the runner key.** Run the `zsvault add aws_ci_runner` line the script prints, then
-   delete the file under `~/Backups/aws/`. The vault entry must export exactly
-   `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, or else configure a named profile
-   `buzz-ci-runner` with the same credentials — `remote-ci.sh` accepts either.
-4. **First run.** `scripts/zs/remote-ci.sh zs/main` (or a branch, or named targets:
+3. **Store the runner key**, using the two commands the script prints (it fills in the real file
+   path), then delete the file:
+   ```
+   sed -n 's/^AWS_ACCESS_KEY_ID=//p' <file> \
+     | zsvault add aws_ci_runner_access_key_id --type api_key \
+         --env-name AWS_ACCESS_KEY_ID --yes --value-stdin
+   sed -n 's/^AWS_SECRET_ACCESS_KEY=//p' <file> \
+     | zsvault add aws_ci_runner_secret_access_key --type api_key \
+         --env-name AWS_SECRET_ACCESS_KEY --yes --value-stdin
+   rm -f <file>
+   ```
+   The env names must be exactly `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`; a named
+   profile `buzz-ci-runner` with the same credentials works too — `remote-ci.sh` accepts either.
+4. **Deactivate the admin access key in IAM.** Only `provision.sh` ever needs it, and the
+   day-to-day lane uses the scoped runner key. Reactivate it if you re-provision.
+5. **First run.** `scripts/zs/remote-ci.sh zs/main` (or a branch, or named targets:
    `scripts/zs/remote-ci.sh my-branch desktop-test desktop-tauri-test`).
-5. **After a network change**, refresh the SSH allow-list: `scripts/zs/remote-ci/provision.sh
+6. **After a network change**, refresh the SSH allow-list: `scripts/zs/remote-ci/provision.sh
    --allow-ip`. The security group opens port 22 to the caller's public IP only.
 
-Verification available now, with no AWS account: `scripts/zs/remote-ci/test-remote-ci.sh`
-shellchecks all four scripts, runs `provision.sh --dry-run` against a stub `aws` and asserts the
-whole plan (instance type, 200 GB volume, alarm, both IAM policies, the final stop) while
-asserting the real `aws` was never called, exercises `--help`, and checks `box.env` parsing
-including that a hostile line in it is rejected rather than executed.
+Verification available now, with no AWS account: `scripts/zs/remote-ci/test-remote-ci.sh` (66
+checks). It shellchecks all four scripts, runs `provision.sh --dry-run` against a stub `aws` and
+asserts the whole plan (instance type, 200 GB volume, client token, owner tag, alarm, both IAM
+policies, the final stop) while asserting the real `aws` was never called, and drives each new
+guard to its failure: two owner-tagged instances abort with no launch, a denied
+`describe-instances` aborts with no launch, and a `running` box refuses a second run without
+starting or stopping anything. It also exercises `--help` and `box.env` parsing, including that
+a hostile line in `box.env` is rejected rather than executed.
 
 ### What Devin still has to do
 
-Two things, both credential work no agent may do:
+Three things, all credential work no agent may do:
 
-1. `aws configure --profile zs-admin` with an admin key (billing lane: AWS, approved 2026-09-05).
-2. Run `provision.sh`, then `zsvault add aws_ci_runner` with the key it creates.
+1. Put the AWS admin key in ZS Vault as `aws_admin_access_key_id` and
+   `aws_admin_secret_access_key` (billing lane: AWS, approved 2026-09-05).
+2. Run `provision.sh`, then store the runner key it creates as the two vault entries above.
+3. Deactivate the admin access key in IAM once provisioning has succeeded.
 
-Until both are done, `box.env` does not exist and `remote-ci.sh` refuses with a message that
-says so. Nothing else in the repo depends on it.
+Until the first two are done, `box.env` does not exist and `remote-ci.sh` refuses with a message
+that says so. Nothing else in the repo depends on it.
 
 Hetzner (AX or CCX line) does the same job for a flat $40 to $60 per month with no start/stop
 logic, but it is a second new vendor and Devin approved AWS specifically; revisit if the

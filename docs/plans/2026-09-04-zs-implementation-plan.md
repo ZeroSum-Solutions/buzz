@@ -433,7 +433,9 @@ Created on the fork only when Devin asks. Titles:
   and exits with the gate's own exit code — so a green run there means the same thing a green
   local gate means, without holding the lock or heating the Mac. Use `--push-local <branch>`
   for a branch that is not pushed yet (it sends the committed tree, never uncommitted work) and
-  `--status` to check the box. If `box.env` is absent the script says so and does nothing; fall
+  `--status` to check the box. There is one box, so one run at a time: a run holds an exclusive
+  lock on it and a second run refuses and prints who holds it, rather than checking a second
+  commit into the same tree. If `box.env` is absent the script says so and does nothing; fall
   back to `with-gate-lock.sh`. Blacksmith stays the merge gate either way. Setup and cost
   guardrails: `docs/plans/2026-09-05-ci-merge-gate-and-runner.md`, Step 3.
 - A header-box change moved `chromeWrapperRef` and shifted the channel column by 42 px without
