@@ -251,6 +251,79 @@ Sol still audits every ticket and still looks at fix diffs; Gemini still tests e
 ticket; every landing still goes through CI on the merged result; DCO, conventional commits,
 and the port procedure stay. Defects of the classes in the table above still block.
 
+## Second baseline, provisional (waves 2 and 3, measured 2026-09-05)
+
+Status: observational, not a causal test of the revised loop. It records what waves 2 and 3 cost under the
+revised loop; it does not show that the loop change caused the difference, because the tickets were
+smaller by design (see caveat 1). Reviewed by GPT-5.6 Sol on 2026-09-05 before publication; its two
+corrections (reconcile the table totals, narrow the claims) are applied here.
+
+Scope: every workflow agent that ran for the wave 2 and wave 3 tickets between 2026-09-04T22:55Z and
+2026-09-05T10:09Z, read from the workflow transcripts. Method: one agent = one transcript; agent-minutes =
+last timestamp minus first timestamp, rounded per agent; stage = the role line of the agent's prompt. The
+same method reproduces the wave-1 table above to within one agent-minute (2,588 vs 2,587; audit 606 in
+19 runs; tester 193 in 11; PR opener 91 in 7), so the two tables are comparable. Wave 4 (T3b, T12, T7b)
+and the first wave-5 ticket (T15) were still running when this was measured and are not included.
+
+### Agent time by stage
+
+| Stage | Wave 1 (7 tickets) | Waves 2 and 3 (4 code tickets, 3 memos) |
+|---|---|---|
+| Builder (first build) | 274 min | 303 min in 7 runs |
+| Fix rounds, all sources | 1,182 min (audit 790, critic 238, tester 154) | 328 min in 12 consolidated runs |
+| Sol audit, full pass | 606 min in 19 runs | 116 min in 7 runs |
+| Sol delta pass | did not exist | 157 min in 10 runs |
+| Sol-finding verifiers (driver-added, T3) | did not exist | 51 min in 18 runs |
+| Critic | 241 min in 16 runs | 156 min in 9 runs |
+| Port check | did not exist | 72 min in 2 runs |
+| Gemini tester | 193 min in 11 runs | 77 min in 9 runs |
+| PR opener | 91 min in 7 runs | 66 min in 5 runs |
+| Extra review-round workflows (T12a rounds 3 to 5; T9 and T7a round 3) | none | 119 min in 9 runs |
+| Total | 2,588 agent-minutes, 88 agents | 1,443 agent-minutes, 88 agents (rows sum to 1,445 from per-row rounding) |
+
+### Per ticket
+
+| Ticket | Kind | Agents | Agent-min | Wall clock | Sol runs (full + delta) |
+|---|---|---|---|---|---|
+| T3 port/4316 | port | 32 | 451 | 7.4 h (incl. a 2 h driver fix round and 18 verifiers) | 3 |
+| T6-config | feature half | 10 | 163 | 2.2 h | 2 |
+| T9 PDF export | feature | 11 | 219 | 3.5 h | 3 |
+| T7a registry core | feature half | 17 | 275 | 4.4 h | 4 (one over the cap) |
+| T7 memo | memo | 2 | 26 | 0.4 h | 1 |
+| T11 cut | memo | 2 | 22 | 0.4 h | 1 |
+| T12a memo | memo | 10 | 183 | 6.8 h across four workflows | 3 plus critic rounds 4 to 6 |
+| Shared round-3 workflow (T9 and T7a findings re-verified together) | review round | 4 | 104 | 1.4 h | 0 |
+| Total | | 88 | 1,443 | | |
+
+### Reading against the plan's expectations
+
+- **Audit plus fix-audit** (F1) was expected to fall from 1,396 to 550-750 agent-minutes per seven tickets.
+  Measured upper bound: full audit 116 + delta 157 + verifiers 51 + all fix rounds 328 = 652 for four code
+  tickets and three memos. It is an upper bound because the fix rounds are consolidated and the audit-driven
+  share cannot be separated from the tester- and critic-driven share. Per code ticket that is at most about
+  160 agent-minutes against about 200 in wave 1: a modest drop, not the predicted 40 to 60 percent, and not
+  attributable to the loop shape alone (caveat 1).
+- **Critic loop** (F2) fell from 479 to 156 agent-minutes; memos got no critic, ports got the single port check.
+- **Gemini tester** (F3) fell from 347 to 77 agent-minutes; no tester fix round was triggered by a missing-test list.
+- **Wall clock per code ticket** fell from 3.9-13.6 h to 2.2-4.4 h. Most of that is F8 (split tickets: T6
+  config half, T7a backend half) and F9 (tester and auditor in parallel), not the audit shape.
+- **Sol run cap** held at three for every ticket except T7a (four) and the T12a memo, which ran three Sol
+  passes and then critic rounds 4 to 6 in separate workflows despite the one-pass memo rule (F6). The cap has
+  to live in the workflow script, not only in this document.
+- **PR stage** (F4): 13 agent-minutes per PR-opener run, unchanged. The plan's 25-40 minute wall-clock target
+  for the PR stage is NOT measured here; agent-minutes and wall minutes are different quantities.
+
+### Caveats
+
+1. Load-bearing: waves 2 and 3 tickets were smaller by design (a port, two feature halves, three memos), so the
+   drop from 2,588 to 1,443 agent-minutes and the wall-clock drop cannot be attributed mainly to the revised
+   loop. A like-for-like test needs a full feature ticket under the revised loop; T3b, T12 and T7b in wave 4
+   are the first candidates.
+2. The 2-hour driver-run fix round and the 18 verifier agents on T3 were outside the workflow script; they are
+   counted because they were real cost.
+3. Wave 4 is appended when it lands; its running totals at 2026-09-05T18:41Z were T3b 235, T7b 150, T12 150
+   and T15 83 agent-minutes.
+
 ## Grok 4.6 audit log
 
 - Pass 1 (2026-09-05, `x-ai/grok-4.6` via OpenRouter): ACCEPT WITH CHANGES, ten required
