@@ -11,7 +11,7 @@
 
 #![cfg(windows)]
 
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 const LAUNCHER: &str = env!("CARGO_BIN_EXE_buzz-mcp-launch");
 
@@ -37,6 +37,14 @@ fn cmd_exe() -> String {
 
 /// Run the launcher over `cmd.exe /C <script>`, with `fault` in its own
 /// environment when given.
+///
+/// The launcher's stdin is a pipe this harness holds open until the launcher
+/// has exited. EOF on that stdin is not idle input: it is one of the endings
+/// `launch::run` supervises — what a dead adapter looks like from inside the
+/// launcher — and it reports exit code 1 without waiting for the server's own
+/// code. `Command::output` closes the child's stdin before it runs, so it ends
+/// every launch that way and can never observe the exit code these tests are
+/// about. Hence the process is driven by hand.
 fn launch(script: &str, fault: Option<&str>) -> Output {
     let mut command = Command::new(LAUNCHER);
     command
@@ -46,11 +54,22 @@ fn launch(script: &str, fault: Option<&str>) -> Output {
         .env_clear()
         .env("SystemRoot", system_root())
         .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .env("RUST_LOG", "info");
+        .env("RUST_LOG", "info")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     if let Some(value) = fault {
         command.env("BUZZ_MCP_LAUNCH_FAULT", value);
     }
-    command.output().expect("launcher runs")
+    let mut child = command.spawn().expect("launcher starts");
+    // Taken rather than left in place: `wait_with_output` closes whatever
+    // stdin the child still holds before it waits, and this handle has to
+    // outlive that wait. It reads both pipes while it waits, so neither can
+    // fill and deadlock the launcher.
+    let held_open = child.stdin.take().expect("stdin is piped");
+    let output = child.wait_with_output().expect("launcher completes");
+    drop(held_open);
+    output
 }
 
 #[test]
