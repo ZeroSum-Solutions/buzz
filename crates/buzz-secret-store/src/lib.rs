@@ -16,6 +16,7 @@ pub mod blob;
 pub mod capability;
 pub mod lookup;
 pub mod namespace;
+pub mod sentinel;
 pub mod testing;
 
 #[cfg(feature = "system-keyring")]
@@ -25,3 +26,4 @@ pub use blob::{parse_blob, serialize_blob, BlobError, BLOB_KEY};
 pub use capability::{AgentCapability, CapabilityError, CAPABILITY_ENV_VAR};
 pub use lookup::{storage_key, LookupError, McpSecretLookup, SecretBlobSource, SecretValue};
 pub use namespace::{looks_like_reference, McpSecretRef, ReferenceError};
+pub use sentinel::{scan_argv, scan_query_pairs, scan_value, SentinelHit};
