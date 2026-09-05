@@ -1,6 +1,6 @@
 import * as React from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Download, FileText, Loader2 } from "lucide-react";
+import { Download, FileText, Loader2, Printer } from "lucide-react";
 import { toast } from "sonner";
 
 import { invokeTauri } from "@/shared/api/tauri";
@@ -12,6 +12,7 @@ import {
   focusMarkdownDocPanelClose,
   restoreFocusToMarkdownDocOpener,
 } from "@/features/channels/ui/markdownDocFocus";
+import { exportMarkdownDocumentToPdf } from "@/features/channels/ui/markdownDocPdfExport";
 import { useEscapeKey } from "@/shared/hooks/useEscapeKey";
 import { useIsThreadPanelOverlay } from "@/shared/hooks/use-mobile";
 import {
@@ -121,6 +122,26 @@ export function MarkdownDocPanel({
   }, [url, filename]);
 
   const decoded = docQuery.data;
+  const [isExportingPdf, setIsExportingPdf] = React.useState(false);
+  const documentText = decoded?.kind === "ok" ? decoded.text : null;
+
+  // Export renders the document in document mode (links kept, attachments as
+  // links, code never collapsed) and prints it through the Rust exporter.
+  // A cancelled save dialog resolves false and is not an error; every other
+  // failure is surfaced, never swallowed.
+  const handleExportPdf = React.useCallback(() => {
+    if (documentText === null) return;
+    setIsExportingPdf(true);
+    exportMarkdownDocumentToPdf({ content: documentText, filename })
+      .then((saved) => {
+        if (saved) toast.success(`Exported ${filename} as PDF`);
+      })
+      .catch((err: unknown) => {
+        toast.error(err instanceof Error ? err.message : "PDF export failed");
+      })
+      .finally(() => setIsExportingPdf(false));
+  }, [documentText, filename]);
+
   const errorMessage = docQuery.isError
     ? "Couldn't load this file from the relay."
     : decoded && decoded.kind !== "ok"
@@ -154,6 +175,22 @@ export function MarkdownDocPanel({
             <AuxiliaryPanelHeaderTitleBlock title={filename} />
           </AuxiliaryPanelHeaderGroup>
           <AuxiliaryPanelHeaderActions includeCloseAction>
+            {documentText !== null ? (
+              <Button
+                aria-label={`Export ${filename} as PDF`}
+                data-testid="markdown-doc-export-pdf"
+                disabled={isExportingPdf}
+                onClick={handleExportPdf}
+                size="icon"
+                variant="ghost"
+              >
+                {isExportingPdf ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Printer className="h-4 w-4" />
+                )}
+              </Button>
+            ) : null}
             <Button
               aria-label={`Download ${filename}`}
               data-testid="markdown-doc-download"
