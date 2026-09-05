@@ -8,6 +8,7 @@ pub(crate) use access_policy::{owner_only, owner_only_access_build, projected_ac
 pub(crate) use agent_env::{
     baked_build_env, build_buzz_agent_provider_defaults, discovery_env_with_baked_floor,
 };
+pub mod agent_config_gen;
 mod agent_description;
 pub(crate) use agent_description::{effective_agent_description, record_effective_description};
 mod backend;
