@@ -17,6 +17,41 @@ async function waitForMockLiveSubscription(page: Page, channelName: string) {
   );
 }
 
+/**
+ * The channel title, the tab strip and the first file row must stack without
+ * overlapping, and nothing may push the document into horizontal scroll.
+ */
+async function assertNoOverlap(page: Page) {
+  const title = await page.getByTestId("chat-title").boundingBox();
+  const tabs = await page.getByRole("tab", { name: "Files" }).boundingBox();
+  const row = await page
+    .getByRole("link", { name: "release-notes.md", exact: true })
+    .boundingBox();
+
+  expect(title, "chat title has a box").not.toBeNull();
+  expect(tabs, "tab strip has a box").not.toBeNull();
+  expect(row, "first file row has a box").not.toBeNull();
+  if (!title || !tabs || !row) return;
+
+  expect(
+    title.y + title.height,
+    "the channel title must sit above the tab strip",
+  ).toBeLessThanOrEqual(tabs.y + 1);
+  expect(
+    tabs.y + tabs.height,
+    "the tab strip must sit above the first file row",
+  ).toBeLessThanOrEqual(row.y + 1);
+
+  const overflow = await page.evaluate(() => ({
+    scrollWidth: document.documentElement.scrollWidth,
+    clientWidth: document.documentElement.clientWidth,
+  }));
+  expect(
+    overflow.scrollWidth,
+    "the Files tab must not scroll the document horizontally",
+  ).toBeLessThanOrEqual(overflow.clientWidth + 1);
+}
+
 test.describe("channel Files tab", () => {
   test("lists file attachments, labels a Markdown file by its imeta filename, and jumps back to the message", async ({
     page,
@@ -64,6 +99,19 @@ test.describe("channel Files tab", () => {
       name: "release-notes.md",
       exact: true,
     });
+    await expect(fileRow).toBeVisible();
+
+    // Visibility alone does not prove the layout: Playwright reports an
+    // element visible while sticky header chrome sits on top of it, which is
+    // exactly the overlap this header/tab-strip layout exists to prevent.
+    // Assert the stacking order geometrically, at the default width and again
+    // narrow, so removing the measured header ref or the Files padding fails
+    // here rather than shipping.
+    await assertNoOverlap(page);
+    await page.setViewportSize({ width: 720, height: 720 });
+    await expect(fileRow).toBeVisible();
+    await assertNoOverlap(page);
+    await page.setViewportSize({ width: 1280, height: 720 });
     await expect(fileRow).toBeVisible();
     // The plain, attachment-less message must not appear in the Files tab.
     await expect(

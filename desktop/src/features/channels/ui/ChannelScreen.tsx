@@ -96,9 +96,14 @@ import * as searchForwarding from "./searchTargetForwarding";
 import { ChannelFilesTab } from "@/features/channel-files/ChannelFilesTab";
 import { useChannelFiles } from "@/features/channel-files/useChannelFiles";
 import { useFileFolders } from "@/features/channel-files/useFileFolders";
-const CHANNEL_TAB_CHAT = "chat",
-  CHANNEL_TAB_FILES = "files",
-  EMPTY_RELAY_EVENTS: RelayEvent[] = [];
+import {
+  CHANNEL_TAB_CHAT,
+  CHANNEL_TAB_FILES,
+  ChannelTabStrip,
+  channelTabId,
+  channelTabPanelId,
+} from "@/features/channels/ui/ChannelTabStrip";
+const EMPTY_RELAY_EVENTS: RelayEvent[] = [];
 export function ChannelScreen({
   activeChannel,
   autoSendDraftKey,
@@ -225,12 +230,20 @@ export function ChannelScreen({
     threadScrollTargetId,
   );
   useChannelSubscription(activeChannel);
-  const channelFiles = useChannelFiles(activeChannel);
+  // The Files projection re-parses the whole loaded message window on every
+  // live message, so it stays off until the user actually opens the tab for
+  // this channel; a Chat-only session never pays for it.
+  const [filesTabOpened, setFilesTabOpened] = React.useState(false);
+  React.useEffect(() => {
+    if (activeTab === CHANNEL_TAB_FILES) setFilesTabOpened(true);
+  }, [activeTab]);
+  const channelFiles = useChannelFiles(activeChannel, filesTabOpened);
   const fileFoldersHook = useFileFolders(activeChannelId, currentPubkey);
   // Reset to chat tab when switching channels
   // biome-ignore lint/correctness/useExhaustiveDependencies: activeChannelId is the intentional reset trigger
   React.useEffect(() => {
     setActiveTab(CHANNEL_TAB_CHAT);
+    setFilesTabOpened(false);
   }, [activeChannelId]);
   const { fetchOlder, hasOlderMessages, historyExhausted, isFetchingOlder } =
     useFetchOlderMessages(activeChannel);
@@ -793,52 +806,25 @@ export function ChannelScreen({
     () => setIsMembersSidebarOpen((prev) => !prev),
     [],
   );
-  // The tab strip rides *inside* the channel header rather than sitting
-  // between the header and the tab content. The header is an overlay whose
-  // measured title-row height drives every downstream offset (timeline
-  // padding, sticky day divider, shared blur band); a sibling strip would add
-  // a second, unmeasured offset those all miss — the bug this replaces.
-  const channelTabs = React.useMemo(() => {
-    if (!activeChannelType || activeChannelType === "forum") {
-      return null;
-    }
-    const tabClass = (isActive: boolean) =>
-      cn(
-        "-mb-px border-b-2 px-4 py-2.5 text-sm font-medium transition-colors",
-        isActive
-          ? "border-foreground text-foreground"
-          : "border-transparent text-muted-foreground hover:text-foreground",
-      );
-    return (
-      // `-mx-5` bleeds the bottom rule past the header's inline padding;
-      // `px-1` then re-aligns the first tab label with the channel title.
-      <div
-        className="-mx-5 border-b border-border bg-background px-1"
-        role="tablist"
-      >
-        <div className="flex gap-0">
-          <button
-            aria-selected={activeTab === CHANNEL_TAB_CHAT}
-            className={tabClass(activeTab === CHANNEL_TAB_CHAT)}
-            onClick={() => setActiveTab(CHANNEL_TAB_CHAT)}
-            role="tab"
-            type="button"
-          >
-            Chat
-          </button>
-          <button
-            aria-selected={activeTab === CHANNEL_TAB_FILES}
-            className={tabClass(activeTab === CHANNEL_TAB_FILES)}
-            onClick={() => setActiveTab(CHANNEL_TAB_FILES)}
-            role="tab"
-            type="button"
-          >
-            Files
-          </button>
-        </div>
-      </div>
-    );
-  }, [activeChannelType, activeTab]);
+  const showChannelTabs =
+    !!activeChannelType && activeChannelType !== "forum";
+  const channelTabs = React.useMemo(
+    () =>
+      showChannelTabs ? (
+        <ChannelTabStrip activeTab={activeTab} onSelect={setActiveTab} />
+      ) : null,
+    [activeTab, showChannelTabs],
+  );
+  // Only the selected panel is mounted, so the strip's `aria-controls`
+  // resolves for the active tab and this one container carries that panel's
+  // identity. Forum channels have no tab strip and so stay a plain div.
+  const channelTabPanelProps = showChannelTabs
+    ? {
+        "aria-labelledby": channelTabId(activeTab),
+        id: channelTabPanelId(activeTab),
+        role: "tabpanel",
+      }
+    : {};
   const channelHeader = React.useMemo(
     () => (
       <ChannelScreenHeader
@@ -944,7 +930,10 @@ export function ChannelScreen({
                 searchTarget,
               )
             ) : (
-              <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+              <div
+                className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
+                {...channelTabPanelProps}
+              >
                 {/* The channel header (tab strip included) stays threaded
                     into ChannelPane on Chat: it is the overlay whose measured
                     title-row height every pane-internal offset clears, so
@@ -1126,22 +1115,25 @@ export function ChannelScreen({
                       )}
                     >
                   <ChannelFilesTab
+                    canMutateFolders={fileFoldersHook.canMutate}
                     fileFolderMap={fileFoldersHook.fileFolderMap}
                     files={channelFiles.files}
-                    folders={fileFoldersHook.folders}
+                    foldersError={fileFoldersHook.isError}
+                    foldersInvalidReason={fileFoldersHook.invalidReason}
                     foldersLoading={fileFoldersHook.isLoading}
+                    isError={channelFiles.isError}
                     isLoading={channelFiles.isLoading}
-                    onAddFileToFolder={fileFoldersHook.addFileToFolder}
-                    onAddFilesToFolder={fileFoldersHook.addFilesToFolder}
+                    onAssignFiles={fileFoldersHook.assignFiles}
                     onCreateFolder={fileFoldersHook.createFolder}
                     onDeleteFolder={fileFoldersHook.deleteFolder}
                     onJumpToMessage={handleJumpToMessage}
-                    onRemoveFileFromFolder={fileFoldersHook.removeFileFromFolder}
-                    onRemoveFilesFromFolder={fileFoldersHook.removeFilesFromFolder}
-                    onRenameFolder={fileFoldersHook.renameFolder}
-                    onSetFolderParent={fileFoldersHook.setFolderParent}
+                    onMoveFolder={fileFoldersHook.moveFolder}
+                    onRetryFiles={channelFiles.refetch}
+                    onRetryFolders={() => void fileFoldersHook.refetch()}
                     senderAvatarUrls={fileSenderAvatarUrls}
                     senderNames={fileSenderNames}
+                    snapshot={fileFoldersHook.snapshot}
+                    truncated={channelFiles.truncated}
                   />
                     </div>
                   </>
