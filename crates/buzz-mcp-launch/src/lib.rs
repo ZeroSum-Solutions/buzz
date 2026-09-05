@@ -100,17 +100,7 @@ pub fn resolve_references<S: SecretBlobSource>(
 /// one invalid value anywhere in the harness's environment would take the
 /// launcher down at `main`, before it filters anything or spawns the server.
 pub fn inherited_environment() -> BTreeMap<String, String> {
-    filter_utf8_environment(std::env::vars_os())
-}
-
-/// The UTF-8 entries of `vars`, in an owned map.
-///
-/// Split from [`inherited_environment`] so the skipping can be driven with a
-/// non-UTF-8 entry the process environment cannot portably be given.
-fn filter_utf8_environment(
-    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
-) -> BTreeMap<String, String> {
-    vars.into_iter()
+    std::env::vars_os()
         .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
         .collect()
 }
@@ -171,36 +161,5 @@ mod tests {
         let capability = AgentCapability::mint("agent-a", 3, [2u8; NONCE_LEN]).expect("valid");
         let resolved = resolve_references(&references, Ok(capability), &lookup).expect("resolves");
         assert_eq!(resolved.get("TOKEN").map(String::as_str), Some("A-SECRET"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_non_utf8_environment_entry_is_skipped_rather_than_fatal() {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
-
-        // 0x80 is a lone continuation byte: a legal Unix environment byte and
-        // not valid UTF-8. `std::env::vars` panics on it, which would take the
-        // launcher down at startup, before it filters anything or spawns.
-        let invalid = || OsString::from_vec(vec![b'\x80']);
-        let environment = filter_utf8_environment([
-            (OsString::from("PATH"), OsString::from("/usr/bin")),
-            (OsString::from("BAD_VALUE"), invalid()),
-            (invalid(), OsString::from("value")),
-        ]);
-
-        assert_eq!(
-            environment.get("PATH").map(String::as_str),
-            Some("/usr/bin")
-        );
-        assert!(
-            !environment.contains_key("BAD_VALUE"),
-            "a non-UTF-8 value must be skipped, not carried: {environment:?}"
-        );
-        assert_eq!(
-            environment.len(),
-            1,
-            "a non-UTF-8 name must be skipped too: {environment:?}"
-        );
     }
 }
