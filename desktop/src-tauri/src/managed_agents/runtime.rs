@@ -490,6 +490,72 @@ pub(crate) fn spawn_with_effort_proof(
     cmd.spawn()
 }
 
+/// The registry roots for this app: the document and the staging tree under
+/// the app data directory, and each agent's own working directory under the
+/// nest.
+///
+/// `None` when the nest cannot be resolved, which is the same sandboxed case
+/// `default_agent_workdir` already returns `None` for; a spawn there gets no
+/// registry servers rather than a directory outside the nest.
+fn mcp_registry_paths<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+) -> Result<Option<super::mcp_registry::paths::RegistryPaths>, String> {
+    let Some(nest) = super::default_agent_workdir() else {
+        return Ok(None);
+    };
+    Ok(Some(super::mcp_registry::paths::RegistryPaths::new(
+        super::managed_agents_base_dir(app)?,
+        nest,
+    )))
+}
+
+/// Resolve this spawn's MCP registry plan.
+///
+/// Returns an empty plan when no generation has been adopted, when this agent
+/// has no generated configuration in it, or when the nest is unavailable. An
+/// error refuses the spawn, and is the message the operator sees.
+fn mcp_registry_spawn_plan<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    record: &ManagedAgentRecord,
+    runtime_meta: Option<&KnownAcpRuntime>,
+) -> Result<super::mcp_registry::spawn::McpSpawnPlan, String> {
+    // A runtime the registry may offer nothing to needs no plan at all, so an
+    // unknown or MCP-less harness never touches the staging tree.
+    let Some(meta) = runtime_meta.filter(|meta| !meta.mcp_transports.is_empty()) else {
+        return Ok(super::mcp_registry::spawn::McpSpawnPlan::default());
+    };
+    let Some(paths) = mcp_registry_paths(app)? else {
+        return Ok(super::mcp_registry::spawn::McpSpawnPlan::default());
+    };
+    super::mcp_registry::spawn::plan_for_spawn(
+        &paths,
+        &record.pubkey,
+        meta.mcp_config_placement,
+        read_mcp_binding_record,
+    )
+    .map_err(|error| {
+        format!(
+            "cannot spawn agent {}: mcp server configuration: {error}",
+            record.name
+        )
+    })
+}
+
+/// Read one record out of the durable store by blob key.
+///
+/// The registry only ever asks for a binding record, whose key it derives from
+/// the agent id and the generation; it has no by-name entry point here. An
+/// unavailable backend is an error, never `Ok(None)`: read as "no record" it
+/// would refuse the spawn with a message blaming missing configuration.
+fn read_mcp_binding_record(key: &str) -> Result<Option<String>, String> {
+    if !cfg!(feature = "system-keyring") {
+        return Ok(None);
+    }
+    crate::secret_store::SecretStore::shared(crate::app_state::keyring_service())
+        .load_all_readonly()
+        .map(|records| records.and_then(|records| records.get(key).cloned()))
+}
+
 /// Spawn an agent process without holding any locks on records or runtimes.
 /// Returns the child process and log path on success. The caller is responsible
 /// for updating `ManagedAgentRecord` fields and inserting into the runtimes map.
@@ -559,6 +625,16 @@ pub fn spawn_agent_child(
             })?;
     let effective_command = &descriptor.command;
     let agent_args = &descriptor.args;
+
+    // MCP registry (memo decisions 5, 9 and 11): read the adopted generation
+    // for this agent and turn it into the artefacts, the working directory and
+    // the capability this spawn has to carry. Resolved here, before the log
+    // marker and the log file, so a refusal -- a registry entry this agent has
+    // enabled that the loader rejected, or generated servers with nothing to
+    // authenticate them -- leaves no trace, exactly like the orphan and
+    // harness refusals above. A refusal is an error, never a quietly shorter
+    // server list.
+    let mcp_plan = mcp_registry_spawn_plan(app, record, known_acp_runtime(effective_command))?;
 
     let log_path = super::managed_agent_runtime_log_path(app, &runtime_key)?;
     append_log_marker(
@@ -774,6 +850,13 @@ pub fn spawn_agent_child(
     command.env_remove("BUZZ_ACP_PRIVATE_KEY");
     command.env_remove("BUZZ_ACP_API_TOKEN");
     command.env_remove("BUZZ_API_TOKEN");
+    // The registry variables are stripped here, before the user env layer, so
+    // an ambient value from the desktop's own environment cannot stand in for
+    // one this spawn's plan did not set. A stale capability is the case that
+    // matters: it names a generation that no longer exists.
+    for key in super::mcp_registry::spawn::MANAGED_ENV_VARS {
+        command.env_remove(key);
+    }
 
     if let Some(ref auth_tag) = record.auth_tag {
         command.env("BUZZ_AUTH_TAG", auth_tag);
@@ -836,6 +919,17 @@ pub fn spawn_agent_child(
     // BUZZ_ACP_REPLAY_FLOOR — the shadow `apply_replay_floor` strips from the
     // provider payload's `launch.env` tier for the same reason.
     apply_replay_floor_env(&mut command, replay_floor_unix);
+
+    // Written AFTER the `descriptor.env` loop for the same reason the replay
+    // floor is: the capability and the generated config path are this spawn's
+    // own authority and a saved user value must not shadow either. The working
+    // directory moves only for a placement that needs a cwd-relative file.
+    for (key, value) in &mcp_plan.set {
+        command.env(key, value);
+    }
+    if let Some(workdir) = &mcp_plan.workdir {
+        command.current_dir(workdir);
+    }
 
     // A1: for local claude agents, ANTHROPIC_MODEL is the single startup model authority.
     // BUZZ_ACP_MODEL is removed (live ACP switches only; two authorities in the same env

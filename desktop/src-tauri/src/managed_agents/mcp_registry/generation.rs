@@ -158,6 +158,11 @@ pub enum GenerationError {
     /// The journal on disk could not be read.
     #[error("configuration journal is unreadable: {0}")]
     Journal(String),
+    /// Building the plan failed before anything was staged — a secret store
+    /// that could not be read or written, or an artefact that would not
+    /// render. Nothing is adopted: the pointer has not moved.
+    #[error("could not build the configuration change: {0}")]
+    Plan(String),
     /// The `current` pointer exists but does not name a generation.
     #[error("configuration pointer is unreadable: {0}")]
     Pointer(String),
