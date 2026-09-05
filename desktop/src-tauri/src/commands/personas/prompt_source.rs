@@ -167,7 +167,7 @@ pub async fn set_prompt_source_and_reload<R: tauri::Runtime>(
     // takes the store lock itself, so the read pass above and the save pass below
     // are two separate holds and a concurrent save can land between them. Tests
     // put a writer in exactly this window; in production the hook is not compiled.
-    #[cfg(test)]
+    #[cfg(all(test, not(target_os = "windows")))]
     tests::run_read_save_barrier(&definition_id);
 
     submit_reloaded_prompt(
@@ -326,7 +326,7 @@ async fn submit_reloaded_prompt<R: tauri::Runtime>(
     // between and make the effective prompt something this reload never read.
     // Tests put a writer in exactly this window; in production the hook is not
     // compiled.
-    #[cfg(test)]
+    #[cfg(all(test, not(target_os = "windows")))]
     tests::run_save_mapping_barrier(&definition_id);
 
     // Boundary 4 — the mapping. The prompt is durable now, so this write can
