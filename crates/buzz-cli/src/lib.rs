@@ -1,4 +1,5 @@
 pub mod agent_management;
+mod attachment;
 mod client;
 mod commands;
 mod error;
