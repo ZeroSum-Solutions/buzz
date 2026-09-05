@@ -15,15 +15,18 @@ use buzz_sdk::mentions::{
 /// Append each attachment's preview line to the message content.
 ///
 /// Images and video get an inline `![image]`/`![video]` link so every client
-/// renders them in place. A document gets nothing: it is not renderable inline,
-/// and its `imeta` tag already carries the URL, MIME type and file name the
-/// desktop needs to offer it as a viewer panel or a Files-tab entry.
+/// renders them in place. A document gets a plain `[name](url)` link, the same
+/// line the desktop composer emits for a generic file: the renderer mounts an
+/// attachment card only for a URL literally present in the body, so an `imeta`
+/// tag on its own would show the reader nothing.
 fn content_with_attachments(content: &str, uploads: &[UploadedAttachment]) -> String {
     let mut media_content = String::new();
     for uploaded in uploads {
-        if let Some(line) = uploaded.kind.content_line(&uploaded.descriptor.url) {
-            media_content.push_str(&line);
-        }
+        media_content.push_str(
+            &uploaded
+                .kind
+                .content_line(&uploaded.descriptor.url, &uploaded.filename),
+        );
     }
     if media_content.is_empty() {
         content.to_string()
@@ -678,6 +681,7 @@ pub async fn cmd_send_message(
         media_tags.push(crate::client::build_imeta_tag(
             &uploaded.descriptor,
             Some(&uploaded.filename),
+            Some(&uploaded.content_type),
         )?);
         uploads.push(uploaded);
     }
@@ -1916,15 +1920,17 @@ mod tests {
                 duration: None,
             },
             kind,
+            content_type: "text/markdown".to_string(),
             filename: "plan.md".to_string(),
         }
     }
 
-    /// A document attachment adds nothing to the message content — the `imeta`
-    /// tag carries it, and an `![image]` line would render a broken image in
-    /// every client.
+    /// A document attachment adds a plain, escaped link to the message content.
+    /// An `![image]` line would render a broken image in every client, but no
+    /// line at all renders nothing: the desktop mounts an attachment card only
+    /// from a URL that is literally in the body.
     #[test]
-    fn a_document_attachment_adds_no_line_to_the_content() {
+    fn a_document_attachment_adds_an_escaped_link_to_the_content() {
         use crate::attachment::AttachmentKind;
 
         let content = content_with_attachments(
@@ -1934,7 +1940,10 @@ mod tests {
                 "https://relay.test/media/deadbeef.bin",
             )],
         );
-        assert_eq!(content, "T15 check");
+        assert_eq!(
+            content, "T15 check\n[plan.md](https://relay.test/media/deadbeef.bin)",
+            "a document whose URL is absent from the body renders as nothing"
+        );
         assert!(!content.contains("!["), "no inline media line: {content}");
     }
 
@@ -1953,7 +1962,7 @@ mod tests {
         );
         assert_eq!(
             content,
-            "look\n![image](https://relay.test/a.jpg)\n![video](https://relay.test/b.mp4)"
+            "look\n![image](https://relay.test/a.jpg)\n![video](https://relay.test/b.mp4)\n[plan.md](https://relay.test/c.bin)"
         );
     }
 }

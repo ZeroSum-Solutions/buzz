@@ -123,14 +123,42 @@ impl AttachmentKind {
     }
 
     /// The markdown line `messages send` appends to the message content for an
-    /// attachment of this kind, or `None` when the `imeta` tag alone carries it.
-    pub(crate) fn content_line(self, url: &str) -> Option<String> {
+    /// attachment of this kind.
+    ///
+    /// Every attachment needs one. The desktop renderer mounts an attachment
+    /// card only from the anchor or image renderer, and both key on a URL
+    /// literally present in the body
+    /// (`desktop/src/features/messages/lib/imetaMediaMarkdown.ts`); an `imeta`
+    /// tag whose URL appears nowhere in the content renders as nothing at all.
+    /// Images and video get the inline `![image]`/`![video]` line they always
+    /// had; a document gets the same plain link the desktop's own composer
+    /// emits for a generic file, so it renders as a download card and, for a
+    /// `.md`, opens in the document viewer.
+    pub(crate) fn content_line(self, url: &str, filename: &str) -> String {
         match self {
-            Self::Image => Some(format!("\n![image]({url})")),
-            Self::Video => Some(format!("\n![video]({url})")),
-            Self::Document => None,
+            Self::Image => format!("\n![image]({url})"),
+            Self::Video => format!("\n![video]({url})"),
+            Self::Document => format!("\n[{}]({url})", escape_markdown_label(filename)),
         }
     }
+}
+
+/// Escape the markdown link-label metacharacters `\`, `[` and `]`.
+///
+/// Mirrors the desktop composer's own generic-file line, which applies
+/// `label.replace(/[\\[\]]/g, "\\$&")`
+/// (`desktop/src/features/messages/lib/imetaMediaMarkdown.ts`), so a file named
+/// `a].pdf` still renders as a download card with the right label instead of a
+/// broken link.
+fn escape_markdown_label(label: &str) -> String {
+    let mut escaped = String::with_capacity(label.len());
+    for ch in label.chars() {
+        if matches!(ch, '\\' | '[' | ']') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 /// A local file accepted for upload.
@@ -391,19 +419,28 @@ mod tests {
     }
 
     #[test]
-    fn a_document_adds_no_line_to_the_message_content() {
+    fn a_document_adds_a_plain_link_line_to_the_message_content() {
         assert_eq!(
-            AttachmentKind::Image.content_line("https://relay.test/a.jpg"),
-            Some("\n![image](https://relay.test/a.jpg)".to_string())
+            AttachmentKind::Image.content_line("https://relay.test/a.jpg", "shot.jpg"),
+            "\n![image](https://relay.test/a.jpg)"
         );
         assert_eq!(
-            AttachmentKind::Video.content_line("https://relay.test/a.mp4"),
-            Some("\n![video](https://relay.test/a.mp4)".to_string())
+            AttachmentKind::Video.content_line("https://relay.test/a.mp4", "clip.mp4"),
+            "\n![video](https://relay.test/a.mp4)"
         );
         assert_eq!(
-            AttachmentKind::Document.content_line("https://relay.test/a.bin"),
-            None,
-            "the imeta tag carries a document, the content must not"
+            AttachmentKind::Document.content_line("https://relay.test/a.bin", "plan.md"),
+            "\n[plan.md](https://relay.test/a.bin)",
+            "a document with no line in the body renders as nothing at all"
+        );
+    }
+
+    #[test]
+    fn a_document_label_escapes_markdown_metacharacters() {
+        assert_eq!(
+            AttachmentKind::Document.content_line("https://relay.test/a.bin", "a]b[c\\d.md"),
+            "\n[a\\]b\\[c\\\\d.md](https://relay.test/a.bin)",
+            "an unescaped bracket breaks the link the renderer keys on"
         );
     }
 

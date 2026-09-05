@@ -51,6 +51,13 @@ pub struct UploadedAttachment {
     pub descriptor: BlobDescriptor,
     /// Which relay pipeline the file took.
     pub kind: AttachmentKind,
+    /// `Content-Type` the upload declared for this file.
+    ///
+    /// The relay re-sniffs every body and discards the declared header
+    /// (`crates/buzz-media/src/validation.rs`), so a report with no magic bytes
+    /// comes back typed `application/octet-stream`. This is the only place the
+    /// real type survives.
+    pub content_type: String,
     /// Bounded base name of the local file, for the `imeta` `filename` field.
     pub filename: String,
 }
@@ -61,6 +68,7 @@ impl UploadedAttachment {
         Self {
             descriptor,
             kind: classified.kind,
+            content_type: classified.content_type,
             filename: classified.filename,
         }
     }
@@ -91,6 +99,25 @@ fn imeta_field(key: &str, value: &str) -> Result<String, CliError> {
     Ok(format!("{key} {value}"))
 }
 
+/// MIME type the relay reports for any body it could not sniff.
+const GENERIC_MIME: &str = "application/octet-stream";
+
+/// Which MIME type the `imeta` `m` field should carry.
+///
+/// The relay's descriptor is authoritative whenever it says anything specific:
+/// it is what the blob is actually stored and served as. It is not
+/// authoritative for a body with no magic bytes, because
+/// `crates/buzz-media/src/validation.rs` discards the declared `Content-Type`
+/// and answers `application/octet-stream` for every one of them — markdown,
+/// HTML, CSV, JSON and plain text alike. In that one case the type the upload
+/// declared is the only description of the file that exists, so it wins.
+fn imeta_mime<'a>(descriptor_mime: &'a str, declared: Option<&'a str>) -> &'a str {
+    match declared {
+        Some(declared) if descriptor_mime == GENERIC_MIME && declared != GENERIC_MIME => declared,
+        _ => descriptor_mime,
+    }
+}
+
 /// Build an `imeta` tag array from a BlobDescriptor (NIP-92 media metadata).
 ///
 /// `filename` is the attachment's local base name. The desktop keys its
@@ -98,17 +125,23 @@ fn imeta_field(key: &str, value: &str) -> Result<String, CliError> {
 /// MIME type, because a file with no magic bytes is stored under a `.bin` blob
 /// key as `application/octet-stream`.
 ///
+/// `declared_content_type` is the `Content-Type` the upload sent, used for the
+/// `m` field only when the relay's own answer is the generic
+/// `application/octet-stream` (see [`imeta_mime`]). Pass `None` when there is
+/// no declared type to fall back to.
+///
 /// The tag carries at most ten fields, each bounded by
 /// [`MAX_IMETA_FIELD_BYTES`]; an oversized or control-character value is an
 /// error rather than a silently truncated field.
 pub fn build_imeta_tag(
     d: &BlobDescriptor,
     filename: Option<&str>,
+    declared_content_type: Option<&str>,
 ) -> Result<Vec<String>, CliError> {
     let mut tag = vec![
         "imeta".to_string(),
         imeta_field("url", &d.url)?,
-        imeta_field("m", &d.mime_type)?,
+        imeta_field("m", imeta_mime(&d.mime_type, declared_content_type))?,
         imeta_field("x", &d.sha256)?,
         format!("size {}", d.size),
     ];
@@ -2710,10 +2743,25 @@ mod attachment_upload_tests {
 
     /// A minimal `BlobDescriptor` JSON body, as the relay's generic file path
     /// returns it: no `dim`, no `blurhash`, no `thumb`.
-    fn descriptor_json(mime: &str, size: usize) -> String {
+    fn descriptor_json(mime: &str, ext: &str, size: usize) -> String {
         format!(
-            r#"{{"url":"https://relay.test/media/deadbeef.bin","sha256":"deadbeef","size":{size},"type":"{mime}","uploaded":0}}"#
+            r#"{{"url":"https://relay.test/media/deadbeef.{ext}","sha256":"deadbeef","size":{size},"type":"{mime}","uploaded":0}}"#
         )
+    }
+
+    /// How the relay types and names a stored blob.
+    ///
+    /// Mirrors `crates/buzz-media/src/validation.rs`: the body is re-sniffed and
+    /// the request's declared `Content-Type` is discarded, so a body with no
+    /// magic bytes — every markdown, HTML, CSV, JSON or text report — is stored
+    /// as `application/octet-stream` under a `.bin` blob key. A fake relay that
+    /// echoed the declared header back would let a wrong `imeta` `m` field pass
+    /// its own test.
+    fn relay_storage(body: &[u8]) -> (String, String) {
+        match infer::get(body) {
+            Some(kind) => (kind.mime_type().to_string(), kind.extension().to_string()),
+            None => ("application/octet-stream".to_string(), "bin".to_string()),
+        }
     }
 
     /// Spawn a fake relay that records every upload request and answers
@@ -2733,12 +2781,16 @@ mod attachment_upload_tests {
                 .unwrap_or_default()
                 .to_string();
             let size = body.len();
+            let (stored_mime, stored_ext) = relay_storage(&body);
             log.lock().unwrap().push(Recorded {
                 path: path.to_string(),
-                content_type: content_type.clone(),
+                content_type,
                 body: body.to_vec(),
             });
-            (StatusCode::OK, descriptor_json(&content_type, size))
+            (
+                StatusCode::OK,
+                descriptor_json(&stored_mime, &stored_ext, size),
+            )
         }
 
         type S = (Log, StatusCode);
@@ -2964,12 +3016,17 @@ mod attachment_upload_tests {
         );
     }
 
+    /// The descriptor the real relay returns for a markdown report: it re-sniffs
+    /// the body, finds no magic bytes, and stores it as
+    /// `application/octet-stream` under a `.bin` blob key
+    /// (`crates/buzz-media/src/validation.rs`). The declared `Content-Type`
+    /// never appears here.
     fn document_descriptor() -> BlobDescriptor {
         BlobDescriptor {
             url: "https://relay.test/media/deadbeef.bin".to_string(),
             sha256: "deadbeef".to_string(),
             size: 42,
-            mime_type: "text/markdown".to_string(),
+            mime_type: "application/octet-stream".to_string(),
             uploaded: 0,
             dim: None,
             blurhash: None,
@@ -2981,9 +3038,19 @@ mod attachment_upload_tests {
     /// The desktop keys its markdown viewer off the imeta `filename` field, so
     /// a document's tag must carry it alongside `m`, `x` and `size` — and
     /// nothing that only an image has.
+    ///
+    /// `m` is the type the upload declared, not the relay's `application/octet-
+    /// stream`: the relay re-sniffs and cannot tell a report from a blob, and
+    /// the Files tab classifies on this field
+    /// (`desktop/src/features/channel-files/useChannelFiles.ts`).
     #[test]
     fn a_document_tag_carries_the_filename_and_no_image_fields() {
-        let tag = build_imeta_tag(&document_descriptor(), Some("plan.md")).unwrap();
+        let tag = build_imeta_tag(
+            &document_descriptor(),
+            Some("plan.md"),
+            Some("text/markdown"),
+        )
+        .unwrap();
 
         assert_eq!(tag[0], "imeta");
         assert!(tag.contains(&"filename plan.md".to_string()), "{tag:?}");
@@ -3008,7 +3075,7 @@ mod attachment_upload_tests {
         descriptor.dim = Some("800x600".to_string());
         descriptor.blurhash = Some("LEHV6nWB".to_string());
 
-        let tag = build_imeta_tag(&descriptor, Some("shot.png")).unwrap();
+        let tag = build_imeta_tag(&descriptor, Some("shot.png"), Some("image/png")).unwrap();
         assert!(tag.contains(&"filename shot.png".to_string()), "{tag:?}");
         assert!(tag.contains(&"dim 800x600".to_string()), "{tag:?}");
         assert!(tag.contains(&"blurhash LEHV6nWB".to_string()), "{tag:?}");
@@ -3024,7 +3091,7 @@ mod attachment_upload_tests {
             "a".repeat(super::MAX_IMETA_FIELD_BYTES)
         );
 
-        let error = build_imeta_tag(&descriptor, Some("plan.md")).unwrap_err();
+        let error = build_imeta_tag(&descriptor, Some("plan.md"), None).unwrap_err();
         assert!(
             error.to_string().starts_with("oversized imeta url field:"),
             "got {error}"
@@ -3032,7 +3099,7 @@ mod attachment_upload_tests {
 
         let mut descriptor = document_descriptor();
         descriptor.blurhash = Some("b".repeat(super::MAX_IMETA_FIELD_BYTES + 1));
-        let error = build_imeta_tag(&descriptor, Some("plan.md")).unwrap_err();
+        let error = build_imeta_tag(&descriptor, Some("plan.md"), None).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -3048,10 +3115,78 @@ mod attachment_upload_tests {
         let mut descriptor = document_descriptor();
         descriptor.mime_type = "text/markdown\nx evil".to_string();
 
-        let error = build_imeta_tag(&descriptor, Some("plan.md")).unwrap_err();
+        let error = build_imeta_tag(&descriptor, Some("plan.md"), None).unwrap_err();
         assert_eq!(
             error.to_string(),
             "imeta m field contains a control character"
+        );
+    }
+
+    /// End to end against a relay that behaves like the real one: it re-sniffs
+    /// the body, so the descriptor it returns types a markdown report as
+    /// `application/octet-stream` under a `.bin` key. The `imeta` `m` field
+    /// must still say `text/markdown` — that is the only place the file's real
+    /// type survives, and the Files tab and the document viewer read it.
+    #[tokio::test]
+    async fn a_document_tag_carries_the_declared_type_not_the_relays_generic_one() {
+        let file = temp_file(".md", b"# Report\n\nbody\n");
+        let (base, _log) = fake_relay(StatusCode::OK).await;
+
+        let uploaded = test_client(&base)
+            .upload_attachment(file.path().to_str().unwrap())
+            .await
+            .expect("a markdown document must be accepted");
+
+        assert_eq!(
+            uploaded.descriptor.mime_type, "application/octet-stream",
+            "the relay discards the declared Content-Type and re-sniffs"
+        );
+        assert!(
+            uploaded.descriptor.url.ends_with(".bin"),
+            "the blob key is named for the sniffed type: {}",
+            uploaded.descriptor.url
+        );
+
+        let tag = build_imeta_tag(
+            &uploaded.descriptor,
+            Some(&uploaded.filename),
+            Some(&uploaded.content_type),
+        )
+        .unwrap();
+        assert!(
+            tag.contains(&"m text/markdown".to_string()),
+            "the tag must describe the file, not the blob: {tag:?}"
+        );
+        assert!(
+            tag.contains(&format!("url {}", uploaded.descriptor.url)),
+            "url, x and size stay the relay's: {tag:?}"
+        );
+        assert!(tag.contains(&"x deadbeef".to_string()), "{tag:?}");
+    }
+
+    /// The relay stays authoritative whenever it types the blob at all: only
+    /// its generic `application/octet-stream` answer defers to the declaration.
+    #[test]
+    fn a_specific_relay_type_wins_over_the_declared_one() {
+        let mut descriptor = document_descriptor();
+        descriptor.mime_type = "application/zip".to_string();
+
+        let tag = build_imeta_tag(&descriptor, Some("bundle.md"), Some("text/markdown")).unwrap();
+        assert!(
+            tag.contains(&"m application/zip".to_string()),
+            "the relay knows what it stored: {tag:?}"
+        );
+    }
+
+    /// The declared type reaches the same DTO cap as every relay-sourced value.
+    #[test]
+    fn an_oversized_declared_type_is_refused_rather_than_truncated() {
+        let declared = "text/".to_string() + &"m".repeat(super::MAX_IMETA_FIELD_BYTES);
+        let error =
+            build_imeta_tag(&document_descriptor(), Some("plan.md"), Some(&declared)).unwrap_err();
+        assert!(
+            error.to_string().starts_with("oversized imeta m field:"),
+            "got {error}"
         );
     }
 
@@ -3064,7 +3199,7 @@ mod attachment_upload_tests {
         descriptor.thumb = Some("https://relay.test/t.jpg".to_string());
         descriptor.duration = Some(1.5);
 
-        let tag = build_imeta_tag(&descriptor, Some("clip.mp4")).unwrap();
+        let tag = build_imeta_tag(&descriptor, Some("clip.mp4"), Some("video/mp4")).unwrap();
         assert_eq!(tag.len(), 10, "every field present is ten entries: {tag:?}");
     }
 }
