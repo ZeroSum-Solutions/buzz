@@ -762,11 +762,18 @@ export function ChannelScreen({
     hasAuxiliaryPanel &&
     channelContentWidthPx > 0 &&
     channelContentWidthPx < 760;
+  // The single-panel view replaces the chat column with a full-width
+  // auxiliary panel, so the channel header is dropped there. The Files tab
+  // renders no auxiliary panel, so it keeps its header (and with it the tab
+  // strip, the only way back to Chat).
+  const hideChannelHeader =
+    isSinglePanelView && activeTab === CHANNEL_TAB_CHAT;
+  const activeChannelType = activeChannel?.channelType;
   const channelHeaderChromeRef = useMeasuredCssVariable({
     targetRef: mainInsetRef,
     ...channelContentTopPaddingMeasurement,
     resetKey: activeChannelId,
-    enabled: !isSinglePanelView,
+    enabled: !hideChannelHeader,
   });
   const { handleManageChannel, handleOpenMarkdownDoc } = useChannelPaneOpeners({
     channelType: activeChannel?.channelType,
@@ -786,6 +793,52 @@ export function ChannelScreen({
     () => setIsMembersSidebarOpen((prev) => !prev),
     [],
   );
+  // The tab strip rides *inside* the channel header rather than sitting
+  // between the header and the tab content. The header is an overlay whose
+  // measured title-row height drives every downstream offset (timeline
+  // padding, sticky day divider, shared blur band); a sibling strip would add
+  // a second, unmeasured offset those all miss — the bug this replaces.
+  const channelTabs = React.useMemo(() => {
+    if (!activeChannelType || activeChannelType === "forum") {
+      return null;
+    }
+    const tabClass = (isActive: boolean) =>
+      cn(
+        "-mb-px border-b-2 px-4 py-2.5 text-sm font-medium transition-colors",
+        isActive
+          ? "border-foreground text-foreground"
+          : "border-transparent text-muted-foreground hover:text-foreground",
+      );
+    return (
+      // `-mx-5` bleeds the bottom rule past the header's inline padding;
+      // `px-1` then re-aligns the first tab label with the channel title.
+      <div
+        className="-mx-5 border-b border-border bg-background px-1"
+        role="tablist"
+      >
+        <div className="flex gap-0">
+          <button
+            aria-selected={activeTab === CHANNEL_TAB_CHAT}
+            className={tabClass(activeTab === CHANNEL_TAB_CHAT)}
+            onClick={() => setActiveTab(CHANNEL_TAB_CHAT)}
+            role="tab"
+            type="button"
+          >
+            Chat
+          </button>
+          <button
+            aria-selected={activeTab === CHANNEL_TAB_FILES}
+            className={tabClass(activeTab === CHANNEL_TAB_FILES)}
+            onClick={() => setActiveTab(CHANNEL_TAB_FILES)}
+            role="tab"
+            type="button"
+          >
+            Files
+          </button>
+        </div>
+      </div>
+    );
+  }, [activeChannelType, activeTab]);
   const channelHeader = React.useMemo(
     () => (
       <ChannelScreenHeader
@@ -804,14 +857,23 @@ export function ChannelScreen({
         onJoinChannel={joinChannelMutation.mutateAsync}
         onManageChannel={handleManageChannel}
         onToggleMembers={handleToggleMembers}
-        showHeaderContent={!isSinglePanelView && !isHuddleTranscript}
-        transparentChrome={activeChannel?.channelType !== "forum"}
+        showHeaderContent={!hideChannelHeader && !isHuddleTranscript}
+        tabs={channelTabs}
+        // On Chat the shared blur band inside ChannelPane backs this header;
+        // the Files tab has no such band, so the header carries its own.
+        transparentChrome={
+          activeChannelType !== "forum" && activeTab === CHANNEL_TAB_CHAT
+        }
       />
     ),
     [
       activeChannel,
       activeChannelEphemeralDisplay,
       activeChannelTitle,
+      activeChannelType,
+      activeTab,
+      channelTabs,
+      hideChannelHeader,
       shouldCompactHeaderActions,
       activeDmAvatarUrl,
       activeDmHeaderParticipants,
@@ -824,7 +886,6 @@ export function ChannelScreen({
       joinChannelMutation.mutateAsync,
       handleManageChannel,
       handleToggleMembers,
-      isSinglePanelView,
       isHuddleTranscript,
     ],
   );
@@ -884,59 +945,12 @@ export function ChannelScreen({
               )
             ) : (
               <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-                {/* One shared header above the tab strip, not threaded into
-                    ChannelPane, so Chat and Files get identical channel
-                    title/actions instead of the Chat tab's own internal,
-                    sticky-backdropped copy. Hidden during a huddle
-                    transcript and in the narrow single-panel view (an
-                    auxiliary panel — thread, management — taking the full
-                    width), matching ChannelPane's own former
-                    `!isSinglePanelView && !isHuddleTranscript` gate for
-                    this same header. */}
-                {isHuddleTranscript || isSinglePanelView ? null : channelHeader}
-                {isHuddleTranscript ? null : (
-                  <div
-                    className={cn(
-                      // The header above renders with zero net flow height
-                      // (its own overlay negative-margin cancels it), so
-                      // without this the tab strip's real content sits at
-                      // the header's own start position and gets visually
-                      // covered by it — see channelChrome.clearHeaderMargin.
-                      channelChrome.clearHeaderMargin,
-                      "shrink-0 border-b border-border bg-background px-4",
-                    )}
-                    role="tablist"
-                  >
-                    <div className="flex gap-0">
-                      <button
-                        aria-selected={activeTab === CHANNEL_TAB_CHAT}
-                        className={`px-4 py-2.5 text-sm font-medium transition-colors border-b-2 -mb-px ${
-                          activeTab === CHANNEL_TAB_CHAT
-                            ? "border-foreground text-foreground"
-                            : "border-transparent text-muted-foreground hover:text-foreground"
-                        }`}
-                        onClick={() => setActiveTab(CHANNEL_TAB_CHAT)}
-                        role="tab"
-                        type="button"
-                      >
-                        Chat
-                      </button>
-                      <button
-                        aria-selected={activeTab === CHANNEL_TAB_FILES}
-                        className={`px-4 py-2.5 text-sm font-medium transition-colors border-b-2 -mb-px ${
-                          activeTab === CHANNEL_TAB_FILES
-                            ? "border-foreground text-foreground"
-                            : "border-transparent text-muted-foreground hover:text-foreground"
-                        }`}
-                        onClick={() => setActiveTab(CHANNEL_TAB_FILES)}
-                        role="tab"
-                        type="button"
-                      >
-                        Files
-                      </button>
-                    </div>
-                  </div>
-                )}
+                {/* The channel header (tab strip included) stays threaded
+                    into ChannelPane on Chat: it is the overlay whose measured
+                    title-row height every pane-internal offset clears, so
+                    hoisting it out of the pane left those offsets stacking
+                    below a header that was no longer there. The Files tab
+                    renders the same header element itself. */}
                 {isHuddleTranscript || activeTab === CHANNEL_TAB_CHAT ? (
               <React.Suspense
                 fallback={
@@ -960,6 +974,7 @@ export function ChannelScreen({
                     currentPubkey={currentPubkey}
                     canResetThreadPanelWidth={canResetThreadPanelWidth}
                     fetchOlder={fetchOlder}
+                    header={channelHeader}
                     {...{
                       idleAuxiliaryHeaderActions,
                       idleAuxiliaryOverridesThread,
@@ -1098,6 +1113,18 @@ export function ChannelScreen({
                 )}
               </React.Suspense>
                 ) : (
+                  <>
+                    {channelHeader}
+                    {/* The header overlays the top of this column (its own
+                        negative margin cancels its measured title row), so the
+                        Files content clears exactly that one measured offset —
+                        the same offset MessageTimeline applies on Chat. */}
+                    <div
+                      className={cn(
+                        "flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden",
+                        channelChrome.contentPadding,
+                      )}
+                    >
                   <ChannelFilesTab
                     fileFolderMap={fileFoldersHook.fileFolderMap}
                     files={channelFiles.files}
@@ -1116,6 +1143,8 @@ export function ChannelScreen({
                     senderAvatarUrls={fileSenderAvatarUrls}
                     senderNames={fileSenderNames}
                   />
+                    </div>
+                  </>
                 )}
               </div>
             )

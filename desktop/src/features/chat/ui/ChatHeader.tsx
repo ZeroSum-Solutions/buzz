@@ -23,7 +23,11 @@ import { writeTextToClipboard } from "@/shared/lib/clipboard";
 type ChatHeaderProps = {
   actions?: React.ReactNode;
   belowSystemChrome?: boolean;
-  /** Ref to the outer chrome wrapper when `belowSystemChrome` is true. */
+  /**
+   * Ref to the measured title row. Its height becomes
+   * `--buzz-channel-content-top-padding`, so it deliberately excludes `tabs`
+   * — every header-relative offset downstream clears the title row only.
+   */
   chromeWrapperRef?: React.Ref<HTMLDivElement>;
   title: string;
   description?: string;
@@ -33,6 +37,12 @@ type ChatHeaderProps = {
   mode?: "home" | "channel" | "agents" | "workflows" | "pulse" | "projects";
   overlaysContent?: boolean;
   statusBadge?: React.ReactNode;
+  /**
+   * Row rendered inside the header, directly below the title row (e.g. a
+   * channel tab strip). It grows the header box instead of becoming a
+   * separate sibling, so header-relative geometry stays a single offset.
+   */
+  tabs?: React.ReactNode;
   /** Identity adornment rendered exactly 4px after a DM title. */
   titleAdornment?: React.ReactNode;
   /** Render the chrome wrapper without an individual backdrop when a parent supplies shared blur. */
@@ -98,6 +108,7 @@ export function ChatHeader({
   mode = "channel",
   overlaysContent = false,
   statusBadge,
+  tabs,
   titleAdornment,
   transparentChrome = false,
 }: ChatHeaderProps) {
@@ -118,59 +129,66 @@ export function ChatHeader({
   const header = (
     <header
       className={cn(
-        "pointer-events-auto relative z-30 min-w-0 shrink-0 cursor-default select-none bg-transparent px-5 py-2 transition-[margin,padding] duration-200 ease-linear",
+        "pointer-events-auto relative z-30 min-w-0 shrink-0 cursor-default select-none bg-transparent px-5 transition-[margin,padding] duration-200 ease-linear",
         overlaysContent && !belowSystemChrome && "-mb-14",
       )}
       data-testid="chat-header"
       data-tauri-drag-region
     >
-      <div className="flex h-9 min-w-0 items-center gap-2.5">
-        <div className="min-w-0 flex-1">
-          <div className="group/title flex min-w-0 items-center gap-[4px] overflow-hidden">
-            <div className="flex shrink-0 items-center">
-              {leadingContent ?? (
-                <ChannelIcon
-                  channelType={channelType}
-                  mode={mode}
-                  visibility={visibility}
-                />
-              )}
-            </div>
-            <h1
-              className={cn(
-                "min-w-0 truncate text-base font-semibold leading-6 tracking-tight",
-                channelType !== "dm" && "translate-y-px",
-              )}
-              data-testid="chat-title"
-              title={trimmedDescription || undefined}
-            >
-              {title}
-            </h1>
-            {titleAdornment}
-            <Button
-              aria-label={`Copy channel name: ${title}`}
-              className="h-6 w-6 shrink-0 opacity-0 text-muted-foreground transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover/title:opacity-100"
-              onClick={() => void handleCopyTitle()}
-              size="icon-xs"
-              title="Copy channel name"
-              type="button"
-              variant="ghost"
-            >
-              <Copy className="h-3.5 w-3.5" />
-            </Button>
-            {statusBadge ? (
-              <div className="flex shrink-0 flex-wrap items-center gap-1">
-                {statusBadge}
+      {/* The measured row. `py-2` lives here rather than on <header> so the
+          measured chrome height stays the title row alone even when `tabs`
+          grows the header box, and so <header>'s own inline padding (read by
+          the header-action gap assertions) is unchanged. */}
+      <div className="py-2" ref={chromeWrapperRef}>
+        <div className="flex h-9 min-w-0 items-center gap-2.5">
+          <div className="min-w-0 flex-1">
+            <div className="group/title flex min-w-0 items-center gap-[4px] overflow-hidden">
+              <div className="flex shrink-0 items-center">
+                {leadingContent ?? (
+                  <ChannelIcon
+                    channelType={channelType}
+                    mode={mode}
+                    visibility={visibility}
+                  />
+                )}
               </div>
-            ) : null}
+              <h1
+                className={cn(
+                  "min-w-0 truncate text-base font-semibold leading-6 tracking-tight",
+                  channelType !== "dm" && "translate-y-px",
+                )}
+                data-testid="chat-title"
+                title={trimmedDescription || undefined}
+              >
+                {title}
+              </h1>
+              {titleAdornment}
+              <Button
+                aria-label={`Copy channel name: ${title}`}
+                className="h-6 w-6 shrink-0 opacity-0 text-muted-foreground transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover/title:opacity-100"
+                onClick={() => void handleCopyTitle()}
+                size="icon-xs"
+                title="Copy channel name"
+                type="button"
+                variant="ghost"
+              >
+                <Copy className="h-3.5 w-3.5" />
+              </Button>
+              {statusBadge ? (
+                <div className="flex shrink-0 flex-wrap items-center gap-1">
+                  {statusBadge}
+                </div>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="flex shrink-0 items-center gap-1">
+            <UpdateIndicator />
+            {actions ? <div className="shrink-0">{actions}</div> : null}
           </div>
         </div>
-
-        <div className="flex shrink-0 items-center gap-1">
-          <UpdateIndicator />
-          {actions ? <div className="shrink-0">{actions}</div> : null}
-        </div>
       </div>
+      {tabs}
     </header>
   );
 
@@ -180,7 +198,6 @@ export function ChatHeader({
 
   return (
     <div
-      ref={chromeWrapperRef}
       className={cn(
         "pointer-events-none relative z-40 overflow-visible rounded-tl-xl",
         transparentChrome
