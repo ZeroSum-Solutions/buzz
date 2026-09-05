@@ -45,6 +45,8 @@ type ChannelScreenHeaderProps = {
   isAddBotOpen?: boolean;
   isJoining?: boolean;
   showHeaderContent?: boolean;
+  /** Row rendered inside the header, directly below the title row. */
+  tabs?: React.ReactNode;
   transparentChrome?: boolean;
   onAddBotOpenChange?: (open: boolean) => void;
   onJoinChannel?: () => Promise<void>;
@@ -67,6 +69,7 @@ export function ChannelScreenHeader({
   isJoining = false,
   onAddBotOpenChange,
   showHeaderContent = true,
+  tabs,
   transparentChrome = false,
   onJoinChannel,
   onManageChannel,
@@ -208,6 +211,7 @@ export function ChannelScreenHeader({
           ) : null}
         </>
       }
+      tabs={tabs}
       title={activeChannelTitle}
       titleAdornment={
         activeChannel?.channelType === "dm" && !isGroupDm ? (

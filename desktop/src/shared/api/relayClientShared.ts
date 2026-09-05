@@ -103,6 +103,13 @@ export type PendingEvent = {
   resolve: (event: RelayEvent) => void;
   reject: (error: Error) => void;
   timeout: number;
+  /**
+   * Receives the relay's OK message on a successful publish. A replaceable
+   * aggregate needs it: this relay answers a superseded write with a
+   * *successful* OK whose message reads `duplicate:`, so a caller that treats
+   * every OK as an applied write silently loses the update.
+   */
+  onOk?: (message: string) => void;
 };
 
 export type RelaySubscription =

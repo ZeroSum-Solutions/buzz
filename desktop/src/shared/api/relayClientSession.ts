@@ -721,6 +721,7 @@ export class RelayClient {
     event: RelayEvent,
     timeoutMessage: string,
     sendErrorMessage: string,
+    onOk?: (message: string) => void,
   ) {
     return publishSessionEvent(
       {
@@ -738,6 +739,7 @@ export class RelayClient {
       event,
       timeoutMessage,
       sendErrorMessage,
+      onOk,
     );
   }
 
@@ -903,6 +905,7 @@ export class RelayClient {
     this.pendingEvents.delete(eventId);
 
     if (success) {
+      pendingEvent.onOk?.(message);
       pendingEvent.resolve(pendingEvent.event);
     } else {
       // Back-pressure now arrives here rather than as a NOTICE: the relay

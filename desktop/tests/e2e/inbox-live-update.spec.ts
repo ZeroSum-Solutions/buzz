@@ -138,9 +138,31 @@ function getListPane(page: import("@playwright/test").Page) {
 async function getScrollTop(page: import("@playwright/test").Page) {
   return page.evaluate(() => {
     const pane = document.querySelector(
-      '[data-testid="home-inbox-detail"] [aria-busy]',
+      '[data-testid="home-inbox-detail-scroll"]',
     ) as HTMLElement | null;
     return pane?.scrollTop ?? 0;
+  });
+}
+
+/**
+ * Waits until the detail scroll container's scrollTop stops moving across
+ * two animation frames. Guards against measuring mid-flight: composer-height
+ * padding and bottom-anchored append writes can still be adjusting scrollTop
+ * for a frame or two after a DOM mutation is observed.
+ */
+async function waitForDetailScrollToSettle(
+  page: import("@playwright/test").Page,
+) {
+  await page.waitForFunction(async () => {
+    const pane = document.querySelector(
+      '[data-testid="home-inbox-detail-scroll"]',
+    ) as HTMLElement | null;
+    if (!pane) return false;
+    const before = pane.scrollTop;
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+    );
+    return Math.abs(pane.scrollTop - before) < 0.5;
   });
 }
 
@@ -315,30 +337,9 @@ test.describe("inbox stable-conversation regressions", () => {
 
     await expect(detail).toContainText("Filler reply 0");
 
-    // Scroll to a deterministic mid-position: assign scrollTop directly so the
-    // test does not depend on wheel-event routing or animation timing.
-    // First scroll to bottom (ensures scrollable content is laid out), then
-    // pull back up by half to create a non-zero, non-bottom scrollTop.
-    await page.evaluate(() => {
-      const pane = document.querySelector(
-        '[data-testid="home-inbox-detail"] [aria-busy]',
-      ) as HTMLElement | null;
-      if (!pane) return;
-      pane.scrollTop = pane.scrollHeight; // go to bottom
-      const mid = Math.max(1, Math.floor(pane.scrollHeight / 2));
-      pane.scrollTop = mid; // settle at mid
-    });
-    // State-based wait: scroll must be non-zero before proceeding.
-    await page.waitForFunction(() => {
-      const pane = document.querySelector(
-        '[data-testid="home-inbox-detail"] [aria-busy]',
-      ) as HTMLElement | null;
-      return (pane?.scrollTop ?? 0) > 0;
-    });
-    const scrollTopBefore = await getScrollTop(page);
-    expect(scrollTopBefore).toBeGreaterThan(0);
-
-    // Type a draft and confirm focus before the live update.
+    // Put the composer in its final geometry BEFORE establishing the scroll
+    // baseline: focusing/filling it changes its measured height, which feeds
+    // useComposerHeightPadding and can itself move scrollTop.
     const composer = detail.getByTestId("message-input");
     await composer.click();
     await composer.fill("My draft text — must survive the live update");
@@ -346,6 +347,38 @@ test.describe("inbox stable-conversation regressions", () => {
       "My draft text — must survive the live update",
     );
     await expect(composer).toBeFocused();
+
+    // Scroll to a deterministic mid-position of the actual scrollable range
+    // (scrollHeight - clientHeight, not scrollHeight) so the baseline lands
+    // well outside the app's 32px "at-bottom" band. Dispatch a scroll event
+    // so useAnchoredScroll's onScroll handler runs synchronously, same as a
+    // real user scroll.
+    await page.evaluate(async () => {
+      await document.fonts.ready;
+      const pane = document.querySelector(
+        '[data-testid="home-inbox-detail-scroll"]',
+      ) as HTMLElement | null;
+      if (!pane) return;
+      const maxScrollTop = pane.scrollHeight - pane.clientHeight;
+      if (maxScrollTop <= 128) {
+        throw new Error("Inbox fixture is not sufficiently scrollable");
+      }
+      pane.scrollTop = Math.floor(maxScrollTop / 2);
+      pane.dispatchEvent(new Event("scroll", { bubbles: true }));
+    });
+    // State-based wait: scroll must be well clear of both the top and the
+    // bottom "at-bottom" band before proceeding.
+    await page.waitForFunction(() => {
+      const pane = document.querySelector(
+        '[data-testid="home-inbox-detail-scroll"]',
+      ) as HTMLElement | null;
+      if (!pane) return false;
+      const bottomGap = pane.scrollHeight - pane.clientHeight - pane.scrollTop;
+      return pane.scrollTop >= 64 && bottomGap >= 64;
+    });
+    await waitForDetailScrollToSettle(page);
+    const scrollTopBefore = await getScrollTop(page);
+    expect(scrollTopBefore).toBeGreaterThan(0);
 
     // Reset scroll spy so only calls from the live update are counted.
     await resetScrollIntoViewCount(page);
@@ -356,6 +389,7 @@ test.describe("inbox stable-conversation regressions", () => {
     await expect(
       page.getByTestId(`home-inbox-item-${"c2".repeat(32)}`),
     ).toBeVisible();
+    await waitForDetailScrollToSettle(page);
 
     // ── 1: scroll position preserved ──────────────────────────────────
     const scrollTopAfter = await getScrollTop(page);

@@ -19,6 +19,7 @@ export async function publishSessionEvent(
   event: RelayEvent,
   timeoutMessage: string,
   sendErrorMessage: string,
+  onOk?: (message: string) => void,
 ): Promise<RelayEvent> {
   const publishOwnership = session.ownership();
   await waitForRateLimit();
@@ -32,7 +33,7 @@ export async function publishSessionEvent(
       session.pendingEvents.delete(event.id);
       reject(new Error(timeoutMessage));
     }, PUBLISH_TIMEOUT_MS);
-    const pendingEvent = { event, resolve, reject, timeout };
+    const pendingEvent = { event, resolve, reject, timeout, onOk };
     session.pendingEvents.set(event.id, pendingEvent);
 
     void session

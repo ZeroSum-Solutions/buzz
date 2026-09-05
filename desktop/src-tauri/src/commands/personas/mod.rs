@@ -68,6 +68,10 @@ pub use create::create_persona;
 mod sharing;
 pub use sharing::set_persona_shared;
 pub use sharing::update_persona_and_publish;
+mod prompt_source;
+pub use prompt_source::get_prompt_source;
+pub use prompt_source::reset_prompt_sources;
+pub use prompt_source::set_prompt_source_and_reload;
 mod update;
 pub use update::update_persona;
 mod inbound;
@@ -146,7 +150,10 @@ fn commit_cascade_agents(
 }
 
 #[tauri::command]
-pub async fn delete_persona(id: String, app: AppHandle) -> Result<(), String> {
+pub async fn delete_persona<R: tauri::Runtime>(
+    id: String,
+    app: AppHandle<R>,
+) -> Result<(), String> {
     use tauri::Manager;
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
@@ -254,6 +261,11 @@ pub async fn delete_persona(id: String, app: AppHandle) -> Result<(), String> {
             //   persona save fails → cascade agents gone, persona survives; a retry
             //                        finds an empty cascade and proceeds cleanly
             // Keys and tombstones are enqueued only after their records leave disk.
+            // Drop the machine-local prompt-file binding before anything is
+            // destroyed — see `forget_prompt_source` for why every removal path
+            // must, and why it goes first.
+            crate::managed_agents::prompt_source::forget_prompt_source(&app, &id)?;
+
             if !cascade.is_empty() {
                 commit_cascade_agents(&mut agents, &cascade, |recs| {
                     save_managed_agents(&app, recs)

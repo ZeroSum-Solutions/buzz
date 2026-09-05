@@ -402,7 +402,12 @@ test("upload progress floats above the dock and lifts Jump to latest", async ({
         __BUZZ_E2E__?: { mock?: { uploadDelayMs?: number } };
       }
     ).__BUZZ_E2E__;
-    if (e2e?.mock) e2e.mock.uploadDelayMs = 2_000;
+    // A short delay lets a slow CI runner's own step latency (each await
+    // above) eat into it before the boundingBox() measurement below, racing
+    // real upload completion (which unmounts composer-upload-progress-motion
+    // and can drop Jump-to-latest). 10s keeps ample margin without the test
+    // itself ever waiting on the mock delay directly.
+    if (e2e?.mock) e2e.mock.uploadDelayMs = 10_000;
   });
   await page.getByTestId("channel-deep-history").click();
 
@@ -426,6 +431,20 @@ test("upload progress floats above the dock and lifts Jump to latest", async ({
   });
   await expect(jumpToLatest).toBeVisible();
   await page.waitForTimeout(250);
+
+  // Sending arms a one-shot "snap to bottom on next append" pin
+  // (ChannelPane.handleSendMessage -> scrollToBottomOnNextUpdate) so the
+  // sender's own outbound row is guaranteed visible. That pin's landing time
+  // is not deterministic under load, so it can consume itself during the
+  // wait above and pull the timeline back to the floor moments before the
+  // measurement, unmounting Jump-to-latest out from under boundingBox() and
+  // hanging the test for the full action timeout. Re-assert the manual
+  // mid-scroll immediately before measuring to close that window.
+  await timeline.evaluate((element) => {
+    element.scrollTop = Math.max(500, element.scrollHeight / 2);
+    element.dispatchEvent(new Event("scroll", { bubbles: true }));
+  });
+  await expect(jumpToLatest).toBeVisible();
 
   const [uploadBox, dockBackdropBox, liftedBox] = await Promise.all([
     uploadMotion.boundingBox(),
