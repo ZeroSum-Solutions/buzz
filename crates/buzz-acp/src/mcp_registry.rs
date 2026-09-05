@@ -18,8 +18,13 @@
 //! 2. **The open does not follow a symlink** and the result must be a regular
 //!    file, so nothing can swap the confined path for a link elsewhere.
 //! 3. **Every entry's command is the bundled launcher**, resolved beside this
-//!    binary. An entry naming anything else refuses startup rather than losing
-//!    the marker silently.
+//!    binary. A declared command must be a plain absolute path — no `.`, no
+//!    `..`, the same shape the registry path itself must take — and must name
+//!    that file; an entry naming anything else refuses startup rather than
+//!    losing the marker silently. What the accepted entry carries onward is
+//!    the **derived** launcher path, never the declared string, so the value
+//!    `buzz-agent` execs under the session's own working directory is the
+//!    value this check resolved.
 //!
 //! No entry may declare an `env` block. `buzz-agent` applies `McpServer.env` to
 //! the **launcher's** own `Command`, so a declared `DYLD_INSERT_LIBRARIES` or
@@ -121,6 +126,11 @@ pub fn bundled_launcher() -> Result<PathBuf, String> {
 /// canonicalized — most often a path that does not exist — falls back to the
 /// literal comparison, which is the conservative answer: it refuses rather
 /// than accepts.
+///
+/// Passing this check is **not** what makes the entry safe to exec: the
+/// declared string is never executed. [`parse_registry_file`] stores
+/// [`launcher_command`]'s derived path instead, so a link swapped after this
+/// call changes nothing about what runs.
 fn same_file(declared: &str, expected: &Path) -> bool {
     match (
         std::fs::canonicalize(declared),
@@ -129,6 +139,52 @@ fn same_file(declared: &str, expected: &Path) -> bool {
         (Ok(a), Ok(b)) => a == b,
         _ => Path::new(declared) == expected,
     }
+}
+
+/// The command string every accepted registry entry becomes.
+///
+/// Derived from `launcher` — [`bundled_launcher`]'s sibling-of-this-binary
+/// path — and never from the document. Canonicalized when the filesystem can
+/// resolve it, which is the same path `same_file` compared against, so the
+/// value that runs is the value that passed the check; a link swapped after
+/// the check cannot redirect the exec, and a relative declared command cannot
+/// be resolved a second time against the child's own `cwd`
+/// (`buzz-agent` sets `Command::current_dir(spec.cwd)` before it spawns).
+///
+/// # Errors
+/// A message when the derived path is not valid UTF-8, since `McpServer`
+/// carries the command as a `String` on the ACP wire.
+fn launcher_command(launcher: &Path) -> Result<String, String> {
+    let derived = std::fs::canonicalize(launcher).unwrap_or_else(|_| launcher.to_path_buf());
+    derived.to_str().map(str::to_string).ok_or_else(|| {
+        format!(
+            "the bundled launcher's path {} is not valid UTF-8, so it cannot be named on the ACP \
+             wire",
+            derived.display()
+        )
+    })
+}
+
+/// Why `path` is not a plain absolute path, or `None` when it is one.
+///
+/// One shape, two callers: the registry file's own path
+/// ([`confine_registry_path`]) and every entry's declared command. Both are
+/// strings that reach an `open` or an `exec`, and both are refused unless they
+/// are absolute and free of `.` and `..` — a relative path is resolved against
+/// whichever working directory the consumer happens to hold, and a `..`
+/// component lets a confined-looking path name something outside the
+/// confinement.
+fn plain_absolute_defect(path: &Path) -> Option<&'static str> {
+    if !path.is_absolute() {
+        return Some("is not an absolute path");
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Some("holds a `.` or `..` component");
+    }
+    None
 }
 
 /// Refuse a registry path that is not the one the adopted generation wrote.
@@ -145,18 +201,9 @@ fn same_file(declared: &str, expected: &Path) -> bool {
 /// A message naming the path when it is relative, holds a `.` or `..`
 /// component, or does not end in the required five components.
 pub fn confine_registry_path(path: &Path, capability: &AgentCapability) -> Result<(), String> {
-    if !path.is_absolute() {
+    if let Some(defect) = plain_absolute_defect(path) {
         return Err(format!(
-            "{MCP_REGISTRY_ENV_VAR} names {}, which is not an absolute path",
-            path.display()
-        ));
-    }
-    if path
-        .components()
-        .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
-    {
-        return Err(format!(
-            "{MCP_REGISTRY_ENV_VAR} names {}, which holds a `.` or `..` component",
+            "{MCP_REGISTRY_ENV_VAR} names {}, which {defect}",
             path.display()
         ));
     }
@@ -315,16 +362,26 @@ fn open_no_follow(path: &Path) -> std::io::Result<File> {
 /// a hook, exactly like an extras entry.
 ///
 /// `launcher` is the bundled launcher's absolute path ([`bundled_launcher`]).
-/// Every entry's command must be that file: the `registry_launched` marker is
-/// what makes `buzz-agent` hand a child the capability, so an entry naming
-/// anything else refuses startup rather than losing the marker silently.
+/// Every entry's command must be a plain absolute path — no `.`, no `..`, the
+/// same shape [`confine_registry_path`] requires — naming that file: the
+/// `registry_launched` marker is what makes `buzz-agent` hand a child the
+/// capability, so an entry naming anything else refuses startup rather than
+/// losing the marker silently.
+///
+/// The accepted entry's `command` is then built from `launcher`, not from the
+/// document (see [`launcher_command`]). The declared string is compared and
+/// discarded: `buzz-agent` execs the stored command under the session's own
+/// `cwd`, so storing the declared string would resolve a relative path a
+/// second time somewhere else, and would re-follow a symlink that could have
+/// been swapped since the comparison.
 ///
 /// # Errors
 /// A message naming the failing entry by index — never by content, since an
 /// argument may be operator-supplied — when the document does not parse,
 /// declares an unsupported version, holds more servers than `max_servers`,
-/// repeats a name, declares an `env` block, names a command other than
-/// `launcher`, or breaches a per-entry bound.
+/// repeats a name, declares an `env` block, names a command that is relative,
+/// holds a `.` or `..` component, or is not `launcher`, or breaches a
+/// per-entry bound. Also when the derived launcher path is not valid UTF-8.
 pub fn parse_registry_file(
     bytes: &[u8],
     max_servers: usize,
@@ -345,6 +402,10 @@ pub fn parse_registry_file(
             document.servers.len()
         ));
     }
+
+    // Resolved once, from this process's own binary location, and stored on
+    // every accepted entry in place of the declared string.
+    let command = launcher_command(launcher)?;
 
     let mut servers: Vec<McpServer> = Vec::with_capacity(document.servers.len());
     for (index, server) in document.servers.iter().enumerate() {
@@ -403,6 +464,19 @@ pub fn parse_registry_file(
                 server.env.len()
             ));
         }
+        // Shape before identity. A relative command would be resolved against
+        // whatever working directory the consumer holds — `buzz-agent` execs
+        // this entry under the session's `cwd`, not this process's — and a
+        // `..` component would let a launcher-shaped prefix name something
+        // else. Neither can be answered by the `same_file` comparison below,
+        // which resolves against *this* process's working directory.
+        if let Some(defect) = plain_absolute_defect(Path::new(&server.command)) {
+            return Err(format!(
+                "mcp registry entry {entry} names a command that {defect}; the desktop writes the \
+                 bundled launcher {} by resolved absolute path",
+                launcher.display()
+            ));
+        }
         if !same_file(&server.command, launcher) {
             return Err(format!(
                 "mcp registry entry {entry} names a command that is not the bundled launcher \
@@ -420,7 +494,13 @@ pub fn parse_registry_file(
         }
         servers.push(McpServer {
             name: server.name.clone(),
-            command: server.command.clone(),
+            // The derived launcher path, never `server.command`. The declared
+            // string was compared above and is discarded here: what runs is
+            // the path this process resolved beside its own binary, so a
+            // symlink swapped after the comparison, or a relative path
+            // re-resolved against the session's `cwd`, cannot redirect the
+            // exec that carries this agent's capability.
+            command: command.clone(),
             args: server.args.clone(),
             // Never an `env` block: the check above refused any document that
             // declared one, and this is what `buzz-agent` applies to the
@@ -589,6 +669,18 @@ mod tests {
         fn command(&self) -> String {
             self.path().display().to_string()
         }
+
+        /// The path a parsed entry must carry: the launcher this process
+        /// derived, canonicalized. On macOS a `tempfile` directory sits under
+        /// `/var`, a symlink to `/private/var`, so this differs from
+        /// [`Self::command`] and a test asserting it catches a build that
+        /// stored the declared string instead.
+        fn canonical_command(&self) -> String {
+            std::fs::canonicalize(self.path())
+                .expect("the stand-in launcher canonicalizes")
+                .display()
+                .to_string()
+        }
     }
 
     /// A document holding one server as the desktop generates it: the launcher
@@ -632,7 +724,8 @@ mod tests {
         .expect("a well-formed document loads");
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "github");
-        assert_eq!(servers[0].command, launcher.command());
+        // The derived launcher path, not the declared string.
+        assert_eq!(servers[0].command, launcher.canonical_command());
         // The credential rides the launcher's own argv as a reference, so the
         // wire entry carries no environment at all — `buzz-agent` would apply
         // one to the launcher's process, not the server's.
@@ -692,6 +785,100 @@ mod tests {
         )
         .expect_err("a foreign command is refused");
         assert!(error.contains("bundled launcher"), "{error}");
+    }
+
+    /// What runs is the launcher this process derived, never the string the
+    /// document declared.
+    ///
+    /// A link to the launcher passes the identity check — both sides
+    /// canonicalize to the same file — but storing the link would leave the
+    /// exec pointing at a name whose target can be re-pointed after the check
+    /// and before `buzz-agent` spawns it, with this agent's capability in the
+    /// child's environment. Building `McpServer.command` from the declared
+    /// string again fails this: the stored command would be the link.
+    #[test]
+    #[cfg(unix)]
+    fn registry_file_commands_are_the_derived_launcher_not_the_declared_path() {
+        let launcher = Launcher::new();
+        let link = launcher.dir.path().join("link-to-launcher");
+        std::os::unix::fs::symlink(launcher.path(), &link).expect("symlink to the launcher");
+
+        let entry = format!(
+            "{{\"name\":\"a\",\"command\":\"{}\",\"args\":[]}}",
+            link.display()
+        );
+        let servers = parse_registry_file(
+            document(&entry).as_bytes(),
+            MAX_MCP_SERVERS,
+            &launcher.path(),
+        )
+        .expect("a link to the bundled launcher names the bundled launcher");
+
+        assert_eq!(servers.len(), 1);
+        assert!(
+            servers[0].registry_launched,
+            "the entry lost the marker it earned"
+        );
+        assert_ne!(
+            Path::new(&servers[0].command),
+            link.as_path(),
+            "a registry-launched server would exec the declared symlink"
+        );
+        assert_eq!(servers[0].command, launcher.canonical_command());
+    }
+
+    /// A relative command is refused, and the reason reaches the operator.
+    ///
+    /// `buzz-agent` execs a registry entry under the **session's** working
+    /// directory (`Command::current_dir(spec.cwd)`), not this process's, so a
+    /// relative command names one file where it is checked and another where
+    /// it runs. The shape check refuses it first; without it the entry falls
+    /// through to the identity comparison, which reports the wrong cause —
+    /// this test asserts the surfaced reason, so deleting the shape check
+    /// fails it.
+    #[test]
+    fn registry_file_refuses_a_relative_command() {
+        let launcher = Launcher::new();
+        let relative = document(&format!(
+            "{{\"name\":\"a\",\"command\":\"{LAUNCHER_FILE_NAME}\",\"args\":[]}}"
+        ));
+        let error = parse_registry_file(relative.as_bytes(), MAX_MCP_SERVERS, &launcher.path())
+            .expect_err("a relative command is refused");
+        assert!(
+            error.contains("is not an absolute path"),
+            "a relative command was refused for the wrong reason: {error}"
+        );
+    }
+
+    /// An absolute command holding a `..` component is refused.
+    ///
+    /// The path below canonicalizes to the launcher, so the identity
+    /// comparison accepts it on its own: only the shape check refuses it, and
+    /// deleting that check turns this refusal into an accepted
+    /// `registry_launched` entry.
+    #[test]
+    fn registry_file_refuses_a_command_with_a_parent_directory_component() {
+        let launcher = Launcher::new();
+        let dir = launcher.dir.path();
+        std::fs::create_dir_all(dir.join("sub")).expect("create the traversed directory");
+        let traversal = dir.join("sub").join("..").join(LAUNCHER_FILE_NAME);
+        assert_eq!(
+            std::fs::canonicalize(&traversal).expect("the traversal resolves"),
+            std::fs::canonicalize(launcher.path()).expect("the launcher resolves"),
+            "the traversal must resolve to the launcher, or this test proves nothing"
+        );
+
+        let doc = document(&format!(
+            "{{\"name\":\"a\",\"command\":\"{}\",\"args\":[]}}",
+            traversal.display()
+        ));
+        let error = parse_registry_file(doc.as_bytes(), MAX_MCP_SERVERS, &launcher.path())
+            .expect_err("a `..` traversal in the command is refused");
+        assert!(
+            error.contains("holds a `.` or `..` component"),
+            "{} was refused for the wrong reason: {error}",
+            traversal.display()
+        );
     }
 
     /// The accepted path is this agent's directory in the adopted generation.

@@ -293,12 +293,16 @@ pub struct CliArgs {
     /// `--extra-mcp-commands` does: the servers it declares are untrusted, and
     /// only that adapter acts on the marker.
     ///
-    /// Unlike `--extra-mcp-commands`, a registry server may carry an `env`
-    /// block. Its values are `mcp:` references, never secrets — the bundled
-    /// `buzz-mcp-launch`, which is the command on every generated entry, is the
-    /// side that resolves them — so no credential reaches this process, the
-    /// ACP wire, or a `ps` listing. Written by the desktop; not meant to be
-    /// hand-edited.
+    /// No registry server may carry an `env` block: a document declaring one
+    /// is refused, because `buzz-agent` applies that block to the launcher's
+    /// own process, where a loader variable would run before `main` while the
+    /// agent's capability is in its environment. A declared variable travels
+    /// in the launcher's own argv instead, as a `--set` value or an `mcp:`
+    /// reference behind `--secret`. The bundled `buzz-mcp-launch`, which is
+    /// the command on every generated entry, is the side that resolves those
+    /// references and the side that applies them to the server it starts — so
+    /// no credential reaches this process, the ACP wire, or a `ps` listing.
+    /// Written by the desktop; not meant to be hand-edited.
     #[arg(long, env = "BUZZ_ACP_MCP_REGISTRY")]
     pub mcp_registry: Option<String>,
 

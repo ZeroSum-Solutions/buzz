@@ -9529,10 +9529,12 @@ mod build_mcp_servers_tests {
         // reference in the launcher's own argv, declares no environment at all,
         // and stays untrusted like any third-party server.
         let github = &servers[2];
+        // The launcher this process derived, canonicalized — not the string
+        // the document declared.
         assert_eq!(
             github.command,
-            dir.path()
-                .join(mcp_registry::LAUNCHER_FILE_NAME)
+            std::fs::canonicalize(dir.path().join(mcp_registry::LAUNCHER_FILE_NAME))
+                .expect("the stand-in launcher canonicalizes")
                 .display()
                 .to_string()
         );

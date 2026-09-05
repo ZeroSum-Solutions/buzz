@@ -496,6 +496,96 @@ fn mcp_registry_a_toggle_changes_only_the_named_agents_config() {
     );
 }
 
+/// The regenerated native config is **installed**, never rewritten in place.
+///
+/// `plan_for_spawn` writes this file on every spawn, and a harness may already
+/// be reading the previous generation's copy. `write_atomically` writes a
+/// temporary and renames it, so the old inode stays whole for whoever holds it
+/// and the path flips to the new one in a single step; a plain
+/// `std::fs::write` would truncate the live file and let a concurrent reader
+/// observe a prefix of the new configuration. Replacing `write_atomically`
+/// with a direct write keeps the inode, which is what this asserts.
+#[test]
+#[cfg(unix)]
+fn mcp_registry_a_regenerated_config_is_installed_by_rename() {
+    use std::io::Read as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let paths = paths(root.path());
+    let store = FakeStore::default();
+    let nonces = CountingNonces::default();
+    let placement = McpConfigPlacement::ProjectFileInWorkdir { file: ".mcp.json" };
+    let both = registry(&format!(
+        "{},{}",
+        stdio("gh", "github"),
+        stdio("sn", "sentry")
+    ));
+
+    converge(
+        &paths,
+        &both,
+        &[selection(AGENT_A, placement, &["gh"])],
+        LAUNCHER,
+        SERVICE,
+        &store,
+        &nonces,
+    )
+    .expect("the first convergence");
+    let plan = plan_for_spawn(&paths, AGENT_A, placement, binding_reader(&store))
+        .expect("the first plan resolves");
+    let workdir = plan.workdir.clone().expect("a project file needs a cwd");
+    let file = workdir.join(".mcp.json");
+    let first = std::fs::metadata(&file).expect("readable").ino();
+    // A harness that already opened the file, as one running under the
+    // previous generation would have.
+    let mut held = std::fs::File::open(&file).expect("the previous generation opens");
+
+    converge(
+        &paths,
+        &both,
+        &[selection(AGENT_A, placement, &["gh", "sn"])],
+        LAUNCHER,
+        SERVICE,
+        &store,
+        &nonces,
+    )
+    .expect("the second convergence");
+    plan_for_spawn(&paths, AGENT_A, placement, binding_reader(&store))
+        .expect("the second plan resolves");
+
+    assert_ne!(
+        first,
+        std::fs::metadata(&file).expect("readable").ino(),
+        "the regenerated config replaced the live file in place, so a harness reading it could \
+         observe a prefix of the new generation"
+    );
+
+    let mut previous = String::new();
+    held.read_to_string(&mut previous)
+        .expect("the held handle still reads");
+    assert!(
+        previous.contains("github") && !previous.contains("sentry"),
+        "the held handle saw a torn file: {previous}"
+    );
+
+    let installed = std::fs::read_to_string(&file).expect("readable");
+    assert!(
+        installed.contains("github") && installed.contains("sentry"),
+        "{installed}"
+    );
+
+    // The temporary the install renamed from leaves nothing behind for a
+    // reader to pick up.
+    let leftovers: Vec<String> = std::fs::read_dir(&workdir)
+        .expect("the working directory lists")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
 /// The env-rooted placement writes under the agent's own working directory and
 /// names it with the variable the runtime catalog gives.
 #[test]
