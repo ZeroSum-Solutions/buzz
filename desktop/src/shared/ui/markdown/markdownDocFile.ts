@@ -124,6 +124,70 @@ export const MAX_MARKDOWN_DOC_DELIMITER_WORK = 16_777_216;
 export const MAX_MARKDOWN_DOC_TABLE_CELL_MARKERS = 3_072;
 
 /**
+ * Work model for `mdast-util-to-hast`'s GFM table expansion: the sum, over
+ * the document's tables, of (header columns × body rows).
+ *
+ * Every other cap on this page bounds a quantity the *parse* produces. This
+ * one bounds a quantity only the conversion produces: `mdast-util-to-hast`
+ * pads every table body row out to the *header's* column count, emitting an
+ * empty `<td>` for each cell the row never wrote. mdast carries only the
+ * cells that were written; hast carries `rows × columns`. So a table whose
+ * header declares many columns and whose body rows carry no `|` at all is
+ * invisible to `MAX_MARKDOWN_DOC_TABLE_CELL_MARKERS` (which counts `|` and
+ * finds only the header's) and to `MAX_MARKDOWN_DOC_NODES` (which counts
+ * mdast, about three nodes per row), while costing `rows × columns` in every
+ * phase after the parse.
+ *
+ * The shape is ordinary GFM — a header row, a delimiter row, then plain
+ * lines with no `|` in them — and it is the round-4 blind critic's F6. This
+ * counter is not a proxy for that cost, it *is* it: measured through the
+ * production entry `renderMarkdownDocumentHtml`, `tableCellWork` equals the
+ * number of `<td>` elements the render emits, exactly.
+ *
+ * | shape | bytes | `|` markers | `tableCellWork` | `<td>` emitted |
+ * |---|---|---|---|---|
+ * | 10 columns × 5 rows | 64 | 22 | 50 | 50 |
+ * | 100 columns × 100 rows | 794 | 202 | 10,000 | 10,000 |
+ * | 100 columns × 500 rows | 1,594 | 202 | 50,000 | 50,000 |
+ * | 300 columns × 200 rows | 2,394 | 602 | 60,000 | 60,000 |
+ *
+ * Measured on this machine (M-series, Node 24.15.0) through the same entry,
+ * one fresh process per shape and three distinct documents per process so
+ * the module-level parse cache cannot flatter a run — worst of three:
+ *
+ * | shape | `tableCellWork` | render |
+ * |---|---|---|
+ * | 12 × 100 | 1,200 | 17 ms |
+ * | 12 × 683 | 8,196 | 97 ms |
+ * | 96 × 170 | 16,320 | 110 ms |
+ * | 48 × 341 | 16,368 | 114 ms |
+ * | 12 × 1,365 | 16,380 | 149 ms |
+ * | 96 × 256 | 24,576 | 139 ms |
+ * | 12 × 2,730 | 32,760 | 282 ms |
+ * | 192 × 256 | 49,152 | 225 ms |
+ * | 1,534 × 32 | 49,088 | 338 ms |
+ *
+ * 16,384 (2^14) keeps the worst measured admitted table at 149 ms, inside
+ * this app's 200 ms main-thread task budget, against a maximum of 5,006
+ * across the 2,464 real markdown files reachable from this repository — 3.3×
+ * headroom over anything real, and that maximum belongs to the one generated
+ * API listing the marker cap already refuses. A table whose body rows do
+ * write their cells is bounded by the marker cap long before this one: with
+ * the cells written out, columns × rows is about the `|` count. This cap only
+ * binds the padded shape.
+ *
+ * The one shape it admits that still costs more than the budget is a table as
+ * wide as the marker cap allows — 1,534 columns is 3,070 markers — whose
+ * header alone measures 130 ms at a single body row. That floor is the marker
+ * cap's, recorded there; 1,534 × 10 (15,340) measures 214 ms.
+ *
+ * Summed document-wide rather than taken per table, for the same reason the
+ * marker cap is: thirty-two tables cost what one table of the same total
+ * costs, so splitting them must not buy a document past the cap.
+ */
+export const MAX_MARKDOWN_DOC_TABLE_CELL_WORK = 16_384;
+
+/**
  * Source-side approximation of the parsed-tree node count, used only to
  * bound the parse the real budget (`MAX_MARKDOWN_DOC_NODES`, enforced on the
  * tree in `markdownParseBudget.ts`) has to run before it can refuse.
@@ -151,7 +215,7 @@ export const MAX_MARKDOWN_DOC_TABLE_CELL_MARKERS = 3_072;
 export const MAX_MARKDOWN_DOC_ESTIMATED_NODES = 48_000;
 
 /**
- * The four parse-work quantities a single linear scan of the source can
+ * The five parse-work quantities a single linear scan of the source can
  * measure. Exported for the unit tests, which assert the caps against the
  * numbers rather than only against the predicate.
  */
@@ -162,6 +226,8 @@ export type MarkdownDocParseWork = {
   delimiterWork: number;
   /** `|` characters, document-wide. */
   tableCellMarkers: number;
+  /** Σ over tables of (header columns × body rows) — the padded hast cells. */
+  tableCellWork: number;
   /** 3 × lines + delimiters + 3 × literal-autolink candidates. */
   estimatedNodes: number;
 };
@@ -208,6 +274,27 @@ export function measureMarkdownDocParseWork(
   // space is part of the marker and not indentation of its own.
   let quoteSpacePending = false;
   let lineHasContent = false;
+  // Per-line facts the GFM table model needs: a table is a header row, a
+  // delimiter row of the same cell count, and then every following non-blank
+  // line, each of which hast pads out to the header's column count.
+  let linePipes = 0;
+  let lineFirstContentIsPipe = false;
+  let lineLastContentCode = 0;
+  let lineDelimiterShaped = true;
+  let lineHasDash = false;
+  // 0: no table open. 1: the previous line could be a header row.
+  // 2: inside the body of a table `tableColumns` wide.
+  let tablePhase = 0;
+  let tableHeaderCells = 0;
+  let tableColumns = 0;
+  let tableRows = 0;
+  let tableCellWork = 0;
+
+  /** Charge the open table's padded cells and close it. */
+  const closeTable = () => {
+    if (tablePhase === 2) tableCellWork += tableColumns * tableRows;
+    tablePhase = 0;
+  };
 
   const endLine = () => {
     descentWork += (prefixColumns >> 1) + prefixQuotes;
@@ -215,6 +302,37 @@ export function measureMarkdownDocParseWork(
       // A blank line closes the block: bank its quadratic cost and reset.
       delimiterWork += blockDelimiters * blockDelimiters;
       blockDelimiters = 0;
+      // It closes the table too — a GFM table body ends at a blank line.
+      closeTable();
+      return;
+    }
+    // GFM cell count: pipes split cells, and a leading or trailing pipe is
+    // the row's fence rather than a split. Escaped `\|` is counted as a
+    // split here, which can only over-count columns and so only makes the
+    // bound stricter.
+    const cells =
+      linePipes +
+      1 -
+      (lineFirstContentIsPipe ? 1 : 0) -
+      (lineLastContentCode === 124 /* "|" */ ? 1 : 0);
+    if (tablePhase === 2) {
+      tableRows++;
+    } else if (
+      tablePhase === 1 &&
+      lineDelimiterShaped &&
+      lineHasDash &&
+      cells > 0 &&
+      cells === tableHeaderCells
+    ) {
+      // A delimiter row of the header's own width opens the body.
+      tablePhase = 2;
+      tableColumns = tableHeaderCells;
+      tableRows = 0;
+    } else if (linePipes > 0) {
+      tablePhase = 1;
+      tableHeaderCells = cells;
+    } else {
+      tablePhase = 0;
     }
   };
 
@@ -228,6 +346,11 @@ export function measureMarkdownDocParseWork(
       prefixQuotes = 0;
       quoteSpacePending = false;
       lineHasContent = false;
+      linePipes = 0;
+      lineFirstContentIsPipe = false;
+      lineLastContentCode = 0;
+      lineDelimiterShaped = true;
+      lineHasDash = false;
       continue;
     }
     if (inLinePrefix) {
@@ -252,12 +375,27 @@ export function measureMarkdownDocParseWork(
       inLinePrefix = false;
       quoteSpacePending = false;
       lineHasContent = true;
+      lineFirstContentIsPipe = code === 124 /* "|" */;
+    }
+    if (code !== 32 /* " " */ && code !== 9 /* "\t" */) {
+      // Trailing whitespace is not part of a row, so the last *content* code
+      // is what decides whether the row ends on a fencing pipe.
+      lineLastContentCode = code;
+      if (code === 45 /* "-" */) lineHasDash = true;
+      else if (
+        lineDelimiterShaped &&
+        code !== 124 /* "|" */ &&
+        code !== 58 /* ":" */
+      ) {
+        lineDelimiterShaped = false;
+      }
     }
     if (isDelimiterCode(code)) {
       delimiters++;
       blockDelimiters++;
     } else if (code === 124 /* "|" */) {
       tableCellMarkers++;
+      linePipes++;
     } else if (code === 64 /* "@", email autolink */) {
       autolinkCandidates++;
     } else if (
@@ -277,11 +415,13 @@ export function measureMarkdownDocParseWork(
   }
   endLine();
   delimiterWork += blockDelimiters * blockDelimiters;
+  closeTable();
 
   return {
     descentWork,
     delimiterWork,
     tableCellMarkers,
+    tableCellWork,
     // A table cell delimiter yields about two nodes, so it counts twice.
     estimatedNodes:
       3 * lines + delimiters + 2 * tableCellMarkers + 3 * autolinkCandidates,
@@ -294,7 +434,9 @@ export function measureMarkdownDocParseWork(
  *
  * This is the cheap pre-filter, not the guard: it bounds micromark's own
  * tokenizers, which run before any mdast node exists and so before
- * `MAX_MARKDOWN_DOC_NODES` can see anything. The guard is
+ * `MAX_MARKDOWN_DOC_NODES` can see anything, plus the one phase *after* the
+ * parse whose cost the node count does not predict — a GFM table's padded
+ * cells, bounded by `MAX_MARKDOWN_DOC_TABLE_CELL_WORK`. The guard is
  * `isMarkdownDocumentTooComplex` in `documentMode.tsx`, which runs this and
  * then the parse, with the node budget enforced inside it.
  */
@@ -310,6 +452,7 @@ export function exceedsMarkdownDocParseWorkBudget(
     work.descentWork > MAX_MARKDOWN_DOC_DESCENT_WORK ||
     work.delimiterWork > MAX_MARKDOWN_DOC_DELIMITER_WORK ||
     work.tableCellMarkers > MAX_MARKDOWN_DOC_TABLE_CELL_MARKERS ||
+    work.tableCellWork > MAX_MARKDOWN_DOC_TABLE_CELL_WORK ||
     work.estimatedNodes > MAX_MARKDOWN_DOC_ESTIMATED_NODES
   );
 }

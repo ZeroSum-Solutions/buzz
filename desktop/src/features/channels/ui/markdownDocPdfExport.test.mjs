@@ -8,6 +8,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { getMarkdownParseCount } from "@/shared/ui/markdown/nodeCache";
+
 import {
   MAX_PDF_DOCUMENT_SOURCE_BYTES,
   exportMarkdownDocumentToPdf,
@@ -205,6 +207,87 @@ test("refuses a wide table before it is rendered", async () => {
   const content = header + separator + row.repeat(100);
   assert.ok(!content.includes("["));
   await assertRefusedBeforeRender(content, "table.md");
+});
+
+test("refuses a table whose header pads every body row (round-4 critic F6)", async () => {
+  // `mdast-util-to-hast` pads every body row out to the header's column
+  // count, so a 1,500-column header over 2,000 rows that carry no `|` at all
+  // is 3,000,000 `<td>` — while the source shows 14,894 bytes, 3,002 `|`
+  // (under the marker cap) and 9,003 mdast nodes (under the node budget).
+  // Measured before this bound: 8,813 ms on the panel-open path with Export
+  // offered, and 1,000 × 5,900 exhausted a 4 GB heap inside the gate.
+  const columns = 1500;
+  const header = `|${Array.from({ length: columns }, (_, i) => `c${i}`).join("|")}|\n`;
+  const separator = `|${Array.from({ length: columns }, () => "-").join("|")}|\n`;
+  const content = `${header}${separator}${"x\n".repeat(2000)}`;
+  assert.equal(content.length, 14_894);
+  assert.ok(!content.includes("["));
+
+  const bridge = installBridge(() => true);
+  try {
+    // The parse counter is `renderCachedMarkdown`'s own: it ticks once per
+    // fresh react-markdown call, which is where mdast→hast, the React tree
+    // and `renderToStaticMarkup` all happen. Unchanged across the refusal is
+    // the measurement that the conversion was never reached.
+    const parsesBefore = getMarkdownParseCount();
+    const started = performance.now();
+    await assert.rejects(
+      exportMarkdownDocumentToPdf({ content, filename: "padded-table.md" }),
+      /too many elements/,
+    );
+    const elapsed = performance.now() - started;
+    assert.equal(getMarkdownParseCount(), parsesBefore);
+    assert.equal(bridge.calls.length, 0);
+    assert.ok(
+      elapsed < 20,
+      `the gate must refuse before the conversion, took ${elapsed}ms`,
+    );
+  } finally {
+    bridge.restore();
+  }
+});
+
+test("a padded table just inside the bound still exports", async () => {
+  const bridge = installBridge(() => true);
+  try {
+    // 16 columns × 1,024 pipeless rows is exactly 16,384 padded cells, the
+    // largest table the bound admits, and it renders here for real.
+    const header = `|${Array.from({ length: 16 }, (_, i) => `c${i}`).join("|")}|\n`;
+    const separator = `|${Array.from({ length: 16 }, () => "-").join("|")}|\n`;
+    const content = `${header}${separator}${"x\n".repeat(1024)}`;
+    assert.equal(
+      await exportMarkdownDocumentToPdf({ content, filename: "padded.md" }),
+      true,
+    );
+    assert.equal(bridge.calls.length, 1);
+    assert.equal(
+      (bridge.calls[0].payload.bodyHtml.match(/<td/g) ?? []).length,
+      16_384,
+    );
+  } finally {
+    bridge.restore();
+  }
+});
+
+test("an ordinary 12 x 200 table still exports", async () => {
+  const bridge = installBridge(() => true);
+  try {
+    const header = `|${Array.from({ length: 12 }, (_, i) => `c${i}`).join("|")}|\n`;
+    const separator = `|${Array.from({ length: 12 }, () => "-").join("|")}|\n`;
+    const row = `|${Array.from({ length: 12 }, () => "x").join("|")}|\n`;
+    const content = `# Report\n\n${header}${separator}${row.repeat(200)}`;
+    assert.equal(
+      await exportMarkdownDocumentToPdf({ content, filename: "report.md" }),
+      true,
+    );
+    assert.equal(bridge.calls.length, 1);
+    assert.equal(
+      (bridge.calls[0].payload.bodyHtml.match(/<td/g) ?? []).length,
+      2400,
+    );
+  } finally {
+    bridge.restore();
+  }
 });
 
 test("refuses a deeply nested list before it is rendered", async () => {

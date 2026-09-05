@@ -8,6 +8,13 @@
  * costs in proportion to the number of mdast nodes, and nothing before this
  * point counts them.
  *
+ * With one measured exception, which this budget does *not* bound: a GFM
+ * table. `mdast-util-to-hast` pads every body row out to the header's column
+ * count, so a table can emit up to 668× the cells mdast carries while staying
+ * far inside this cap. That shape is bounded before the parse instead, by
+ * `MAX_MARKDOWN_DOC_TABLE_CELL_WORK` in `markdownDocFile.ts`, which counts
+ * exactly the cells the conversion emits.
+ *
  * Measured on this machine (M-series, Node 24.15.0, this branch's pinned
  * pipeline) through the production entry `renderMarkdownDocumentHtml`, over
  * the 2,456 real markdown files reachable from this repository:

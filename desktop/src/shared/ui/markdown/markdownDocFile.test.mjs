@@ -10,6 +10,7 @@ import {
   MAX_MARKDOWN_DOC_DESCENT_WORK,
   MAX_MARKDOWN_DOC_ESTIMATED_NODES,
   MAX_MARKDOWN_DOC_TABLE_CELL_MARKERS,
+  MAX_MARKDOWN_DOC_TABLE_CELL_WORK,
   measureMarkdownDocParseWork,
 } from "./markdownDocFile.ts";
 
@@ -86,6 +87,16 @@ function gfmTable(cols, rows) {
   const separator = `|${Array.from({ length: cols }, () => "-").join("|")}|\n`;
   const row = `|${Array.from({ length: cols }, () => "x").join("|")}|\n`;
   return header + separator + row.repeat(rows);
+}
+
+/**
+ * A GFM table whose header declares `cols` columns and whose `rows` body
+ * lines carry no `|` at all — hast pads each of them to the header's width.
+ */
+function pipelessTable(cols, rows) {
+  const header = `|${Array.from({ length: cols }, (_, i) => `c${i}`).join("|")}|\n`;
+  const separator = `|${Array.from({ length: cols }, () => "-").join("|")}|\n`;
+  return header + separator + "x\n".repeat(rows);
 }
 
 /** A list nested one level deeper on each line. */
@@ -221,6 +232,98 @@ test("table markers: are counted document-wide, not per block", () => {
 test("table markers: a document with prose-scale pipes is not penalized", () => {
   const text = `# Report\n\n${gfmTable(4, 40)}\n\nUse \`a || b\` when either matches.\n`;
   assert.equal(exceedsMarkdownDocParseBudget(text), false);
+});
+
+// ── table cell work (mdast→hast row padding) ──────────────────────────────
+//
+// `mdast-util-to-hast` pads every table body row out to the *header's* column
+// count. mdast carries only the cells that were written; hast carries
+// `rows × columns`. So a table whose header declares many columns and whose
+// body rows carry no `|` at all is invisible to every counter above — the
+// marker count finds only the header's pipes, and the parsed tree the node
+// budget walks holds about three nodes per row. This was the round-4 blind
+// critic's F6. `markdownParseBudget.test.mjs` asserts that this counter
+// equals the `<td>` count the production render emits; these bound it.
+
+test("table cell work: false at exactly the cap", () => {
+  // 16 columns × 1,024 rows is exactly 16,384 padded cells: 131 ms measured
+  // through `renderMarkdownDocumentHtml`, the largest table admitted.
+  const text = pipelessTable(16, 1024);
+  assert.equal(
+    measureMarkdownDocParseWork(text).tableCellWork,
+    MAX_MARKDOWN_DOC_TABLE_CELL_WORK,
+  );
+  assert.equal(exceedsMarkdownDocParseBudget(text), false);
+});
+
+test("table cell work: true one row past the cap", () => {
+  const text = pipelessTable(16, 1025);
+  assert.equal(
+    measureMarkdownDocParseWork(text).tableCellWork,
+    MAX_MARKDOWN_DOC_TABLE_CELL_WORK + 16,
+  );
+  assert.equal(exceedsMarkdownDocParseBudget(text), true);
+});
+
+test("table cell work: refuses the round-4 critic's F6 table", () => {
+  // 1,500 columns × 2,000 pipeless rows: 14,894 bytes — 0.7% of the byte cap
+  // — and every other counter says it is cheap. Rendered, it is 3,000,000
+  // `<td>` elements: 8,813 ms on the panel-open path measured, and a 4 GB
+  // heap exhausted at 1,000 × 5,900.
+  const text = pipelessTable(1500, 2000);
+  const work = measureMarkdownDocParseWork(text);
+  assert.ok(text.length < MAX_MARKDOWN_DOC_BYTES);
+  assert.ok(work.tableCellMarkers <= MAX_MARKDOWN_DOC_TABLE_CELL_MARKERS);
+  assert.ok(work.estimatedNodes <= MAX_MARKDOWN_DOC_ESTIMATED_NODES);
+  assert.equal(work.descentWork, 0);
+  assert.equal(work.delimiterWork, 0);
+  assert.equal(work.tableCellWork, 3_000_000);
+  assert.equal(exceedsMarkdownDocParseBudget(text), true);
+});
+
+test("table cell work: an ordinary table is admitted, written out or not", () => {
+  // 12 × 200 is the same 2,400 cells whether the rows write them or not —
+  // which is the point: the count is of the cells the conversion emits.
+  assert.equal(
+    measureMarkdownDocParseWork(pipelessTable(12, 200)).tableCellWork,
+    2400,
+  );
+  assert.equal(
+    measureMarkdownDocParseWork(gfmTable(12, 200)).tableCellWork,
+    2400,
+  );
+  assert.equal(exceedsMarkdownDocParseBudget(pipelessTable(12, 200)), false);
+  assert.equal(exceedsMarkdownDocParseBudget(gfmTable(12, 200)), false);
+});
+
+test("table cell work: is summed document-wide, not taken per table", () => {
+  // Two tables of 100 × 100 cost what one table of 20,000 cells costs, so
+  // splitting a table must not buy a document past the cap.
+  const text = `${pipelessTable(100, 100)}\n${pipelessTable(100, 100)}`;
+  assert.equal(measureMarkdownDocParseWork(text).tableCellWork, 20_000);
+  assert.equal(exceedsMarkdownDocParseBudget(text), true);
+});
+
+test("table cell work: a blank line ends the body, as it does in the parser", () => {
+  // Verified against the render: a 10 × 3 table followed by a blank line and
+  // five more lines emits 30 `<td>`, not 80 — the lines after the blank are a
+  // paragraph. A model that kept counting them would refuse real documents.
+  const text = `${pipelessTable(1000, 0)}\n${"x\n".repeat(4000)}`;
+  assert.equal(measureMarkdownDocParseWork(text).tableCellWork, 0);
+});
+
+test("table cell work: a delimiter row of another width is not a table", () => {
+  // Verified against the render: this emits no `<td>` at all — GFM requires
+  // the delimiter row to have the header's cell count, so the whole block
+  // stays a paragraph.
+  const text = `|a|b|c|\n|-|-|\n${"x\n".repeat(2000)}`;
+  assert.equal(measureMarkdownDocParseWork(text).tableCellWork, 0);
+  assert.equal(exceedsMarkdownDocParseBudget(text), false);
+});
+
+test("table cell work: prose that merely carries a pipe opens no table", () => {
+  const text = "# Report\n\nSome | pipe in prose.\n\n---\n\nmore text\n";
+  assert.equal(measureMarkdownDocParseWork(text).tableCellWork, 0);
 });
 
 // ── descent work (document tokenizer) ─────────────────────────────────────

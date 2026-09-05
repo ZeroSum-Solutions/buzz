@@ -18,8 +18,13 @@ import { test } from "node:test";
 import {
   documentModeComponents,
   isMarkdownDocumentTooComplex,
+  renderMarkdownDocumentHtml,
 } from "./documentMode.tsx";
-import { exceedsMarkdownDocParseBudget } from "./markdownDocFile.ts";
+import {
+  exceedsMarkdownDocParseBudget,
+  MAX_MARKDOWN_DOC_TABLE_CELL_WORK,
+  measureMarkdownDocParseWork,
+} from "./markdownDocFile.ts";
 import {
   countMarkdownNodesWithinBudget,
   isMarkdownTooComplexError,
@@ -147,6 +152,64 @@ test("the document gate refuses the round-3 critic's F4 and F5 shapes", () => {
     ),
     true,
   );
+});
+
+// ── the table bound, against the cost it claims to be ─────────────────────
+//
+// The node budget bounds mdast. `mdast-util-to-hast` pads every GFM table
+// body row out to the header's column count, so for a table the tree it
+// bounds is not the tree that costs — the round-4 blind critic's F6. The
+// source-side `tableCellWork` counter bounds that phase instead, and this is
+// the assertion that it is the cost and not another proxy: through the
+// production render, the counter equals the cells emitted, exactly.
+
+/** A GFM table whose `rows` body lines carry no `|` at all. */
+function pipelessTable(cols, rows) {
+  const header = `|${Array.from({ length: cols }, (_, i) => `c${i}`).join("|")}|\n`;
+  const separator = `|${Array.from({ length: cols }, () => "-").join("|")}|\n`;
+  return header + separator + "x\n".repeat(rows);
+}
+
+test("table cell work counts the cells the render emits, not the cells written", async () => {
+  for (const [cols, rows] of [
+    [10, 5],
+    [100, 100],
+    [100, 500],
+  ]) {
+    const text = pipelessTable(cols, rows);
+    const html = await renderMarkdownDocumentHtml(text);
+    assert.equal(
+      measureMarkdownDocParseWork(text).tableCellWork,
+      (html.match(/<td/g) ?? []).length,
+      `${cols} x ${rows}: the counter must be the emitted cell count`,
+    );
+  }
+});
+
+test("the largest table the bound admits renders inside the task budget", async () => {
+  // 16 columns × 1,024 pipeless rows is exactly the cap. 200 ms is this app's
+  // main-thread task budget; the shape measures 77–131 ms in a fresh process.
+  // A cap raised past this fails with a timing, not only with arithmetic.
+  const text = pipelessTable(16, 1024);
+  assert.equal(
+    measureMarkdownDocParseWork(text).tableCellWork,
+    MAX_MARKDOWN_DOC_TABLE_CELL_WORK,
+  );
+  assert.equal(isMarkdownDocumentTooComplex(text), false);
+  const started = performance.now();
+  await renderMarkdownDocumentHtml(text);
+  const elapsed = performance.now() - started;
+  assert.ok(elapsed < 400, `rendered in ${elapsed}ms`);
+});
+
+test("the document gate refuses the round-4 critic's F6 table", () => {
+  // 1,500 columns × 2,000 pipeless rows, 14,894 bytes: 3,002 `|` (under the
+  // marker cap), 9,003 mdast nodes (under the node budget), no descent and no
+  // delimiters — and 3,000,000 `<td>` if it is let through. Both Preview and
+  // Export ask this one function, so both refuse it.
+  const text = pipelessTable(1500, 2000);
+  assert.equal(exceedsMarkdownDocParseBudget(text), true);
+  assert.equal(isMarkdownDocumentTooComplex(text), true);
 });
 
 test("the exported budget is the one document mode applies", () => {
