@@ -194,11 +194,28 @@ export function createChannelFilesIndexController({
         if (disposed) return;
 
         // Ingest first, advance the cursor second: a failure between the two
-        // costs a refetch of one page, never a skipped one.
-        const changed = ingest(events);
+        // costs a refetch of one page, never a skipped one. The relay's page
+        // is untrusted shape as well as untrusted content, so reading it is
+        // allowed to fail — and when it does the walk stops with a message
+        // rather than throwing out of `start()` as an unhandled rejection.
+        let changed: boolean;
+        let next: Cursor | null;
+        let pageSize: number;
+        try {
+          if (!Array.isArray(events)) {
+            throw new Error("the relay returned a page that is not a list");
+          }
+          pageSize = events.length;
+          changed = ingest(events);
+          next = oldestPageCursor(events);
+        } catch (cause) {
+          historyError = `Could not load older files (page ${
+            pagesFetched + 1
+          }): ${detail(cause)}`;
+          return;
+        }
         pagesFetched += 1;
-        const next = oldestPageCursor(events);
-        if (events.length < BACKFILL_PAGE_LIMIT || next === null) {
+        if (pageSize < BACKFILL_PAGE_LIMIT || next === null) {
           complete = true;
           return;
         }

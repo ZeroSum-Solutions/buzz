@@ -525,3 +525,58 @@ test("a relay failure message is capped before it reaches the user", async () =>
     `error length ${error.length}`,
   );
 });
+
+test("a history page that is not an array is refused, not thrown out of the walk", async () => {
+  // `fetchPage` returns whatever the backend command sent. A contract
+  // violation used to escape `backfill` as an unhandled rejection: the walk
+  // stopped, nothing was surfaced, and the tab sat on a partial list saying
+  // everything was fine.
+  const h = harness({ pages: [() => null, [fileEvent({ index: 1 })]] });
+
+  await assert.doesNotReject(() => h.controller.start());
+
+  const snapshot = h.controller.snapshot();
+  assert.match(snapshot.error ?? "", /Could not load older files/);
+  // Named for what actually went wrong, not the TypeError it would otherwise
+  // surface from deep inside ingestion.
+  assert.match(snapshot.error ?? "", /page that is not a list/);
+  assert.equal(snapshot.complete, false, "a refused page is not the end");
+  assert.equal(snapshot.hasMore, true, "the user can still retry");
+});
+
+test("a page the index cannot read leaves the cursor where it was", async () => {
+  // The ordering guard: events are ingested before the cursor advances, so a
+  // failure in between costs a refetch of one page and never skips one.
+  const first = Array.from({ length: BACKFILL_PAGE_LIMIT }, (_unused, i) =>
+    fileEvent({ index: 500 - i }),
+  );
+  const hostile = Array.from({ length: BACKFILL_PAGE_LIMIT }, (_unused, i) =>
+    fileEvent({ index: 400 - i }),
+  );
+  // A relay-shaped object whose `tags` cannot be read. Reading it is the first
+  // thing ingestion does, so the page fails before anything is recorded.
+  Object.defineProperty(hostile[0], "tags", {
+    get() {
+      throw new Error("tags unreadable");
+    },
+  });
+
+  const h = harness({
+    pages: [first, hostile, [fileEvent({ index: 1 })]],
+  });
+
+  await assert.doesNotReject(() => h.controller.start());
+
+  const stopped = h.controller.snapshot();
+  assert.match(stopped.error ?? "", /tags unreadable/);
+  assert.equal(stopped.complete, false);
+  assert.equal(fileKeys(h.controller).length, BACKFILL_PAGE_LIMIT);
+
+  await h.controller.loadMore();
+
+  // The retry asks for the SAME page again: the failed page advanced nothing.
+  assert.equal(h.requests[2].until, h.requests[1].until);
+  assert.equal(h.requests[2].beforeId, h.requests[1].beforeId);
+  const keys = fileKeys(h.controller);
+  assert.equal(new Set(keys).size, keys.length, "the retry adds no duplicates");
+});
