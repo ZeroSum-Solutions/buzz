@@ -164,7 +164,21 @@ jobs:
         if: steps.playwright-cache.outputs.cache-hit != 'true'
         run: cd desktop && pnpm exec playwright install chromium
       - name: Install Playwright system dependencies
-        run: cd desktop && pnpm exec playwright install-deps chromium
+        # zs fork: install-deps runs apt against Ubuntu mirrors that drop out
+        # from the Blacksmith network for minutes at a time; retry with a pause.
+        run: |
+          cd desktop
+          for attempt in 1 2 3 4 5; do
+            if pnpm exec playwright install-deps chromium; then
+              break
+            fi
+            if [ "$attempt" = 5 ]; then
+              echo "::error::playwright install-deps failed after 5 attempts"
+              exit 1
+            fi
+            echo "install-deps attempt $attempt failed; retrying in 30s"
+            sleep 30
+          done
       - name: Save Playwright browser cache
         if: steps.playwright-cache.outputs.cache-hit != 'true' && github.event_name == 'push' && matrix.shard == 1
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
