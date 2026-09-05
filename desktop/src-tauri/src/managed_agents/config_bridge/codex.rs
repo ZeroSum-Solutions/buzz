@@ -7,7 +7,7 @@ pub(super) fn read_config_file() -> Option<RuntimeFileConfig> {
     parse_codex_config(&raw)
 }
 
-fn parse_codex_config(toml_str: &str) -> Option<RuntimeFileConfig> {
+pub(super) fn parse_codex_config(toml_str: &str) -> Option<RuntimeFileConfig> {
     let table: toml::Table = toml_str.parse().ok()?;
 
     let model = toml_string(&table, "model");

@@ -122,9 +122,9 @@ type ProfileSyncParams = Vec<(
 )>;
 
 #[tauri::command]
-pub async fn update_persona(
+pub async fn update_persona<R: tauri::Runtime>(
     input: UpdatePersonaRequest,
-    app: AppHandle,
+    app: AppHandle<R>,
 ) -> Result<UpdatePersonaResult, String> {
     let (persona, ()) = update_persona_with(input, app, |app, state, persona| {
         retain_persona_pending(app, state, persona);
@@ -145,17 +145,46 @@ pub async fn update_persona(
 /// [`update_persona`] enqueues best-effort, while
 /// [`sharing::update_persona_and_publish`] prepares a strict publication and
 /// returns the event so the caller can await relay acceptance.
-pub(super) async fn update_persona_with<R: Send + 'static>(
+pub(super) async fn update_persona_with<R: tauri::Runtime, T: Send + 'static>(
     input: UpdatePersonaRequest,
-    app: AppHandle,
-    retain: impl FnOnce(&AppHandle, &AppState, &AgentDefinition) -> Result<R, String> + Send + 'static,
-) -> Result<(AgentDefinition, R), String> {
+    app: AppHandle<R>,
+    retain: impl FnOnce(&AppHandle<R>, &AppState, &AgentDefinition) -> Result<T, String>
+        + Send
+        + 'static,
+) -> Result<(AgentDefinition, T), String> {
+    update_persona_with_precondition(input, None, app, retain).await
+}
+
+/// [`update_persona_with`] with an optional lost-update guard.
+///
+/// A caller that builds its request from a *read* of the stored definition
+/// rather than from a form the user filled in (the prompt-source reload) cannot
+/// hold the store lock across both passes, because this function takes it
+/// itself. `expected_updated_at` closes that window: it is the `updated_at` the
+/// caller read, and the save is refused if the stored definition has moved
+/// since. `updated_at` is an RFC-3339 timestamp with sub-second precision
+/// written on every save (`util::now_iso`), so two saves never share one.
+///
+/// The check runs before any field is applied, so a refusal writes nothing:
+/// the concurrent edit stands and the caller is told to retry, instead of the
+/// request's replace-everything fields silently reverting it.
+///
+/// `None` keeps the unguarded behaviour every form-driven caller wants: the
+/// user typed the values they can see, and last write wins.
+pub(super) async fn update_persona_with_precondition<R: tauri::Runtime, T: Send + 'static>(
+    input: UpdatePersonaRequest,
+    expected_updated_at: Option<String>,
+    app: AppHandle<R>,
+    retain: impl FnOnce(&AppHandle<R>, &AppState, &AgentDefinition) -> Result<T, String>
+        + Send
+        + 'static,
+) -> Result<(AgentDefinition, T), String> {
     use tauri::Manager;
 
     // Phase 1: synchronous save (persona record + linked agent avatar updates)
     let (result, retained, profile_sync_params) = tokio::task::spawn_blocking({
         let app = app.clone();
-        move || -> Result<(AgentDefinition, R, ProfileSyncParams), String> {
+        move || -> Result<(AgentDefinition, T, ProfileSyncParams), String> {
             let state = app.state::<AppState>();
             let display_name = trim_required(&input.display_name, "Display name")?;
             let system_prompt = input.system_prompt.clone();
@@ -176,6 +205,15 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
                 .iter_mut()
                 .find(|record| record.id == input.id)
                 .ok_or_else(|| format!("agent {} not found", input.id))?;
+
+            if let Some(expected) = expected_updated_at.as_deref() {
+                if persona.updated_at != expected {
+                    return Err(format!(
+                        "agent {} was edited while its prompt file was being read; nothing was written. Reload the file again.",
+                        input.id
+                    ));
+                }
+            }
 
             // Track what changed so we can propagate to linked agent records.
             let avatar_changed = persona.avatar_url != avatar_url;
