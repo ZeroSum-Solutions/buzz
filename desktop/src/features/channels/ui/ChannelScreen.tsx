@@ -70,7 +70,11 @@ import { AgentSessionProvider } from "@/shared/context/AgentSessionContext";
 import { ProfilePanelProvider } from "@/shared/context/ProfilePanelContext";
 import { useChannelPaneOpeners } from "@/features/channels/ui/useChannelPaneOpeners";
 import { useMainInsetRef } from "@/shared/layout/MainInsetContext";
-import { channelContentTopPaddingMeasurement } from "@/shared/layout/chromeLayout";
+import {
+  channelChrome,
+  channelContentTopPaddingMeasurement,
+} from "@/shared/layout/chromeLayout";
+import { cn } from "@/shared/lib/cn";
 import { useMeasuredCssVariable } from "@/shared/layout/useMeasuredCssVariable";
 import { useElementWidth } from "@/shared/hooks/use-mobile";
 import { useThreadPanelWidth } from "@/shared/hooks/useThreadPanelWidth";
@@ -86,7 +90,19 @@ import { useChannelRouteTarget } from "./useChannelRouteTarget";
 import { useChannelOpenReadState } from "./useChannelOpenReadState";
 import { useChannelUnreadState } from "./useChannelUnreadState";
 import type { ChannelScreenProps } from "./ChannelScreen.types";
-import { GuardedChannelPane } from "./GuardedChannelPane"; import { useNavigationGuard } from "./useNavigationGuard"; import * as searchForwarding from "./searchTargetForwarding";
+import { GuardedChannelPane } from "./GuardedChannelPane";
+import { useNavigationGuard } from "./useNavigationGuard";
+import * as searchForwarding from "./searchTargetForwarding";
+import { ChannelFilesTab } from "@/features/channel-files/ChannelFilesTab";
+import { useChannelFiles } from "@/features/channel-files/useChannelFiles";
+import { useFileFolders } from "@/features/channel-files/useFileFolders";
+import {
+  CHANNEL_TAB_CHAT,
+  CHANNEL_TAB_FILES,
+  ChannelTabStrip,
+  channelTabId,
+  channelTabPanelId,
+} from "@/features/channels/ui/ChannelTabStrip";
 const EMPTY_RELAY_EVENTS: RelayEvent[] = [];
 export function ChannelScreen({
   activeChannel,
@@ -103,7 +119,7 @@ export function ChannelScreen({
   ...searchTarget
 }: ChannelScreenProps) {
   const queryClient = useQueryClient();
-  const { goHome } = useAppNavigation();
+  const { goHome, goChannel } = useAppNavigation();
   const { activeCommunity } = useCommunities();
   const {
     clearChannelUnreadSource,
@@ -157,6 +173,7 @@ export function ChannelScreen({
   } = useThreadPanelWidth(channelContentWidthPx || undefined);
   const [isMembersSidebarOpen, setIsMembersSidebarOpen] = React.useState(false);
   const [isAddBotOpen, setIsAddBotOpen] = React.useState(false);
+  const [activeTab, setActiveTab] = React.useState<string>(CHANNEL_TAB_CHAT);
   const [expandedThreadReplyIds, setExpandedThreadReplyIds] = React.useState(
     () => new Set<string>(),
   );
@@ -213,6 +230,21 @@ export function ChannelScreen({
     threadScrollTargetId,
   );
   useChannelSubscription(activeChannel);
+  // The Files projection re-parses the whole loaded message window on every
+  // live message, so it stays off until the user actually opens the tab for
+  // this channel; a Chat-only session never pays for it.
+  const [filesTabOpened, setFilesTabOpened] = React.useState(false);
+  React.useEffect(() => {
+    if (activeTab === CHANNEL_TAB_FILES) setFilesTabOpened(true);
+  }, [activeTab]);
+  const channelFiles = useChannelFiles(activeChannel, filesTabOpened);
+  const fileFoldersHook = useFileFolders(activeChannelId, currentPubkey);
+  // Reset to chat tab when switching channels
+  // biome-ignore lint/correctness/useExhaustiveDependencies: activeChannelId is the intentional reset trigger
+  React.useEffect(() => {
+    setActiveTab(CHANNEL_TAB_CHAT);
+    setFilesTabOpened(false);
+  }, [activeChannelId]);
   const { fetchOlder, hasOlderMessages, historyExhausted, isFetchingOlder } =
     useFetchOlderMessages(activeChannel);
   const latestActiveMessage = React.useMemo(() => {
@@ -380,6 +412,42 @@ export function ChannelScreen({
     relayAgents,
   });
   const messageOwnerProfiles = useMessageOwnerProfiles(messageProfiles);
+  // Build a pubkey -> display name map for the Files tab attribution
+  const fileSenderNames = React.useMemo(() => {
+    const map = new Map<string, string>();
+    for (const file of channelFiles.files) {
+      if (map.has(file.pubkey)) continue;
+      const profile = messageProfiles[file.pubkey];
+      if (profile) {
+        map.set(
+          file.pubkey,
+          profile.displayName ?? profile.name ?? profile.nip05Handle ?? "",
+        );
+      }
+    }
+    return map;
+  }, [channelFiles.files, messageProfiles]);
+
+  // Build a pubkey -> avatar URL map for the Files tab
+  const fileSenderAvatarUrls = React.useMemo(() => {
+    const map = new Map<string, string | null>();
+    for (const file of channelFiles.files) {
+      if (map.has(file.pubkey)) continue;
+      const profile = messageProfiles[file.pubkey];
+      map.set(file.pubkey, profile?.avatarUrl ?? null);
+    }
+    return map;
+  }, [channelFiles.files, messageProfiles]);
+
+  const handleJumpToMessage = React.useCallback(
+    (eventId: string) => {
+      if (activeChannelId) {
+        void goChannel(activeChannelId, { messageId: eventId });
+        setActiveTab(CHANNEL_TAB_CHAT);
+      }
+    },
+    [activeChannelId, goChannel],
+  );
   const communityAgentPubkeys = useKnownAgentPubkeys();
   const agentPubkeys = React.useMemo(() => {
     const pubkeys = new Set([...communityAgentPubkeys, ...knownAgentPubkeys]);
@@ -707,11 +775,18 @@ export function ChannelScreen({
     hasAuxiliaryPanel &&
     channelContentWidthPx > 0 &&
     channelContentWidthPx < 760;
+  // The single-panel view replaces the chat column with a full-width
+  // auxiliary panel, so the channel header is dropped there. The Files tab
+  // renders no auxiliary panel, so it keeps its header (and with it the tab
+  // strip, the only way back to Chat).
+  const hideChannelHeader =
+    isSinglePanelView && activeTab === CHANNEL_TAB_CHAT;
+  const activeChannelType = activeChannel?.channelType;
   const channelHeaderChromeRef = useMeasuredCssVariable({
     targetRef: mainInsetRef,
     ...channelContentTopPaddingMeasurement,
     resetKey: activeChannelId,
-    enabled: !isSinglePanelView,
+    enabled: !hideChannelHeader,
   });
   const { handleManageChannel, handleOpenMarkdownDoc } = useChannelPaneOpeners({
     channelType: activeChannel?.channelType,
@@ -731,6 +806,25 @@ export function ChannelScreen({
     () => setIsMembersSidebarOpen((prev) => !prev),
     [],
   );
+  const showChannelTabs =
+    !!activeChannelType && activeChannelType !== "forum";
+  const channelTabs = React.useMemo(
+    () =>
+      showChannelTabs ? (
+        <ChannelTabStrip activeTab={activeTab} onSelect={setActiveTab} />
+      ) : null,
+    [activeTab, showChannelTabs],
+  );
+  // Only the selected panel is mounted, so the strip's `aria-controls`
+  // resolves for the active tab and this one container carries that panel's
+  // identity. Forum channels have no tab strip and so stay a plain div.
+  const channelTabPanelProps = showChannelTabs
+    ? {
+        "aria-labelledby": channelTabId(activeTab),
+        id: channelTabPanelId(activeTab),
+        role: "tabpanel",
+      }
+    : {};
   const channelHeader = React.useMemo(
     () => (
       <ChannelScreenHeader
@@ -749,14 +843,23 @@ export function ChannelScreen({
         onJoinChannel={joinChannelMutation.mutateAsync}
         onManageChannel={handleManageChannel}
         onToggleMembers={handleToggleMembers}
-        showHeaderContent={!isSinglePanelView && !isHuddleTranscript}
-        transparentChrome={activeChannel?.channelType !== "forum"}
+        showHeaderContent={!hideChannelHeader && !isHuddleTranscript}
+        tabs={channelTabs}
+        // On Chat the shared blur band inside ChannelPane backs this header;
+        // the Files tab has no such band, so the header carries its own.
+        transparentChrome={
+          activeChannelType !== "forum" && activeTab === CHANNEL_TAB_CHAT
+        }
       />
     ),
     [
       activeChannel,
       activeChannelEphemeralDisplay,
       activeChannelTitle,
+      activeChannelType,
+      activeTab,
+      channelTabs,
+      hideChannelHeader,
       shouldCompactHeaderActions,
       activeDmAvatarUrl,
       activeDmHeaderParticipants,
@@ -769,10 +872,10 @@ export function ChannelScreen({
       joinChannelMutation.mutateAsync,
       handleManageChannel,
       handleToggleMembers,
-      isSinglePanelView,
       isHuddleTranscript,
     ],
   );
+
   return (
     <AgentSessionProvider onOpenAgentSession={handleOpenAgentSession}>
       <ProfilePanelProvider onOpenProfilePanel={handleOpenProfilePanel}>
@@ -827,6 +930,17 @@ export function ChannelScreen({
                 searchTarget,
               )
             ) : (
+              <div
+                className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
+                {...channelTabPanelProps}
+              >
+                {/* The channel header (tab strip included) stays threaded
+                    into ChannelPane on Chat: it is the overlay whose measured
+                    title-row height every pane-internal offset clears, so
+                    hoisting it out of the pane left those offsets stacking
+                    below a header that was no longer there. The Files tab
+                    renders the same header element itself. */}
+                {isHuddleTranscript || activeTab === CHANNEL_TAB_CHAT ? (
               <React.Suspense
                 fallback={
                   <ChannelScreenLoadingFallback
@@ -987,6 +1101,44 @@ export function ChannelScreen({
                   searchTarget,
                 )}
               </React.Suspense>
+                ) : (
+                  <>
+                    {channelHeader}
+                    {/* The header overlays the top of this column (its own
+                        negative margin cancels its measured height), so the
+                        Files content clears exactly that one measured offset —
+                        the same offset MessageTimeline applies on Chat. */}
+                    <div
+                      className={cn(
+                        "flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden",
+                        channelChrome.contentPadding,
+                      )}
+                    >
+                  <ChannelFilesTab
+                    canMutateFolders={fileFoldersHook.canMutate}
+                    fileFolderMap={fileFoldersHook.fileFolderMap}
+                    files={channelFiles.files}
+                    foldersError={fileFoldersHook.isError}
+                    foldersInvalidReason={fileFoldersHook.invalidReason}
+                    foldersLoading={fileFoldersHook.isLoading}
+                    isError={channelFiles.isError}
+                    isLoading={channelFiles.isLoading}
+                    onAssignFiles={fileFoldersHook.assignFiles}
+                    onCreateFolder={fileFoldersHook.createFolder}
+                    onDeleteFolder={fileFoldersHook.deleteFolder}
+                    onJumpToMessage={handleJumpToMessage}
+                    onMoveFolder={fileFoldersHook.moveFolder}
+                    onRetryFiles={channelFiles.refetch}
+                    onRetryFolders={() => void fileFoldersHook.refetch()}
+                    senderAvatarUrls={fileSenderAvatarUrls}
+                    senderNames={fileSenderNames}
+                    snapshot={fileFoldersHook.snapshot}
+                    truncated={channelFiles.truncated}
+                  />
+                    </div>
+                  </>
+                )}
+              </div>
             )
           ) : (
             <ChannelScreenEmptyState />

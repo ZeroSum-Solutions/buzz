@@ -23,7 +23,16 @@ import { writeTextToClipboard } from "@/shared/lib/clipboard";
 type ChatHeaderProps = {
   actions?: React.ReactNode;
   belowSystemChrome?: boolean;
-  /** Ref to the outer chrome wrapper when `belowSystemChrome` is true. */
+  /**
+   * Ref to the outer chrome wrapper when `belowSystemChrome` is true. Its
+   * height becomes `--buzz-channel-content-top-padding`, and the same
+   * variable is the wrapper's own negative bottom margin, so the header
+   * contributes zero flow height and overlays the content below it. `tabs`
+   * is inside that box on purpose: leaving it out would make the wrapper
+   * taller than the margin cancels, pushing the whole column down by the
+   * strip's height and shrinking every child of the column — including the
+   * channel drop-zone overlay — by that much.
+   */
   chromeWrapperRef?: React.Ref<HTMLDivElement>;
   title: string;
   description?: string;
@@ -33,6 +42,12 @@ type ChatHeaderProps = {
   mode?: "home" | "channel" | "agents" | "workflows" | "pulse" | "projects";
   overlaysContent?: boolean;
   statusBadge?: React.ReactNode;
+  /**
+   * Row rendered inside the header, directly below the title row (e.g. a
+   * channel tab strip). It grows the header box instead of becoming a
+   * separate sibling, so header-relative geometry stays a single offset.
+   */
+  tabs?: React.ReactNode;
   /** Identity adornment rendered exactly 4px after a DM title. */
   titleAdornment?: React.ReactNode;
   /** Render the chrome wrapper without an individual backdrop when a parent supplies shared blur. */
@@ -98,6 +113,7 @@ export function ChatHeader({
   mode = "channel",
   overlaysContent = false,
   statusBadge,
+  tabs,
   titleAdornment,
   transparentChrome = false,
 }: ChatHeaderProps) {
@@ -118,59 +134,66 @@ export function ChatHeader({
   const header = (
     <header
       className={cn(
-        "pointer-events-auto relative z-30 min-w-0 shrink-0 cursor-default select-none bg-transparent px-5 py-2 transition-[margin,padding] duration-200 ease-linear",
+        "pointer-events-auto relative z-30 min-w-0 shrink-0 cursor-default select-none bg-transparent px-5 transition-[margin,padding] duration-200 ease-linear",
         overlaysContent && !belowSystemChrome && "-mb-14",
       )}
       data-testid="chat-header"
       data-tauri-drag-region
     >
-      <div className="flex h-9 min-w-0 items-center gap-2.5">
-        <div className="min-w-0 flex-1">
-          <div className="group/title flex min-w-0 items-center gap-[4px] overflow-hidden">
-            <div className="flex shrink-0 items-center">
-              {leadingContent ?? (
-                <ChannelIcon
-                  channelType={channelType}
-                  mode={mode}
-                  visibility={visibility}
-                />
-              )}
-            </div>
-            <h1
-              className={cn(
-                "min-w-0 truncate text-base font-semibold leading-6 tracking-tight",
-                channelType !== "dm" && "translate-y-px",
-              )}
-              data-testid="chat-title"
-              title={trimmedDescription || undefined}
-            >
-              {title}
-            </h1>
-            {titleAdornment}
-            <Button
-              aria-label={`Copy channel name: ${title}`}
-              className="h-6 w-6 shrink-0 opacity-0 text-muted-foreground transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover/title:opacity-100"
-              onClick={() => void handleCopyTitle()}
-              size="icon-xs"
-              title="Copy channel name"
-              type="button"
-              variant="ghost"
-            >
-              <Copy className="h-3.5 w-3.5" />
-            </Button>
-            {statusBadge ? (
-              <div className="flex shrink-0 flex-wrap items-center gap-1">
-                {statusBadge}
+      {/* `py-2` lives on the title row rather than on <header> so `tabs`
+          renders flush under it instead of below a stale 8px gap, and so
+          <header>'s own inline padding (read by the header-action gap
+          assertions) is unchanged. */}
+      <div className="py-2">
+        <div className="flex h-9 min-w-0 items-center gap-2.5">
+          <div className="min-w-0 flex-1">
+            <div className="group/title flex min-w-0 items-center gap-[4px] overflow-hidden">
+              <div className="flex shrink-0 items-center">
+                {leadingContent ?? (
+                  <ChannelIcon
+                    channelType={channelType}
+                    mode={mode}
+                    visibility={visibility}
+                  />
+                )}
               </div>
-            ) : null}
+              <h1
+                className={cn(
+                  "min-w-0 truncate text-base font-semibold leading-6 tracking-tight",
+                  channelType !== "dm" && "translate-y-px",
+                )}
+                data-testid="chat-title"
+                title={trimmedDescription || undefined}
+              >
+                {title}
+              </h1>
+              {titleAdornment}
+              <Button
+                aria-label={`Copy channel name: ${title}`}
+                className="h-6 w-6 shrink-0 opacity-0 text-muted-foreground transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover/title:opacity-100"
+                onClick={() => void handleCopyTitle()}
+                size="icon-xs"
+                title="Copy channel name"
+                type="button"
+                variant="ghost"
+              >
+                <Copy className="h-3.5 w-3.5" />
+              </Button>
+              {statusBadge ? (
+                <div className="flex shrink-0 flex-wrap items-center gap-1">
+                  {statusBadge}
+                </div>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="flex shrink-0 items-center gap-1">
+            <UpdateIndicator />
+            {actions ? <div className="shrink-0">{actions}</div> : null}
           </div>
         </div>
-
-        <div className="flex shrink-0 items-center gap-1">
-          <UpdateIndicator />
-          {actions ? <div className="shrink-0">{actions}</div> : null}
-        </div>
       </div>
+      {tabs}
     </header>
   );
 
