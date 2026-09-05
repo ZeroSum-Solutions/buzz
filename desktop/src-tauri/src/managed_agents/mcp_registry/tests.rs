@@ -23,8 +23,26 @@ use crate::managed_agents::McpTransport;
 
 const LAUNCHER: &str = "/Applications/Buzz.app/Contents/MacOS/buzz-mcp-launch";
 
+/// Where the fixtures put a server binary.
+///
+/// The loader refuses a command the host calls relative, and `is_absolute` is
+/// host-specific: on Windows a root with no volume — `/usr/local/bin/x` — is
+/// relative to the current drive, so a Unix path would have every fixture
+/// below rejected for the one rule it is not about. Forward slashes are a
+/// Windows separator too, so a single shape serves both hosts.
+#[cfg(unix)]
+const SERVER_BIN: &str = "/usr/local/bin";
+#[cfg(windows)]
+const SERVER_BIN: &str = "C:/buzz/bin";
+
+/// Wrap `servers` in a document, with their commands rooted where this host
+/// calls absolute. The fixtures are written Unix-first; this is the one place
+/// that rewrites them, so each stays a readable JSON literal.
 fn document(servers: &str) -> String {
-    format!("{{\"version\":1,\"servers\":[{servers}]}}")
+    format!(
+        "{{\"version\":1,\"servers\":[{}]}}",
+        servers.replace("/usr/local/bin", SERVER_BIN)
+    )
 }
 
 fn stdio(id: &str, name: &str) -> String {
@@ -336,7 +354,7 @@ fn mcp_registry_generated_config_names_the_launcher_and_carries_no_value() {
             "{label} must name the bundled launcher by absolute path"
         );
         assert!(
-            !rendered.contains("/usr/local/bin/github-mcp\"\n"),
+            !rendered.contains(&format!("{SERVER_BIN}/github-mcp\"\n")),
             "{label} must not name the server binary as the command"
         );
         assert!(
