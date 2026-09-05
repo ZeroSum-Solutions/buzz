@@ -32,6 +32,13 @@ max-threads = 1
 [[profile.postgres-ci.overrides]]
 filter = "test(/cluster_global_/)"
 test-group = "postgres-cluster-global"
+# zs fork: the cluster-global probes count every session on the shared
+# cluster, and the group serializes only these tests, not the per-database
+# tests running beside them on eight workers. A concurrent session shows up as
+# MaskedActivity { masked: 1 } roughly once in ten runs on shared runners and
+# has ejected three merge-queue entries in one evening. Retry in place; a
+# genuine regression fails every attempt.
+retries = 3
 
 [[profile.postgres-ci.scripts]]
 # Script filters are separate from default-filter: they attach the setup and
@@ -39,3 +46,10 @@ test-group = "postgres-cluster-global"
 filter = "(test(/postgres_tests::/) or binary(/^postgres_/)) and not test(/(^|::)external_infra[^:]*::/)"
 setup = "postgres-template"
 run-wrapper = "postgres-isolation"
+
+# zs fork: this cancellation test races the turn's completion under load and
+# fails roughly once in twenty runs on shared runners while passing 15/15 in
+# isolation on the same tree. Retry it in place instead of failing the run.
+[[profile.default.overrides]]
+filter = "test(=cancelled_turn_with_usage_emits_notification_before_response)"
+retries = 2

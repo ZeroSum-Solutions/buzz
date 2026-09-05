@@ -31,6 +31,8 @@ export type MentionSuggestion = {
   notInChannel?: boolean;
   ownerLabel?: string | null;
   role?: string | null;
+  /** One-line agent role/description from the kind-0 `about` field. */
+  description?: string | null;
 };
 
 type MentionAutocompleteProps = {
@@ -279,6 +281,39 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
               suggestion.pubkey &&
                 lockedAgentPubkeys?.has(suggestion.pubkey.toLowerCase()),
             );
+            // The row's `aria-label` overrides all descendant text as the
+            // accessible name, so neither metadata line below is announced
+            // to screen-reader users without `aria-describedby`. Both the
+            // agent's self-authored `about` and the verified
+            // `managed by <owner>` provenance get an id here so the
+            // description carries both — promoting only the untrusted
+            // self-authored half while silently dropping verified
+            // provenance would let an agent's `about` fabricate ownership
+            // unchallenged.
+            const descriptionId =
+              suggestion.isAgent && suggestion.description
+                ? `mention-agent-description-${index}`
+                : undefined;
+            const provenanceId =
+              ownerLabel || suggestion.notInChannel
+                ? `mention-agent-provenance-${index}`
+                : undefined;
+            // In the name-collision branch `ownerLabel` is deliberately
+            // nulled above and the npub becomes the only trusted
+            // disambiguator between two rows that otherwise render and
+            // announce identically ("Mention Rex" for both). It needs the
+            // same treatment as `provenanceId`: without an id wired into
+            // `aria-describedby`, a screen-reader user hears two identical,
+            // self-authored-only descriptions and has no way to tell the
+            // agents apart, even though the sighted user sees the distinct
+            // npub.
+            const collisionNpubId = collisionNpub
+              ? `mention-collision-npub-${index}`
+              : undefined;
+            const describedBy =
+              [descriptionId, provenanceId, collisionNpubId]
+                .filter(Boolean)
+                .join(" ") || undefined;
 
             return (
               <div
@@ -293,6 +328,7 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
                 key={suggestionKey}
               >
                 <button
+                  aria-describedby={describedBy}
                   aria-label={`Mention ${suggestion.displayName}`}
                   className={cn(
                     "flex min-w-0 flex-1 items-center gap-2 rounded-lg px-3 py-1.5 text-left",
@@ -344,13 +380,24 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
                             team · {suggestion.teamMembers?.length ?? 0} agents
                           </span>
                         ) : suggestion.isAgent ? (
-                          <span className="inline-flex shrink-0 items-center gap-1">
+                          <span className="inline-flex min-w-0 items-center gap-1">
                             <Bot
                               aria-hidden="true"
-                              className="h-3.5 w-3.5"
+                              className="h-3.5 w-3.5 shrink-0"
                               data-testid="mention-agent-icon"
                             />
-                            agent
+                            {suggestion.description ? (
+                              <span
+                                className="min-w-0 truncate"
+                                data-testid="mention-agent-description"
+                                id={descriptionId}
+                                title={suggestion.description}
+                              >
+                                {suggestion.description}
+                              </span>
+                            ) : (
+                              "agent"
+                            )}
                             {showAgentProvenanceMarker ? (
                               <OtherSetupAgentMarker testId="mention-agent-provenance" />
                             ) : null}
@@ -366,6 +413,7 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
                         {ownerLabel || suggestion.notInChannel ? (
                           <span
                             className="min-w-0 truncate"
+                            id={provenanceId}
                             title={
                               ownerLabel && suggestion.notInChannel
                                 ? `managed by ${ownerLabel} · not in channel`
@@ -385,6 +433,7 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
                           <span
                             className="-translate-y-0.5 shrink-0 font-mono leading-none"
                             data-testid="mention-collision-npub"
+                            id={collisionNpubId}
                             title={collisionNpub}
                           >
                             {truncatePubkey(collisionNpub)}
