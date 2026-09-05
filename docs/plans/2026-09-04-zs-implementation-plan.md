@@ -297,9 +297,12 @@ the root workspace excludes that manifest (`Cargo.toml:35`).
 
 ## Order and parallelism
 
-Wave 1 (parallel build; serialized landing): T1, T2, T4, T5, T13, T8, T11.
-Wave 2: T3 (after wave 1 lands), then T3b after T3 lands; T7 memo then T7 (after T4); T12a (after T11); T6 config-generation half (fake server; the OpenSEO half waits for approval).
-Wave 3: T9 (after T2 and T8), T10 (after T3b), T12 (after T12a).
+Wave 1 (parallel build; serialized landing): T1 (landed, PR #6), T2 (landed, PR #5), T4 (landed,
+PR #4), T5 (landed, PR #7), T13 (landed, PR #1), T8 (landed, PR #3), T11 (landed, PR #2).
+Wave 2: T3 (landed, PR #11), then T3b after T3 lands (not started); T7 memo (landed, PR #9) then
+T7a (open, PR #14, not yet enqueued); T12a (open, PR #15, not yet enqueued); T6 config-generation
+half (fake server; landed, PR #8); the OpenSEO live half still waits for DataForSEO approval.
+Wave 3: T9 (landed, PR #13), T10 (after T3b, not started), T12 (after T12a, not started).
 
 ## Ticket list for GitHub issues
 
@@ -357,6 +360,47 @@ Created on the fork only when Devin asks. Titles:
   do not re-run it.
 - Scratch import branches from ports (`pr-<N>`) are left in place; deleting a branch needs Devin's
   explicit go-ahead on this machine.
+
+## Operational notes from waves 2 to 4 (2026-09-05)
+
+- Long pre-push hooks under load can outlast the SSH idle window. Git opens the SSH session
+  before the hooks run, so a slow hook run kills the push with exit 141 and nothing transfers.
+  Push with `GIT_SSH_COMMAND="ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=40"` and check
+  the exit code explicitly. A killed push can leave a zero-byte `.git/index.lock`; remove it only
+  after confirming no git process is still running.
+- Merge `origin/zs/main` into the branch before marking a PR ready. `dorny/paths-filter` run
+  against a stale base counts `zs/main`'s own changes since the branch forked, so it runs the
+  Rust and Postgres lanes even on a docs-only PR.
+- Local Playwright: `playwright.config.ts` sets `reuseExistingServer` when not on CI, so two
+  worktrees both running e2e on port 4173 silently test each other's build. Run e2e through a
+  scratch config on a free port with `reuseExistingServer: false`.
+- The Claude session limit can stop a workflow mid-run. Resume with the same run id so the
+  agents that already finished replay from cache instead of rerunning.
+- Merge-queue ejections seen so far: flaky `cluster_global_probe` postgres tests (now retried,
+  PR #10); apt mirror dropouts during the Playwright `install-deps` step (now retried, PR #10);
+  `inbox-live-update.spec.ts` scroll baseline (fixed in PR #12); `persistent-agent-audience.spec.ts`
+  and shard-3 five-second timeouts (still flaky; rerun and say so in the PR).
+- A header-box change moved `chromeWrapperRef` and shifted the channel column by 42 px without
+  failing any existing test, until the file-drop overlay no longer lined up with the drop zone.
+  The geometry test in `channel-files-tab.spec.ts` now binds the measured chrome height to the
+  header box so a future shift fails that test directly.
+- The T3 Files tab replaced upstream PR 4316's per-folder plaintext kind:30078 events with one
+  encrypted event per user and channel (folders v2). The relay is Block-hosted for this fork, so
+  relay-side scoping for the plaintext folder events cannot be deployed here.
+- Windows-only code paths (Job Objects, `launcher_windows` tests) run for the first time on CI,
+  not locally. Two harness bugs surfaced there: `Command::output` closing stdin, and a fixture
+  that assumed a Unix-absolute path.
+
+### Follow-up tickets filed
+
+- T2b: render markdown documents in a worker and bound the hast tree (from the T9 critic's
+  findings F7 and F8).
+- T3c: relay-side channel scoping for folder events, if the team ever self-hosts a relay.
+- T7a follow-ups carried in PR 14: unsafe acceptance for the Windows launcher, the
+  desktop-standalone sidecar list, a memo amendment for the Windows containment shape, and the
+  ten run-3 WARNs.
+- T6 live half still needs DataForSEO approval before it can run.
+- R1 (agent descriptions) is blocked on the "Agent-managed profiles" setting decision.
 
 ## Review log
 
