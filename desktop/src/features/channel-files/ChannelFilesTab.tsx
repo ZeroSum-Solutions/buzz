@@ -29,6 +29,12 @@ import {
   type FileCategory,
   type FileSort,
 } from "./useChannelFiles";
+import {
+  MAX_BULK_DROP_FILES,
+  resolveBulkDropKeys,
+  setBulkDragDropEnabled,
+  useBulkDragDropEnabled,
+} from "./bulkDropPreference";
 import { Button } from "@/shared/ui/button";
 
 const CATEGORY_TABS: { value: FileCategory; label: string }[] = [
@@ -51,8 +57,19 @@ export type ChannelFilesTabProps = {
   /** True when the file projection hit its row cap and is not the whole set. */
   truncated?: boolean;
   isLoading: boolean;
+  /** True when the file list could not be loaded at all. */
   isError?: boolean;
+  /**
+   * Set when the list is showing files but is known to be incomplete — a
+   * history page failed, or live updates stopped. The list still renders; the
+   * banner says what is missing and offers the same retry.
+   */
+  filesError?: string | null;
   onRetryFiles?: () => void;
+  /** True when the index stopped short of the channel's oldest attachment. */
+  canLoadOlder?: boolean;
+  /** Continue the history walk from where it stopped. */
+  onLoadOlder?: () => void;
   senderNames?: Map<string, string>;
   senderAvatarUrls?: Map<string, string | null>;
   onJumpToMessage?: (eventId: string) => void;
@@ -90,7 +107,10 @@ export function ChannelFilesTab({
   truncated = false,
   isLoading,
   isError = false,
+  filesError = null,
   onRetryFiles,
+  canLoadOlder = false,
+  onLoadOlder,
   senderNames,
   senderAvatarUrls,
   onJumpToMessage,
@@ -115,6 +135,7 @@ export function ChannelFilesTab({
   const [isCreatingFolder, setIsCreatingFolder] = useState(false);
   const [newFolderName, setNewFolderName] = useState("");
   const [dragOverFolder, setDragOverFolder] = useState<string | null>(null);
+  const bulkDragDrop = useBulkDragDropEnabled();
   const [isSelecting, setIsSelecting] = useState(false);
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
   const [pending, setPending] = useState<Set<string>>(new Set());
@@ -333,12 +354,34 @@ export function ChannelFilesTab({
       }
       const fileKey = e.dataTransfer.getData("text/plain");
       if (!fileKey || !onAssignFiles) return;
-      if (fileFolderMap?.get(fileKey) === folder.id) return;
-      await runMutation(`file:${fileKey}`, () =>
-        onAssignFiles([fileKey], folder.id),
+      const plan = resolveBulkDropKeys({
+        draggedKey: fileKey,
+        selectedKeys: Array.from(selectedKeys),
+        enabled: bulkDragDrop,
+      });
+      if (!plan.keys) {
+        // Refuse the whole batch out loud: a silently truncated drop leaves
+        // the user believing files moved that did not.
+        toast.error(plan.refusedReason);
+        return;
+      }
+      const keys = plan.keys.filter(
+        (key) => fileFolderMap?.get(key) !== folder.id,
+      );
+      if (keys.length === 0) return;
+      await runMutation(keys.length === 1 ? `file:${keys[0]}` : "bulk", () =>
+        onAssignFiles(keys, folder.id),
       );
     },
-    [canMutateFolders, fileFolderMap, onAssignFiles, onMoveFolder, runMutation],
+    [
+      bulkDragDrop,
+      canMutateFolders,
+      fileFolderMap,
+      onAssignFiles,
+      onMoveFolder,
+      runMutation,
+      selectedKeys,
+    ],
   );
 
   async function handleAssignSelection(folderId: string | null) {
@@ -584,6 +627,19 @@ export function ChannelFilesTab({
             {isSelecting ? "Done" : "Select"}
           </Button>
 
+          {isSelecting ? (
+            <Button
+              aria-pressed={bulkDragDrop}
+              className="h-8 shrink-0 px-2 text-xs"
+              onClick={() => setBulkDragDropEnabled(!bulkDragDrop)}
+              size="sm"
+              title={`Dragging one selected file moves the whole selection, up to ${MAX_BULK_DROP_FILES} files`}
+              variant={bulkDragDrop ? "secondary" : "outline"}
+            >
+              Drag selection
+            </Button>
+          ) : null}
+
           {onCreateFolder ? (
             <Button
               className="h-8 shrink-0 gap-1 px-2 text-xs"
@@ -634,6 +690,26 @@ export function ChannelFilesTab({
           </div>
         ) : null}
       </div>
+
+      {filesError !== null && !isError ? (
+        <div
+          className="flex shrink-0 items-center gap-2 border-b border-destructive/30 bg-destructive/5 px-4 py-2 text-xs"
+          role="alert"
+        >
+          <AlertTriangle className="h-3.5 w-3.5 text-destructive" />
+          <span className="flex-1">{filesError}</span>
+          {onRetryFiles ? (
+            <Button
+              className="h-7 px-2 text-xs"
+              onClick={onRetryFiles}
+              size="sm"
+              variant="outline"
+            >
+              Retry
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
 
       {folderStateBroken ? (
         <div
@@ -781,6 +857,19 @@ export function ChannelFilesTab({
           );
         })()
       )}
+
+      {canLoadOlder && onLoadOlder ? (
+        <div className="shrink-0 border-t border-border p-2 text-center">
+          <Button
+            className="h-7 px-3 text-xs"
+            onClick={onLoadOlder}
+            size="sm"
+            variant="outline"
+          >
+            Load older files
+          </Button>
+        </div>
+      ) : null}
     </div>
   );
 }

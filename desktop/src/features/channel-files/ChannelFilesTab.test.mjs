@@ -397,3 +397,126 @@ test("dragging a file row onto a folder row assigns that one file to the folder"
     cleanup();
   }
 });
+
+test("a partial load failure banners over the files instead of blanking them", async () => {
+  const { cleanup, screen } = await renderTab({
+    files: [{ url: "https://media.example/kept.png", filename: "kept.png" }],
+    filesError: "Could not load older files (page 3): relay page timed out",
+    onRetryFiles: () => {},
+  });
+  try {
+    // The rows the index did load stay on screen ...
+    assert.ok(screen.getByRole("link", { name: "kept.png" }));
+    // ... under an alert that names the failure and offers the retry.
+    const alert = screen.getByRole("alert");
+    assert.match(alert.textContent ?? "", /relay page timed out/);
+    assert.ok(screen.getByRole("button", { name: "Retry" }));
+  } finally {
+    cleanup();
+  }
+});
+
+test("a bulk drag-and-drop is off until the setting is on", async () => {
+  const { setBulkDragDropEnabled } = await import("./bulkDropPreference.ts");
+  const assignments = [];
+  const { act, cleanup, files, screen } = await renderTab({
+    files: [
+      { url: "https://media.example/one.png", filename: "one.png" },
+      { url: "https://media.example/two.png", filename: "two.png" },
+    ],
+    snapshot: {
+      folders: [{ id: FOLDER_ID, name: "Inbox", parent: null }],
+      files: {},
+    },
+    fileFolderMap: new Map(),
+    onAssignFiles: async (keys, folderId) => {
+      assignments.push([keys, folderId]);
+      return true;
+    },
+    onMoveFolder: async () => {},
+  });
+  try {
+    const { fireEvent } = await import("@testing-library/react");
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Select" }));
+    });
+    for (const name of ["Select one.png", "Select two.png"]) {
+      await act(async () => {
+        fireEvent.click(screen.getByRole("checkbox", { name }));
+      });
+    }
+
+    const fileRow = screen
+      .getByRole("link", { name: "one.png", exact: true })
+      .closest('[draggable="true"]');
+    const folderRow = screen
+      .getByRole("button", { name: /Inbox/ })
+      .closest('[draggable="true"]');
+    const drop = async () => {
+      const dataTransfer = stubDataTransfer();
+      await act(async () => {
+        fireEvent.dragStart(fileRow, { dataTransfer });
+      });
+      await act(async () => {
+        fireEvent.drop(folderRow, { dataTransfer });
+      });
+    };
+
+    await drop();
+    assert.deepEqual(
+      assignments.at(-1),
+      [[files[0].key], FOLDER_ID],
+      "with the setting off only the dragged file moves",
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Drag selection" }));
+    });
+    await drop();
+    assert.deepEqual(
+      assignments.at(-1),
+      [[files[0].key, files[1].key], FOLDER_ID],
+      "with the setting on the whole selection moves",
+    );
+  } finally {
+    cleanup();
+    setBulkDragDropEnabled(false);
+  }
+});
+
+test("a history walk that stopped short still offers a way to continue", async () => {
+  let continued = 0;
+  const { act, cleanup, screen } = await renderTab({
+    files: [{ url: "https://media.example/a.png", filename: "a.png" }],
+    canLoadOlder: true,
+    onLoadOlder: () => {
+      continued += 1;
+    },
+  });
+  try {
+    const { fireEvent } = await import("@testing-library/react");
+    const button = screen.getByRole("button", { name: "Load older files" });
+    await act(async () => {
+      fireEvent.click(button);
+    });
+    assert.equal(continued, 1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("a completed history walk offers no load-older control", async () => {
+  const { cleanup, screen } = await renderTab({
+    files: [{ url: "https://media.example/a.png", filename: "a.png" }],
+    canLoadOlder: false,
+    onLoadOlder: () => {},
+  });
+  try {
+    assert.equal(
+      screen.queryByRole("button", { name: "Load older files" }),
+      null,
+    );
+  } finally {
+    cleanup();
+  }
+});
