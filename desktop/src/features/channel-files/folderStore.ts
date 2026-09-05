@@ -265,6 +265,12 @@ export function withFolderCreated(
   if (!isFolderId(folder.id)) {
     return { ok: false, error: "Invalid folder id." };
   }
+  if (snapshot.folders.some((existing) => existing.id === folder.id)) {
+    // Replaying a create whose write already landed (another device wrote on
+    // top of it before our acknowledgement arrived). Appending again would put
+    // two folders under one id; the stored folder is already the result.
+    return { ok: true, snapshot };
+  }
   if (snapshot.folders.length >= MAX_FOLDERS) {
     return {
       ok: false,

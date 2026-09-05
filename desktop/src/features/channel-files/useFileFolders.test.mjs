@@ -92,13 +92,17 @@ async function setup(options = {}) {
   };
   relayClient.publishEvent = async (event, _timeout, _fail, onOk) => {
     state.published.push(event);
-    const okMessage = state.okMessages.shift() ?? "";
-    // A superseded write is acknowledged but not stored.
-    if (!/^inserted$/i.test(okMessage.trim()) && okMessage.trim().length > 0) {
-      onOk?.(okMessage);
-      return event;
-    }
-    state.head = event;
+    // An entry may be a bare message, or `{ message, stored }` to model the
+    // relay's committed-then-acknowledged-as-duplicate answer: a socket-level
+    // resend of an already-stored event is accepted with `duplicate:`.
+    const next = state.okMessages.shift() ?? "";
+    const okMessage = typeof next === "string" ? next : next.message;
+    const trimmed = okMessage.trim();
+    const stored =
+      typeof next === "string"
+        ? trimmed.length === 0 || /^inserted$/i.test(trimmed)
+        : next.stored;
+    if (stored) state.head = event;
     onOk?.(okMessage);
     return event;
   };
@@ -406,6 +410,80 @@ test("every folder write carries a created_at strictly newer than the head", asy
       last.created_at > 4_000_000_000,
       `expected a monotonic created_at, got ${last.created_at}`,
     );
+  } finally {
+    harness.teardown();
+  }
+});
+
+test("a duplicate OK for a write that did land is reported as saved, not replayed", async () => {
+  const harness = await setup({
+    okMessages: [{ message: "duplicate:", stored: true }],
+  });
+  try {
+    const rejection = await harness.mutate(() =>
+      harness.result.current.createFolder("Only once", null),
+    );
+
+    assert.equal(rejection, null, "a committed write is not an error");
+    assert.equal(
+      harness.state.published.length,
+      1,
+      "the committed write is never published a second time",
+    );
+    assert.deepEqual(
+      harness.result.current.folders.map((folder) => folder.name),
+      ["Only once"],
+      "one action must not leave two folders behind",
+    );
+  } finally {
+    harness.teardown();
+  }
+});
+
+test("a committed delete acknowledged as a duplicate is not reported as missing", async () => {
+  const harness = await setup();
+  try {
+    await harness.mutate(() =>
+      harness.result.current.createFolder("Doomed", null),
+    );
+    const folderId = harness.result.current.folders[0].id;
+
+    harness.state.okMessages.push({ message: "duplicate:", stored: true });
+    const rejection = await harness.mutate(() =>
+      harness.result.current.deleteFolder(folderId),
+    );
+
+    assert.equal(
+      rejection,
+      null,
+      "a delete that landed must not surface 'That folder no longer exists.'",
+    );
+    assert.deepEqual(harness.result.current.folders, []);
+  } finally {
+    harness.teardown();
+  }
+});
+
+test("a replayed create reuses its folder id instead of minting a second one", async () => {
+  const harness = await setup({
+    okMessages: ["duplicate: exists", "Inserted"],
+  });
+  try {
+    await harness.mutate(() =>
+      harness.result.current.createFolder("Retried", null),
+    );
+
+    assert.equal(harness.state.published.length, 2, "the write is replayed");
+    const ids = harness.state.published.map(
+      (event) =>
+        payloadOf(event).folders.find((folder) => folder.name === "Retried").id,
+    );
+    assert.equal(
+      ids[0],
+      ids[1],
+      "the transform is pure: the retry carries the same folder id",
+    );
+    assert.equal(harness.result.current.folders.length, 1);
   } finally {
     harness.teardown();
   }

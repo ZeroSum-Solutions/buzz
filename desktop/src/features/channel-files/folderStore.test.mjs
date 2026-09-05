@@ -422,3 +422,20 @@ test("hasSiblingNamed is case-insensitive and scoped to one parent", () => {
   assert.equal(hasSiblingNamed(tree, null, "design", ID_A), false);
   assert.equal(hasSiblingNamed(tree, ID_A, "Specs"), false);
 });
+
+test("creating a folder whose id is already stored leaves the snapshot alone", () => {
+  const stored = snapshot([{ id: ID_A, name: "Design", parent: null }], {
+    [KEY_1]: ID_A,
+  });
+
+  const replayed = unwrap(
+    withFolderCreated(stored, { id: ID_A, name: "Design", parent: null }),
+  );
+
+  assert.deepEqual(
+    replayed.folders,
+    [{ id: ID_A, name: "Design", parent: null }],
+    "a replayed create must not put two folders under one id",
+  );
+  assert.deepEqual(replayed.files, { [KEY_1]: ID_A });
+});

@@ -160,9 +160,13 @@ export function useFileFolders(
   /**
    * Serialise one transform onto the channel's mutation queue: read the head
    * this client last saw, apply the transform to it, publish, and only then
-   * update the cache. A superseded acknowledgement re-reads the head and
-   * replays the transform once before surfacing an error — it is never
-   * reported to the user as a saved change.
+   * update the cache. A superseded acknowledgement re-reads the head: when the
+   * head *is* the event we just signed the write did land (the relay answers a
+   * re-sent, already-stored event `accepted: true` with `duplicate:`,
+   * `crates/buzz-relay/src/handlers/ingest.rs:3206`), so it is reported as
+   * saved; otherwise the transform is replayed once before surfacing an error.
+   * The transform must be a pure `(snapshot) => snapshot` function, because
+   * that replay calls it a second time.
    */
   const runMutation = useCallback(
     async (
@@ -211,6 +215,11 @@ export function useFileFolders(
             return;
           }
           current = await readHead(true);
+          // The acknowledgement was an echo of our own committed write — a
+          // socket-level resend of the same signed event returns `duplicate:`
+          // after the first send stored it. Replaying here would publish the
+          // change twice; telling the user it failed would be a lie.
+          if (current.head?.id === event.id) return;
         }
 
         throw new Error(
@@ -236,10 +245,15 @@ export function useFileFolders(
   );
 
   const createFolder = useCallback(
-    (name: string, parent: string | null = null) =>
-      runMutation("creating the folder.", (current) =>
-        withFolderCreated(current, { id: newFolderId(), name, parent }),
-      ),
+    (name: string, parent: string | null = null) => {
+      // Minted once, outside the transform: `runMutation` may replay the
+      // transform against a re-read head, and a fresh id per attempt would
+      // publish the same folder twice under two ids.
+      const id = newFolderId();
+      return runMutation("creating the folder.", (current) =>
+        withFolderCreated(current, { id, name, parent }),
+      );
+    },
     [runMutation],
   );
 
