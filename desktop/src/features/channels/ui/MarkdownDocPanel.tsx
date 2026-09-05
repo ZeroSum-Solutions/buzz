@@ -1,6 +1,6 @@
 import * as React from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Download, FileText, Loader2 } from "lucide-react";
+import { Download, FileText, Loader2, Printer } from "lucide-react";
 import { toast } from "sonner";
 
 import { invokeTauri } from "@/shared/api/tauri";
@@ -12,6 +12,7 @@ import {
   focusMarkdownDocPanelClose,
   restoreFocusToMarkdownDocOpener,
 } from "@/features/channels/ui/markdownDocFocus";
+import { exportMarkdownDocumentToPdf } from "@/features/channels/ui/markdownDocPdfExport";
 import { useEscapeKey } from "@/shared/hooks/useEscapeKey";
 import { useIsThreadPanelOverlay } from "@/shared/hooks/use-mobile";
 import {
@@ -24,9 +25,9 @@ import {
 } from "@/shared/layout/AuxiliaryPanel";
 import { Button } from "@/shared/ui/button";
 import { Markdown, SyntaxHighlightedCode } from "@/shared/ui/markdown";
+import { isMarkdownDocumentTooComplex } from "@/shared/ui/markdown/documentMode";
 import {
   decodeMarkdownDocBytes,
-  isMarkdownDocTooComplexForPreview,
   type MarkdownDocDecodeResult,
 } from "@/shared/ui/markdown/markdownDocFile";
 import { SegmentedControl } from "@/shared/ui/segmented-control";
@@ -57,7 +58,7 @@ function decodeErrorMessage(kind: "too-large" | "binary"): string {
 }
 
 const PREVIEW_TOO_COMPLEX_MESSAGE =
-  "This document has too many lines to render a formatted preview. Switch to Code view, or download it.";
+  "This document has too many elements to render a formatted preview. Switch to Code view, or download it.";
 
 /**
  * Right auxiliary panel rendering a shared markdown attachment in-app.
@@ -121,19 +122,51 @@ export function MarkdownDocPanel({
   }, [url, filename]);
 
   const decoded = docQuery.data;
+  const [isExportingPdf, setIsExportingPdf] = React.useState(false);
+
+  // Bounds the render by the parser's own work and then by the parsed tree's
+  // node count, independent of the byte cap above: a flat list of one-line
+  // items, one line packed with delimiters, or a shallow-looking document held
+  // at depth across thousands of lines all cost far more than their size
+  // suggests (see markdownDocFile.ts and markdownParseBudget.ts). Preview and
+  // Export run the same parse, so one predicate gates both — a document too
+  // complex to preview is too complex to print. Memoized because the second
+  // half of that predicate *is* a parse; it must not run on every render.
+  // Code view is safe without this gate — SyntaxHighlightedCode bounds its own
+  // highlighting and plain-text fallback independently, so it stays available.
+  const previewTooComplex = React.useMemo(
+    () => decoded?.kind === "ok" && isMarkdownDocumentTooComplex(decoded.text),
+    [decoded],
+  );
+
+  // Exportable only when the document both decoded and is inside that bound,
+  // so the button is never offered for a document the panel itself refuses to
+  // render.
+  const documentText =
+    decoded?.kind === "ok" && !previewTooComplex ? decoded.text : null;
+
+  // Export renders the document in document mode (links kept, attachments as
+  // links, code never collapsed) and prints it through the Rust exporter.
+  // A cancelled save dialog resolves false and is not an error; every other
+  // failure is surfaced, never swallowed.
+  const handleExportPdf = React.useCallback(() => {
+    if (documentText === null) return;
+    setIsExportingPdf(true);
+    exportMarkdownDocumentToPdf({ content: documentText, filename })
+      .then((saved) => {
+        if (saved) toast.success(`Exported ${filename} as PDF`);
+      })
+      .catch((err: unknown) => {
+        toast.error(err instanceof Error ? err.message : "PDF export failed");
+      })
+      .finally(() => setIsExportingPdf(false));
+  }, [documentText, filename]);
+
   const errorMessage = docQuery.isError
     ? "Couldn't load this file from the relay."
     : decoded && decoded.kind !== "ok"
       ? decodeErrorMessage(decoded.kind)
       : null;
-
-  // Bounds Preview's mdast/micromark parse by line count, independent of the
-  // byte cap above: a flat list of one-line items well under 2 MiB still
-  // parses at superlinear cost (see markdownDocFile.ts). Code view is safe
-  // without this gate — SyntaxHighlightedCode bounds its own highlighting
-  // and plain-text fallback independently, so it stays available here.
-  const previewTooComplex =
-    decoded?.kind === "ok" && isMarkdownDocTooComplexForPreview(decoded.text);
 
   return (
     <AuxiliaryPanel
@@ -154,6 +187,22 @@ export function MarkdownDocPanel({
             <AuxiliaryPanelHeaderTitleBlock title={filename} />
           </AuxiliaryPanelHeaderGroup>
           <AuxiliaryPanelHeaderActions includeCloseAction>
+            {documentText !== null ? (
+              <Button
+                aria-label={`Export ${filename} as PDF`}
+                data-testid="markdown-doc-export-pdf"
+                disabled={isExportingPdf}
+                onClick={handleExportPdf}
+                size="icon"
+                variant="ghost"
+              >
+                {isExportingPdf ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Printer className="h-4 w-4" />
+                )}
+              </Button>
+            ) : null}
             <Button
               aria-label={`Download ${filename}`}
               data-testid="markdown-doc-download"

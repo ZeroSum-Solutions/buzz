@@ -1262,6 +1262,8 @@ declare global {
     /** Last payload written through the native clipboard command. */
     __BUZZ_E2E_LAST_CLIPBOARD__?: { html: string | null; text: string };
     __BUZZ_E2E_COMMANDS__?: string[];
+    /** Which outcome the mocked `export_document_pdf` returns. */
+    __BUZZ_E2E_PDF_EXPORT_MODE__?: "saved" | "cancelled" | "failed";
     __BUZZ_E2E_COMMAND_PAYLOADS__?: Array<{
       command: string;
       payload: unknown;
@@ -14541,6 +14543,20 @@ export function maybeInstallE2eTauriMocks() {
         const buf = new ArrayBuffer(jsonBytes.length);
         new Uint8Array(buf).set(jsonBytes);
         return buf;
+      }
+      case "export_document_pdf": {
+        // Neither the native save dialog nor the headless browser can run in
+        // E2E, so the outcome the real command would have produced is chosen
+        // by `window.__BUZZ_E2E_PDF_EXPORT_MODE__`. Specs assert what was
+        // sent via `__BUZZ_E2E_COMMAND_PAYLOADS__`.
+        const pdfExportMode = window.__BUZZ_E2E_PDF_EXPORT_MODE__ ?? "saved";
+        if (pdfExportMode === "cancelled") return false;
+        if (pdfExportMode === "failed") {
+          throw new Error(
+            "PDF export needs Google Chrome or Chromium installed on this machine.",
+          );
+        }
+        return true;
       }
       case "download_image":
       case "save_png_data_url":

@@ -70,6 +70,7 @@ export default defineConfig({
         "**/pubkey-display-screenshots.spec.ts",
         "**/file-attachment.spec.ts",
         "**/markdown-doc-viewer.spec.ts",
+        "**/pdf-export.spec.ts",
         "**/image-attachment-gallery.spec.ts",
         "**/composer-image-draw.spec.ts",
         "**/video-attachment.spec.ts",
