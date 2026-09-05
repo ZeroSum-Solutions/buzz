@@ -109,9 +109,14 @@ pub fn plan_codex_paths(
 }
 
 /// Writes the Claude project configuration: every pinned skill under
-/// `<root>/.claude/skills/<name>/SKILL.md`, then — when the spec declares at
-/// least one server — `<root>/.claude/settings.local.json` naming exactly those
-/// servers in `enabledMcpjsonServers`, then `<root>/.mcp.json`.
+/// `<root>/.claude/skills/<name>/SKILL.md`, then
+/// `<root>/.claude/settings.local.json` naming exactly this spec's servers in
+/// `enabledMcpjsonServers`, then `<root>/.mcp.json`.
+///
+/// A spec with no servers writes the settings file only if one is already
+/// there, and then to *remove* `enabledMcpjsonServers` — a stale approval list
+/// left beside a server-less `.mcp.json` would keep approving servers this
+/// generation does not declare.
 ///
 /// The approval list is not decoration. Claude does not use a project-scoped
 /// MCP server until the project has approved it, so a `.mcp.json` written
@@ -164,12 +169,18 @@ fn claude_plan(
     spec: &AgentRuntimeConfigSpec,
 ) -> Result<Vec<PlannedWrite>, ConfigGenError> {
     let mut plan = skill_plan(CLAUDE_RUNTIME_ID, root, spec)?;
-    if !spec.servers().is_empty() {
-        let path = root.join(CLAUDE_LOCAL_SETTINGS);
-        let contents = render_claude_local_settings(&path, spec)?;
+    let settings = root.join(CLAUDE_LOCAL_SETTINGS);
+    // A spec with no servers still has to rewrite an approval list that is
+    // already there: leaving a previous `enabledMcpjsonServers` live would keep
+    // approving servers this spec does not declare, while `.mcp.json` below is
+    // replaced with one that has none. `symlink_metadata` rather than `exists`
+    // so a planted symlink is seen here and refused by the write, not skipped.
+    // Nothing is created where no settings file exists.
+    if !spec.servers().is_empty() || settings.symlink_metadata().is_ok() {
+        let contents = render_claude_local_settings(&settings, spec)?;
         plan.push(PlannedWrite {
             base: root.to_path_buf(),
-            path,
+            path: settings,
             contents,
         });
     }
@@ -213,7 +224,13 @@ fn render_claude_local_settings(
         .iter()
         .map(|s| serde_json::Value::String(s.name().to_string()))
         .collect();
-    doc.insert(ENABLED_MCP_KEY.to_string(), serde_json::Value::Array(names));
+    if names.is_empty() {
+        // No servers, so no approval: the key is removed rather than left
+        // holding a stale list. Every other key the file carries survives.
+        doc.remove(ENABLED_MCP_KEY);
+    } else {
+        doc.insert(ENABLED_MCP_KEY.to_string(), serde_json::Value::Array(names));
+    }
     let mut rendered =
         serde_json::to_string_pretty(&serde_json::Value::Object(doc)).map_err(|e| {
             ConfigGenError::Io {

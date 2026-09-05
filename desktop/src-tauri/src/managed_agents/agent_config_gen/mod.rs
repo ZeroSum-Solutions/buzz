@@ -302,20 +302,23 @@ impl McpServerSpec {
 
     /// Validates and builds an HTTP server entry.
     ///
+    /// The URL is parsed rather than prefix-matched, because a prefix match
+    /// accepts strings that are not usable endpoints and are dangerous to
+    /// store: `http://` with no host, and — worse — `https://user:token@host/`,
+    /// which puts a credential in a config file this generator otherwise never
+    /// writes a secret to. Plaintext `http://` is confined to loopback, so a
+    /// generated config cannot send MCP traffic over the network in the clear.
+    ///
     /// # Errors
     ///
     /// Returns [`ConfigGenError`] when the name or URL breaks a ceiling or a
-    /// charset rule, or the URL is not `http://` or `https://`.
+    /// charset rule, when the URL does not parse, when its scheme is not
+    /// `http`/`https`, when it carries userinfo or a fragment, when it has no
+    /// host, or when it is plaintext `http` to a non-loopback host.
     pub fn http(name: &str, url: &str) -> Result<Self, ConfigGenError> {
         check_name("server.name", 0, name)?;
         check_len("server.url", 0, url, MAX_URL_BYTES)?;
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
-            return Err(ConfigGenError::Invalid {
-                field: "server.url",
-                index: 0,
-                expected: "an http:// or https:// URL",
-            });
-        }
+        check_http_url(url)?;
         Ok(Self {
             name: name.to_string(),
             transport: McpTransport::Http {
@@ -585,4 +588,50 @@ fn check_env_name(field: &'static str, index: usize, value: &str) -> Result<(), 
         });
     }
     Ok(())
+}
+
+/// An MCP endpoint URL: parsed, not prefix-matched.
+///
+/// A prefix match accepts `http://` on its own, `https://user:token@host/mcp`
+/// and `https://host/mcp#anchor`. The first is not an endpoint, the second
+/// smuggles a credential into a generated file, and the third is a fragment the
+/// server never sees. Plaintext `http` is confined to loopback so a generated
+/// config cannot put MCP traffic on the network in the clear.
+fn check_http_url(url: &str) -> Result<(), ConfigGenError> {
+    let invalid = |expected: &'static str| ConfigGenError::Invalid {
+        field: "server.url",
+        index: 0,
+        expected,
+    };
+    let parsed = url::Url::parse(url).map_err(|_| invalid("a parseable absolute URL"))?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(invalid("an http:// or https:// URL"));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(invalid(
+            "a URL with no userinfo; a credential must not be stored in a config file",
+        ));
+    }
+    if parsed.fragment().is_some() {
+        return Err(invalid("a URL with no '#' fragment"));
+    }
+    let Some(host) = parsed.host() else {
+        return Err(invalid("a URL with a host"));
+    };
+    if scheme == "http" && !is_loopback_host(&host) {
+        return Err(invalid(
+            "https://, unless the host is loopback (127.0.0.1, ::1, localhost)",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a parsed URL host is loopback, and so safe to reach over plaintext.
+fn is_loopback_host(host: &url::Host<&str>) -> bool {
+    match host {
+        url::Host::Domain(name) => name.eq_ignore_ascii_case("localhost"),
+        url::Host::Ipv4(addr) => addr.is_loopback(),
+        url::Host::Ipv6(addr) => addr.is_loopback(),
+    }
 }

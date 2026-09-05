@@ -217,6 +217,44 @@ fn non_http_url_is_rejected() {
     assert!(McpServerSpec::http("s", "ws://example.test").is_err());
 }
 
+/// The URL is parsed, not prefix-matched. Replacing `check_http_url` with a
+/// `starts_with` test leaves every rejection below red.
+#[test]
+fn an_endpoint_url_must_be_a_usable_secure_endpoint() {
+    for bad in [
+        // plaintext to somewhere other than this machine
+        "http://app.openseo.so/mcp",
+        "http://10.0.0.5:8080/mcp",
+        // a credential smuggled into a file this generator writes no secret to
+        "https://user:token@app.openseo.so/mcp",
+        "https://user@app.openseo.so/mcp",
+        // no host at all
+        "http:///mcp",
+        "http://",
+        // a fragment the server never receives
+        "https://app.openseo.so/mcp#anchor",
+        // not a URL at all
+        "not a url",
+        "/mcp",
+    ] {
+        assert!(
+            McpServerSpec::http("s", bad).is_err(),
+            "{bad:?} must be rejected"
+        );
+    }
+    for good in [
+        "http://127.0.0.1:8080/mcp",
+        "http://localhost:8080/mcp",
+        "http://[::1]:8080/mcp",
+        "https://app.openseo.so/mcp",
+    ] {
+        assert!(
+            McpServerSpec::http("s", good).is_ok(),
+            "{good:?} must be accepted"
+        );
+    }
+}
+
 #[test]
 fn empty_command_and_empty_body_are_rejected() {
     assert!(McpServerSpec::stdio("s", "   ", &[], &[]).is_err());
@@ -439,13 +477,52 @@ fn skill_directories_come_from_the_runtime_catalog() {
     ));
 }
 
+/// The project `.mcp.json` must land in the directory `runtime.rs` gives the
+/// child. Both resolvers start from the same candidate — `nest_dir()` — but
+/// `default_agent_workdir` falls back to `$HOME` when the nest is absent and
+/// this one deliberately does not, so comparing the two resolved values is only
+/// meaningful where a nest exists. A machine without `~/.buzz` (every CI runner
+/// is one) would otherwise compare `None` against `$HOME` and fail on the
+/// fallback rather than on anything this generator does.
+///
+/// So the binding is asserted on the rule, through the `buzz_owned_root` seam,
+/// against a nest this test owns — both branches, on any machine — and the
+/// end-to-end agreement is asserted where a real nest makes it well defined.
 #[test]
 fn claude_project_root_is_the_spawn_working_directory() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let nest = dir.path().join(".buzz");
+    std::fs::create_dir(&nest).expect("mkdir");
+
+    // A nest that exists is the root, unchanged: the spawn path's working
+    // directory is the nest itself, so this generator writes into that exact
+    // directory and never a parent, a child or a resolved target.
     assert_eq!(
-        claude_project_config_root(),
-        crate::managed_agents::default_agent_workdir(),
-        "the project .mcp.json must land in the directory runtime.rs gives the child"
+        buzz_owned_root(Some(nest.clone())),
+        Some(nest.clone()),
+        "an existing nest is the write root, verbatim"
     );
+
+    // A nest that is absent yields nothing. `default_agent_workdir` falls back
+    // to `$HOME` in this branch; this generator must not, or a generation on a
+    // machine with no nest would write the agent's config — and its skills —
+    // into the operator's own home directory.
+    std::fs::remove_dir(&nest).expect("rmdir");
+    assert_eq!(
+        buzz_owned_root(Some(nest)),
+        None,
+        "a missing nest is not a reason to fall back to $HOME"
+    );
+
+    // Where the machine running this does have a nest, the two resolvers must
+    // name the same directory.
+    if let Some(root) = claude_project_config_root() {
+        assert_eq!(
+            Some(root),
+            crate::managed_agents::default_agent_workdir(),
+            "with a nest present, the generator's root is the spawn working directory"
+        );
+    }
 }
 
 #[test]
@@ -1030,6 +1107,43 @@ fn the_approval_list_preserves_other_settings_and_is_absent_without_servers() {
             .iter()
             .any(|p| p.ends_with(".claude/settings.local.json")),
         "no servers, nothing to approve"
+    );
+}
+
+/// A regenerated spec that declares no server must not leave a previous
+/// approval list live: `.mcp.json` is rewritten with no servers, so an
+/// `enabledMcpjsonServers` naming the old ones would keep approving what this
+/// generation does not declare. Restoring the `if !spec.servers().is_empty()`
+/// guard around the settings write leaves this red.
+#[test]
+fn a_zero_server_generation_clears_a_previous_approval_list() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    write_claude_project_config(root, &spec_with(vec![stdio_server()], Vec::new())).expect("write");
+    let settings = root.join(".claude/settings.local.json");
+    let seeded: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).expect("read")).expect("JSON");
+    assert_eq!(seeded["enabledMcpjsonServers"][0], "openseo-fake");
+
+    // Regenerate the same root from a spec that declares no server at all.
+    let written = write_claude_project_config(root, &spec_with(Vec::new(), vec![skill("probe")]))
+        .expect("write");
+    assert!(
+        written.contains(&settings),
+        "the existing settings file is rewritten, not skipped: {written:?}"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).expect("read")).expect("JSON");
+    assert!(
+        doc.get("enabledMcpjsonServers").is_none(),
+        "no servers, so no approval survives: {doc}"
+    );
+    let mcp: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(root.join(".mcp.json")).expect("read"))
+            .expect("JSON");
+    assert!(
+        mcp["mcpServers"].as_object().expect("object").is_empty(),
+        "and the config it approved is gone too"
     );
 }
 
