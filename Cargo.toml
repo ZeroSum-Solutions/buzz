@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/buzz-relay",
+    "crates/buzz-mcp-launch",
     "crates/buzz-secret-store",
     "crates/buzz-core",
     "crates/buzz-conformance",

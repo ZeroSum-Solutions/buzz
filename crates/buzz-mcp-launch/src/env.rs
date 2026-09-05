@@ -201,7 +201,9 @@ mod tests {
         assert!(proxy_value_carries_userinfo("http://u@host"));
         assert!(proxy_value_carries_userinfo("u:p@host:3128"));
         assert!(!proxy_value_carries_userinfo("http://host:3128"));
-        assert!(!proxy_value_carries_userinfo("http://host/path@notuserinfo"));
+        assert!(!proxy_value_carries_userinfo(
+            "http://host/path@notuserinfo"
+        ));
         assert!(!proxy_value_carries_userinfo("localhost,127.0.0.1"));
     }
 }

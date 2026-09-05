@@ -171,7 +171,7 @@ _ensure-sidecar-stubs:
     set -euo pipefail
     TARGET=$(rustc -vV | sed -n 's|host: ||p')
     mkdir -p desktop/src-tauri/binaries
-    SIDECARS=(buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz)
+    SIDECARS=(buzz-acp buzz-agent buzz-dev-mcp buzz-mcp-launch git-credential-nostr buzz)
     if [[ "$TARGET" != *windows* ]]; then
         SIDECARS+=(buzz-backend-kubernetes)
     fi
@@ -289,6 +289,7 @@ desktop-release-build target="aarch64-apple-darwin":
         touch "desktop/src-tauri/binaries/buzz-backend-kubernetes-$TARGET"
     fi
     touch "desktop/src-tauri/binaries/buzz-dev-mcp-$TARGET"
+    touch "desktop/src-tauri/binaries/buzz-mcp-launch-$TARGET"
     touch "desktop/src-tauri/binaries/git-credential-nostr-$TARGET"
     touch "desktop/src-tauri/binaries/buzz-$TARGET"
     pnpm install
@@ -311,7 +312,7 @@ desktop-demo-build demo_name target="aarch64-apple-darwin":
     DEMO_SLUG="$(read_config slug)"
     cargo build --release --target "$TARGET" \
       -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes -p buzz-dev-mcp \
-      -p git-credential-nostr -p buzz-cli
+      -p buzz-mcp-launch -p git-credential-nostr -p buzz-cli
     ./scripts/bundle-sidecars.sh "$TARGET"
     pnpm install
     cd {{desktop_dir}}
