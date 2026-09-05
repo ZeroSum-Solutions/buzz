@@ -31,6 +31,23 @@ Unit Tests 13, macOS build 8. No real regression was found in any failed run.
 Expected: about 15 minutes per queue entry instead of 17 to 28. Verify on the next five queue
 runs with `gh run list --event merge_group` and the job durations in `gh run view --json jobs`.
 
+Measured after PR #20 landed (queue runs 33990765603 for #20 and 33992052113 for #21):
+entries took 27 and 24 minutes. Desktop Core 9 min, Desktop Compiled Flags 10 to 11 min, smoke
+shards 6 to 10 min, Unit Tests 9 min: step 1 held. The long pole moved to the two GitHub-hosted
+jobs, which the first measurement under-reported: Windows Rust 26 and 23 min (the rust-cache
+save alone 4 to 6 min per entry, and it repeats even when Cargo.lock is unchanged) and Desktop
+Build (macOS) 20 and 9 min (`cargo tauri build` 18 min on the slow run).
+
+### Step 1b: move those two jobs to Blacksmith (PR `ci/blacksmith-mac-win`)
+
+`Desktop Build (macOS)` on `blacksmith-6vcpu-macos-latest` (M4 Pro) and `Windows Rust` on
+`blacksmith-8vcpu-windows-2025` (public beta). On that PR's own run (33993211509): macOS job
+7.5 min (`cargo tauri build` 5.6 min), Windows job 8.5 min (Tauri crate test 2.8 min, cache
+restore 14 s, no save on a pull_request run). Both were picked up within a minute. Expected
+queue entry after this lands: bounded by Desktop Compiled Flags at about 11 minutes, plus the
+Windows cache save on merge_group runs. Watch the first two queue entries; if the Windows beta
+runner fails to pick a job up, revert that one label.
+
 Still open after this PR: the three flaky specs above. Rerun and name them in the PR body until
 someone fixes the wait conditions. Option not taken yet: `max_entries_to_build` 2 or 3 with
 `ALLGREEN` grouping lets several PRs share one CI run; try it once the run itself is stable.
