@@ -1,0 +1,49 @@
+{
+  "_comment": "Workflow ids per wave for agent-minutes.py. Labels are best-effort from the prompts; the ids are the ground truth. Transcripts live only on the orchestrator machine (workflows_dir) and are never committed. expected_agent_minutes are the totals published in 2026-09-05-zs-throughput-plan.md; the regression check (--check) must reproduce them within the tolerance.",
+  "workflows_dir": "~/.claude/projects/-Users-zero-suminc-/a0fab389-7ac7-4f57-88e6-599d452e8e3a/subagents/workflows",
+  "waves": {
+    "wave-1": {
+      "description": "Seven tickets under the original loop, one workflow, 2026-09-04T08:35Z to 22:09Z.",
+      "workflows": {
+        "wf_d039d459-774": "wave 1, seven tickets (T2, T5, T8, T11 and others)"
+      },
+      "expected_agent_minutes": 2588,
+      "tolerance": 2
+    },
+    "waves-2-3": {
+      "description": "Four code tickets and three memos under the revised loop, 2026-09-04T22:55Z to 2026-09-05T10:09Z.",
+      "workflows": {
+        "wf_4991aff2-011": "T3 port/4316 build",
+        "wf_f8590a1f-179": "T6-config",
+        "wf_b85b65b5-727": "T9 PDF export",
+        "wf_231309b6-0bd": "T7a registry core",
+        "wf_a2d9707f-d29": "T3 Sol-finding verifiers (driver-added)",
+        "wf_72bf0947-3d5": "T3 port check and fix",
+        "wf_ab7d7b5c-0a4": "T12a memo",
+        "wf_a6a94c02-398": "T7a round 3",
+        "wf_5ebaa29c-46d": "shared round 3 (T9 and T7a) and T12a",
+        "wf_d9ff25f2-d0d": "T12a round"
+      },
+      "excluded": {
+        "wf_fc2164f3-4da": "13 short agents on 2026-09-05T04:57Z to 05:28Z, not ticket-loop work; left out of the published table",
+        "wf_c4f4430b-f95": "5 agents on 2026-09-05T06:00Z to 06:40Z, not ticket-loop work; left out of the published table"
+      },
+      "note": "wf_4991aff2-011 and wf_b85b65b5-727 each carry more than one ticket (T3 with the T7 and T11 memos; T9 with two T12a agents). The published per-ticket table split them by prompt; per-workflow totals here differ from it by per-agent rounding only.",
+      "expected_agent_minutes": 1443,
+      "tolerance": 5
+    },
+    "wave-4": {
+      "description": "First like-for-like test: full feature tickets under the revised loop. Measured when all three land.",
+      "workflows": {
+        "wf_d128b3c8-44d": "T3b",
+        "wf_771a8364-c74": "T12",
+        "wf_5eb938b7-85e": "T7b"
+      },
+      "excluded": {
+        "wf_2f417f8f-23a": "T15 CLI document attachments: concurrent load, not part of the cohort",
+        "wf_a2bacbdf-50f": "studio-kb: concurrent load, not part of the cohort"
+      },
+      "expected_agent_minutes": null
+    }
+  }
+}
