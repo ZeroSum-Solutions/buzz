@@ -104,8 +104,11 @@ pub fn spawn_contained(command: &mut Command, program: &str) -> Result<Contained
     // hook, so the launcher takes no `unsafe` on this path.
     command.process_group(0);
 
-    // The launcher itself asks the kernel to kill it when its parent dies, so
-    // an adapter that is SIGKILLed still takes the scope down on Linux.
+    // Ask the kernel to signal the launcher when its parent dies, so an adapter
+    // that is SIGKILLed is still noticed on Linux. This delivers SIGTERM to the
+    // *launcher*, and it takes the scope down only because `launch::run`
+    // catches that signal and calls `Contained::terminate`; on the default
+    // disposition it would kill the supervisor and orphan the server tree.
     #[cfg(target_os = "linux")]
     set_parent_death_signal();
 
@@ -162,6 +165,9 @@ pub fn spawn_contained(command: &mut Command, program: &str) -> Result<Contained
 #[cfg(target_os = "linux")]
 fn set_parent_death_signal() {
     use nix::sys::prctl::set_pdeathsig;
+    // SIGTERM rather than SIGKILL: `launch::run` has a handler for it and tears
+    // the containment scope down there. SIGKILL cannot be caught, so it would
+    // leave the server tree behind.
     if let Err(error) = set_pdeathsig(Some(Signal::SIGTERM)) {
         tracing::warn!(%error, "could not set PR_SET_PDEATHSIG; falling back to stdin EOF");
     }

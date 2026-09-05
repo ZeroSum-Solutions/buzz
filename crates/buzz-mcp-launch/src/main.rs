@@ -1,6 +1,5 @@
 //! Entry point for `buzz-mcp-launch`.
 
-use std::process::ExitCode;
 use std::sync::Arc;
 
 use buzz_mcp_launch::cli::{parse_env_pairs, Cli, Mode};
@@ -14,7 +13,7 @@ use buzz_secret_store::{AgentCapability, McpSecretLookup, McpSecretRef};
 use clap::Parser;
 
 #[tokio::main]
-async fn main() -> ExitCode {
+async fn main() {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -24,15 +23,22 @@ async fn main() -> ExitCode {
         .init();
 
     let cli = Cli::parse();
-    match run(cli).await {
-        Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
+    let code = match run(cli).await {
+        Ok(code) => i32::from(u8::try_from(code).unwrap_or(1)),
         Err(error) => {
             // Every failure reaches the operator on stderr with its context;
             // the adapter captures this stream.
             tracing::error!("{error}");
-            ExitCode::FAILURE
+            1
         }
-    }
+    };
+    // Exit rather than return: returning drops the runtime, which waits for the
+    // blocking read the stdin relay is parked in, and only the adapter can end
+    // that. Containment is already torn down by `launch::run`, and every write
+    // to our stdout is flushed as it is made, so there is nothing left to
+    // unwind. Without this a launcher that stops for any reason other than its
+    // own stdin closing hangs until the adapter goes away.
+    std::process::exit(code);
 }
 
 async fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {

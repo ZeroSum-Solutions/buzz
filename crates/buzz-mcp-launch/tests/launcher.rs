@@ -184,7 +184,7 @@ fn the_capability_is_stripped_before_the_server_starts() {
 }
 
 #[test]
-fn the_child_tree_dies_when_the_launcher_loses_its_parent() {
+fn the_child_tree_dies_when_our_stdin_reaches_eof() {
     let dir = tempfile::tempdir().expect("temp dir");
     let pidfile = dir.path().join("grandchild.pid");
     let script = "sleep 300 & echo $! > \"$PIDFILE\"; sleep 300";
@@ -279,6 +279,181 @@ sleep 300;
             "the cgroup leaf did not kill a setsid() escapee"
         );
     }
+}
+
+/// A `SIGTERM` must take the whole server tree down.
+///
+/// This is the signal `PR_SET_PDEATHSIG` delivers when a `SIGKILL`ed adapter
+/// dies, and it is also what an operator or a supervisor sends. Without the
+/// handler in `launch::run` the default disposition kills the launcher
+/// instantly, `Contained::terminate` never runs, and the grandchild below
+/// survives — which is exactly what this test fails on.
+#[test]
+fn a_sigterm_tears_the_server_tree_down() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let pidfile = dir.path().join("grandchild.pid");
+    let mut launched = launch(
+        "sleep 300 & echo $! > \"$PIDFILE\"; sleep 300",
+        &[("PIDFILE", pidfile.to_str().expect("utf-8 path"))],
+        &[],
+        None,
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(10), || read_pid(&pidfile).is_some()),
+        "the fixture never reported its grandchild"
+    );
+    let grandchild = read_pid(&pidfile).expect("a pid");
+    assert!(pid_is_alive(grandchild), "the grandchild should be running");
+
+    let launcher = launched.child().id() as i32;
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-TERM", &launcher.to_string()])
+            .status()
+            .expect("kill runs")
+            .success(),
+        "the launcher must accept a SIGTERM"
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(10), || !pid_is_alive(grandchild)),
+        "the grandchild outlived a SIGTERMed launcher: no signal handler tore the scope down"
+    );
+    let status = launched.take().wait().expect("the launcher exits");
+    assert!(
+        !status.success(),
+        "a signalled launcher must not report success: {status:?}"
+    );
+}
+
+/// The Linux half of the same guard, through the mechanism that actually
+/// happens in production: the adapter is `SIGKILL`ed, so nothing closes our
+/// stdin and only `PR_SET_PDEATHSIG` reports the loss.
+///
+/// The launcher's stdin is a fifo it holds read-write, so it can never reach
+/// EOF; the only path left to the teardown is the signal handler.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_child_tree_dies_when_an_interposed_parent_is_sigkilled() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let pidfile = dir.path().join("grandchild.pid");
+    let fifo = dir.path().join("stdin.fifo");
+    assert!(
+        Command::new("/usr/bin/mkfifo")
+            .arg(&fifo)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false),
+        "mkfifo must create the launcher's stdin"
+    );
+
+    let script = dir.path().join("parent.sh");
+    std::fs::write(
+        &script,
+        "exec 3<> \"$FIFO\"\n\
+         \"$LAUNCHER\" launch --server fixture --set PIDFILE=\"$PIDFILE\" -- \
+         /bin/sh -c 'sleep 300 & echo $! > \"$PIDFILE\"; sleep 300' <&3 &\n\
+         wait\n",
+    )
+    .expect("write the interposed parent");
+
+    let mut parent = Command::new("/bin/sh")
+        .arg(&script)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("LAUNCHER", LAUNCHER)
+        .env("FIFO", &fifo)
+        .env("PIDFILE", &pidfile)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the interposed parent starts");
+
+    assert!(
+        wait_until(Duration::from_secs(15), || read_pid(&pidfile).is_some()),
+        "the fixture never reported its grandchild"
+    );
+    let grandchild = read_pid(&pidfile).expect("a pid");
+    assert!(pid_is_alive(grandchild), "the grandchild should be running");
+
+    parent.kill().expect("SIGKILL the interposed parent");
+    let _ = parent.wait();
+
+    assert!(
+        wait_until(Duration::from_secs(15), || !pid_is_alive(grandchild)),
+        "the grandchild outlived a SIGKILLed adapter: PR_SET_PDEATHSIG only killed the launcher"
+    );
+}
+
+/// A server that never drains its stdin must not wedge the launcher: the
+/// adapter's death is still observed and the scope still goes away.
+///
+/// The 96 KiB below is more than any pipe buffer, so with the relay halves
+/// coupled in one loop — a read of our stdin followed by an unbounded
+/// `write_all` to the server's — the launcher parks in that write and never
+/// sees its own EOF. This test then hangs instead of passing.
+#[test]
+fn a_server_that_never_reads_its_stdin_does_not_wedge_the_launcher() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let pidfile = dir.path().join("grandchild.pid");
+    let mut launched = launch(
+        "sleep 300 & echo $! > \"$PIDFILE\"; sleep 300",
+        &[("PIDFILE", pidfile.to_str().expect("utf-8 path"))],
+        &[],
+        None,
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(10), || read_pid(&pidfile).is_some()),
+        "the fixture never reported its grandchild"
+    );
+    let grandchild = read_pid(&pidfile).expect("a pid");
+
+    {
+        let stdin = launched.child().stdin.as_mut().expect("stdin is piped");
+        stdin
+            .write_all(&vec![b'x'; 96 * 1024])
+            .expect("the launcher absorbs a frame burst");
+        stdin.flush().expect("flush");
+    }
+    drop(launched.child().stdin.take());
+
+    assert!(
+        wait_until(Duration::from_secs(20), || !pid_is_alive(grandchild)),
+        "the launcher never noticed its own stdin EOF behind a server that stopped reading"
+    );
+}
+
+/// A server that closes its stdout but keeps running has ended the reply path:
+/// every frame forwarded from then on, including a mutating tool call, reaches
+/// a server that can never answer it. The launcher must stop and say so rather
+/// than keep relaying and then report success.
+#[test]
+fn a_server_that_closes_its_stdout_ends_the_launch() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let log = dir.path().join("launcher.log");
+    let mut launched = launch("exec 1>&-; sleep 300", &[], &[], Some(&log));
+
+    assert!(
+        wait_until(Duration::from_secs(20), || launched
+            .child()
+            .try_wait()
+            .ok()
+            .flatten()
+            .is_some()),
+        "the launcher kept running against a server that had closed its stdout"
+    );
+    let status = launched.take().wait().expect("the launcher exits");
+    assert!(
+        !status.success(),
+        "a dead reply path must not be reported as success: {status:?}"
+    );
+    let stderr = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        stderr.contains("closed its stdout"),
+        "the failure must name the dead reply path: {stderr}"
+    );
 }
 
 #[test]
