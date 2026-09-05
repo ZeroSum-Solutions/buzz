@@ -7,6 +7,7 @@ import {
   ShieldCheck,
 } from "lucide-react";
 import { toast } from "sonner";
+import { attachmentLabel } from "./boundedImeta";
 import type { ChannelFile } from "./useChannelFiles";
 import { truncatePubkey } from "@/shared/lib/pubkey";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
@@ -88,11 +89,16 @@ export type FileRowProps = {
   senderName?: string;
   senderAvatarUrl?: string | null;
   onJumpToMessage?: (eventId: string) => void;
-  onDragStart?: (e: React.DragEvent, eventId: string) => void;
-  /** Selection mode */
+  /** Drag payload is the attachment's file key, not its message id. */
+  onDragStart?: (e: React.DragEvent, fileKey: string) => void;
+  /** True only while the user has explicitly turned selection mode on. */
   selecting?: boolean;
   selected?: boolean;
-  onToggleSelect?: (eventId: string) => void;
+  /**
+   * `shiftKey` carries the modifier from both the pointer and the keyboard
+   * path, which is what makes Shift-range selection reachable at all.
+   */
+  onToggleSelect?: (fileKey: string, shiftKey: boolean) => void;
 };
 
 export function FileRow({
@@ -105,16 +111,14 @@ export function FileRow({
   selected,
   onToggleSelect,
 }: FileRowProps) {
-  const filename = file.filename ?? file.rawUrl.split("/").pop() ?? "file";
+  const filename = attachmentLabel(file.filename, file.rawUrl);
 
   const handleClick = (e: React.MouseEvent) => {
     if (selecting) {
       e.preventDefault();
-      onToggleSelect?.(file.eventId);
+      onToggleSelect?.(file.key, e.shiftKey);
     }
   };
-
-  const handleToggleSelect = () => onToggleSelect?.(file.eventId);
 
   return (
     // biome-ignore lint/a11y/noStaticElementInteractions: mouse convenience duplicate of the keyboard-reachable checkbox below (row click toggles select only while selecting)
@@ -125,7 +129,7 @@ export function FileRow({
       } ${selecting ? "cursor-pointer" : ""}`}
       draggable={!!onDragStart}
       onClick={handleClick}
-      onDragStart={(e) => onDragStart?.(e, file.eventId)}
+      onDragStart={(e) => onDragStart?.(e, file.key)}
     >
       {selecting ? (
         <div className="flex shrink-0 items-center">
@@ -140,7 +144,13 @@ export function FileRow({
             }`}
             onClick={(e) => {
               e.stopPropagation();
-              handleToggleSelect();
+              onToggleSelect?.(file.key, e.shiftKey);
+            }}
+            onKeyDown={(e) => {
+              if (e.key !== "Enter" && e.key !== " ") return;
+              e.preventDefault();
+              e.stopPropagation();
+              onToggleSelect?.(file.key, e.shiftKey);
             }}
             role="checkbox"
             type="button"
@@ -172,7 +182,12 @@ export function FileRow({
         rel="noreferrer"
         target="_blank"
         onClick={(e) => {
-          if (selecting) e.preventDefault();
+          if (!selecting) {
+            e.stopPropagation();
+            return;
+          }
+          e.preventDefault();
+          onToggleSelect?.(file.key, e.shiftKey);
         }}
       >
         <FileRowThumbnail file={file} />
@@ -186,7 +201,12 @@ export function FileRow({
           rel="noreferrer"
           target="_blank"
           onClick={(e) => {
-            if (selecting) e.preventDefault();
+            if (!selecting) {
+              e.stopPropagation();
+              return;
+            }
+            e.preventDefault();
+            onToggleSelect?.(file.key, e.shiftKey);
           }}
           title={filename}
         >
@@ -238,7 +258,9 @@ export function FileRow({
         </div>
         <span className="w-16 text-right">{formatDate(file.createdAt)}</span>
 
-        <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+        {/* Revealed on hover *and* on keyboard focus — an opacity-0 control
+            that focus can reach but the eye cannot find is not reachable. */}
+        <div className="flex items-center gap-0.5 opacity-0 transition-opacity focus-within:opacity-100 group-focus-within:opacity-100 group-hover:opacity-100">
           <button
             aria-label={`Copy link for ${filename}`}
             className="rounded p-1 hover:bg-muted"

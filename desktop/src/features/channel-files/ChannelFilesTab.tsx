@@ -1,4 +1,5 @@
 import { useCallback, useMemo, useRef, useState } from "react";
+import { VList } from "virtua";
 import {
   Search,
   ArrowUpDown,
@@ -10,9 +11,17 @@ import {
   X,
   Undo2,
   FolderInput,
+  AlertTriangle,
 } from "lucide-react";
+import { toast } from "sonner";
 import { FileRow, FileRowSkeleton } from "./FileCard";
-import { type FileFolder, wouldCreateFolderCycle } from "./useFileFolders";
+import {
+  type FlatFolder,
+  type FolderNode,
+  type FolderSnapshot,
+  flattenFolders,
+  hasSiblingNamed,
+} from "./folderStore";
 import {
   categorizeFile,
   sortFiles,
@@ -39,50 +48,63 @@ const SORT_OPTIONS: { value: FileSort; label: string }[] = [
 
 export type ChannelFilesTabProps = {
   files: ChannelFile[];
+  /** True when the file projection hit its row cap and is not the whole set. */
+  truncated?: boolean;
   isLoading: boolean;
+  isError?: boolean;
+  onRetryFiles?: () => void;
   senderNames?: Map<string, string>;
   senderAvatarUrls?: Map<string, string | null>;
   onJumpToMessage?: (eventId: string) => void;
-  folders?: FileFolder[];
+  snapshot?: FolderSnapshot;
   foldersLoading?: boolean;
+  foldersError?: boolean;
+  /** Non-null when the stored folder payload could not be trusted. */
+  foldersInvalidReason?: string | null;
+  onRetryFolders?: () => void;
+  /** False while the folder state is unknown, failed, or invalid. */
+  canMutateFolders?: boolean;
+  /** fileKey → owning folder id. */
   fileFolderMap?: Map<string, string>;
-  onCreateFolder?: (name: string) => Promise<unknown>;
-  onDeleteFolder?: (folder: FileFolder) => Promise<unknown>;
-  onRenameFolder?: (folder: FileFolder, name: string) => Promise<unknown>;
-  onAddFileToFolder?: (folder: FileFolder, eventId: string) => Promise<unknown>;
-  onAddFilesToFolder?: (
-    folder: FileFolder,
-    eventIds: string[],
-  ) => Promise<unknown>;
-  onRemoveFileFromFolder?: (
-    folder: FileFolder,
-    eventId: string,
-  ) => Promise<unknown>;
-  onRemoveFilesFromFolder?: (
-    folder: FileFolder,
-    eventIds: string[],
-  ) => Promise<unknown>;
-  onSetFolderParent?: (
-    folder: FileFolder,
-    parentDTag?: string,
+  onCreateFolder?: (name: string, parent: string | null) => Promise<unknown>;
+  onDeleteFolder?: (id: string) => Promise<unknown>;
+  onMoveFolder?: (id: string, parent: string | null) => Promise<unknown>;
+  onAssignFiles?: (
+    fileKeys: string[],
+    folderId: string | null,
   ) => Promise<unknown>;
 };
 
+type Row =
+  | { kind: "folder"; key: string; folder: FolderNode; depth: number }
+  | { kind: "folder-empty"; key: string; folderId: string }
+  | { kind: "file"; key: string; file: ChannelFile; folderId: string | null };
+
+const EMPTY_SNAPSHOT: FolderSnapshot = { folders: [], files: {} };
+
+/** Row count at which the list switches to a virtualized viewport. */
+const VIRTUALIZE_ROW_THRESHOLD = 60;
+
 export function ChannelFilesTab({
   files,
+  truncated = false,
   isLoading,
+  isError = false,
+  onRetryFiles,
   senderNames,
   senderAvatarUrls,
   onJumpToMessage,
-  folders = [],
+  snapshot = EMPTY_SNAPSHOT,
+  foldersLoading = false,
+  foldersError = false,
+  foldersInvalidReason = null,
+  onRetryFolders,
+  canMutateFolders = false,
   fileFolderMap,
   onCreateFolder,
   onDeleteFolder,
-  onAddFileToFolder,
-  onAddFilesToFolder,
-  onRemoveFileFromFolder,
-  onRemoveFilesFromFolder,
-  onSetFolderParent,
+  onMoveFolder,
+  onAssignFiles,
 }: ChannelFilesTabProps) {
   const [category, setCategory] = useState<FileCategory>("all");
   const [searchQuery, setSearchQuery] = useState("");
@@ -93,10 +115,40 @@ export function ChannelFilesTab({
   const [isCreatingFolder, setIsCreatingFolder] = useState(false);
   const [newFolderName, setNewFolderName] = useState("");
   const [dragOverFolder, setDragOverFolder] = useState<string | null>(null);
-
-  // Selection
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [isSelecting, setIsSelecting] = useState(false);
+  const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
+  const [pending, setPending] = useState<Set<string>>(new Set());
   const lastClickedRef = useRef<string | null>(null);
+
+  const folders = snapshot.folders;
+
+  /**
+   * One place every mutation goes through: it marks its control pending (so a
+   * second click while the write is in flight is a no-op), awaits the result,
+   * and swallows nothing — the hook has already surfaced the error to the
+   * user, and the boolean it returns tells the caller whether to clear local
+   * state such as the selection.
+   */
+  const runMutation = useCallback(
+    async (controlId: string, action: () => Promise<unknown>) => {
+      if (pending.has(controlId)) return false;
+      setPending((prev) => new Set(prev).add(controlId));
+      try {
+        await action();
+        return true;
+      } catch {
+        // The folders hook toasts the failure; nothing further to report.
+        return false;
+      } finally {
+        setPending((prev) => {
+          const next = new Set(prev);
+          next.delete(controlId);
+          return next;
+        });
+      }
+    },
+    [pending],
+  );
 
   const filtered = useMemo(() => {
     let result = files;
@@ -122,9 +174,7 @@ export function ChannelFilesTab({
       document: 0,
       other: 0,
     };
-    for (const f of files) {
-      c[categorizeFile(f.mimeType)]++;
-    }
+    for (const f of files) c[categorizeFile(f.mimeType)]++;
     return c;
   }, [files]);
 
@@ -132,12 +182,11 @@ export function ChannelFilesTab({
     const map = new Map<string, ChannelFile[]>();
     if (!fileFolderMap) return map;
     for (const file of filtered) {
-      const dTag = fileFolderMap.get(file.eventId);
-      if (dTag) {
-        const list = map.get(dTag) ?? [];
-        list.push(file);
-        map.set(dTag, list);
-      }
+      const folderId = fileFolderMap.get(file.key);
+      if (!folderId) continue;
+      const list = map.get(folderId) ?? [];
+      list.push(file);
+      map.set(folderId, list);
     }
     return map;
   }, [filtered, fileFolderMap]);
@@ -145,203 +194,301 @@ export function ChannelFilesTab({
   const unfiledFiles = useMemo(
     () =>
       fileFolderMap
-        ? filtered.filter((f) => !fileFolderMap.has(f.eventId))
+        ? filtered.filter((f) => !fileFolderMap.has(f.key))
         : filtered,
     [filtered, fileFolderMap],
   );
 
-  const allVisibleIds = useMemo(() => {
-    const ids: string[] = [];
-    for (const f of unfiledFiles) ids.push(f.eventId);
-    for (const dTag of expandedFolders) {
-      for (const f of filesByFolder.get(dTag) ?? []) ids.push(f.eventId);
-    }
-    return ids;
-  }, [unfiledFiles, expandedFolders, filesByFolder]);
+  const flatFolders: FlatFolder[] = useMemo(
+    () => flattenFolders(snapshot, expandedFolders),
+    [snapshot, expandedFolders],
+  );
 
-  // Determine which selected files are inside a folder (for bulk remove)
-  const selectedInFolder = useMemo(() => {
-    if (!fileFolderMap || selectedIds.size === 0) return null;
-    let commonDTag: string | null = null;
-    for (const id of selectedIds) {
-      const dTag = fileFolderMap.get(id);
-      if (dTag) {
-        if (commonDTag === null) commonDTag = dTag;
-        else if (commonDTag !== dTag) return null;
-      } else {
-        return null;
+  const rows = useMemo(() => {
+    const result: Row[] = [];
+    for (const { folder, depth } of flatFolders) {
+      result.push({
+        kind: "folder",
+        key: `folder:${folder.id}`,
+        folder,
+        depth,
+      });
+      if (!expandedFolders.has(folder.id)) continue;
+      const folderFiles = filesByFolder.get(folder.id) ?? [];
+      if (folderFiles.length === 0) {
+        result.push({
+          kind: "folder-empty",
+          key: `empty:${folder.id}`,
+          folderId: folder.id,
+        });
+        continue;
+      }
+      for (const file of folderFiles) {
+        result.push({
+          kind: "file",
+          key: `${folder.id}:${file.key}`,
+          file,
+          folderId: folder.id,
+        });
       }
     }
-    return commonDTag;
-  }, [fileFolderMap, selectedIds]);
-
-  // Tree structure: parent → children
-  const folderTree = useMemo(() => {
-    const children = new Map<string | "root", FileFolder[]>();
-    for (const f of folders) {
-      const parent = f.parentDTag ?? "root";
-      const list = children.get(parent) ?? [];
-      list.push(f);
-      children.set(parent, list);
+    for (const file of unfiledFiles) {
+      result.push({ kind: "file", key: file.key, file, folderId: null });
     }
-    return children;
-  }, [folders]);
-
-  // Flat list with depth for rendering — only includes children of expanded folders
-  const flatFolders = useMemo(() => {
-    const result: { folder: FileFolder; depth: number }[] = [];
-    const root = folderTree.get("root") ?? [];
-    function walk(parentDTag: string | undefined, depth: number) {
-      const children = parentDTag ? (folderTree.get(parentDTag) ?? []) : root;
-      for (const f of children) {
-        result.push({ folder: f, depth });
-        // Only recurse into children if this folder is expanded
-        if (expandedFolders.has(f.dTag)) {
-          walk(f.dTag, depth + 1);
-        }
-      }
-    }
-    walk(undefined, 0);
     return result;
-  }, [folderTree, expandedFolders]);
+  }, [flatFolders, expandedFolders, filesByFolder, unfiledFiles]);
 
-  function toggleFolder(dTag: string) {
+  /** Selection order follows render order, so a Shift range means what it looks like. */
+  const visibleFileKeys = useMemo(
+    () => rows.flatMap((row) => (row.kind === "file" ? [row.file.key] : [])),
+    [rows],
+  );
+
+  const selectedFolderId = useMemo(() => {
+    if (!fileFolderMap || selectedKeys.size === 0) return null;
+    let common: string | null = null;
+    for (const key of selectedKeys) {
+      const folderId = fileFolderMap.get(key);
+      if (!folderId) return null;
+      if (common === null) common = folderId;
+      else if (common !== folderId) return null;
+    }
+    return common;
+  }, [fileFolderMap, selectedKeys]);
+
+  function toggleFolder(id: string) {
     setExpandedFolders((prev) => {
       const next = new Set(prev);
-      if (next.has(dTag)) next.delete(dTag);
-      else next.add(dTag);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
       return next;
     });
   }
 
+  const handleToggleSelect = useCallback(
+    (fileKey: string, shiftKey: boolean) => {
+      setSelectedKeys((prev) => {
+        const next = new Set(prev);
+        if (shiftKey && lastClickedRef.current) {
+          const lastIdx = visibleFileKeys.indexOf(lastClickedRef.current);
+          const thisIdx = visibleFileKeys.indexOf(fileKey);
+          if (lastIdx !== -1 && thisIdx !== -1) {
+            const [start, end] =
+              lastIdx < thisIdx ? [lastIdx, thisIdx] : [thisIdx, lastIdx];
+            for (let i = start; i <= end; i++) next.add(visibleFileKeys[i]);
+            lastClickedRef.current = fileKey;
+            return next;
+          }
+        }
+        if (next.has(fileKey)) next.delete(fileKey);
+        else next.add(fileKey);
+        lastClickedRef.current = fileKey;
+        return next;
+      });
+    },
+    [visibleFileKeys],
+  );
+
   async function handleCreateFolder() {
-    if (!newFolderName.trim() || !onCreateFolder) return;
-    await onCreateFolder(newFolderName.trim());
+    const name = newFolderName.trim();
+    if (!name || !onCreateFolder || !canMutateFolders) return;
+    if (hasSiblingNamed(snapshot, null, name)) {
+      toast.error(`A folder named "${name}" already exists here.`);
+      return;
+    }
+    const ok = await runMutation("create-folder", () =>
+      onCreateFolder(name, null),
+    );
+    if (!ok) return;
     setNewFolderName("");
     setIsCreatingFolder(false);
   }
 
-  const handleDragStart = useCallback((e: React.DragEvent, eventId: string) => {
-    e.dataTransfer.setData("text/plain", eventId);
+  const handleDragStart = useCallback((e: React.DragEvent, fileKey: string) => {
+    e.dataTransfer.setData("text/plain", fileKey);
     e.dataTransfer.effectAllowed = "move";
   }, []);
 
-  const handleFolderDragOver = useCallback(
-    (e: React.DragEvent, dTag: string) => {
-      e.preventDefault();
-      e.dataTransfer.dropEffect = "move";
-      setDragOverFolder(dTag);
-    },
-    [],
-  );
-
-  const handleFolderDragLeave = useCallback(() => {
-    setDragOverFolder(null);
+  const handleFolderDragOver = useCallback((e: React.DragEvent, id: string) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    setDragOverFolder(id);
   }, []);
 
   const handleFolderDrop = useCallback(
-    async (e: React.DragEvent, folder: FileFolder) => {
+    async (e: React.DragEvent, folder: FolderNode) => {
       e.preventDefault();
       setDragOverFolder(null);
-      // Check if a folder is being dragged (nesting) vs a file
-      const folderDTag = e.dataTransfer.getData("application/x-folder");
-      if (folderDTag) {
-        const draggedFolder = folders.find((f) => f.dTag === folderDTag);
-        if (!draggedFolder) return;
-        // Don't nest a folder into itself or one of its own descendants —
-        // either makes the folder its own ancestor, which drops it (and
-        // everything under it) out of every walk that starts from a root.
-        if (wouldCreateFolderCycle(folders, folderDTag, folder.dTag)) return;
-        onSetFolderParent?.(draggedFolder, folder.dTag);
+      if (!canMutateFolders) return;
+      const draggedFolderId = e.dataTransfer.getData("application/x-folder");
+      if (draggedFolderId) {
+        if (!onMoveFolder) return;
+        // The transform refuses a cycle too; refusing here as well keeps the
+        // pointless write off the relay.
+        if (draggedFolderId === folder.id) return;
+        await runMutation(`folder:${draggedFolderId}`, () =>
+          onMoveFolder(draggedFolderId, folder.id),
+        );
         return;
       }
-      const eventId = e.dataTransfer.getData("text/plain");
-      if (!eventId || !onAddFileToFolder) return;
-      if (fileFolderMap?.get(eventId) === folder.dTag) return;
-      await onAddFileToFolder(folder, eventId);
+      const fileKey = e.dataTransfer.getData("text/plain");
+      if (!fileKey || !onAssignFiles) return;
+      if (fileFolderMap?.get(fileKey) === folder.id) return;
+      await runMutation(`file:${fileKey}`, () =>
+        onAssignFiles([fileKey], folder.id),
+      );
     },
-    [fileFolderMap, onAddFileToFolder, onSetFolderParent, folders],
+    [canMutateFolders, fileFolderMap, onAssignFiles, onMoveFolder, runMutation],
   );
 
-  // ── Selection ────────────────────────────────────────────────────
-
-  function handleToggleSelect(eventId: string, e?: React.MouseEvent) {
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      const shift = e?.shiftKey ?? false;
-
-      if (shift && lastClickedRef.current) {
-        const lastIdx = allVisibleIds.indexOf(lastClickedRef.current);
-        const thisIdx = allVisibleIds.indexOf(eventId);
-        if (lastIdx !== -1 && thisIdx !== -1) {
-          const [start, end] =
-            lastIdx < thisIdx ? [lastIdx, thisIdx] : [thisIdx, lastIdx];
-          for (let i = start; i <= end; i++) {
-            next.add(allVisibleIds[i]);
-          }
-        }
-      } else if (next.has(eventId)) {
-        next.delete(eventId);
-      } else {
-        next.add(eventId);
-      }
-
-      lastClickedRef.current = eventId;
-      return next;
-    });
-  }
-
-  function selectAll() {
-    setSelectedIds(new Set(allVisibleIds));
-  }
-
-  async function handleBulkMoveToFolder(dTag: string) {
-    if (!onAddFilesToFolder) return;
-    const folder = folders.find((f) => f.dTag === dTag);
-    if (!folder) return;
-    const ids = Array.from(selectedIds);
-    await onAddFilesToFolder(folder, ids);
-    toast(
-      `Moved ${ids.length} file${ids.length !== 1 ? "s" : ""} to ${folder.name}`,
+  async function handleAssignSelection(folderId: string | null) {
+    if (!onAssignFiles || !canMutateFolders) return;
+    const keys = Array.from(selectedKeys);
+    if (keys.length === 0) return;
+    const ok = await runMutation("bulk", () => onAssignFiles(keys, folderId));
+    if (!ok) return;
+    const target =
+      folderId === null
+        ? "unfiled"
+        : (folders.find((f) => f.id === folderId)?.name ?? "the folder");
+    toast.success(
+      `Moved ${keys.length} file${keys.length !== 1 ? "s" : ""} to ${target}`,
     );
-    setSelectedIds(new Set());
+    setSelectedKeys(new Set());
   }
-
-  async function handleBulkRemoveFromFolder() {
-    if (!onRemoveFilesFromFolder || !selectedInFolder) return;
-    const folder = folders.find((f) => f.dTag === selectedInFolder);
-    if (!folder) return;
-    const ids = Array.from(selectedIds);
-    // One event for the whole selection — a sequential per-file loop here
-    // published N separate replaceable events, each built from the same
-    // stale `folder` reference, so every iteration after the first re-added
-    // the files the previous iteration had just removed.
-    await onRemoveFilesFromFolder(folder, ids);
-    toast(
-      `Removed ${ids.length} file${ids.length !== 1 ? "s" : ""} from ${folder.name}`,
-    );
-    setSelectedIds(new Set());
-  }
-
-  function toast(msg: string) {
-    import("sonner").then(({ toast: t }) => t.success(msg)).catch(() => {});
-  }
-
-  const selectedCount = selectedIds.size;
 
   function renderFileRow(file: ChannelFile) {
     return (
       <FileRow
         file={file}
-        key={file.key}
-        onDragStart={handleDragStart}
+        onDragStart={canMutateFolders ? handleDragStart : undefined}
         onJumpToMessage={onJumpToMessage}
-        onToggleSelect={(id) => handleToggleSelect(id)}
-        selected={selectedIds.has(file.eventId)}
-        selecting={true}
+        onToggleSelect={handleToggleSelect}
+        selected={selectedKeys.has(file.key)}
+        selecting={isSelecting}
         senderAvatarUrl={senderAvatarUrls?.get(file.pubkey) ?? null}
         senderName={senderNames?.get(file.pubkey)}
       />
+    );
+  }
+
+  function renderFolderRow(folder: FolderNode, depth: number) {
+    const folderFiles = filesByFolder.get(folder.id) ?? [];
+    const isExpanded = expandedFolders.has(folder.id);
+    const isPending = pending.has(`folder:${folder.id}`);
+    return (
+      // biome-ignore lint/a11y/noStaticElementInteractions: drag-and-drop is the pointer convenience; the "Move folder to" select below is the keyboard-reachable equivalent for every nest/un-nest this accepts
+      <div
+        className={`flex items-center gap-2 px-3 py-2 transition-colors ${
+          dragOverFolder === folder.id
+            ? "bg-primary/10 ring-2 ring-primary/30"
+            : "hover:bg-muted/50"
+        } ${isPending ? "opacity-60" : ""}`}
+        draggable={canMutateFolders}
+        onDragLeave={() => setDragOverFolder(null)}
+        onDragOver={(e) => handleFolderDragOver(e, folder.id)}
+        onDragStart={(e) => {
+          e.dataTransfer.setData("application/x-folder", folder.id);
+          e.dataTransfer.effectAllowed = "move";
+        }}
+        onDrop={(e) => void handleFolderDrop(e, folder)}
+        style={{ paddingLeft: `${12 + depth * 20}px` }}
+      >
+        <button
+          aria-expanded={isExpanded}
+          className="flex flex-1 items-center gap-2 text-left text-sm font-medium"
+          onClick={() => toggleFolder(folder.id)}
+          type="button"
+        >
+          {isExpanded ? (
+            <ChevronDown className="h-4 w-4 text-muted-foreground" />
+          ) : (
+            <ChevronRight className="h-4 w-4 text-muted-foreground" />
+          )}
+          <Folder className="h-4 w-4 text-muted-foreground" />
+          {folder.name}
+          <span className="text-xs text-muted-foreground">
+            ({folderFiles.length})
+          </span>
+        </button>
+        {onMoveFolder ? (
+          <select
+            aria-label={`Move folder ${folder.name} to`}
+            className="h-7 rounded border border-border bg-background px-1 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+            disabled={!canMutateFolders || isPending}
+            onChange={(e) => {
+              const value = e.target.value;
+              if (!value) return;
+              void runMutation(`folder:${folder.id}`, () =>
+                onMoveFolder(folder.id, value === "root" ? null : value),
+              );
+            }}
+            value=""
+          >
+            <option disabled value="">
+              Move to…
+            </option>
+            <option value="root">Root</option>
+            {folders
+              .filter((candidate) => candidate.id !== folder.id)
+              .map((candidate) => (
+                <option key={candidate.id} value={candidate.id}>
+                  {candidate.name}
+                </option>
+              ))}
+          </select>
+        ) : null}
+        {onDeleteFolder ? (
+          <Button
+            aria-label={`Delete folder ${folder.name}`}
+            className="h-7 w-7 opacity-60 hover:opacity-100"
+            disabled={!canMutateFolders || isPending}
+            onClick={() =>
+              void runMutation(`folder:${folder.id}`, () =>
+                onDeleteFolder(folder.id),
+              )
+            }
+            size="icon-xs"
+            variant="ghost"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+          </Button>
+        ) : null}
+      </div>
+    );
+  }
+
+  function renderRow(row: Row) {
+    if (row.kind === "folder") return renderFolderRow(row.folder, row.depth);
+    if (row.kind === "folder-empty") {
+      return (
+        <p className="ml-6 border-l-2 border-l-muted px-3 py-4 text-xs text-muted-foreground">
+          Empty folder — drag files here, or select files and use “Move to
+          folder”.
+        </p>
+      );
+    }
+    if (row.folderId === null) return renderFileRow(row.file);
+    return (
+      <div className="group ml-6 flex items-center border-l-2 border-l-muted">
+        <div className="min-w-0 flex-1">{renderFileRow(row.file)}</div>
+        {onAssignFiles ? (
+          <Button
+            aria-label={`Remove ${row.file.filename ?? "file"} from folder`}
+            className="mr-2 h-7 w-7 shrink-0 opacity-0 transition-opacity focus-visible:opacity-100 group-focus-within:opacity-100 group-hover:opacity-100"
+            disabled={!canMutateFolders || pending.has(`file:${row.file.key}`)}
+            onClick={() =>
+              void runMutation(`file:${row.file.key}`, () =>
+                onAssignFiles([row.file.key], null),
+              )
+            }
+            size="icon-xs"
+            variant="ghost"
+          >
+            <Undo2 className="h-3.5 w-3.5" />
+          </Button>
+        ) : null}
+      </div>
     );
   }
 
@@ -358,9 +505,11 @@ export function ChannelFilesTab({
     );
   }
 
+  const selectedCount = selectedKeys.size;
+  const folderStateBroken = foldersError || foldersInvalidReason !== null;
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      {/* Toolbar */}
       <div className="shrink-0 space-y-2 border-b border-border px-4 pb-3 pt-3">
         <div className="flex items-center gap-1 overflow-x-auto [scrollbar-width:none]">
           {CATEGORY_TABS.map((tab) => (
@@ -420,9 +569,25 @@ export function ChannelFilesTab({
             <ArrowUpDown className="pointer-events-none absolute left-2 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground" />
           </div>
 
+          <Button
+            aria-pressed={isSelecting}
+            className="h-8 shrink-0 px-2 text-xs"
+            onClick={() => {
+              setIsSelecting((prev) => {
+                if (prev) setSelectedKeys(new Set());
+                return !prev;
+              });
+            }}
+            size="sm"
+            variant={isSelecting ? "secondary" : "outline"}
+          >
+            {isSelecting ? "Done" : "Select"}
+          </Button>
+
           {onCreateFolder ? (
             <Button
               className="h-8 shrink-0 gap-1 px-2 text-xs"
+              disabled={!canMutateFolders}
               onClick={() => setIsCreatingFolder(true)}
               size="sm"
               variant="outline"
@@ -448,7 +613,11 @@ export function ChannelFilesTab({
             />
             <Button
               className="h-8 px-3 text-xs"
-              disabled={!newFolderName.trim()}
+              disabled={
+                !newFolderName.trim() ||
+                !canMutateFolders ||
+                pending.has("create-folder")
+              }
               onClick={() => void handleCreateFolder()}
               size="sm"
             >
@@ -466,23 +635,60 @@ export function ChannelFilesTab({
         ) : null}
       </div>
 
-      {/* Bulk action bar — below toolbar, above file list */}
+      {folderStateBroken ? (
+        <div
+          className="flex shrink-0 items-center gap-2 border-b border-destructive/30 bg-destructive/5 px-4 py-2 text-xs"
+          role="alert"
+        >
+          <AlertTriangle className="h-3.5 w-3.5 text-destructive" />
+          <span className="flex-1">
+            {foldersError
+              ? "Folders could not be loaded, so the list below shows every file as unfiled."
+              : "This channel's folder data could not be read, so folders are disabled."}
+          </span>
+          {onRetryFolders ? (
+            <Button
+              className="h-7 px-2 text-xs"
+              onClick={onRetryFolders}
+              size="sm"
+              variant="outline"
+            >
+              Retry
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
+
+      {foldersLoading ? (
+        <p className="shrink-0 border-b border-border px-4 py-1.5 text-xs text-muted-foreground">
+          Loading folders…
+        </p>
+      ) : null}
+
+      {truncated ? (
+        <p className="shrink-0 border-b border-border px-4 py-1.5 text-xs text-muted-foreground">
+          Showing the most recent attachments only — this channel has more than
+          the Files tab loads at once.
+        </p>
+      ) : null}
+
       {selectedCount > 0 ? (
         <div className="flex shrink-0 items-center gap-2 border-b border-primary/20 bg-primary/5 px-4 py-2">
           <span className="text-xs font-medium">{selectedCount} selected</span>
           <Button
             className="h-7 px-2 text-xs"
-            onClick={selectAll}
+            onClick={() => setSelectedKeys(new Set(visibleFileKeys))}
             size="sm"
             variant="ghost"
           >
             Select all
           </Button>
           <div className="flex-1" />
-          {selectedInFolder ? (
+          {selectedFolderId ? (
             <Button
               className="h-7 gap-1 px-2 text-xs"
-              onClick={() => void handleBulkRemoveFromFolder()}
+              disabled={!canMutateFolders || pending.has("bulk")}
+              onClick={() => void handleAssignSelection(null)}
               size="sm"
               variant="outline"
             >
@@ -494,9 +700,10 @@ export function ChannelFilesTab({
               <select
                 aria-label="Move selected files to folder"
                 className="h-7 appearance-none rounded border border-border bg-background pl-2 pr-6 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                disabled={!canMutateFolders || pending.has("bulk")}
                 onChange={(e) => {
                   if (e.target.value)
-                    void handleBulkMoveToFolder(e.target.value);
+                    void handleAssignSelection(e.target.value);
                 }}
                 value=""
               >
@@ -504,7 +711,7 @@ export function ChannelFilesTab({
                   Move to folder…
                 </option>
                 {folders.map((f) => (
-                  <option key={f.dTag} value={f.dTag}>
+                  <option key={f.id} value={f.id}>
                     {f.name}
                   </option>
                 ))}
@@ -514,7 +721,7 @@ export function ChannelFilesTab({
           )}
           <Button
             className="h-7 px-2 text-xs"
-            onClick={() => setSelectedIds(new Set())}
+            onClick={() => setSelectedKeys(new Set())}
             size="sm"
             variant="ghost"
           >
@@ -524,143 +731,56 @@ export function ChannelFilesTab({
         </div>
       ) : null}
 
-      {/* File list */}
-      {/* biome-ignore lint/a11y/noStaticElementInteractions: drag-drop target only (drop a dragged folder here to un-nest it), no click handler; ported as-is from upstream PR #4316 — no keyboard alternative for this specific action exists yet, tracked as a follow-up */}
-      <div
-        className="flex-1 overflow-y-auto"
-        onDragOver={(e) => {
-          // Accept folder drops to un-nest (move to root)
-          if (e.dataTransfer.types.includes("application/x-folder")) {
-            e.preventDefault();
-            e.dataTransfer.dropEffect = "move";
-          }
-        }}
-        onDrop={(e) => {
-          const folderDTag = e.dataTransfer.getData("application/x-folder");
-          if (folderDTag) {
-            e.preventDefault();
-            const folder = folders.find((f) => f.dTag === folderDTag);
-            if (folder?.parentDTag) {
-              void onSetFolderParent?.(folder, undefined);
-            }
-          }
-        }}
-      >
-        {filtered.length === 0 && folders.length === 0 ? (
-          <div className="flex items-center justify-center p-12">
-            <div className="flex max-w-xs flex-col items-center gap-2 text-center">
-              <p className="text-sm font-medium">No files yet</p>
-              <p className="text-xs text-muted-foreground">
-                Files shared in this channel will appear here.
-              </p>
-            </div>
-          </div>
-        ) : (
-          <div className="divide-y divide-border py-1">
-            {flatFolders.map(({ folder, depth }) => {
-              const folderFiles = filesByFolder.get(folder.dTag) ?? [];
-              const isExpanded = expandedFolders.has(folder.dTag);
-
-              return (
-                <div key={folder.dTag}>
-                  {/* biome-ignore lint/a11y/noStaticElementInteractions: drag source/target only (nest/un-nest via DnD); expand and delete are separate keyboard-reachable buttons below, ported as-is from upstream PR #4316 */}
-                  <div
-                    className={`flex items-center gap-2 px-3 py-2 transition-colors ${
-                      dragOverFolder === folder.dTag
-                        ? "bg-primary/10 ring-2 ring-primary/30"
-                        : "hover:bg-muted/50"
-                    }`}
-                    draggable
-                    onDragLeave={handleFolderDragLeave}
-                    onDragOver={(e) => handleFolderDragOver(e, folder.dTag)}
-                    onDragStart={(e) => {
-                      e.dataTransfer.setData(
-                        "application/x-folder",
-                        folder.dTag,
-                      );
-                      e.dataTransfer.effectAllowed = "move";
-                    }}
-                    onDrop={(e) => void handleFolderDrop(e, folder)}
-                    style={{ paddingLeft: `${12 + depth * 20}px` }}
-                  >
-                    <button
-                      className="flex flex-1 items-center gap-2 text-sm font-medium"
-                      onClick={() => toggleFolder(folder.dTag)}
-                      type="button"
-                    >
-                      {isExpanded ? (
-                        <ChevronDown className="h-4 w-4 text-muted-foreground" />
-                      ) : (
-                        <ChevronRight className="h-4 w-4 text-muted-foreground" />
-                      )}
-                      <Folder className="h-4 w-4 text-muted-foreground" />
-                      {folder.name}
-                      <span className="text-xs text-muted-foreground">
-                        ({folderFiles.length})
-                      </span>
-                    </button>
-                    {onDeleteFolder ? (
-                      <Button
-                        aria-label={`Delete folder ${folder.name}`}
-                        className="h-7 w-7 opacity-50 hover:opacity-100"
-                        onClick={() => void onDeleteFolder(folder)}
-                        size="icon-xs"
-                        variant="ghost"
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </Button>
-                    ) : null}
-                  </div>
-                  {isExpanded ? (
-                    <div className="divide-y divide-border border-l-2 border-l-muted ml-6">
-                      {folderFiles.length === 0 &&
-                      !folderTree.has(folder.dTag) ? (
-                        <p className="px-3 py-4 text-xs text-muted-foreground">
-                          Empty folder — drag files here or use checkboxes to
-                          add them.
-                        </p>
-                      ) : (
-                        folderFiles.map((file) => (
-                          <div
-                            className="group flex items-center"
-                            key={file.key}
-                          >
-                            <div className="flex-1">{renderFileRow(file)}</div>
-                            {onRemoveFileFromFolder ? (
-                              <Button
-                                aria-label="Remove from folder"
-                                className="mr-2 h-7 w-7 shrink-0 opacity-0 transition-opacity group-hover:opacity-100"
-                                onClick={() =>
-                                  void onRemoveFileFromFolder(
-                                    folder,
-                                    file.eventId,
-                                  )
-                                }
-                                size="icon-xs"
-                                variant="ghost"
-                              >
-                                <Undo2 className="h-3.5 w-3.5" />
-                              </Button>
-                            ) : null}
-                          </div>
-                        ))
-                      )}
-                    </div>
-                  ) : null}
-                </div>
-              );
-            })}
-
-            {dragOverFolder ? (
-              <div className="px-3 py-1.5 text-xs text-muted-foreground">
-                Drop file to add to folder
-              </div>
+      {isError ? (
+        <div className="flex flex-1 items-center justify-center p-12">
+          <div className="flex max-w-xs flex-col items-center gap-2 text-center">
+            <AlertTriangle className="h-5 w-5 text-destructive" />
+            <p className="text-sm font-medium">Files could not be loaded</p>
+            <p className="text-xs text-muted-foreground">
+              This is not an empty channel — the request failed.
+            </p>
+            {onRetryFiles ? (
+              <Button onClick={onRetryFiles} size="sm" variant="outline">
+                Retry
+              </Button>
             ) : null}
-
-            {unfiledFiles.map((file) => renderFileRow(file))}
           </div>
-        )}
-      </div>
+        </div>
+      ) : rows.length === 0 ? (
+        <div className="flex flex-1 items-center justify-center p-12">
+          <div className="flex max-w-xs flex-col items-center gap-2 text-center">
+            <p className="text-sm font-medium">No files yet</p>
+            <p className="text-xs text-muted-foreground">
+              Files shared in this channel will appear here.
+            </p>
+          </div>
+        </div>
+      ) : (
+        (() => {
+          const children = rows.map((row) => (
+            <div className="border-b border-border" key={row.key}>
+              {renderRow(row)}
+            </div>
+          ));
+          // Above the threshold the list is virtualized, so the mounted DOM
+          // stays proportional to the viewport however many attachments the
+          // channel holds. Below it the whole list is already smaller than a
+          // virtualizer's own window, and rendering it plainly keeps the rows
+          // reachable to find-in-page and to assistive technology.
+          return rows.length >= VIRTUALIZE_ROW_THRESHOLD ? (
+            <VList className="flex-1" data-testid="channel-files-list">
+              {children}
+            </VList>
+          ) : (
+            <div
+              className="flex-1 overflow-y-auto"
+              data-testid="channel-files-list"
+            >
+              {children}
+            </div>
+          );
+        })()
+      )}
     </div>
   );
 }
