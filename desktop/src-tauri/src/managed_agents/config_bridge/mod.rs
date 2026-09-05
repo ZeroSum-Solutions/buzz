@@ -36,3 +36,23 @@ pub(crate) fn all_known_effort_keys() -> impl Iterator<Item = &'static str> {
 pub(crate) fn read_goose_file_config() -> Option<RuntimeFileConfig> {
     goose::read_config_file()
 }
+
+/// Read a Claude config pair (`settings.json` + `.claude.json`) from an
+/// explicit directory.
+///
+/// The production reader, reachable from this crate's tests so a module that
+/// *generates* such a document can prove Buzz reads it back — see
+/// `managed_agents::agent_config_gen`.
+#[cfg(test)]
+pub(crate) fn read_claude_config_at(dir: &std::path::Path) -> Option<RuntimeFileConfig> {
+    claude::read_config_file(Some(dir))
+}
+
+/// Parse a Codex `config.toml` document from a string.
+///
+/// The production parser, reachable for the same reason as
+/// `read_claude_config_at`.
+#[cfg(test)]
+pub(crate) fn parse_codex_config_str(raw: &str) -> Option<RuntimeFileConfig> {
+    codex::parse_codex_config(raw)
+}

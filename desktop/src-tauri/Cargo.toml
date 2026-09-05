@@ -157,3 +157,8 @@ tokio = { version = "1", features = ["test-util"] }
 # The relay's media validation, so desktop-produced snapshots and voice notes
 # can prove their full client-sanitize → relay-accept contract end to end.
 buzz_media_pkg = { package = "buzz-media", path = "../../crates/buzz-media" }
+# The ACP harness itself, so the prompt-source reload is provable end to end:
+# file bytes -> reload -> the value a restart writes to BUZZ_ACP_SYSTEM_PROMPT
+# -> the harness's own env parse, prompt composition and `session/new` request.
+# The feature only re-exports that path; it adds no test-only code.
+buzz_acp_pkg = { package = "buzz-acp", path = "../../crates/buzz-acp", features = ["delivery-seam-test-api"] }

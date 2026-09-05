@@ -77,6 +77,11 @@ use huddle::{
     HuddlePhase,
 };
 use initial_window::*;
+/// Generation of a managed agent's extra MCP servers and pinned skills as
+/// runtime configuration files. Re-exported so the `openseo-config-emit`
+/// example — the seam `scripts/zs/openseo-smoke.sh` drives — runs the same
+/// generator the app links, rather than a shell reimplementation of it.
+pub use managed_agents::agent_config_gen;
 use managed_agents::{
     backfill_persona_snapshots, ensure_nest, list_managed_agent_runtimes,
     put_managed_agent_runtime_lifecycle, reconcile_managed_agent_runtimes,
@@ -743,6 +748,9 @@ pub fn run() {
             create_persona,
             update_persona,
             update_persona_and_publish,
+            set_prompt_source_and_reload,
+            get_prompt_source,
+            reset_prompt_sources,
             delete_persona,
             set_persona_active,
             set_persona_shared,

@@ -85,6 +85,8 @@ import { useProviderApiKeyFieldState } from "./providerApiKeyFieldState";
 import { buildRuntimeModelProviderPayload } from "./agentDefinitionSubmitPayload";
 import { AgentDefinitionDialogFooter } from "./AgentDefinitionDialogFooter";
 import { AgentDefinitionDialogShell } from "./AgentDefinitionDialogShell";
+import { PromptSourceField } from "./PromptSourceField";
+import { DIRTY_EXEMPT_SELECTOR } from "./promptSourceActions";
 import { AddCustomHarnessDialog } from "./AddCustomHarnessDialog";
 import {
   ADD_CUSTOM_HARNESS_OPTION,
@@ -145,6 +147,18 @@ export function AgentDefinitionDialog({
   const aiDefaultsTriggerRef = React.useRef<HTMLButtonElement>(null);
   const [avatarUrl, setAvatarUrl] = React.useState("");
   const [systemPrompt, setSystemPrompt] = React.useState("");
+  /**
+   * True while the instructions-file field has a request in flight.
+   *
+   * A reload replaces the instructions outright, so typing into the textarea
+   * during the round trip is silently discarded when the answer lands, and a
+   * Save in the same window submits the pre-reload draft through
+   * `update_persona`, which carries no precondition — the reload's write is
+   * then overwritten with no error anywhere. Both controls are the dialog's,
+   * not the field's, so the fence lives here.
+   */
+  const [isPromptSourcePending, setIsPromptSourcePending] =
+    React.useState(false);
   const [runtime, setRuntime] = React.useState("");
   const [model, setModel] = React.useState("");
   const [isCustomModelEditing, setIsCustomModelEditing] = React.useState(false);
@@ -189,6 +203,10 @@ export function AgentDefinitionDialog({
     [globalConfig.preferred_runtime, runtimes],
   );
   const isCreateMode = Boolean(initialValues && !("id" in initialValues));
+  // Reloading writes straight to a stored definition, so the field only
+  // exists in edit mode, where there is an id to write to.
+  const editedDefinitionId =
+    initialValues && "id" in initialValues ? initialValues.id : null;
   const shouldReduceMotion = useReducedMotion();
   const initialModelProviderEditableWithoutRuntime = Boolean(
     initialValues &&
@@ -501,6 +519,9 @@ export function AgentDefinitionDialog({
   // source of truth with the readiness gate so display and Save can't drift.
   const canSubmit =
     canSubmitPersonaDialog({ displayName, isPending }) &&
+    // A save started while a reload is in flight would submit the draft the
+    // reload is about to replace, and win.
+    !isPromptSourcePending &&
     (!isCreateMode || runtime.trim().length > 0) &&
     (!isCreateMode || selectedRuntimeIsAvailable) &&
     (!isCreateMode || !createSubmitBlocked) &&
@@ -745,7 +766,18 @@ export function AgentDefinitionDialog({
     <form
       className="grid gap-5 lg:grid-cols-[220px_minmax(0,1fr)]"
       id="persona-dialog-form"
-      onChangeCapture={() => setHasUserChanges(true)}
+      onChangeCapture={(event) => {
+        // Controls in a dirty-exempt subtree hold machine-local values that
+        // are neither submitted nor published (the instructions-file path).
+        // Counting them as edits would arm a catalog publish for a field the
+        // catalog never carries. This runs in the capture phase from the
+        // form down, so the check must live here: a child cannot stop an
+        // ancestor's capture listener that has already fired.
+        if ((event.target as HTMLElement).closest(DIRTY_EXEMPT_SELECTOR)) {
+          return;
+        }
+        setHasUserChanges(true);
+      }}
       onSubmit={handleSubmitForm}
     >
       <AgentCreationPreview
@@ -785,13 +817,27 @@ export function AgentDefinitionDialog({
                 "min-h-40 resize-y px-3 py-3 leading-5",
                 PERSONA_FIELD_CONTROL_CLASS,
               )}
-              disabled={isPending}
+              disabled={isPending || isPromptSourcePending}
               id="persona-system-prompt"
               onChange={(event) => setSystemPrompt(event.target.value)}
               placeholder="Describe what this agent should do."
               value={systemPrompt}
             />
           </div>
+          {editedDefinitionId ? (
+            <PromptSourceField
+              definitionId={editedDefinitionId}
+              disabled={isPending}
+              onPendingChange={setIsPromptSourcePending}
+              onPromptReloaded={(prompt) => {
+                // Only the instructions are now stored. `hasUserChanges` is
+                // the whole dialog's dirty state, so clearing it here would
+                // drop an unsaved edit to another field out of the save's
+                // catalog publish and let local and relay diverge silently.
+                setSystemPrompt(prompt);
+              }}
+            />
+          ) : null}
         </div>
 
         {modelFieldVisible ? (

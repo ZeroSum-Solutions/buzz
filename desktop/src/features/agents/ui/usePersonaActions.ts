@@ -33,7 +33,10 @@ import {
   useSetPersonaCatalogSharedMutation,
   useUpdatePersonaAndPublishMutation,
 } from "@/features/agents/lib/usePersonaCatalogRelay";
-import { personaSaveNotice } from "@/features/agents/lib/personaSaveNotice";
+import {
+  catalogBookkeepingSentence,
+  personaSaveNotice,
+} from "@/features/agents/lib/personaSaveNotice";
 import { useCreatedAgentChannelAttachment } from "@/features/agents/useCreatedAgentChannelAttachment";
 import { useCommunities } from "@/features/communities/useCommunities";
 import { useIdentityQuery } from "@/shared/api/hooks";
@@ -198,7 +201,11 @@ export function usePersonaActions() {
             );
           }
           setPersonaNoticeMessage(
-            personaSaveNotice(input.displayName, result.publicationStatus),
+            personaSaveNotice(
+              input.displayName,
+              result.publicationStatus,
+              result.bookkeepingError,
+            ),
           );
         } else {
           await updatePersonaMutation.mutateAsync(input);
@@ -515,14 +522,18 @@ export function usePersonaActions() {
           ? { ...current, persona: result.persona }
           : current,
       );
+      // Appended to every branch: the relay took the head but the local sync
+      // record may not have updated, and the user is the only one who can
+      // decide whether a head that will be sent again matters to them.
+      const bookkeeping = catalogBookkeepingSentence(result.bookkeepingError);
       if (result.publicationStatus === "queued") {
         if (shared) {
           setPersonaNoticeMessage(
-            `Sharing ${persona.displayName} is queued. It will appear after the relay accepts the update.`,
+            `Sharing ${persona.displayName} is queued. It will appear after the relay accepts the update.${bookkeeping}`,
           );
         } else {
           setPersonaNoticeMessage(
-            `Removing ${persona.displayName} is queued. It may remain discoverable until the relay accepts the update.`,
+            `Removing ${persona.displayName} is queued. It may remain discoverable until the relay accepts the update.${bookkeeping}`,
           );
         }
         if (result.relayMessage) {
@@ -532,11 +543,11 @@ export function usePersonaActions() {
         }
       } else if (!shared) {
         setPersonaNoticeMessage(
-          `${persona.displayName} is no longer discoverable in the community catalog.`,
+          `${persona.displayName} is no longer discoverable in the community catalog.${bookkeeping}`,
         );
       } else {
         setPersonaNoticeMessage(
-          `Published ${persona.displayName} to the community catalog.`,
+          `Published ${persona.displayName} to the community catalog.${bookkeeping}`,
         );
       }
     } catch (error) {

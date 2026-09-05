@@ -28,6 +28,35 @@ pub use config::Config;
 pub use config::ConfigError;
 pub use usage::TurnUsage;
 
+/// The `session/new` delivery seam, re-exported for cross-crate end-to-end tests.
+///
+/// Every item here is production code on the path a spawned harness takes from
+/// its environment to the adapter's `session/new` request: the CLI/env parse
+/// that reads `BUZZ_ACP_SYSTEM_PROMPT` ([`CliArgs`](delivery_seam::CliArgs) and
+/// [`Config::from_args`](delivery_seam::Config::from_args)),
+/// the standing-prompt composition
+/// ([`combined_system_prompt`](delivery_seam::combined_system_prompt)), the
+/// per-adapter transport choice
+/// ([`session_new_system_prompt`](delivery_seam::session_new_system_prompt)),
+/// and the client that puts the request on the wire
+/// ([`AcpClient`](delivery_seam::AcpClient)). Nothing here is written for a
+/// test; the module only widens where those items can be reached from.
+///
+/// Gated on the `delivery-seam-test-api` feature, which only
+/// `desktop/src-tauri`'s dev-dependency turns on, so no shipped build of this
+/// crate gains public API.
+#[cfg(feature = "delivery-seam-test-api")]
+pub mod delivery_seam {
+    pub use crate::acp::{AcpClient, SessionNewResponse, SystemPromptTransport};
+    pub use crate::config::{CliArgs, Config};
+    pub use crate::pool::{
+        combined_system_prompt, session_new_system_prompt, CLAUDE_AGENT_ACP_NAME,
+    };
+    /// `clap`'s trait, so a caller can reach `CliArgs::try_parse_from` without
+    /// depending on the same `clap` release this crate resolved.
+    pub use clap::Parser;
+}
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
