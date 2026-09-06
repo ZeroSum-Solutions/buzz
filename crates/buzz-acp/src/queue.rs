@@ -78,7 +78,7 @@ impl IntoScope for &Uuid {
 }
 
 /// Maximum events drained into a single batch.
-const MAX_BATCH_EVENTS: usize = 50;
+pub(crate) const MAX_BATCH_EVENTS: usize = 50;
 
 /// Maximum retry attempts before a batch is dead-lettered.
 pub(crate) const MAX_RETRIES: u32 = 10;
@@ -164,6 +164,23 @@ pub struct FlushBatch {
     /// [`Steer`](CancelReason::Steer) framing if a merge somehow lacks a reason
     /// (see [`MergeFraming::for_reason`]).
     pub cancel_reason: Option<CancelReason>,
+    /// Whether this batch's turn saw agent output or a tool call.
+    /// Shared via `Arc` across clones so panic/crash recovery in `TaskMeta` retains
+    /// the started status.
+    pub started: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl FlushBatch {
+    /// Whether this batch started executing (produced output or tool calls).
+    pub fn is_started(&self) -> bool {
+        self.started.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Mark this batch as started.
+    pub fn mark_started(&self) {
+        self.started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Per-channel event queue with per-channel in-flight enforcement.
@@ -198,6 +215,7 @@ pub struct FlushBatch {
 ///     events = drain up to MAX_BATCH_EVENTS from queues[channel]
 ///     in_flight_channels.insert(channel)
 ///     in_flight_deadlines.insert(channel, now + in_flight_deadline)
+///     return Some(            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
 ///     return Some(FlushBatch { channel, events })
 ///
 ///   mark_complete(channel_id):
@@ -251,6 +269,8 @@ pub struct EventQueue {
     /// and refusing to grow past the cap keeps a caller that never drains from
     /// turning this into an unbounded backlog.
     parked_out: VecDeque<ParkHandoff>,
+    /// Number of times `flush_next` has been called.
+    flush_count: usize,
 }
 
 /// Most batches held in the park hand-off at once.
@@ -292,7 +312,14 @@ impl EventQueue {
             withheld_native_steer: HashMap::new(),
             in_flight_deadline: Duration::from_secs(DEFAULT_IN_FLIGHT_DEADLINE_SECS),
             parked_out: VecDeque::new(),
+            flush_count: 0,
         }
+    }
+
+    /// Number of times `flush_next` has been called on this queue.
+    #[allow(dead_code)]
+    pub fn flush_count(&self) -> usize {
+        self.flush_count
     }
 
     /// Set the in-flight backstop deadline from the configured max turn
@@ -411,6 +438,7 @@ impl EventQueue {
     /// across channels), drains ALL events for that channel into a single batch,
     /// inserts into `in_flight_channels`, and returns the batch.
     pub fn flush_next(&mut self) -> Option<FlushBatch> {
+        self.flush_count += 1;
         let now = Instant::now();
 
         // Auto-expire any stuck in-flight entries that missed mark_complete.
@@ -482,6 +510,7 @@ impl EventQueue {
                             events: cancelled,
                             cancelled_events: vec![],
                             cancel_reason,
+                            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                         });
                     }
                     None => return None,
@@ -534,6 +563,7 @@ impl EventQueue {
             events,
             cancelled_events,
             cancel_reason,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -566,6 +596,17 @@ impl EventQueue {
                 self.retry_counts.remove(&scope);
             }
         }
+    }
+
+    /// Mark the scope complete for in-flight tracking without clearing `retry_counts`.
+    ///
+    /// Used when a turn ends in Pause or BreakerOpen or when batches are held,
+    /// so accumulated retries are not lost across the pause or breaker.
+    pub fn mark_complete_preserving_retries<K: IntoScope>(&mut self, scope: K) {
+        let scope = scope.into_scope();
+        self.in_flight_scopes.remove(&scope);
+        self.in_flight_deadlines.remove(&scope);
+        self.in_flight_batch_sizes.remove(&scope);
     }
 
     /// Re-queue a batch of events that failed to process.
@@ -2797,6 +2838,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
@@ -2833,6 +2875,7 @@ mod tests {
                 received_at: Instant::now(),
             }],
             cancel_reason: reason,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -2973,6 +3016,7 @@ mod tests {
                 received_at: Instant::now(),
             }],
             cancel_reason: Some(CancelReason::Steer),
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
         assert!(prompt.contains("<new-message-arrived-while-you-were-working count=\"2\">"));
@@ -3025,6 +3069,7 @@ mod tests {
                 received_at: Instant::now(),
             }],
             cancel_reason: Some(CancelReason::Steer),
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
@@ -3206,6 +3251,7 @@ mod tests {
             ],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
@@ -3236,6 +3282,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
@@ -3261,6 +3308,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let core = "[Agent Memory — core]\nbe helpful";
         let prompt = format_prompt(
@@ -3295,6 +3343,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let prompt = format_prompt(
             &batch,
@@ -3327,6 +3376,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let core = "[Agent Memory — core]\nbe helpful";
         let prompt = format_prompt(
@@ -3356,6 +3406,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         // format_prompt no longer accepts or emits base_prompt/system_prompt.
@@ -3382,6 +3433,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let core = "[Agent Memory — core]\nremember this";
@@ -3442,6 +3494,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let canvas = "[Channel Canvas]\ncanvas content";
         let core = "[Agent Memory — core]\nremember this";
@@ -3497,6 +3550,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let prompt = format_prompt(
@@ -3537,6 +3591,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let ctx = ConversationContext::Thread {
@@ -3802,6 +3857,7 @@ mod tests {
                 received_at: Instant::now(),
             }],
             cancel_reason: Some(CancelReason::Interrupt),
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         // Simulate the flushed-then-held state: scope is in-flight.
         q.push(make_queued(ch, "placeholder"));
@@ -4150,6 +4206,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let ci = PromptChannelInfo {
             name: "engineering".into(),
@@ -4185,6 +4242,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let ci = PromptChannelInfo {
             name: "DM".into(),
@@ -4234,6 +4292,7 @@ mod tests {
                         }],
                         cancelled_events: vec![],
                         cancel_reason: None,
+                        started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     };
                     let ci = PromptChannelInfo {
                         name: "test".into(),
@@ -4317,6 +4376,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
@@ -4345,6 +4405,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let mut ctx = ConversationContext::Thread {
             messages: vec![
@@ -4478,6 +4539,7 @@ mod tests {
             ],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let mixed_prompt = format_prompt(
             &mixed_batch,
@@ -4504,6 +4566,7 @@ mod tests {
             ],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let same_thread_prompt = format_prompt(
             &same_thread_batch,
@@ -4534,6 +4597,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let ci = PromptChannelInfo {
             name: "DM".into(),
@@ -4592,6 +4656,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let ctx = ConversationContext::Thread {
             messages: vec![ContextMessage {
@@ -4803,6 +4868,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let ci = PromptChannelInfo {
             name: "DM".into(),
@@ -4875,6 +4941,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let trigger_only_prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
@@ -4910,6 +4977,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let ci = PromptChannelInfo {
             name: "DM".into(),
@@ -4962,6 +5030,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let ci = PromptChannelInfo {
             name: "DM".into(),
@@ -5006,6 +5075,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
@@ -5032,6 +5102,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
@@ -5057,6 +5128,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
@@ -5486,6 +5558,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         // No profile lookup → sender treated as human → human-facing thread
@@ -5530,6 +5603,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let ci = PromptChannelInfo {
             name: "DM".into(),
@@ -5568,6 +5642,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         // Top-level human message (no lookup → human): the reply opens a new
@@ -5599,6 +5674,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let ci = PromptChannelInfo {
             name: "DM".into(),
@@ -5645,6 +5721,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         // Human-facing (no lookup) deep reply: anchor to the thread ROOT to
@@ -5683,6 +5760,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
@@ -5727,6 +5805,7 @@ mod tests {
             ],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         // Scope derives from the last (threaded) event; human-facing → anchor
@@ -5766,6 +5845,7 @@ mod tests {
             ],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         // Last event is top-level and human-facing → opens a new thread
@@ -5795,6 +5875,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -6097,6 +6178,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let prompt = format_prompt(
             &batch,
@@ -6128,6 +6210,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let prompt = format_prompt(
             &batch,
@@ -6158,6 +6241,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
         assert!(
@@ -6621,6 +6705,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 

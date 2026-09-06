@@ -11,7 +11,7 @@
 //! Design: `docs/plans/2026-09-06-harness-reliability-design.md`, "Ledger records".
 
 use std::collections::HashSet;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, Utc};
@@ -311,6 +311,7 @@ impl Ledger {
         let path = dir.join(LEDGER_FILE);
         // Create it if absent so the mode is ours from the first byte.
         drop(state_dir::open_append(&path)?);
+        sanitize_dangling_final_line(&path)?;
         let mut ledger = Self {
             len_bytes: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
             path,
@@ -497,6 +498,55 @@ fn fit_to_budget(
     Ok((remaining, dropped))
 }
 
+/// Detect and truncate a dangling final line without a trailing newline, so
+/// future appends are not fused with corrupted partial lines.
+fn sanitize_dangling_final_line(path: &Path) -> io::Result<()> {
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last_byte = [0u8; 1];
+    file.read_exact(&mut last_byte)?;
+    if last_byte[0] == b'\n' {
+        return Ok(());
+    }
+
+    let mut pos = len - 1;
+    let mut found_nl = false;
+    let mut buf = [0u8; 4096];
+    while pos > 0 {
+        let chunk_size = (pos as usize).min(buf.len());
+        let chunk_start = pos - chunk_size as u64;
+        file.seek(SeekFrom::Start(chunk_start))?;
+        file.read_exact(&mut buf[..chunk_size])?;
+        if let Some(offset) = buf[..chunk_size].iter().rposition(|&b| b == b'\n') {
+            file.set_len(chunk_start + offset as u64 + 1)?;
+            found_nl = true;
+            break;
+        }
+        pos = chunk_start;
+    }
+    if !found_nl {
+        file.set_len(0)?;
+    }
+    file.sync_all()?;
+    tracing::warn!(
+        path = %path.display(),
+        "truncated dangling partial line with no trailing newline in ledger file"
+    );
+    Ok(())
+}
+
 /// Read a JSONL ledger file with a hard byte cap on the input and a hard cap
 /// per line.
 fn read_records(path: &Path) -> io::Result<Vec<LedgerRecord>> {
@@ -620,5 +670,53 @@ mod tests {
 
         let crashed = ledger.replays_without_finish().unwrap();
         assert_eq!(crashed, vec![batch_id2]);
+    }
+
+    #[test]
+    fn test_ledger_open_quarantines_dangling_final_line_without_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LEDGER_FILE);
+        let now = Utc::now();
+
+        // Pre-seed a ledger file with valid lines, then a truncated line with no trailing newline:
+        let valid_record = LedgerRecord {
+            at: now,
+            agent: "test-agent".to_string(),
+            body: LedgerBody::AgentResumed(AgentResumed {}),
+        };
+        let valid_line = format!("{}\n", serde_json::to_string(&valid_record).unwrap());
+        let truncated_line =
+            "{\"at\":\"2026-09-06T00:01:00Z\",\"agent\":\"test-agent\",\"kind\":\"batch_parked\",\"batch_id\":\"";
+        std::fs::write(&path, format!("{valid_line}{truncated_line}")).unwrap();
+
+        let mut ledger = Ledger::open(dir.path(), "test-agent", now).unwrap();
+
+        // Append a new record
+        let new_batch_id = Uuid::new_v4();
+        ledger
+            .append(
+                now,
+                LedgerBody::BatchParked(BatchParked {
+                    batch_id: new_batch_id,
+                    channel_id: Uuid::new_v4(),
+                    reason: "retry".to_string(),
+                    started: false,
+                    events: 1,
+                }),
+            )
+            .unwrap();
+
+        let records = ledger.read_all().unwrap();
+        assert!(
+            records.iter().any(
+                |r| matches!(&r.body, LedgerBody::BatchParked(bp) if bp.batch_id == new_batch_id)
+            ),
+            "new record must be recovered cleanly and not fused with dangling line"
+        );
+        assert_eq!(
+            records.len(),
+            2,
+            "must recover 1 valid pre-seeded record + 1 new record"
+        );
     }
 }

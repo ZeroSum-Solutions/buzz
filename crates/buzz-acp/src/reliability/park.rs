@@ -70,6 +70,10 @@ pub enum ParkReason {
     Auth,
     /// A scope breaker stayed open for its whole six-hour budget.
     BreakerExpired,
+    /// The agent was paused due to provider capacity limit.
+    Pause,
+    /// The scope breaker opened due to repeated failures.
+    BreakerOpen,
 }
 
 impl ParkReason {
@@ -80,6 +84,8 @@ impl ParkReason {
             Self::HardTimeout => "hard_timeout",
             Self::Auth => "auth",
             Self::BreakerExpired => "breaker_expired",
+            Self::Pause => "pause",
+            Self::BreakerOpen => "breaker_open",
         }
     }
 }
@@ -254,6 +260,9 @@ pub enum ParkError {
     /// A batch larger than the queue can build.
     #[error("batch carries {0} events, over the park file's per-batch cap")]
     TooManyEvents(usize),
+    /// A single batch line exceeds the per-line cap.
+    #[error("serialized batch is {0} bytes, over the {MAX_LINE_BYTES}-byte line cap — the batch was NOT parked")]
+    LineTooLong(usize),
     /// The write itself failed.
     #[error("park file write failed: {0}")]
     Io(#[from] io::Error),
@@ -332,12 +341,12 @@ impl ParkFile {
         }
         let mut next = self.batches.clone();
         next.push(batch);
+        apply_scope_cap(&mut next);
         let bytes = serialize(&next)?;
         if bytes.len() as u64 > MAX_PARK_BYTES {
             return Err(ParkError::Full(next.len(), bytes.len() as u64));
         }
         self.commit(next, bytes)?;
-        self.enforce_scope_cap()?;
         Ok(())
     }
 
@@ -434,45 +443,26 @@ impl ParkFile {
                 report.aged_out += 1;
             }
         }
+        report.over_scope_cap = apply_scope_cap(&mut next);
         if !report.is_empty() {
             let bytes = serialize(&next)?;
             self.commit(next, bytes)?;
         }
-        report.over_scope_cap = self.enforce_scope_cap()?;
         Ok(report)
     }
 
     /// Demote the oldest replay-eligible batches of any scope over
     /// [`MAX_PARKED_PER_SCOPE`] to the review list. Returns how many moved.
+    #[allow(dead_code)]
     fn enforce_scope_cap(&mut self) -> Result<usize, ParkError> {
-        use std::collections::HashMap;
-
-        let mut per_scope: HashMap<SessionScope, Vec<usize>> = HashMap::new();
-        for (index, batch) in self.batches.iter().enumerate() {
-            if batch.replay_eligible() {
-                per_scope.entry(batch.scope()).or_default().push(index);
-            }
-        }
-        let mut demote: Vec<usize> = Vec::new();
-        for indices in per_scope.values() {
-            if indices.len() > MAX_PARKED_PER_SCOPE {
-                demote.extend(&indices[..indices.len() - MAX_PARKED_PER_SCOPE]);
-            }
-        }
-        if demote.is_empty() {
-            return Ok(0);
-        }
         let mut next = self.batches.clone();
-        for index in &demote {
-            let batch = &mut next[*index];
-            batch.needs_review = true;
-            batch.needs_review_reason = Some(format!(
-                "more than {MAX_PARKED_PER_SCOPE} batches were waiting for this conversation"
-            ));
+        let demoted = apply_scope_cap(&mut next);
+        if demoted == 0 {
+            return Ok(0);
         }
         let bytes = serialize(&next)?;
         self.commit(next, bytes)?;
-        Ok(demote.len())
+        Ok(demoted)
     }
 
     fn mutate(
@@ -508,12 +498,44 @@ impl ParkFile {
     }
 }
 
+/// Demote the oldest replay-eligible batches of any scope over
+/// [`MAX_PARKED_PER_SCOPE`] to the review list. Returns how many moved.
+fn apply_scope_cap(batches: &mut [ParkedBatch]) -> usize {
+    use std::collections::HashMap;
+
+    let mut per_scope: HashMap<SessionScope, Vec<usize>> = HashMap::new();
+    for (index, batch) in batches.iter().enumerate() {
+        if batch.replay_eligible() {
+            per_scope.entry(batch.scope()).or_default().push(index);
+        }
+    }
+    let mut demote_count = 0;
+    for indices in per_scope.values() {
+        if indices.len() > MAX_PARKED_PER_SCOPE {
+            for &index in &indices[..indices.len() - MAX_PARKED_PER_SCOPE] {
+                let batch = &mut batches[index];
+                batch.needs_review = true;
+                batch.needs_review_reason = Some(format!(
+                    "more than {MAX_PARKED_PER_SCOPE} batches were waiting for this conversation"
+                ));
+                demote_count += 1;
+            }
+        }
+    }
+    demote_count
+}
+
 fn serialize(batches: &[ParkedBatch]) -> Result<Vec<u8>, ParkError> {
     let mut buffer = Vec::new();
     for batch in batches {
+        let start = buffer.len();
         serde_json::to_writer(&mut buffer, batch)
             .map_err(|e| ParkError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
         buffer.push(b'\n');
+        let line_len = buffer.len() - start;
+        if line_len > MAX_LINE_BYTES {
+            return Err(ParkError::LineTooLong(line_len));
+        }
     }
     Ok(buffer)
 }
@@ -606,6 +628,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -628,6 +651,30 @@ mod tests {
         let reopened = ParkFile::open(dir.path()).unwrap();
         assert!(reopened.contains(b_id));
         assert_eq!(reopened.batches().len(), 1);
+    }
+
+    #[test]
+    fn test_park_rejects_oversized_individual_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut park = ParkFile::open(dir.path()).unwrap();
+        let ch = Uuid::new_v4();
+        let b_id = Uuid::new_v4();
+        let scope = SessionScope::Conversation { channel_id: ch };
+        // Create an event whose serialized line exceeds MAX_LINE_BYTES (512 KB),
+        // but whose size is well under MAX_PARK_BYTES (10 MB).
+        let big_content = "x".repeat(MAX_LINE_BYTES + 1024);
+        let batch = dummy_batch(ch, b_id, scope, &big_content);
+        let parked =
+            ParkedBatch::from_batch(&batch, ParkReason::RetriesExhausted, false, Utc::now())
+                .unwrap();
+
+        let result = park.park(parked);
+        assert!(
+            result.is_err(),
+            "park() must reject line exceeding MAX_LINE_BYTES"
+        );
+        assert!(!park.contains(b_id));
+        assert!(park.batches().is_empty());
     }
 
     #[test]
@@ -682,5 +729,72 @@ mod tests {
         let candidates = park.replay_candidates(&scope);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].batch_id, b_not_started.batch_id);
+    }
+
+    #[test]
+    fn test_park_101st_batch_scope_cap_single_atomic_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut park = ParkFile::open(dir.path()).unwrap();
+        let ch = Uuid::new_v4();
+        let scope = SessionScope::Conversation { channel_id: ch };
+
+        for i in 0..100 {
+            let b_id = Uuid::new_v4();
+            let batch = dummy_batch(ch, b_id, scope.clone(), &format!("msg {i}"));
+            let parked =
+                ParkedBatch::from_batch(&batch, ParkReason::RetriesExhausted, false, Utc::now())
+                    .unwrap();
+            park.park(parked).unwrap();
+        }
+        assert_eq!(park.batches().len(), 100);
+        assert_eq!(park.replay_candidates(&scope).len(), 100);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let original_mode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+            let b_id_101 = Uuid::new_v4();
+            let batch_101 = dummy_batch(ch, b_id_101, scope.clone(), "msg 101");
+            let parked_101 = ParkedBatch::from_batch(
+                &batch_101,
+                ParkReason::RetriesExhausted,
+                false,
+                Utc::now(),
+            )
+            .unwrap();
+
+            let res = park.park(parked_101);
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(original_mode))
+                .unwrap();
+
+            assert!(
+                res.is_err(),
+                "park of 101st batch must fail when write fails"
+            );
+            let on_disk = read_batches(park.path()).unwrap();
+            assert_eq!(
+                on_disk.len(),
+                100,
+                "disk must still hold exactly 100 batches"
+            );
+            assert!(!on_disk.iter().any(|b| b.batch_id == b_id_101));
+            assert_eq!(park.batches().len(), 100);
+            assert!(!park.contains(b_id_101));
+        }
+
+        // When write succeeds, 101st batch lands and oldest is demoted in ONE atomic update:
+        let b_id_101 = Uuid::new_v4();
+        let batch_101 = dummy_batch(ch, b_id_101, scope.clone(), "msg 101");
+        let parked_101 =
+            ParkedBatch::from_batch(&batch_101, ParkReason::RetriesExhausted, false, Utc::now())
+                .unwrap();
+        park.park(parked_101).unwrap();
+
+        assert_eq!(park.batches().len(), 101);
+        assert!(park.contains(b_id_101));
+        assert_eq!(park.replay_candidates(&scope).len(), 100);
+        assert!(park.batches()[0].needs_review);
     }
 }

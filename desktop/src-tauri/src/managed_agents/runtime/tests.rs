@@ -1244,3 +1244,78 @@ fn make_pair_runtime_placeholder() -> crate::managed_agents::ManagedAgentPairRun
     };
     crate::managed_agents::ManagedAgentPairRuntime::starting(process)
 }
+
+// ── state dir env tests ──────────────────────────────────────────────────
+
+struct EnvVarGuard {
+    key: String,
+    prior: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &str, value: &str) -> Self {
+        let prior = std::env::var_os(key);
+        #[allow(deprecated)]
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self {
+            key: key.to_string(),
+            prior,
+        }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        #[allow(deprecated)]
+        unsafe {
+            match &self.prior {
+                Some(v) => std::env::set_var(&self.key, v),
+                None => std::env::remove_var(&self.key),
+            }
+        }
+    }
+}
+
+#[test]
+fn test_command_execution_overrides_and_ignores_ambient_state_dir() {
+    // Inspects the built `Command`'s own env overrides via `get_envs()` —
+    // never spawns a real child. Spawning `/usr/bin/env` here would inherit
+    // the *entire* ambient process environment (every real credential in the
+    // test runner's shell) and print it to stdout on any assertion failure,
+    // turning a test failure into a credential leak. `get_envs()` reports
+    // only what this command explicitly sets or removes.
+    let _lock = crate::managed_agents::lock_env_mutex();
+    let _guard = EnvVarGuard::set(super::STATE_DIR_ENV_VAR, "/ambient/state/dir");
+
+    // 1. Config specifies a state dir -> command carries the configured path,
+    //    never the ambient value.
+    let mut cmd_override = std::process::Command::new("buzz-acp");
+    super::apply_state_dir_env(
+        &mut cmd_override,
+        Some(std::path::Path::new("/config/specified/state/dir")),
+    );
+    let configured = cmd_override
+        .get_envs()
+        .find(|(key, _)| *key == std::ffi::OsStr::new(super::STATE_DIR_ENV_VAR))
+        .and_then(|(_, value)| value);
+    assert_eq!(
+        configured,
+        Some(std::ffi::OsStr::new("/config/specified/state/dir")),
+        "command must carry the configured state dir, not the ambient value, got: {configured:?}"
+    );
+
+    // 2. Config specifies None -> command carries an explicit removal
+    //    (Some(key) -> None), never silent fallthrough to ambient inheritance.
+    let mut cmd_none = std::process::Command::new("buzz-acp");
+    super::apply_state_dir_env(&mut cmd_none, None);
+    let removed = cmd_none
+        .get_envs()
+        .find(|(key, _)| *key == std::ffi::OsStr::new(super::STATE_DIR_ENV_VAR));
+    assert_eq!(
+        removed,
+        Some((std::ffi::OsStr::new(super::STATE_DIR_ENV_VAR), None)),
+        "command must explicitly remove the ambient state dir, not inherit it, got: {removed:?}"
+    );
+}

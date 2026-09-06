@@ -100,6 +100,93 @@ pub fn truncate_chars(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
+/// Sanitize and bound an error string for external diagnostics (observer events,
+/// warnings, channel notices).
+///
+/// Bounded to at most [`MAX_RAW_ERROR_CHARS`] (512 chars).
+/// Redacts sensitive tokens (bearer tokens, secret keys, passwords, credentials)
+/// and trims excessive stack traces.
+pub fn sanitize_error_diagnostic(raw: &str) -> String {
+    let mut text = raw.to_string();
+
+    // 1. Redact stack backtrace if present
+    if let Some(idx) = text.to_lowercase().find("stack backtrace:") {
+        text.truncate(idx);
+        text.push_str("[stack backtrace redacted]");
+    }
+
+    // 2. Token-level redaction
+    let mut words: Vec<String> = Vec::new();
+    let mut prev_is_bearer = false;
+    for part in text.split_whitespace() {
+        let (trimmed_part, trailing_punct) = if part.ends_with(',') || part.ends_with(';') {
+            (&part[..part.len() - 1], &part[part.len() - 1..])
+        } else {
+            (part, "")
+        };
+        let lower_trimmed = trimmed_part.to_lowercase();
+
+        if prev_is_bearer {
+            words.push(format!("<redacted>{trailing_punct}"));
+            prev_is_bearer = false;
+            continue;
+        }
+        if lower_trimmed == "bearer" {
+            prev_is_bearer = true;
+            words.push(part.to_string());
+            continue;
+        }
+        // sk-ant-... or sk-... secret keys
+        if lower_trimmed.starts_with("sk-") && trimmed_part.len() > 7 {
+            words.push(format!("sk-<redacted>{trailing_punct}"));
+            continue;
+        }
+        // nsec1... private keys
+        if lower_trimmed.starts_with("nsec1") && trimmed_part.len() > 10 {
+            words.push(format!("nsec1<redacted>{trailing_punct}"));
+            continue;
+        }
+        // key=value or key:value
+        if let Some((k, _v)) = trimmed_part.split_once('=') {
+            let k_lower = k.to_lowercase();
+            if matches!(
+                k_lower.as_str(),
+                "token"
+                    | "secret"
+                    | "password"
+                    | "key"
+                    | "api_key"
+                    | "apikey"
+                    | "auth_token"
+                    | "access_token"
+            ) {
+                words.push(format!("{k}=<redacted>{trailing_punct}"));
+                continue;
+            }
+        }
+        if let Some((k, _v)) = trimmed_part.split_once(':') {
+            let k_lower = k.to_lowercase();
+            if matches!(
+                k_lower.as_str(),
+                "token"
+                    | "secret"
+                    | "password"
+                    | "key"
+                    | "api_key"
+                    | "apikey"
+                    | "auth_token"
+                    | "access_token"
+            ) {
+                words.push(format!("{k}:<redacted>{trailing_punct}"));
+                continue;
+            }
+        }
+        words.push(part.to_string());
+    }
+    let sanitized = words.join(" ");
+    truncate_chars(&sanitized, MAX_RAW_ERROR_CHARS)
+}
+
 fn has_marker(lower: &str, markers: &[&str]) -> bool {
     markers.iter().any(|m| lower.contains(m))
 }

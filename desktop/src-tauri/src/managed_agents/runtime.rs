@@ -129,6 +129,28 @@ pub(crate) fn apply_system_prompt_env(
     SystemPromptApplied(())
 }
 
+pub(crate) const STATE_DIR_ENV_VAR: &str = "BUZZ_ACP_STATE_DIR";
+
+/// Apply the harness reliability state-dir env to an agent spawn command.
+///
+/// Called AFTER the `descriptor.env` loop at the real spawn site, so a saved
+/// user value for the reserved key can never redirect an agent's park file.
+/// `None` explicitly removes the key rather than leaving it unset, so the
+/// child never inherits an ambient value from the desktop's own environment.
+pub(crate) fn apply_state_dir_env(
+    command: &mut std::process::Command,
+    state_dir: Option<&std::path::Path>,
+) {
+    match state_dir {
+        Some(dir) => {
+            command.env(STATE_DIR_ENV_VAR, dir);
+        }
+        None => {
+            command.env_remove(STATE_DIR_ENV_VAR);
+        }
+    }
+}
+
 /// Classify an agent's persona against the live catalog for the Agents-menu
 /// drift indicator. Returns `(out_of_date, orphaned)`.
 ///
@@ -1016,10 +1038,10 @@ pub fn spawn_agent_child(
     // the harness logs that parked batches will not survive a restart.
     match super::managed_agent_state_dir(app, &record.pubkey) {
         Ok(state_dir) => {
-            command.env("BUZZ_ACP_STATE_DIR", &state_dir);
+            apply_state_dir_env(&mut command, Some(&state_dir));
         }
         Err(error) => {
-            command.env_remove("BUZZ_ACP_STATE_DIR");
+            apply_state_dir_env(&mut command, None);
             eprintln!(
                 "buzz-desktop: no reliability state dir for agent {}: {error}",
                 record.name,

@@ -95,6 +95,16 @@ impl ReliabilityRuntime {
         &self.state
     }
 
+    /// Release any unconsumed probe permits for pause and scope breaker.
+    pub fn release_probe(&mut self, scope: Option<&SessionScope>) {
+        self.state.release_probe(scope);
+    }
+
+    /// Reissue probe permit alias for `release_probe`.
+    pub fn reissue_probe(&mut self, scope: Option<&SessionScope>) {
+        self.state.reissue_probe(scope);
+    }
+
     /// Read-only view of the park file.
     pub fn park(&self) -> &ParkFile {
         &self.park
@@ -176,11 +186,25 @@ impl ReliabilityRuntime {
         if candidates.is_empty() {
             return None;
         }
-        let mut batch_ids = Vec::with_capacity(candidates.len());
+        let mut batch_ids = Vec::new();
         let mut events = Vec::new();
         for batch in candidates {
+            let batch_events = batch.to_batch_events();
+            if !events.is_empty()
+                && events.len() + batch_events.len() > crate::queue::MAX_BATCH_EVENTS
+            {
+                break;
+            }
+            if events.is_empty() && batch_events.len() > crate::queue::MAX_BATCH_EVENTS {
+                batch_ids.push(batch.batch_id);
+                events.extend(batch_events);
+                break;
+            }
             batch_ids.push(batch.batch_id);
-            events.extend(batch.to_batch_events());
+            events.extend(batch_events);
+        }
+        if batch_ids.is_empty() {
+            return None;
         }
         Some(ReplayPlan {
             batch_ids,
@@ -205,15 +229,26 @@ impl ReliabilityRuntime {
         for batch_id in &plan.batch_ids {
             self.park.mark_replayed(*batch_id, now)?;
         }
+        let mut all_recorded = true;
         for batch_id in &plan.batch_ids {
-            self.record(
+            if !self.record(
                 now,
                 LedgerBody::BatchReplayed(ledger::BatchReplayed {
                     batch_id: *batch_id,
                     channel_id: plan.channel_id,
                     replay_of: new_batch_id,
                 }),
-            );
+            ) {
+                all_recorded = false;
+            }
+        }
+        if !all_recorded {
+            for batch_id in &plan.batch_ids {
+                let _ = self.park.unmark_replayed(*batch_id);
+            }
+            return Err(ParkError::Io(std::io::Error::other(
+                "could not append batch_replayed to ledger",
+            )));
         }
         Ok(())
     }
@@ -267,7 +302,7 @@ impl ReliabilityRuntime {
         let Some(removed) = self.park.remove(batch_id)? else {
             return Ok(false);
         };
-        self.record(
+        let recorded = self.record(
             now,
             LedgerBody::BatchDiscarded(ledger::BatchDiscarded {
                 batch_id,
@@ -275,7 +310,7 @@ impl ReliabilityRuntime {
                 by: super::error_class::truncate_chars(by, ledger::MAX_LABEL_CHARS),
             }),
         );
-        Ok(true)
+        Ok(recorded)
     }
 
     /// Operator control frame `replay_batch`: make one parked batch eligible
@@ -361,6 +396,7 @@ mod tests {
                 }],
                 cancelled_events: vec![],
                 cancel_reason: None,
+                started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
             id,
         )
@@ -527,6 +563,138 @@ mod tests {
                 |r| matches!(&r.body, LedgerBody::BatchNeedsReview(nr) if nr.batch_id == batch_id)
             ),
             "ledger must contain a batch_needs_review record for the crashed batch"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_discard_fails_contract_when_ledger_append_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let now = Utc::now();
+        let mut runtime = ReliabilityRuntime::open_in(dir.path(), pubkey, now).unwrap();
+
+        let channel_id = Uuid::new_v4();
+        let scope = SessionScope::Conversation { channel_id };
+        let (batch, _) = make_flush_batch(channel_id, scope, "to discard");
+        let batch_id = batch.batch_id;
+
+        // Park the batch first.
+        runtime
+            .park_batch(&batch, ParkReason::RetriesExhausted, false, now)
+            .unwrap();
+        assert!(runtime.park().contains(batch_id));
+
+        // Make ledger.jsonl unwritable while keeping the directory and park file writable.
+        let ledger_path = dir.path().join("ledger.jsonl");
+        let original_mode = std::fs::metadata(&ledger_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        std::fs::set_permissions(&ledger_path, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+        let result = runtime.discard(batch_id, "operator", now);
+
+        // Restore permissions for cleanup
+        let _ =
+            std::fs::set_permissions(&ledger_path, std::fs::Permissions::from_mode(original_mode));
+
+        // The batch was removed from park, but ledger write failed.
+        // It must NOT report unconditional success (Ok(true)).
+        assert!(
+            !matches!(result, Ok(true)),
+            "discard must not report unconditional success when ledger write failed: got {result:?}"
+        );
+    }
+
+    fn make_multi_event_batch(
+        channel_id: Uuid,
+        scope: SessionScope,
+        count: usize,
+        prefix: &str,
+    ) -> FlushBatch {
+        let mut events = Vec::with_capacity(count);
+        for i in 0..count {
+            let (event, _) = make_test_event(&format!("{prefix}-{i}"));
+            events.push(BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: Instant::now(),
+            });
+        }
+        FlushBatch {
+            batch_id: Uuid::new_v4(),
+            channel_id,
+            scope,
+            events,
+            cancelled_events: vec![],
+            cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    #[test]
+    fn test_replay_plan_respects_max_batch_events_and_preserves_unincluded_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let now = Utc::now();
+        let mut runtime = ReliabilityRuntime::open_in(dir.path(), pubkey, now).unwrap();
+
+        let channel_id = Uuid::new_v4();
+        let scope = SessionScope::Conversation { channel_id };
+
+        // Park > 50 replay-eligible events across multiple batches for one scope.
+        // Batch 1: 30 events
+        let batch1 = make_multi_event_batch(channel_id, scope.clone(), 30, "batch1");
+        let batch1_id = batch1.batch_id;
+        runtime
+            .park_batch(&batch1, ParkReason::RetriesExhausted, false, now)
+            .unwrap();
+
+        // Batch 2: 30 events (total 60 > 50)
+        let batch2 = make_multi_event_batch(channel_id, scope.clone(), 30, "batch2");
+        let batch2_id = batch2.batch_id;
+        runtime
+            .park_batch(
+                &batch2,
+                ParkReason::RetriesExhausted,
+                false,
+                now + chrono::Duration::seconds(1),
+            )
+            .unwrap();
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+
+        // Run a successful probe (binds replay_after_success)
+        crate::replay_after_success(
+            &mut runtime,
+            &mut queue,
+            &scope,
+            now + chrono::Duration::seconds(2),
+        );
+
+        // The turn for this scope finishes successfully (clearing in-flight replay)
+        let released = runtime.finish_replay(&scope).unwrap();
+        assert_eq!(
+            released,
+            vec![batch1_id],
+            "only the included batch should be finished/released"
+        );
+
+        // The park file must STILL hold batch2, whose events were not included in the dispatched turn
+        assert!(
+            runtime.park().contains(batch2_id),
+            "batch 2 was not included in the dispatched replay turn and must remain in the park file"
+        );
+        let parked2 = runtime
+            .park()
+            .get(batch2_id)
+            .expect("batch 2 still in park");
+        assert!(
+            parked2.replay_eligible(),
+            "batch 2 must still be replay-eligible"
         );
     }
 }

@@ -151,9 +151,8 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     fs::rename(&temp, path)?;
     // Durability of the rename itself: without this a crash can leave the
     // directory entry pointing at neither file.
-    if let Ok(dir) = fs::File::open(parent) {
-        let _ = dir.sync_all();
-    }
+    let dir = fs::File::open(parent)?;
+    dir.sync_all()?;
     Ok(())
 }
 
@@ -165,4 +164,34 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(not(unix))]
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE").map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn test_write_atomic_propagates_parent_dir_fsync_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+
+        // 0o300: write + execute, but NO read permission.
+        // Creating and renaming temp files succeeds, but fs::File::open(parent) fails with PermissionDenied.
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o300)).unwrap();
+
+        let target = sub.join("target.txt");
+        let result = write_atomic(&target, b"test payload");
+
+        // Restore permissions for clean tempdir teardown
+        let _ = fs::set_permissions(&sub, fs::Permissions::from_mode(0o700));
+
+        assert!(
+            result.is_err(),
+            "write_atomic must return Err when parent directory open/fsync fails"
+        );
+    }
 }

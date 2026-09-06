@@ -28,7 +28,7 @@ pub mod runtime;
 pub mod state;
 pub mod state_dir;
 
-pub use error_class::classify_at;
+pub use error_class::{classify_at, sanitize_error_diagnostic};
 pub use park::{ParkError, ParkReason, ParkedBatch};
 pub use runtime::{ReliabilityRuntime, ReplayPlan};
 pub use state::{BreakerGate, BreakerVerdict, PauseGate, ReliabilityState};
@@ -260,5 +260,61 @@ mod tests {
         assert_eq!(first, Action::Retry);
         assert_eq!(second, Action::Retry);
         assert_eq!(third, Action::OpenBreaker);
+    }
+
+    #[test]
+    fn non_provider_failure_resets_consecutive_streak() {
+        let channel_id = Uuid::new_v4();
+        let scope = SessionScope::Conversation { channel_id };
+        let now = log_instant();
+        let mut state = ReliabilityState::default();
+
+        let first = state.on_failure(&scope, ErrorClass::ProviderInternal, now);
+        let second = state.on_failure(
+            &scope,
+            ErrorClass::ProviderInternal,
+            now + chrono::Duration::seconds(5),
+        );
+        let third = state.on_failure(
+            &scope,
+            ErrorClass::Auth,
+            now + chrono::Duration::seconds(10),
+        );
+        let fourth = state.on_failure(
+            &scope,
+            ErrorClass::ProviderInternal,
+            now + chrono::Duration::seconds(15),
+        );
+
+        assert_eq!(first, Action::Retry);
+        assert_eq!(second, Action::Retry);
+        assert_eq!(third, Action::Park);
+        assert_eq!(
+            fourth,
+            Action::Retry,
+            "streak must be reset by Auth failure"
+        );
+    }
+
+    #[test]
+    fn test_consecutive_map_stays_bounded_across_many_scopes() {
+        let now = log_instant();
+        let mut state = ReliabilityState::default();
+
+        for _ in 0..50 {
+            let scope = SessionScope::Conversation {
+                channel_id: Uuid::new_v4(),
+            };
+            let first = state.on_failure(&scope, ErrorClass::ProviderInternal, now);
+            assert_eq!(first, Action::Retry);
+            assert!(state.consecutive_len() > 0);
+
+            let terminal = state.on_failure(&scope, ErrorClass::Auth, now);
+            assert_eq!(terminal, Action::Park);
+            // After the terminal park, the scope is removed from consecutive.
+            assert_eq!(state.consecutive_len(), 0);
+        }
+
+        assert_eq!(state.consecutive_len(), 0);
     }
 }

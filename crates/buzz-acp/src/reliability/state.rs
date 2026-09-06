@@ -42,6 +42,10 @@ pub const BREAKER_MAX_OPEN_HOURS: i64 = 6;
 /// than this.
 pub const PAUSE_RENOTIFY_MINUTES: i64 = 15;
 
+/// Maximum number of scopes tracked for consecutive provider failures before
+/// pruning.
+pub const MAX_CONSECUTIVE_SCOPES: usize = 1_000;
+
 /// Whether the agent may run a turn right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PauseGate {
@@ -91,6 +95,8 @@ struct Breaker {
     probe_issued: bool,
     /// Consecutive failures that opened it, for the ledger record.
     consecutive: u32,
+    /// Whether the failure notice has been successfully posted.
+    notified: bool,
 }
 
 /// Per-agent reliability state: one pause for the whole agent (a capacity
@@ -100,6 +106,7 @@ pub struct ReliabilityState {
     pause: Option<Pause>,
     breakers: HashMap<SessionScope, Breaker>,
     consecutive: HashMap<SessionScope, u32>,
+    generation: u64,
 }
 
 impl ReliabilityState {
@@ -115,8 +122,12 @@ impl ReliabilityState {
     ) -> Action {
         match class {
             // A re-login fixes it; a retry does not.
-            ErrorClass::Auth => Action::Park,
+            ErrorClass::Auth => {
+                self.consecutive.remove(scope);
+                Action::Park
+            }
             ErrorClass::CapacityExhausted { resets_at } => {
+                self.consecutive.remove(scope);
                 let until = clamp_pause(resets_at, now);
                 self.set_pause(until);
                 Action::Pause { until }
@@ -132,14 +143,22 @@ impl ReliabilityState {
             if now - breaker.opened_at >= Duration::hours(BREAKER_MAX_OPEN_HOURS) {
                 self.breakers.remove(scope);
                 self.consecutive.remove(scope);
+                self.generation = self.generation.wrapping_add(1);
                 return Action::Park;
             }
             breaker.next_probe = now + Duration::minutes(BREAKER_PROBE_MINUTES);
             breaker.probe_issued = false;
             breaker.consecutive = breaker.consecutive.saturating_add(1);
+            self.generation = self.generation.wrapping_add(1);
             return Action::OpenBreaker;
         }
 
+        if self.consecutive.len() >= MAX_CONSECUTIVE_SCOPES && !self.consecutive.contains_key(scope)
+        {
+            if let Some(oldest_scope) = self.consecutive.keys().next().cloned() {
+                self.consecutive.remove(&oldest_scope);
+            }
+        }
         let count = self.consecutive.entry(scope.clone()).or_insert(0);
         *count = count.saturating_add(1);
         if *count < BREAKER_THRESHOLD {
@@ -154,8 +173,10 @@ impl ReliabilityState {
                 next_probe: now + Duration::minutes(BREAKER_PROBE_MINUTES),
                 probe_issued: false,
                 consecutive,
+                notified: false,
             },
         );
+        self.generation = self.generation.wrapping_add(1);
         Action::OpenBreaker
     }
 
@@ -168,6 +189,9 @@ impl ReliabilityState {
         let pause_lifted = self.pause.take().is_some();
         let breaker_closed = self.breakers.remove(scope).is_some();
         self.consecutive.remove(scope);
+        if pause_lifted || breaker_closed {
+            self.generation = self.generation.wrapping_add(1);
+        }
         (pause_lifted, breaker_closed)
     }
 
@@ -187,6 +211,7 @@ impl ReliabilityState {
             return PauseGate::Held { until: pause.until };
         }
         pause.probe_issued = true;
+        self.generation = self.generation.wrapping_add(1);
         PauseGate::Probe
     }
 
@@ -212,7 +237,72 @@ impl ReliabilityState {
             };
         }
         breaker.probe_issued = true;
+        self.generation = self.generation.wrapping_add(1);
         BreakerGate::Probe
+    }
+
+    /// Release an unconsumed pause probe permit so a subsequent dispatch may probe.
+    pub fn release_pause_probe(&mut self) {
+        if let Some(pause) = self.pause.as_mut() {
+            if pause.probe_issued {
+                pause.probe_issued = false;
+                self.generation = self.generation.wrapping_add(1);
+            }
+        }
+    }
+
+    /// Release an unconsumed breaker probe permit so a subsequent dispatch may probe.
+    pub fn release_breaker_probe(&mut self, scope: &SessionScope) {
+        if let Some(breaker) = self.breakers.get_mut(scope) {
+            if breaker.probe_issued {
+                breaker.probe_issued = false;
+                self.generation = self.generation.wrapping_add(1);
+            }
+        }
+    }
+
+    /// Release any unconsumed probe permits for pause and scope breaker.
+    pub fn release_probe(&mut self, scope: Option<&SessionScope>) {
+        self.release_pause_probe();
+        if let Some(scope) = scope {
+            self.release_breaker_probe(scope);
+        }
+    }
+
+    /// Reissue probe permit alias for `release_probe`.
+    pub fn reissue_probe(&mut self, scope: Option<&SessionScope>) {
+        self.release_probe(scope);
+    }
+
+    /// Monotonically increasing generation bumped on every pause or breaker state change.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The earliest deadline among an active pause and all open breakers that
+    /// have not yet issued a probe permit.
+    pub fn earliest_probe_deadline(&self) -> Option<DateTime<Utc>> {
+        let pause_until = match &self.pause {
+            Some(p) if !p.probe_issued => Some(p.until),
+            _ => None,
+        };
+        let breaker_until = self
+            .breakers
+            .values()
+            .filter(|b| !b.probe_issued)
+            .map(|b| b.next_probe)
+            .min();
+        match (pause_until, breaker_until) {
+            (Some(p), Some(b)) => Some(p.min(b)),
+            (Some(p), None) => Some(p),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
+    /// Number of scopes currently tracked for consecutive failures.
+    pub fn consecutive_len(&self) -> usize {
+        self.consecutive.len()
     }
 
     /// A probe on an open breaker failed: reschedule, or park once the breaker
@@ -229,10 +319,12 @@ impl ReliabilityState {
         };
         if now - breaker.opened_at >= Duration::hours(BREAKER_MAX_OPEN_HOURS) {
             self.breakers.remove(scope);
+            self.generation = self.generation.wrapping_add(1);
             return BreakerVerdict::Park;
         }
         breaker.next_probe = now + Duration::minutes(BREAKER_PROBE_MINUTES);
         breaker.probe_issued = false;
+        self.generation = self.generation.wrapping_add(1);
         BreakerVerdict::Reschedule {
             next_probe: breaker.next_probe,
         }
@@ -259,6 +351,32 @@ impl ReliabilityState {
         }
     }
 
+    /// Whether this channel still needs a pause notice for the current pause.
+    pub fn pause_needs_notice(&self, channel_id: Uuid) -> bool {
+        self.pause
+            .as_ref()
+            .is_some_and(|p| !p.notified_channels.contains(&channel_id))
+    }
+
+    /// Mark the pause notice for `channel_id` as consumed after post succeeds.
+    pub fn mark_pause_notice_consumed(&mut self, channel_id: Uuid) {
+        if let Some(pause) = self.pause.as_mut() {
+            pause.notified_channels.insert(channel_id);
+        }
+    }
+
+    /// Whether this scope's open breaker has not yet successfully posted a notice.
+    pub fn breaker_needs_notice(&self, scope: &SessionScope) -> bool {
+        self.breakers.get(scope).is_some_and(|b| !b.notified)
+    }
+
+    /// Mark the open breaker's notice as consumed after post succeeds.
+    pub fn mark_breaker_notice_consumed(&mut self, scope: &SessionScope) {
+        if let Some(breaker) = self.breakers.get_mut(scope) {
+            breaker.notified = true;
+        }
+    }
+
     /// Operator control frame `resume_now`: leave Paused and BreakerOpen and
     /// probe immediately. Returns `true` when something was actually lifted.
     pub fn resume_now(&mut self) -> bool {
@@ -266,6 +384,9 @@ impl ReliabilityState {
         let had_breakers = !self.breakers.is_empty();
         self.breakers.clear();
         self.consecutive.clear();
+        if had_pause || had_breakers {
+            self.generation = self.generation.wrapping_add(1);
+        }
         had_pause || had_breakers
     }
 
@@ -283,6 +404,7 @@ impl ReliabilityState {
     }
 
     fn set_pause(&mut self, until: DateTime<Utc>) {
+        self.generation = self.generation.wrapping_add(1);
         match self.pause.as_mut() {
             Some(pause) => {
                 let moved = (until - pause.notified_until).num_minutes().abs();
