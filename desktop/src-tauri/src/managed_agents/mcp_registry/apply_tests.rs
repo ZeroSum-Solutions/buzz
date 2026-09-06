@@ -1044,3 +1044,111 @@ fn walk(root: &Path) -> Vec<PathBuf> {
     }
     found
 }
+
+#[test]
+fn mcp_registry_a_pending_secret_for_an_unselected_server_is_not_silently_dropped() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let root = temporary.path();
+    let store = FakeStore::default();
+    let body = document(
+        "{\"id\":\"auth\",\"name\":\"auth\",\"transport\":\"stdio\",\
+          \"command\":\"/usr/local/bin/auth\",\"args\":[],\"env\":{\"API_KEY\":\"mcp:api-key\"}}",
+    );
+    let pending = BTreeMap::from([("api-key".to_string(), "sk-live-do-not-log".to_string())]);
+
+    // Converge with no agent enabling "auth".
+    converge_with(
+        root,
+        &body,
+        &[selection(&[], &[McpTransport::Stdio])],
+        &store,
+        &pending,
+    )
+    .expect("first convergence without agent selection");
+
+    // Later, agent enables "auth" with no new pending secret.
+    converge_with(
+        root,
+        &body,
+        &[selection(&["auth"], &[McpTransport::Stdio])],
+        &store,
+        &BTreeMap::new(),
+    )
+    .expect("second convergence with agent selection");
+
+    let records = store.records.lock().unwrap().clone();
+    let key = format!("mcp:{AGENT}:2:api-key");
+    assert_eq!(
+        records.get(&key).map(String::as_str),
+        Some("sk-live-do-not-log"),
+        "the secret value must be durably retrievable by the agent's later toggle-on convergence; got {:?}",
+        records.keys().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn mcp_registry_deleted_agent_retires_mcp_state_and_allows_subsequent_convergence() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let root = temporary.path();
+    let store = FakeStore::default();
+    let body = document(
+        "{\"id\":\"auth\",\"name\":\"auth\",\"transport\":\"stdio\",\
+          \"command\":\"/usr/local/bin/auth\",\"args\":[],\"env\":{\"API_KEY\":\"mcp:api-key\"}}",
+    );
+    let agent_a = "aaaaaaaaaaaaaaaa";
+    let agent_b = "bbbbbbbbbbbbbbbb";
+    let sel_a = AgentSelection {
+        agent_id: agent_a.to_string(),
+        runtime_id: "buzz-agent".to_string(),
+        transports: vec![McpTransport::Stdio],
+        placement: McpConfigPlacement::Unsupported,
+        enabled: vec!["auth".to_string()],
+    };
+    let sel_b = AgentSelection {
+        agent_id: agent_b.to_string(),
+        runtime_id: "buzz-agent".to_string(),
+        transports: vec![McpTransport::Stdio],
+        placement: McpConfigPlacement::Unsupported,
+        enabled: vec![],
+    };
+    let pending = BTreeMap::from([("api-key".to_string(), "sk-secret".to_string())]);
+
+    // 1. Initial convergence: both A and B exist, A has auth enabled.
+    converge_with(root, &body, &[sel_a, sel_b.clone()], &store, &pending)
+        .expect("initial convergence");
+    assert!(store
+        .records
+        .lock()
+        .unwrap()
+        .contains_key(&format!("mcp:{agent_a}:1:api-key")));
+
+    // 2. Delete A: simulate post-deletion convergence with records = [B]
+    let mut rec_b = record();
+    rec_b.pubkey = agent_b.to_string();
+    let records = vec![rec_b];
+
+    let selections =
+        super::apply::selections_for_records(&records, &[], &Default::default(), &store);
+    converge_with(root, &body, &selections, &store, &BTreeMap::new())
+        .expect("post-deletion convergence must retire deleted agent");
+
+    // 3. Subsequent convergence for remaining agent B must succeed without MissingAgent
+    let subsequent = converge_with(root, &body, &[sel_b], &store, &BTreeMap::new());
+    assert!(
+        subsequent.is_ok(),
+        "must succeed without MissingAgent, got: {:?}",
+        subsequent
+    );
+
+    // 4. Assert A's keys in store are gone
+    let current_keys = store.records.lock().unwrap().clone();
+    let a_keys: Vec<_> = current_keys
+        .keys()
+        .filter(|k| k.contains(agent_a))
+        .collect();
+    assert!(
+        a_keys.is_empty(),
+        "agent A keys should be gone, found: {:?}",
+        a_keys
+    );
+}

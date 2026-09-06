@@ -322,13 +322,13 @@ export function serverSupport(
   entry: McpRegistryEntry,
   runtime: Pick<
     AcpRuntimeCatalogEntry,
-    "id" | "label" | "mcpTransports"
+    "id" | "label" | "mcpTransports" | "mcpRegistryAvailable"
   > | null,
 ): McpServerSupport {
   if (entry.rejection !== null) {
     return { kind: "rejected", reason: entry.rejection };
   }
-  if (runtime === null) {
+  if (runtime === null || !runtime.mcpRegistryAvailable) {
     return {
       kind: "runtime-unavailable",
       reason:

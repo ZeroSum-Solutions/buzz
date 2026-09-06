@@ -36,6 +36,7 @@ export type McpRegistryEntry = {
 export type McpRegistryView = {
   servers: McpRegistryEntry[];
   document_path: string;
+  refused: [string, string][];
 };
 
 /** The shape the backend deserializes for a save. */

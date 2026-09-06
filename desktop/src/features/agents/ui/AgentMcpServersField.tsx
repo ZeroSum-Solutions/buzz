@@ -31,25 +31,37 @@ export function supportBadge(
   }
 }
 
+export type AgentMcpSelectionState =
+  | { status: "loading" }
+  | { status: "loaded"; enabled: string[] }
+  | { status: "error"; error: string };
+
+export function isSelectionSwitchDisabled(
+  selection: AgentMcpSelectionState,
+): boolean {
+  return selection.status !== "loaded";
+}
+
 /**
  * The per-agent registry toggles in the agent definition dialog.
  *
- * `enabled === null` means the record has never been configured, which memo
- * decision 8 keeps distinct from an empty list: the first toggle is what turns
- * absence into a decision. Both render as "nothing enabled", and only the
- * write tells them apart.
+ * Selection state is a union over `{ status: "loading" }`, `{ status: "loaded", enabled }`,
+ * and `{ status: "error", error }`. Switches are disabled unless `status === "loaded"`,
+ * preventing mutations against uninitialized or failed state.
  *
  * Whether a server may be offered at all is read from the runtime catalog's
  * `mcpTransports`, projected through `AcpRuntimeCatalogEntry` — never from a
  * runtime-id comparison in this component (`features/agents/AGENTS.md`).
  */
 export function AgentMcpServersField({
+  selection: selectionProp,
   enabled,
   onEnabledChange,
   pubkey,
   runtime,
 }: {
-  enabled: readonly string[] | null;
+  selection?: AgentMcpSelectionState;
+  enabled?: readonly string[] | null;
   onEnabledChange: (enabled: string[]) => void;
   /** `null` for a definition that has not been instantiated yet. */
   pubkey: string | null;
@@ -58,7 +70,17 @@ export function AgentMcpServersField({
   const registry = useMcpRegistryQuery();
   const queryClient = useQueryClient();
   const [refusal, setRefusal] = React.useState<string | null>(null);
-  const selection = enabled ?? [];
+
+  const selectionState: AgentMcpSelectionState =
+    selectionProp ??
+    (enabled !== undefined
+      ? enabled === null
+        ? { status: "loading" }
+        : { status: "loaded", enabled: [...enabled] }
+      : { status: "loading" });
+
+  const isLoaded = selectionState.status === "loaded";
+  const selection = isLoaded ? selectionState.enabled : [];
   const servers = registry.data?.servers ?? [];
 
   if (registry.isError) {
@@ -95,6 +117,15 @@ export function AgentMcpServersField({
 
   return (
     <div className="space-y-2" data-testid="agent-mcp-servers">
+      {selectionState.status === "error" ? (
+        <p
+          className="text-sm text-amber-600"
+          data-testid="agent-mcp-servers-error"
+          role="alert"
+        >
+          {selectionState.error}
+        </p>
+      ) : null}
       {servers.map((entry) => {
         const support = serverSupport(entry, runtime);
         const badge = supportBadge(support);
@@ -143,8 +174,10 @@ export function AgentMcpServersField({
             <Switch
               aria-label={`Enable ${entry.name}`}
               checked={checked}
+              disabled={!isLoaded}
               id={inputId}
               onCheckedChange={(next) => {
+                if (!isLoaded) return;
                 const result = toggleServer(selection, entry.id, next, support);
                 if ("refused" in result) {
                   setRefusal(result.refused);

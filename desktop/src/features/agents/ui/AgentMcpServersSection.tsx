@@ -3,7 +3,10 @@ import * as React from "react";
 import { getAgentMcpServers } from "@/shared/api/tauriMcpRegistry";
 import type { AcpRuntimeCatalogEntry } from "@/shared/api/types";
 
-import { AgentMcpServersField } from "./AgentMcpServersField";
+import {
+  AgentMcpServersField,
+  type AgentMcpSelectionState,
+} from "./AgentMcpServersField";
 
 /**
  * The MCP registry section of the agent edit dialog (memo decision 8).
@@ -15,10 +18,9 @@ import { AgentMcpServersField } from "./AgentMcpServersField";
  * unrelated Save would leave the panel and the agent disagreeing about what is
  * enabled.
  *
- * `null` is "this record has never been configured", which memo decision 8
- * keeps distinct from an empty list. A failed load stays `null` rather than
- * becoming `[]`: guessing the other state here would write the wrong one on
- * the next toggle.
+ * `null` from the backend is "this record has never been configured", which
+ * maps to an empty enabled list on load. A failed load moves to `{ status: "error" }`
+ * and disables switches rather than guessing an empty list.
  */
 export function AgentMcpServersSection({
   open,
@@ -29,17 +31,24 @@ export function AgentMcpServersSection({
   pubkey: string;
   runtime: AcpRuntimeCatalogEntry | null;
 }) {
-  const [enabled, setEnabled] = React.useState<string[] | null>(null);
+  const [selection, setSelection] = React.useState<AgentMcpSelectionState>({
+    status: "loading",
+  });
 
   React.useEffect(() => {
     if (!open) return;
     let current = true;
+    setSelection({ status: "loading" });
     void getAgentMcpServers(pubkey)
-      .then((selection) => {
-        if (current) setEnabled(selection);
+      .then((enabled) => {
+        if (current) {
+          setSelection({ status: "loaded", enabled: enabled ?? [] });
+        }
       })
-      .catch(() => {
-        if (current) setEnabled(null);
+      .catch((error) => {
+        if (current) {
+          setSelection({ status: "error", error: String(error) });
+        }
       });
     return () => {
       current = false;
@@ -50,10 +59,12 @@ export function AgentMcpServersSection({
     <div className="space-y-2">
       <p className="text-sm font-medium">MCP servers</p>
       <AgentMcpServersField
-        enabled={enabled}
-        onEnabledChange={setEnabled}
+        onEnabledChange={(next) =>
+          setSelection({ status: "loaded", enabled: next })
+        }
         pubkey={pubkey}
         runtime={runtime}
+        selection={selection}
       />
     </div>
   );

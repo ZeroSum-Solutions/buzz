@@ -291,6 +291,22 @@ pub fn converge<S: SecretStoreIo>(
                 }
             }
 
+            let declared_refs: std::collections::BTreeSet<String> = registry
+                .entries
+                .iter()
+                .flat_map(|entry| entry_references(&entry.entry))
+                .map(|r| r.id().to_string())
+                .collect();
+
+            for (ref_id, value) in *pending {
+                let accounted_for = carried
+                    .keys()
+                    .any(|key| key.ends_with(&format!(":{ref_id}")));
+                if !accounted_for && declared_refs.contains(ref_id) {
+                    carried.insert(holding_key(ref_id), value.clone());
+                }
+            }
+
             // Handed to the store rather than written here: `commit` names
             // every one of these keys in the `PREPARED` journal before it
             // writes any of them, so a crash mid-write leaves debt the next
@@ -298,7 +314,7 @@ pub fn converge<S: SecretStoreIo>(
             // the mutation ahead of its own record.
             Ok(GenerationPlan {
                 files,
-                deletions: stale_secret_deletions(&existing, next),
+                deletions: stale_secret_deletions(&existing, next, &declared_refs),
                 secrets: carried,
             })
         },
@@ -322,9 +338,25 @@ pub fn converge<S: SecretStoreIo>(
     })
 }
 
+/// Holding key prefix for staged, generation-independent secrets.
+pub const HOLDING_KEY_PREFIX: &str = "mcp:#holding:";
+
+/// Blob key holding an unassigned pending secret for a declared registry reference.
+pub fn holding_key(ref_id: &str) -> String {
+    format!("{HOLDING_KEY_PREFIX}{ref_id}")
+}
+
+/// Whether `key` is a holding key for an unassigned pending secret.
+pub fn is_holding_key(key: &str) -> bool {
+    key.starts_with(HOLDING_KEY_PREFIX)
+}
+
 /// The agent id in an `mcp:<agent>:<generation>:<rest>` blob key, or `None`
 /// when the key is not one.
-fn agent_of_key(key: &str) -> Option<&str> {
+pub(crate) fn agent_of_key(key: &str) -> Option<&str> {
+    if is_holding_key(key) {
+        return None;
+    }
     let rest = key.strip_prefix(MCP_NAMESPACE_PREFIX)?;
     let agent = rest.split(':').next()?;
     (!agent.is_empty()).then_some(agent)
@@ -353,6 +385,11 @@ fn carry_secrets(
             // have a secret at all. It is never echoed back — the panel sends
             // it once, this is where it lands, and nothing reads it out again.
             if let Some(value) = pending.get(reference.id()) {
+                carried.insert(storage_key(capability, &reference), value.clone());
+                continue;
+            }
+            // An unassigned pending secret held across convergences:
+            if let Some(value) = existing.get(&holding_key(reference.id())) {
                 carried.insert(storage_key(capability, &reference), value.clone());
                 continue;
             }
@@ -397,11 +434,24 @@ fn entry_references(entry: &RegistryEntry) -> Vec<McpSecretRef> {
 /// Retention keeps one rollback *generation directory*, but not its secrets: a
 /// rollback that could still authenticate a deleted server is the thing this
 /// convergence exists to prevent.
-fn stale_secret_deletions(existing: &BTreeMap<String, String>, adopted: u64) -> Vec<Deletion> {
+fn stale_secret_deletions(
+    existing: &BTreeMap<String, String>,
+    adopted: u64,
+    declared_refs: &std::collections::BTreeSet<String>,
+) -> Vec<Deletion> {
     let keep = format!(":{adopted}:");
     existing
         .keys()
-        .filter(|key| key.starts_with(MCP_NAMESPACE_PREFIX) && !key.contains(&keep))
+        .filter(|key| {
+            if !key.starts_with(MCP_NAMESPACE_PREFIX) {
+                return false;
+            }
+            if is_holding_key(key) {
+                let ref_id = key.strip_prefix(HOLDING_KEY_PREFIX).unwrap_or("");
+                return !declared_refs.contains(ref_id);
+            }
+            !key.contains(&keep)
+        })
         .map(|key| Deletion::Secret { key: key.clone() })
         .collect()
 }

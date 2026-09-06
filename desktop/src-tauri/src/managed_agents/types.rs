@@ -747,6 +747,8 @@ pub struct AcpRuntimeCatalogEntry {
     /// from `mcp_transports`: buzz-agent is offered stdio through a handed-over
     /// registry file while its own config accepts no MCP transport at all.
     pub mcp_native_transports: Vec<super::discovery::McpTransport>,
+    /// Whether the registry can configure this runtime at all.
+    pub mcp_registry_available: bool,
 }
 
 impl AcpRuntimeCatalogEntry {
@@ -790,6 +792,7 @@ impl AcpRuntimeCatalogEntry {
             mcp_config_placement: super::discovery::McpConfigPlacement::Unsupported,
             mcp_transports: Vec::new(),
             mcp_native_transports: Vec::new(),
+            mcp_registry_available: false,
         }
     }
 }

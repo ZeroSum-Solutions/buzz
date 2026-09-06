@@ -380,6 +380,7 @@ export function McpServersSettingsPanel() {
   });
 
   const servers = registry.data?.servers ?? [];
+  const refused = registry.data?.refused ?? [];
 
   return (
     <SettingsOptionGroup
@@ -415,6 +416,32 @@ export function McpServersSettingsPanel() {
         >
           {failure}
         </p>
+      ) : null}
+      {refused.length > 0 ? (
+        <div
+          className="border-b border-border/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-600 dark:text-amber-400"
+          data-testid="mcp-registry-refusals"
+          role="alert"
+        >
+          <div className="flex items-start gap-2">
+            <ShieldAlert
+              aria-hidden="true"
+              className="mt-0.5 h-4 w-4 shrink-0"
+            />
+            <div className="space-y-1">
+              <p className="font-medium">
+                Some agents could not apply their MCP server settings:
+              </p>
+              <ul className="list-inside list-disc space-y-0.5 text-xs">
+                {refused.map(([agentId, reason]) => (
+                  <li key={agentId}>
+                    <span className="font-mono">{agentId}</span>: {reason}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        </div>
       ) : null}
       {servers.length === 0 && draft === null ? (
         <p className="px-4 py-6 text-sm text-muted-foreground/70">

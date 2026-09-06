@@ -8627,6 +8627,7 @@ function mockMcpRegistryView() {
   return {
     servers: mockMcpServers,
     document_path: "/mock/app-data/agents/mcp_servers.json",
+    refused: [],
   };
 }
 

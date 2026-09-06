@@ -193,7 +193,7 @@ pub fn parse_registry(bytes: &[u8]) -> Result<LoadedRegistry, RegistryError> {
 /// plus one byte.
 ///
 /// `Ok(None)` when the file does not exist.
-fn read_bounded_no_follow(path: &Path) -> Result<Option<Vec<u8>>, RegistryError> {
+pub(crate) fn read_bounded_no_follow(path: &Path) -> Result<Option<Vec<u8>>, RegistryError> {
     let io_error = |reason: String| RegistryError::Io {
         path: path.display().to_string(),
         reason,

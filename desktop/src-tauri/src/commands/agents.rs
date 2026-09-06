@@ -1134,7 +1134,17 @@ pub async fn delete_managed_agent(
                 }
                 state.clear_agent_session_caches(&pubkey);
                 records.retain(|record| record.pubkey != pubkey);
-                save_managed_agents(&app, records)
+                save_managed_agents(&app, records)?;
+                if let Err(e) =
+                    crate::managed_agents::mcp_registry::apply::converge_now_with_records(
+                        &app,
+                        records,
+                        &std::collections::BTreeMap::new(),
+                    )
+                {
+                    eprintln!("buzz-desktop: delete_managed_agent: mcp convergence failed: {e}");
+                }
+                Ok(())
             })?;
             crate::managed_agents::delete_agent_key(&pubkey);
             // Tombstone after confirmed removal (inside lock; every published

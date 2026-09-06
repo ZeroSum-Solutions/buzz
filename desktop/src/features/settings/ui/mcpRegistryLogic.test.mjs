@@ -59,12 +59,14 @@ const BUZZ_AGENT = {
   id: "buzz-agent",
   label: "Buzz Agent",
   mcpTransports: ["stdio"],
+  mcpRegistryAvailable: true,
 };
 
 const CLAUDE = {
   id: "claude",
   label: "Claude",
   mcpTransports: ["stdio", "http"],
+  mcpRegistryAvailable: true,
 };
 
 // ── The approve step ──────────────────────────────────────────────────────
@@ -294,4 +296,16 @@ test("an agent on a harness the registry cannot configure is told so", () => {
   const result = toggleServer([], "fake", true, support);
   assert.ok("refused" in result);
   assert.match(result.refused, /not one the registry can configure/);
+});
+
+test("an agent on a harness with mcpRegistryAvailable false is told runtime-unavailable", () => {
+  const goose = {
+    id: "goose",
+    label: "Goose",
+    mcpTransports: ["stdio"],
+    mcpRegistryAvailable: false,
+  };
+  const support = serverSupport(entry(), goose);
+  assert.equal(support.kind, "runtime-unavailable");
+  assert.match(support.reason, /not one the registry can configure/);
 });

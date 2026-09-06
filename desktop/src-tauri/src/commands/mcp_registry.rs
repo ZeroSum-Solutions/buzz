@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 
 use tauri::AppHandle;
 
+use crate::app_state::AppState;
 use crate::managed_agents::mcp_registry::apply;
 use crate::managed_agents::mcp_registry::apply::converge_now;
 use crate::managed_agents::mcp_registry::load::{load_registry, LoadedEntry};
@@ -24,6 +25,7 @@ use crate::managed_agents::mcp_registry::schema::{
     RegistryDocument, RegistryEntry, RegistryTransport, MAX_DOCUMENT_SERVERS,
 };
 use crate::managed_agents::types::{AgentMcpServers, AGENT_MCP_SERVERS_VERSION};
+use crate::managed_agents::ManagedAgentRecord;
 use buzz_secret_store_pkg::{looks_like_reference, McpSecretRef};
 
 /// One registry entry as the panel renders it.
@@ -79,13 +81,45 @@ pub struct McpRegistryView {
     pub servers: Vec<McpRegistryEntryView>,
     /// Absolute path of the document, for the "reveal in Finder" affordance.
     pub document_path: String,
+    /// Agents whose selection could not be resolved, with the message the
+    /// panel shows and the spawn refuses with.
+    pub refused: Vec<(String, String)>,
+}
+
+fn redact_args(args: &[String]) -> Vec<String> {
+    use buzz_secret_store_pkg::sentinel::{is_credential_name, scan_value};
+    let mut out = Vec::with_capacity(args.len());
+    let mut redact_next = false;
+    for arg in args {
+        if redact_next {
+            out.push("<redacted>".to_string());
+            redact_next = false;
+            continue;
+        }
+        if is_credential_name(arg.trim_start_matches('-')) && arg.starts_with('-') {
+            out.push(arg.clone());
+            redact_next = true;
+            continue;
+        }
+        if scan_value(arg).is_some() {
+            out.push("<redacted>".to_string());
+            continue;
+        }
+        out.push(arg.clone());
+    }
+    out
 }
 
 fn view_of(loaded: &LoadedEntry) -> McpRegistryEntryView {
     let entry = &loaded.entry;
     let (transport, command, args, url, auth_scheme) = match &entry.transport {
         RegistryTransport::Stdio { command, args } => {
-            ("stdio", Some(command.clone()), args.clone(), None, None)
+            let effective_args = if loaded.rejection.is_some() {
+                redact_args(args)
+            } else {
+                args.clone()
+            };
+            ("stdio", Some(command.clone()), effective_args, None, None)
         }
         RegistryTransport::Http { url, auth } => (
             "http",
@@ -108,10 +142,17 @@ fn view_of(loaded: &LoadedEntry) -> McpRegistryEntryView {
             .iter()
             .map(|(name, value)| {
                 let is_reference = looks_like_reference(value);
+                let literal = if is_reference {
+                    None
+                } else if loaded.rejection.is_some() {
+                    Some("<redacted>".to_string())
+                } else {
+                    Some(value.clone())
+                };
                 McpRegistryEnvView {
                     name: name.clone(),
                     reference: is_reference.then(|| value.clone()),
-                    literal: (!is_reference).then(|| value.clone()),
+                    literal,
                 }
             })
             .collect(),
@@ -136,12 +177,15 @@ fn document_path<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<std::path::Pat
 /// returned with its `rejection` string, which is the same message a spawn
 /// refuses with.
 #[tauri::command]
-pub fn list_mcp_registry_servers(app: AppHandle) -> Result<McpRegistryView, String> {
+pub fn list_mcp_registry_servers<R: tauri::Runtime>(
+    app: AppHandle<R>,
+) -> Result<McpRegistryView, String> {
     let path = document_path(&app)?;
     let registry = load_registry(&path).map_err(|e| e.to_string())?;
     Ok(McpRegistryView {
         servers: registry.entries.iter().map(view_of).collect(),
         document_path: path.display().to_string(),
+        refused: Vec::new(),
     })
 }
 
@@ -162,11 +206,18 @@ pub fn list_mcp_registry_servers(app: AppHandle) -> Result<McpRegistryView, Stri
 /// A message when the entry is unusable, when the document cannot be written,
 /// or when the convergence fails.
 #[tauri::command]
-pub fn save_mcp_registry_server(
-    app: AppHandle,
+pub fn save_mcp_registry_server<R: tauri::Runtime>(
+    app: AppHandle<R>,
     entry: RegistryEntry,
     secrets: BTreeMap<String, String>,
 ) -> Result<McpRegistryView, String> {
+    use tauri::Manager;
+    let state = app.state::<AppState>();
+    let _lock = state
+        .mcp_registry_store_lock
+        .lock()
+        .map_err(|e| format!("cannot acquire mcp registry lock: {e}"))?;
+
     for id in secrets.keys() {
         // The reference id is operator-typed, so it is validated against the
         // same closed namespace a generated config uses. `identity` and
@@ -189,41 +240,73 @@ pub fn save_mcp_registry_server(
         }
     }
     write_document(&path, &document)?;
-    converge_now(&app, &secrets)?;
-    list_mcp_registry_servers(app)
+    let converged = converge_now(&app, &secrets)?;
+    let mut view = list_mcp_registry_servers(app.clone())?;
+    view.refused = converged.refused;
+    Ok(view)
+}
+
+/// Internal implementation of delete_mcp_registry_server taking an injectable
+/// save closure for testing.
+pub fn delete_mcp_registry_server_internal<R: tauri::Runtime, F>(
+    app: &AppHandle<R>,
+    id: &str,
+    save_records: F,
+) -> Result<McpRegistryView, String>
+where
+    F: FnOnce(&[ManagedAgentRecord]) -> Result<(), String>,
+{
+    let path = document_path(app)?;
+    let mut document = read_document(&path)?;
+    document.servers.retain(|entry| entry.id != id);
+    write_document(&path, &document)?;
+
+    let mut records = crate::managed_agents::load_managed_agents(app)?;
+    let mut touched = false;
+    for record in &mut records {
+        if let Some(selection) = record.mcp_servers.as_mut() {
+            let before = selection.enabled.len();
+            selection.enabled.retain(|enabled| enabled != id);
+            touched |= selection.enabled.len() != before;
+        }
+    }
+    if touched {
+        save_records(&records).map_err(|e| {
+            format!(
+                "mcp registry document updated to remove {id}, but updating agent records failed: {e}; state is inconsistent"
+            )
+        })?;
+    }
+    let converged = converge_now(app, &BTreeMap::new())?;
+    let mut view = list_mcp_registry_servers(app.clone())?;
+    view.refused = converged.refused;
+    Ok(view)
 }
 
 /// Delete one registry entry, drop its id from every agent, and adopt a new
 /// generation.
 ///
-/// The agent records are rewritten *before* the convergence, so the generation
-/// this call adopts is built from the records as they now are. The reverse
-/// order would stage a generation naming a server no record enables any more,
-/// and the deleted server's credential would be carried onto it.
+/// The document is written first so that the server declaration is removed
+/// from the authoritative registry. If updating the agent records subsequently
+/// fails, an error noting the partial/inconsistent state is returned.
 ///
 /// # Errors
 /// A message when the document or the agent store cannot be written, or when
 /// the convergence fails.
 #[tauri::command]
-pub fn delete_mcp_registry_server(app: AppHandle, id: String) -> Result<McpRegistryView, String> {
-    let path = document_path(&app)?;
-    let mut document = read_document(&path)?;
-    document.servers.retain(|entry| entry.id != id);
-    let mut records = crate::managed_agents::load_managed_agents(&app)?;
-    let mut touched = false;
-    for record in &mut records {
-        if let Some(selection) = record.mcp_servers.as_mut() {
-            let before = selection.enabled.len();
-            selection.enabled.retain(|enabled| enabled != &id);
-            touched |= selection.enabled.len() != before;
-        }
-    }
-    if touched {
-        crate::managed_agents::save_managed_agents(&app, &records)?;
-    }
-    write_document(&path, &document)?;
-    converge_now(&app, &BTreeMap::new())?;
-    list_mcp_registry_servers(app)
+pub fn delete_mcp_registry_server<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    id: String,
+) -> Result<McpRegistryView, String> {
+    use tauri::Manager;
+    let state = app.state::<AppState>();
+    let _lock = state
+        .mcp_registry_store_lock
+        .lock()
+        .map_err(|e| format!("cannot acquire mcp registry lock: {e}"))?;
+    delete_mcp_registry_server_internal(&app, &id, |records| {
+        crate::managed_agents::save_managed_agents(&app, records)
+    })
 }
 
 /// Set one agent's enabled registry servers, then adopt a new generation.
@@ -238,11 +321,18 @@ pub fn delete_mcp_registry_server(app: AppHandle, id: String) -> Result<McpRegis
 /// when the convergence fails — including the refusal an unsupported transport
 /// produces, which is surfaced rather than silently dropping the entry.
 #[tauri::command]
-pub fn set_agent_mcp_servers(
-    app: AppHandle,
+pub fn set_agent_mcp_servers<R: tauri::Runtime>(
+    app: AppHandle<R>,
     pubkey: String,
     enabled: Vec<String>,
 ) -> Result<McpRegistryView, String> {
+    use tauri::Manager;
+    let state = app.state::<AppState>();
+    let _lock = state
+        .mcp_registry_store_lock
+        .lock()
+        .map_err(|e| format!("cannot acquire mcp registry lock: {e}"))?;
+
     let mut records = crate::managed_agents::load_managed_agents(&app)?;
     let record = records
         .iter_mut()
@@ -253,8 +343,10 @@ pub fn set_agent_mcp_servers(
         enabled,
     });
     crate::managed_agents::save_managed_agents(&app, &records)?;
-    converge_now(&app, &BTreeMap::new())?;
-    list_mcp_registry_servers(app)
+    let converged = converge_now(&app, &BTreeMap::new())?;
+    let mut view = list_mcp_registry_servers(app.clone())?;
+    view.refused = converged.refused;
+    Ok(view)
 }
 
 /// One agent's current selection, for the definition dialog.
@@ -262,8 +354,8 @@ pub fn set_agent_mcp_servers(
 /// # Errors
 /// A message when the agent store cannot be read.
 #[tauri::command]
-pub fn get_agent_mcp_servers(
-    app: AppHandle,
+pub fn get_agent_mcp_servers<R: tauri::Runtime>(
+    app: AppHandle<R>,
     pubkey: String,
 ) -> Result<Option<Vec<String>>, String> {
     let records = crate::managed_agents::load_managed_agents(&app)?;
@@ -275,18 +367,19 @@ pub fn get_agent_mcp_servers(
 }
 
 fn read_document(path: &std::path::Path) -> Result<RegistryDocument, String> {
-    match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+    match crate::managed_agents::mcp_registry::load::read_bounded_no_follow(path)
+        .map_err(|e| e.to_string())?
+    {
+        Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
             format!(
                 "the mcp registry at {} is not valid json: {e}",
                 path.display()
             )
         }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RegistryDocument {
+        None => Ok(RegistryDocument {
             version: 1,
             servers: Vec::new(),
         }),
-        Err(e) => Err(format!("cannot read {}: {e}", path.display())),
     }
 }
 
@@ -301,3 +394,7 @@ fn write_document(path: &std::path::Path, document: &RegistryDocument) -> Result
     // prefix, and a failed write leaves the previous document intact.
     crate::managed_agents::atomic_write_json(path, &body)
 }
+
+#[cfg(test)]
+#[path = "mcp_registry_tests.rs"]
+mod tests;

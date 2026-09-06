@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { supportBadge } from "./AgentMcpServersField";
+import React from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+
+import {
+  AgentMcpServersField,
+  isSelectionSwitchDisabled,
+  supportBadge,
+} from "./AgentMcpServersField";
 import { serverSupport } from "@/features/settings/ui/mcpRegistryLogic";
 
 function entry(overrides = {}) {
@@ -23,12 +31,14 @@ const BUZZ_AGENT = {
   id: "buzz-agent",
   label: "Buzz Agent",
   mcpTransports: ["stdio"],
+  mcpRegistryAvailable: true,
 };
 
 const CLAUDE = {
   id: "claude",
   label: "Claude",
   mcpTransports: ["stdio", "http"],
+  mcpRegistryAvailable: true,
 };
 
 test("a usable stdio entry on a stdio runtime gets no badge", () => {
@@ -59,4 +69,51 @@ test("an agent whose harness the registry cannot configure is badged, not hidden
     label: "Not configurable",
     tone: "warn",
   });
+});
+
+test("isSelectionSwitchDisabled returns true for loading or error and false for loaded", () => {
+  assert.equal(isSelectionSwitchDisabled({ status: "loading" }), true);
+  assert.equal(
+    isSelectionSwitchDisabled({ status: "error", error: "boom" }),
+    true,
+  );
+  assert.equal(
+    isSelectionSwitchDisabled({ status: "loaded", enabled: [] }),
+    false,
+  );
+});
+
+test("switches are disabled in the DOM when selection state is loading or error", () => {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  queryClient.setQueryData(["mcp-registry"], {
+    servers: [entry()],
+    document_path: "/test/doc.json",
+    refused: [],
+  });
+
+  const renderField = (selection) =>
+    renderToStaticMarkup(
+      React.createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        React.createElement(AgentMcpServersField, {
+          selection,
+          onEnabledChange: () => {},
+          pubkey: "pk1",
+          runtime: BUZZ_AGENT,
+        }),
+      ),
+    );
+
+  const loadingHtml = renderField({ status: "loading" });
+  assert.match(loadingHtml, /data-disabled/);
+
+  const errorHtml = renderField({ status: "error", error: "network failed" });
+  assert.match(errorHtml, /data-disabled/);
+  assert.match(errorHtml, /network failed/);
+
+  const loadedHtml = renderField({ status: "loaded", enabled: [] });
+  assert.doesNotMatch(loadedHtml, /data-disabled/);
 });

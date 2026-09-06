@@ -139,6 +139,51 @@ pub fn selection_for_record(
     }
 }
 
+pub fn selections_for_records<S: SecretStoreIo>(
+    records: &[ManagedAgentRecord],
+    personas: &[crate::managed_agents::AgentDefinition],
+    global: &crate::managed_agents::GlobalAgentConfig,
+    secrets: &S,
+) -> Vec<AgentSelection> {
+    let mut selections: Vec<AgentSelection> = records
+        .iter()
+        .map(|record| {
+            let runtime_id = crate::managed_agents::resolve_effective_harness_descriptor(
+                record, personas, global,
+            )
+            .map(|descriptor| descriptor.command)
+            .unwrap_or_else(|_| record.agent_command.clone());
+            let meta = crate::managed_agents::known_acp_runtime(&runtime_id);
+            selection_for_record(record, meta, &runtime_id)
+        })
+        .collect();
+
+    // Retire any agent that holds mcp: state in the secret store but has been
+    // removed from managed-agents records. Passing it with an empty selection
+    // allows converge() to clean up its artefacts and delete its secret keys
+    // rather than failing with ConvergeError::MissingAgent.
+    if let Ok(existing) = secrets.read_all() {
+        let seen_agents: std::collections::BTreeSet<String> =
+            selections.iter().map(|s| s.agent_id.clone()).collect();
+        let mut retired = std::collections::BTreeSet::new();
+        for key in existing.keys() {
+            if let Some(agent_id) = super::converge::agent_of_key(key) {
+                if !seen_agents.contains(agent_id) && retired.insert(agent_id.to_string()) {
+                    selections.push(AgentSelection {
+                        agent_id: agent_id.to_string(),
+                        runtime_id: "retiring".to_string(),
+                        transports: Vec::new(),
+                        placement: crate::managed_agents::McpConfigPlacement::Unsupported,
+                        enabled: Vec::new(),
+                    });
+                }
+            }
+        }
+    }
+
+    selections
+}
+
 /// The durable secret store, as the generation store and the convergence see
 /// it.
 ///
@@ -217,6 +262,17 @@ pub fn converge_now<R: tauri::Runtime>(
     app: &AppHandle<R>,
     pending: &std::collections::BTreeMap<String, String>,
 ) -> Result<Converged, String> {
+    let records = crate::managed_agents::load_managed_agents(app)?;
+    converge_now_with_records(app, &records, pending)
+}
+
+/// Stage and adopt one generation from the registry document and the provided
+/// agent records.
+pub fn converge_now_with_records<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    records: &[ManagedAgentRecord],
+    pending: &std::collections::BTreeMap<String, String>,
+) -> Result<Converged, String> {
     let Some(paths) = crate::managed_agents::runtime::mcp_registry_paths(app)? else {
         return Err(
             "this build cannot resolve the agent working directory, so mcp server settings \
@@ -234,29 +290,12 @@ pub fn converge_now<R: tauri::Runtime>(
     let launcher = checked_launcher(&launcher_path)?;
 
     let registry = load_registry(&paths.document()).map_err(|e| e.to_string())?;
-    let records = crate::managed_agents::load_managed_agents(app)?;
     let personas = crate::managed_agents::load_personas(app).unwrap_or_default();
     let global = crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
-
-    let selections: Vec<AgentSelection> = records
-        .iter()
-        .map(|record| {
-            // A dangling harness id degrades to the record's own snapshot
-            // rather than failing the whole convergence: the agent is already
-            // unspawnable for a reason the spawn path reports, and dropping it
-            // here would breach the whole-set rule and revoke every other
-            // agent's configuration too.
-            let runtime_id = crate::managed_agents::resolve_effective_harness_descriptor(
-                record, &personas, &global,
-            )
-            .map(|descriptor| descriptor.command)
-            .unwrap_or_else(|_| record.agent_command.clone());
-            let meta = crate::managed_agents::known_acp_runtime(&runtime_id);
-            selection_for_record(record, meta, &runtime_id)
-        })
-        .collect();
-
     let secrets = DesktopSecrets::new(crate::app_state::keyring_service());
+
+    let selections = selections_for_records(records, &personas, &global, &secrets);
+
     converge(
         &paths,
         &registry,

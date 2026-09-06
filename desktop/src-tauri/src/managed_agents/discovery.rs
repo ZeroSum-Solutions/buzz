@@ -1159,6 +1159,7 @@ fn discover_acp_runtime_phase1(runtime: &'static KnownAcpRuntime, force: bool) -
             mcp_config_placement: runtime.mcp_config_placement,
             mcp_transports: runtime.mcp_transports.to_vec(),
             mcp_native_transports: runtime.mcp_native_transports.to_vec(),
+            mcp_registry_available: runtime.mcp_registry_available,
         },
     }
 }
@@ -1305,6 +1306,7 @@ pub fn discover_acp_runtimes_from(
                 mcp_config_placement: McpConfigPlacement::Unsupported,
                 mcp_transports: Vec::new(),
                 mcp_native_transports: Vec::new(),
+                mcp_registry_available: false,
             });
         }
     }
