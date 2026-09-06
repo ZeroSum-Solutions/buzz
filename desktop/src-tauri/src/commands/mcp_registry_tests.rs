@@ -228,7 +228,7 @@ fn mcp_registry_a_rejected_entrys_credential_shaped_args_are_redacted() {
 fn mcp_registry_save_refuses_a_document_over_the_byte_cap() {
     let (_guard, _home) = EnvGuard::new();
     let app = mock_app();
-    let doc_path = document_path(&app.handle()).expect("document path");
+    let doc_path = document_path(app.handle()).expect("document path");
     fs::create_dir_all(doc_path.parent().unwrap()).unwrap();
     fs::write(&doc_path, vec![b'a'; MAX_DOCUMENT_BYTES + 10]).unwrap();
 
@@ -252,7 +252,7 @@ fn mcp_registry_save_refuses_a_document_over_the_byte_cap() {
 fn mcp_registry_save_does_not_follow_a_symlinked_document() {
     let (_guard, _home) = EnvGuard::new();
     let app = mock_app();
-    let doc_path = document_path(&app.handle()).expect("document path");
+    let doc_path = document_path(app.handle()).expect("document path");
     fs::create_dir_all(doc_path.parent().unwrap()).unwrap();
 
     let target = doc_path.parent().unwrap().join("real_document.json");
@@ -283,7 +283,7 @@ fn mcp_registry_save_does_not_follow_a_symlinked_document() {
 fn mcp_registry_delete_server_reports_partial_state_on_agent_save_failure() {
     let (_guard, _home) = EnvGuard::new();
     let app = mock_app();
-    let doc_path = document_path(&app.handle()).expect("document path");
+    let doc_path = document_path(app.handle()).expect("document path");
     fs::create_dir_all(doc_path.parent().unwrap()).unwrap();
 
     let doc = RegistryDocument {
@@ -316,9 +316,9 @@ fn mcp_registry_delete_server_reports_partial_state_on_agent_save_failure() {
         version: AGENT_MCP_SERVERS_VERSION,
         enabled: vec!["srv1".to_string()],
     });
-    save_managed_agents(&app.handle(), &[record]).unwrap();
+    save_managed_agents(app.handle(), &[record]).unwrap();
 
-    let err = delete_mcp_registry_server_internal(&app.handle(), "srv1", |_| {
+    let err = delete_mcp_registry_server_internal(app.handle(), "srv1", |_| {
         Err("injected agent write failure".to_string())
     })
     .unwrap_err();
@@ -377,7 +377,7 @@ fn mcp_registry_save_surfaces_a_refused_agent_not_just_an_error() {
         version: AGENT_MCP_SERVERS_VERSION,
         enabled: vec!["remote-http".to_string()],
     });
-    save_managed_agents(&app.handle(), &[record]).unwrap();
+    save_managed_agents(app.handle(), &[record]).unwrap();
 
     let http_entry = RegistryEntry {
         id: "remote-http".to_string(),
