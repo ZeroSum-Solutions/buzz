@@ -65,6 +65,7 @@ fn a_regular_file_inside_a_root_resolves_to_its_canonical_path() {
     assert_eq!(target.size_bytes, "# report\n".len() as u64);
 }
 
+#[cfg(unix)]
 #[test]
 fn an_absolute_path_inside_a_root_resolves() {
     let fixture = fixture();
@@ -80,6 +81,31 @@ fn an_absolute_path_inside_a_root_resolves() {
 
     assert_eq!(target.kind, PathLinkKind::File);
     assert_eq!(target.filename, "item-7.html");
+}
+
+/// A Windows absolute path always carries backslashes, and the lexical gate
+/// refuses every backslash so that no UNC, verbatim or device spelling ever
+/// reaches `canonicalize`. So on Windows an absolute token is "not a link"
+/// even when it names a real file inside a root; relative tokens with forward
+/// slashes still resolve. Widening the gate to drive-letter paths is a
+/// follow-up, and this test is what a widening has to change.
+#[cfg(windows)]
+#[test]
+fn an_absolute_path_inside_a_root_is_refused_by_inspection() {
+    let fixture = fixture();
+    let file = fixture.root.join("approvals/item-7.html");
+    write(&file, "<p>ok</p>");
+
+    let target = resolve_within_roots(
+        &file.display().to_string(),
+        std::slice::from_ref(&fixture.root),
+    )
+    .expect("resolution succeeds");
+
+    assert!(
+        target.is_none(),
+        "a backslash path never resolves on Windows"
+    );
 }
 
 #[test]
@@ -380,9 +406,21 @@ fn network_device_and_drive_relative_shapes_are_refused_by_inspection() {
             "{candidate} must be refused before any filesystem call"
         );
     }
-    for candidate in ["docs/report.md", "report.md", "/Users/x/projects/report.md"] {
+    // A rooted path with no drive is absolute on Unix and drive-relative on
+    // Windows (`\note.md` shape), so it is a path on one and refused on the
+    // other; a drive-letter path with forward slashes is absolute on Windows.
+    #[cfg(unix)]
+    let absolute = "/Users/x/projects/report.md";
+    #[cfg(windows)]
+    let absolute = "C:/Users/x/projects/report.md";
+    for candidate in ["docs/report.md", "report.md", absolute] {
         assert!(!is_lexically_refused(candidate), "{candidate} is a path");
     }
+    #[cfg(windows)]
+    assert!(
+        is_lexically_refused("/Users/x/projects/report.md"),
+        "a rooted path without a drive is drive-relative on Windows and must be refused"
+    );
 }
 
 #[cfg(unix)]
