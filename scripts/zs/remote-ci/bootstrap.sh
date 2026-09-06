@@ -58,6 +58,10 @@ export DEBIAN_FRONTEND=noninteractive
 # three retries do not cover it, so re-run the whole update+install five times.
 apt_ok=0
 for attempt in 1 2 3 4 5; do
+  # A stop that lands mid-install (the provisioner's own trap, an idle alarm)
+  # leaves dpkg interrupted, and every later apt call refuses until it is
+  # configured; the rerun over ssh must heal that itself.
+  dpkg --configure -a || true
   if apt-get update \
       -o Acquire::Retries=3 \
       -o Acquire::http::Timeout=30 \
