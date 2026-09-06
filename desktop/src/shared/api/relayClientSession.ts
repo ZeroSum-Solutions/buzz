@@ -405,13 +405,29 @@ export class RelayClient {
     return this.subscribe(buildGlobalStreamFilter(50), onEvent);
   }
 
+  /**
+   * Open a live subscription.
+   *
+   * `onReady` reports how the REQ settled — `"eose"`, `"timeout"`, or
+   * `"closed"` when the relay refused it. `onTerminalClose` fires later, and at
+   * most once, if the relay ends an open subscription for good; a caller that
+   * shows connection state must handle both, because either one alone leaves
+   * the other failure invisible.
+   */
   async subscribeLive(
     filter: RelaySubscriptionFilter,
     onEvent: (event: RelayEvent) => void,
     onReady?: (readiness: LiveSubscriptionReadiness) => void,
     readinessTimeoutMs?: number,
+    onTerminalClose?: (message: string) => void,
   ) {
-    return this.subscribe(filter, onEvent, onReady, readinessTimeoutMs);
+    return this.subscribe(
+      filter,
+      onEvent,
+      onReady,
+      readinessTimeoutMs,
+      onTerminalClose,
+    );
   }
   async subscribeToChannelMentionEvents(
     channelId: string,
@@ -600,6 +616,7 @@ export class RelayClient {
     onEvent: (event: RelayEvent) => void,
     onReady?: (readiness: LiveSubscriptionReadiness) => void,
     readinessTimeoutMs = 250,
+    onTerminalClose?: (message: string) => void,
   ) {
     await this.ensureConnected();
 
@@ -622,6 +639,7 @@ export class RelayClient {
       filter,
       onEvent,
       resolveReady,
+      onTerminalClose,
     });
 
     try {

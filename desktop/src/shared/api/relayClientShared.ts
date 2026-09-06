@@ -75,6 +75,19 @@ type LiveSubscription = {
   filter: RelaySubscriptionFilter;
   onEvent: (event: RelayEvent) => void;
   resolveReady?: (readiness: LiveSubscriptionReadiness) => void;
+  /**
+   * Called once when a CLOSED classified `terminal` deletes this subscription,
+   * with the relay's message.
+   *
+   * A terminal CLOSED is the end of the subscription: it is removed from the
+   * map and never re-sent, so its owner stops receiving events for the rest of
+   * the session. Without this notification the owner keeps rendering as if it
+   * were still following the filter, which is the failure `AGENTS.md`'s
+   * review-proven rule 1 names — a terminal failure read as an authoritative
+   * success. Retryable and rate-limited CLOSEDs do not call it, because those
+   * subscriptions recover on their own.
+   */
+  onTerminalClose?: (message: string) => void;
   lastSeenCreatedAt?: number;
   /**
    * Lower bound of a reconnect backfill window that has not yet completed.

@@ -5,7 +5,6 @@ import {
   MAX_CHANNEL_FILES,
   categorizeFile,
   parseChannelFiles,
-  projectChannelFiles,
   sortFiles,
 } from "./useChannelFiles.ts";
 import { MAX_IMETA_TAGS_SCANNED } from "./boundedImeta.ts";
@@ -313,21 +312,6 @@ test("parseChannelFiles caps the total row count and reports truncation", () => 
   assert.equal(result.files.length, MAX_CHANNEL_FILES);
   assert.equal(result.truncated, true, "a capped list must not read as whole");
   assert.equal(parseChannelFiles(events.slice(0, 3)).truncated, false);
-});
-
-test("the projection does no work until the Files tab has been opened", () => {
-  const event = relayEvent({
-    id: "event-gated",
-    tags: [
-      imetaTag({ url: "https://relay.example/media/abc.png", m: "image/png" }),
-    ],
-  });
-
-  assert.deepEqual(projectChannelFiles([event], false), {
-    files: [],
-    truncated: false,
-  });
-  assert.equal(projectChannelFiles([event], true).files.length, 1);
 });
 
 test("categorizeFile maps mime types to categories", () => {

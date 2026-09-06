@@ -52,6 +52,10 @@ mod notifications;
 mod observer_archive;
 mod os_idle;
 pub mod pairing;
+mod path_links;
+#[cfg(test)]
+#[path = "path_links_tests.rs"]
+mod path_links_tests;
 mod pdf_export;
 mod personas;
 mod prevent_sleep;
@@ -117,6 +121,7 @@ pub use notifications::*;
 pub use observer_archive::*;
 pub use os_idle::*;
 pub use pairing::*;
+pub use path_links::*;
 pub use pdf_export::*;
 pub use personas::*;
 pub use prevent_sleep::*;

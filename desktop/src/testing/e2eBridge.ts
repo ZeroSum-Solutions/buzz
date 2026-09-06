@@ -553,6 +553,29 @@ type E2eConfig = {
      */
     snapshotFetchError?: string;
     uploadDescriptors?: RawBlobDescriptor[];
+    /**
+     * Local files the mocked path-link resolver can find. A candidate that is
+     * not listed resolves to `null` — the same "not a link" answer the real
+     * command gives for a missing file or one outside every allowed root.
+     * Containment itself is proven natively (`commands/path_links_tests.rs`);
+     * the bridge only stands in for the filesystem.
+     */
+    pathLinkFiles?: Array<{
+      /** The token text as written in the message. */
+      candidate: string;
+      /** Canonical path the resolver answers with. */
+      path: string;
+      filename: string;
+      kind: "markdown" | "file";
+      /** Body returned by `read_path_link_markdown` for a markdown file. */
+      text?: string;
+      /**
+       * When set, `read_path_link_markdown` throws this message instead of
+       * returning `text` — lets a spec drive the panel's local error branch,
+       * which words its failure differently from a relay fetch failure.
+       */
+      readError?: string;
+    }>;
     // Seed rows returned by `list_save_subscriptions`. Each entry uses the same
     // snake_case wire shape the Rust backend returns so tests can drive the
     // LocalArchiveSettingsCard without a real SQLite database.
@@ -1262,6 +1285,12 @@ declare global {
     /** Last payload written through the native clipboard command. */
     __BUZZ_E2E_LAST_CLIPBOARD__?: { html: string | null; text: string };
     __BUZZ_E2E_COMMANDS__?: string[];
+    /** Every path-link IPC call with its payload, for seam-binding specs. */
+    __BUZZ_E2E_PATH_LINK_CALLS__?: Array<{
+      command: string;
+      candidate: string;
+      senderPubkey: string | null;
+    }>;
     /** Which outcome the mocked `export_document_pdf` returns. */
     __BUZZ_E2E_PDF_EXPORT_MODE__?: "saved" | "cancelled" | "failed";
     __BUZZ_E2E_COMMAND_PAYLOADS__?: Array<{
@@ -11627,6 +11656,7 @@ export function maybeInstallE2eTauriMocks() {
   }
   mockWindows(config.mock?.windowLabel ?? "main");
   window.__BUZZ_E2E_COMMANDS__ = [];
+  window.__BUZZ_E2E_PATH_LINK_CALLS__ = [];
   window.__BUZZ_E2E_COMMAND_PAYLOADS__ = [];
   window.__BUZZ_E2E_COMMAND_LOG__ = [];
   window.__BUZZ_E2E_OBSERVER_CONTROLS__ = [];
@@ -14702,6 +14732,50 @@ export function maybeInstallE2eTauriMocks() {
           payload as { requestId?: string; url: string },
           { maxBytes: 2 * 1024 * 1024 },
         );
+      case "resolve_path_link":
+      case "open_path_link":
+      case "read_path_link_markdown": {
+        const { candidate, senderPubkey } = payload as {
+          candidate?: string;
+          senderPubkey?: string | null;
+        };
+        const text = typeof candidate === "string" ? candidate : "";
+        window.__BUZZ_E2E_PATH_LINK_CALLS__?.push({
+          command,
+          candidate: text,
+          senderPubkey: typeof senderPubkey === "string" ? senderPubkey : null,
+        });
+        // Mirrors the native DTO cap so a spec can prove the refusal shape
+        // without a Rust process.
+        if (new TextEncoder().encode(text).length > 4096) {
+          throw new Error("path link candidate exceeds 4096 bytes");
+        }
+        if (typeof senderPubkey === "string" && senderPubkey.length > 128) {
+          throw new Error("sender pubkey exceeds 128 bytes");
+        }
+        const entry = (activeConfig?.mock?.pathLinkFiles ?? []).find(
+          (file) => file.candidate === text || file.path === text,
+        );
+        if (command === "resolve_path_link") {
+          return entry
+            ? {
+                path: entry.path,
+                filename: entry.filename,
+                kind: entry.kind,
+                sizeBytes: (entry.text ?? "").length,
+              }
+            : null;
+        }
+        if (!entry) throw new Error("That file is no longer on this Mac.");
+        if (command === "open_path_link") return null;
+        if (entry.readError) throw new Error(entry.readError);
+        if (entry.kind !== "markdown") {
+          throw new Error(
+            "That file is not a markdown document the viewer can render.",
+          );
+        }
+        return entry.text ?? "";
+      }
       case "fetch_snapshot_bytes": {
         // The real command fetches + validates a snapshot attachment in memory
         // (size cap, SHA-256, decode). In E2E the bridge returns a minimal
