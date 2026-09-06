@@ -425,7 +425,7 @@ refresh_ssh_rule() {
   if [ -n "$rule_ids" ] && [ "$rule_ids" != "None" ]; then
     log "revoking every existing ingress rule on ${SG_ID}"
     # shellcheck disable=SC2086 # rule ids are a space-separated list by design
-    aws_do ec2 revoke-security-group-rules --group-id "$SG_ID" \
+    aws_do ec2 revoke-security-group-ingress --group-id "$SG_ID" \
       --security-group-rule-ids $rule_ids >/dev/null
   fi
   log "allowing SSH from ${cidr}"

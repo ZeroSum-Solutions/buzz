@@ -8,6 +8,7 @@
 #
 #   scripts/zs/remote-ci/test-remote-ci.sh
 set -euo pipefail
+ORIG_PATH="$PATH"
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REMOTE_CI="${DIR}/../remote-ci.sh"
@@ -400,6 +401,27 @@ else
   pass "the runner key value never reaches argv or the output"
 fi
 unset AWS_STUB_ENV_LOG
+
+# ── 5c. every aws subcommand the scripts name exists in the installed CLI ────
+# The stub above answers any subcommand, so a misspelled one (the adoption path
+# once called ec2 revoke-security-group-rules, which does not exist) only fails
+# against the real CLI. Ask the real CLI for each one when it is installed.
+REAL_AWS="$(PATH="${ORIG_PATH:-$PATH}" command -v aws 2>/dev/null || true)"
+case "$REAL_AWS" in ""|"${WORK}"/*) REAL_AWS="";; esac
+if [ -n "$REAL_AWS" ]; then
+  unknown=""
+  while read -r svc sub; do
+    [ "$sub" = "wait" ] && continue
+    "$REAL_AWS" "$svc" "$sub" help >/dev/null 2>&1 || unknown="${unknown} ${svc} ${sub}"
+  done < <(grep -ohE '\b(ec2|iam|cloudwatch|ssm|sts|service-quotas) [a-z-]+' "$PROVISION" "$REMOTE_CI" | sort -u)
+  if [ -z "$unknown" ]; then
+    pass "every aws subcommand the scripts name exists in the installed CLI"
+  else
+    fail "every aws subcommand the scripts name exists in the installed CLI" "unknown:${unknown}"
+  fi
+else
+  pass "every aws subcommand the scripts name exists in the installed CLI (skipped: no real aws on PATH)"
+fi
 
 # ── 6. box.env parsing ───────────────────────────────────────────────────────
 export AWS_STUB_LOG="${WORK}/status-aws.log"
