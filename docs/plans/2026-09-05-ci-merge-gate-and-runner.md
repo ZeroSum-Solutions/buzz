@@ -253,6 +253,17 @@ removing it and watching the matching check fail.
 
 Three things, all credential work no agent may do:
 
+Account facts (2026-09-06): shared account 767866852083, region us-west-2 next to the MishMash box.
+`buzz-ci-admin` exists with an inline policy scoped to EC2 provisioning, IAM on `buzz-ci-*` names,
+the `buzz-ci-*` CloudWatch alarm and the canonical-AMI SSM parameter; its key is in ZS Vault. The
+account's on-demand Standard vCPU quota (L-1216C47A) was 16 and fully used by the running MishMash
+box, so the first launch failed with VcpuLimitExceeded; a quota case for 32 was already open from
+the MishMash setup and AWS allows one open case per quota. Until it lands, provision with
+`BUZZ_CI_INSTANCE_TYPE=c7a.4xlarge` (16 vCPU) and resize later with
+`ec2 modify-instance-attribute --instance-type` while stopped; request 96 once the 32 case closes.
+Security group, key pair, role and instance profile from the first attempt are tagged and adopted
+on rerun.
+
 1. Put the AWS admin key in ZS Vault as `aws_buzz_ci_admin_key_id` and
    `aws_buzz_ci_admin_secret` (billing lane: AWS, approved 2026-09-05).
 2. Run `provision.sh`. It stores the runner key in ZS Vault itself; no manual key handling.
