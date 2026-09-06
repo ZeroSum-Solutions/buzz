@@ -8,7 +8,11 @@ import { ChannelCanvas } from "@/features/channels/ui/ChannelCanvas";
 import { useChannelModerationCapabilities } from "@/features/channels/ui/ChannelManagementModerationActions";
 import type { Channel } from "@/shared/api/types";
 
-import { CANVAS_UNAVAILABLE_PREVIEW, canvasPreviewText } from "./canvasPreview";
+import {
+  CANVAS_UNAVAILABLE_PREVIEW,
+  canvasPreviewText,
+  MAX_CANVAS_PREVIEW_SOURCE_LENGTH,
+} from "./canvasPreview";
 import type { ChannelFilesCanvas } from "./ChannelFilesTab";
 
 export type UseChannelFilesCanvasInput = {
@@ -54,13 +58,17 @@ export function useChannelFilesCanvas({
   const failed = canvasQuery.error != null;
   const hasMetadata =
     canvasQuery.data?.updatedAt != null || canvasQuery.data?.author != null;
+  // Bounded fallback for presence: some sources (the e2e mock bridge; a relay
+  // that omits author/updatedAt) never populate the metadata fields even when
+  // a canvas exists. Scan only the same bounded prefix the preview itself
+  // reads — never the full, unbounded rawContent — so this stays O(1) instead
+  // of rescanning a relay-sourced body on every render.
+  const hasContentWithinCap =
+    rawContent.slice(0, MAX_CANVAS_PREVIEW_SOURCE_LENGTH).trim().length > 0;
 
   return React.useMemo(() => {
     if (!enabled || channelId === null) return null;
-    // Bounded metadata carries presence: a channel with a canvas has a
-    // non-null author or updatedAt timestamp. We avoid scanning rawContent,
-    // which is relay-sourced and unbounded.
-    if (!failed && !hasMetadata) return null;
+    if (!failed && !hasMetadata && !hasContentWithinCap) return null;
     return {
       preview: failed
         ? CANVAS_UNAVAILABLE_PREVIEW
@@ -78,6 +86,7 @@ export function useChannelFilesCanvas({
     channelId,
     enabled,
     failed,
+    hasContentWithinCap,
     hasMetadata,
     isArchived,
     rawContent,

@@ -162,6 +162,25 @@ test("presence decision does not require reading past MAX_CANVAS_PREVIEW_SOURCE_
   );
 });
 
+test("metadata absent but non-whitespace content within the cap still shows the pinned row", async () => {
+  // Mirrors sources (e.g. the e2e mock bridge) that never populate
+  // author/updatedAt even though a canvas body exists: presence must fall
+  // back to a bounded scan of the content rather than staying null.
+  const { result } = await renderCanvasHook({
+    canvasData: {
+      content: "# Kickoff\n\nThe plan lives here.",
+      updatedAt: null,
+      author: null,
+    },
+  });
+
+  assert.notEqual(
+    result.current,
+    null,
+    "the row must appear when non-whitespace content is found within the bounded cap, even without metadata",
+  );
+});
+
 test("canvas query error returns unavailable preview row rather than null", async () => {
   const { CANVAS_UNAVAILABLE_PREVIEW } = await import("./canvasPreview.ts");
   const { waitFor } = await import("@testing-library/react");
