@@ -569,6 +569,12 @@ type E2eConfig = {
       kind: "markdown" | "file";
       /** Body returned by `read_path_link_markdown` for a markdown file. */
       text?: string;
+      /**
+       * When set, `read_path_link_markdown` throws this message instead of
+       * returning `text` — lets a spec drive the panel's local error branch,
+       * which words its failure differently from a relay fetch failure.
+       */
+      readError?: string;
     }>;
     // Seed rows returned by `list_save_subscriptions`. Each entry uses the same
     // snake_case wire shape the Rust backend returns so tests can drive the
@@ -14569,6 +14575,7 @@ export function maybeInstallE2eTauriMocks() {
         }
         if (!entry) throw new Error("That file is no longer on this Mac.");
         if (command === "open_path_link") return null;
+        if (entry.readError) throw new Error(entry.readError);
         if (entry.kind !== "markdown") {
           throw new Error(
             "That file is not a markdown document the viewer can render.",

@@ -44,7 +44,11 @@ async function commands(page: Page) {
   );
 }
 
-async function seedMessage(page: Page, content: string) {
+async function seedMessage(
+  page: Page,
+  content: string,
+  overrides: { readError?: string } = {},
+) {
   await installMockBridge(page, {
     pathLinkFiles: [
       {
@@ -53,6 +57,7 @@ async function seedMessage(page: Page, content: string) {
         filename: "path-link-note.md",
         kind: "markdown",
         text: FIXTURE_TEXT,
+        ...overrides,
       },
     ],
   });
@@ -118,4 +123,50 @@ test("a bare word is never treated as a path", async ({ page }) => {
 
   await expect(page.locator("[data-path-link]")).toHaveCount(0);
   expect(await commands(page)).not.toContain("resolve_path_link");
+});
+
+test("the viewer's primary action opens a local document, never the relay download", async ({
+  page,
+}) => {
+  // The panel serves both a relay attachment and a local file. For a local
+  // one the primary action hands the path to `open_path_link`, which
+  // re-resolves it natively; sending it to `download_file` would drive a file
+  // that is already on this Mac through the relay.
+  await seedMessage(page, `Report is ready: \`${CANDIDATE}\``);
+
+  const token = page.locator(`[data-path-link]`, { hasText: CANDIDATE }).last();
+  await token.hover();
+  await token.getByRole("button", { name: "Open path-link-note.md" }).click();
+
+  const panel = page.getByTestId("markdown-doc-panel");
+  await expect(panel).toBeVisible();
+  const primaryAction = panel.getByTestId("markdown-doc-download");
+  await expect(primaryAction).toHaveAttribute(
+    "aria-label",
+    "Open path-link-note.md",
+  );
+  await primaryAction.click();
+
+  await expect.poll(() => commands(page)).toContain("open_path_link");
+  expect(await commands(page)).not.toContain("download_file");
+});
+
+test("a local document that fails to read says so without blaming the relay", async ({
+  page,
+}) => {
+  await seedMessage(page, `Report is ready: \`${CANDIDATE}\``, {
+    readError: "This file is too large to preview.",
+  });
+
+  const token = page.locator(`[data-path-link]`, { hasText: CANDIDATE }).last();
+  await token.hover();
+  await token.getByRole("button", { name: "Open path-link-note.md" }).click();
+
+  const panel = page.getByTestId("markdown-doc-panel");
+  await expect(panel).toBeVisible();
+  // The native reason is surfaced, not swallowed into a generic failure, and
+  // not worded as a relay fetch failure.
+  await expect(panel).toContainText("This file is too large to preview.");
+  await expect(panel).not.toContainText("from the relay");
+  await expect(panel.getByRole("button", { name: "Open file" })).toBeVisible();
 });

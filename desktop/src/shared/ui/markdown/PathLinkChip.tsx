@@ -4,11 +4,8 @@ import { toast } from "sonner";
 import { invokeTauri } from "@/shared/api/tauri";
 import { cn } from "@/shared/lib/cn";
 
-import {
-  localMarkdownDocUrl,
-  type PathLinkTarget,
-  resolvePathLink,
-} from "./pathLinks";
+import { usePathLinkResolution } from "./pathLinkResolution";
+import { localMarkdownDocUrl, type PathLinkTarget } from "./pathLinks";
 import { useMarkdownDocViewer } from "./markdownDocViewerContext";
 import { useMarkdownRuntime } from "./runtimeContext";
 
@@ -16,16 +13,6 @@ type PathLinkChipProps = React.ComponentProps<"code"> & {
   /** The token's literal text — the path candidate to resolve. */
   text: string;
 };
-
-type ResolutionState =
-  /** Nothing asked yet. No IPC has happened for this token. */
-  | { status: "idle" }
-  /** A resolution is in flight; further triggers are ignored. */
-  | { status: "pending" }
-  /** The resolver answered "not a link"; the token stays plain text. */
-  | { status: "text" }
-  /** The resolver found a file. */
-  | { status: "link"; target: PathLinkTarget };
 
 function errorMessage(error: unknown, fallback: string): string {
   return error instanceof Error && error.message ? error.message : fallback;
@@ -42,6 +29,10 @@ function errorMessage(error: unknown, fallback: string): string {
  * becomes a link that opens the file — a markdown document in the in-app
  * viewer panel, anything else with the OS default handler. Neither path ever
  * executes the file, and neither asks the relay.
+ *
+ * The resolution lives in `usePathLinkResolution`, which retires an answer
+ * whose message has since been edited, so what a click opens is always what
+ * the token it was aimed at said.
  */
 export function PathLinkChip({
   children,
@@ -51,53 +42,7 @@ export function PathLinkChip({
 }: PathLinkChipProps) {
   const { pathLinkSenderPubkey } = useMarkdownRuntime();
   const openMarkdownDoc = useMarkdownDocViewer();
-  const [state, setState] = React.useState<ResolutionState>({ status: "idle" });
-  // Resolution outlives a hover, so the setter must not write into an
-  // unmounted token.
-  const mountedRef = React.useRef(true);
-  React.useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-    };
-  }, []);
-
   const senderPubkey = pathLinkSenderPubkey ?? null;
-  // `resolve` is the only writer of both; the ref lets a click act on the
-  // resolution it just triggered without waiting for a render.
-  const stateRef = React.useRef<ResolutionState>({ status: "idle" });
-
-  /**
-   * Resolve once, and answer with the settled state so a click can act on the
-   * result of the resolution it triggered rather than waiting for a render.
-   */
-  const resolve = React.useCallback(async (): Promise<ResolutionState> => {
-    const current = stateRef.current;
-    if (current.status !== "idle") return current;
-    setState({ status: "pending" });
-    stateRef.current = { status: "pending" };
-    try {
-      const target = await resolvePathLink(
-        text,
-        senderPubkey,
-        (command, args) => invokeTauri(command, args),
-      );
-      const settled: ResolutionState = target
-        ? { status: "link", target }
-        : { status: "text" };
-      stateRef.current = settled;
-      if (mountedRef.current) setState(settled);
-      return settled;
-    } catch (error) {
-      // A refusal from the resolver is a real failure, not a "not a link":
-      // say so instead of silently leaving the token as text.
-      const settled: ResolutionState = { status: "text" };
-      stateRef.current = settled;
-      if (mountedRef.current) setState(settled);
-      toast.error(errorMessage(error, "Couldn't check that path."));
-      return settled;
-    }
-  }, [senderPubkey, text]);
 
   const open = React.useCallback(
     (target: PathLinkTarget) => {
@@ -118,11 +63,13 @@ export function PathLinkChip({
     [openMarkdownDoc, senderPubkey],
   );
 
-  const activate = React.useCallback(() => {
-    void resolve().then((settled) => {
-      if (settled.status === "link") open(settled.target);
-    });
-  }, [open, resolve]);
+  const { state, resolve, activate } = usePathLinkResolution({
+    invoke: (command, args) => invokeTauri(command, args),
+    onError: (message) => toast.error(message),
+    onOpen: open,
+    senderPubkey,
+    text,
+  });
 
   const isLink = state.status === "link";
   // Resolution said "not a link": the token is ordinary text from here on, so
@@ -150,12 +97,8 @@ export function PathLinkChip({
             "cursor-pointer underline decoration-dotted underline-offset-2",
         )}
         onClick={activate}
-        onFocus={() => {
-          void resolve();
-        }}
-        onPointerEnter={() => {
-          void resolve();
-        }}
+        onFocus={resolve}
+        onPointerEnter={resolve}
         title={isLink ? state.target.path : undefined}
         type="button"
       >

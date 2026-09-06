@@ -33,6 +33,11 @@ export const MAX_PATH_LINK_BYTES = 4096;
  * A token with no slash is a path only when it names a document; a bare word
  * (`cargo`, `SIGKILL`) never qualifies, and neither does a slash-free script
  * or binary name — those are the tokens most likely to be prose or a command.
+ *
+ * The same list is the *native* allowlist for what a resolved link may be
+ * (`OPENABLE_EXTENSIONS` in `commands/path_links.rs`): a token with a slash
+ * still reaches the resolver, and the resolver refuses anything the OS
+ * default handler would run rather than display. Keep the two in sync.
  */
 const DOCUMENT_EXTENSIONS = [
   ".md",
@@ -70,7 +75,10 @@ export type PathLinkTarget = {
   path: string;
   /** Final path component, for the link title and the panel header. */
   filename: string;
-  /** `markdown` opens in the in-app viewer; `file` goes to the OS opener. */
+  /**
+   * `markdown` opens in the in-app viewer; `file` goes to the OS opener, and
+   * the resolver has already proven it is an inert, non-executable document.
+   */
   kind: PathLinkKind;
   /** Size of the resolved file in bytes. */
   sizeBytes: number;

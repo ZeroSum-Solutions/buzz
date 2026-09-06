@@ -454,6 +454,11 @@ type MockBridgeOptions = {
     filename: string;
     kind: "markdown" | "file";
     text?: string;
+    /**
+     * When set, `read_path_link_markdown` throws this message so a spec can
+     * drive the viewer panel's local (not relay) error branch.
+     */
+    readError?: string;
   }>;
   uploadDescriptors?: {
     url: string;
