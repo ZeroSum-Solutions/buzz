@@ -353,6 +353,11 @@ pub struct PromptResult {
     pub outcome: PromptOutcome,
     /// Present on failure in Queue mode, for requeue.
     pub batch: Option<FlushBatch>,
+    /// Whether the harness saw agent output or a tool call for this turn.
+    ///
+    /// A batch whose turn started is never replayed automatically: the agent
+    /// may already have acted on it, so it waits for an operator instead.
+    pub started: bool,
 }
 
 /// Whether the prompt came from a channel event or a heartbeat.
@@ -2015,12 +2020,16 @@ fn send_prompt_result(
     batch: Option<FlushBatch>,
 ) {
     agent.acp.clear_steer_rx();
+    // Read the started signal here, in the one place every prompt outcome
+    // passes through, so no exit path can forget to report it.
+    let started = agent.acp.turn_saw_output();
     let _ = result_tx.send(PromptResult {
         agent,
         source,
         turn_id: turn_id.to_owned(),
         outcome,
         batch,
+        started,
     });
 }
 
@@ -6416,6 +6425,7 @@ mod tests {
         let author_hex = event.pubkey.to_hex();
         let channel_id = Uuid::new_v4();
         let batch = FlushBatch {
+            batch_id: Uuid::new_v4(),
             channel_id,
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
@@ -6668,6 +6678,7 @@ done"#
                 .unwrap();
             let event_id = event.id.to_hex();
             let batch = FlushBatch {
+                batch_id: Uuid::new_v4(),
                 channel_id,
                 scope: SessionScope::Conversation { channel_id },
                 events: vec![crate::queue::BatchEvent {
@@ -6751,6 +6762,7 @@ done"#
             .sign_with_keys(&keys)
             .unwrap();
         let merged_batch = FlushBatch {
+            batch_id: Uuid::new_v4(),
             channel_id,
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
@@ -6766,6 +6778,7 @@ done"#
             cancel_reason: Some(crate::queue::CancelReason::Steer),
         };
         let next_batch = FlushBatch {
+            batch_id: Uuid::new_v4(),
             channel_id,
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
@@ -6922,6 +6935,7 @@ done"#
             .sign_with_keys(&keys)
             .unwrap();
         let batch = FlushBatch {
+            batch_id: Uuid::new_v4(),
             channel_id,
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
@@ -7279,6 +7293,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     fn batch_with_scope(scope: SessionScope, event: nostr::Event) -> FlushBatch {
         FlushBatch {
+            batch_id: Uuid::new_v4(),
             channel_id: scope.channel_id(),
             scope,
             events: vec![crate::queue::BatchEvent {
@@ -7641,6 +7656,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             .sign_with_keys(&keys)
             .unwrap();
         FlushBatch {
+            batch_id: Uuid::new_v4(),
             channel_id,
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
@@ -9389,6 +9405,7 @@ done"#
             .unwrap();
         let event_id = event.id.to_hex();
         let batch = FlushBatch {
+            batch_id: Uuid::new_v4(),
             channel_id,
             scope: conv(channel_id),
             events: vec![crate::queue::BatchEvent {

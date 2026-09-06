@@ -268,6 +268,12 @@ pub struct AcpClient {
     /// a JSON-RPC *success*, not `-32601` — which the main loop would read as
     /// a delivered steer and drop the user's message from the queue.
     steering_supported: bool,
+    /// Whether this turn produced agent output or a tool call.
+    ///
+    /// The reliability path calls a batch **started** when this is true: a
+    /// started batch is never replayed automatically, because the agent may
+    /// already have acted on it. Reset at the top of every prompt.
+    turn_saw_output: bool,
     /// Per-turn channel for receiving goose-native non-cancelling steer
     /// requests from the main loop. Installed by
     /// [`install_steer_rx`](Self::install_steer_rx) at dispatch and
@@ -627,6 +633,7 @@ impl AcpClient {
             observer_context: ObserverContext::default(),
             active_run_id: None,
             steering_supported: false,
+            turn_saw_output: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
@@ -858,6 +865,9 @@ impl AcpClient {
         // misattributed to this turn.
         self.goose_usage.begin_turn(session_id);
         self.standard_usage.begin_turn(session_id);
+        // Reset the started signal for this turn, alongside the usage
+        // trackers, so activity from a previous turn is never attributed here.
+        self.turn_saw_output = false;
 
         self.last_prompt_id = Some(self.next_id);
         let id = self.next_id;
@@ -947,6 +957,12 @@ impl AcpClient {
     /// for the supervisor's post-initialize log line.
     pub fn steering_supported(&self) -> bool {
         self.steering_supported
+    }
+
+    /// Whether the agent produced output or started a tool call during the most
+    /// recent turn. See [`turn_saw_output`](Self::turn_saw_output) on the field.
+    pub fn turn_saw_output(&self) -> bool {
+        self.turn_saw_output
     }
 
     /// Consume per-turn usage for NIP-AM publishing. Goose/buzz-agent is an
@@ -1763,6 +1779,9 @@ impl AcpClient {
                     if let Some(method) = msg.get("method").and_then(|v| v.as_str()) {
                         match method {
                             "session/update" => {
+                                // Any session update is agent output or a tool
+                                // call: the turn has started.
+                                self.turn_saw_output = true;
                                 if self.handle_session_update(&msg) {
                                     let activity_now = Instant::now();
                                     idle_deadline = activity_now + idle_timeout;
@@ -1771,6 +1790,7 @@ impl AcpClient {
                                 }
                             }
                             "_goose/unstable/session/update" => {
+                                self.turn_saw_output = true;
                                 self.handle_goose_usage_update(&msg);
                             }
                             "session/request_permission" => {

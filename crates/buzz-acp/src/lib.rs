@@ -16,7 +16,7 @@ mod prompt_framing;
 mod prompt_project;
 mod queue;
 mod relay;
-mod reliability;
+pub mod reliability;
 mod scope;
 mod setup_mode;
 mod usage;
@@ -1608,6 +1608,7 @@ async fn publish_relay_observer_event(
 /// Maximum age (seconds) for an observer control frame to be considered fresh.
 const OBSERVER_CONTROL_FRESHNESS_SECS: i64 = 300;
 
+#[allow(clippy::too_many_arguments)]
 fn handle_relay_observer_control_event(
     keys: &nostr::Keys,
     event: nostr::Event,
@@ -1615,6 +1616,8 @@ fn handle_relay_observer_control_event(
     observer: Option<&observer::ObserverHandle>,
     owner_pubkey_hex: &str,
     event_publisher: RelayEventPublisher,
+    reliability: Option<&mut reliability::ReliabilityRuntime>,
+    queue: &mut EventQueue,
 ) {
     // Defense-in-depth: verify signature even though the relay already checked.
     if let Err(e) = buzz_core::verify_event(&event) {
@@ -1667,6 +1670,12 @@ fn handle_relay_observer_control_event(
                 observer,
                 event_publisher,
             );
+        }
+        // T16 operator controls. They reach here only after the owner check,
+        // the signature check and the freshness check above — the same gate
+        // `switch_model` passes.
+        Some(command @ ("replay_batch" | "discard_batch" | "resume_now" | "keep_paused")) => {
+            handle_reliability_control(command, &payload, reliability, queue, observer);
         }
         _ => {
             tracing::debug!(payload = %payload, "ignoring unknown observer control frame");
@@ -1951,6 +1960,132 @@ fn handle_switch_model_control(
             }),
         );
     }
+}
+
+/// Longest `batchId` string a control frame may carry before it is refused.
+///
+/// A UUID is 36 characters. The frame is relay-sourced, so the field is capped
+/// at the DTO before it is parsed, not after.
+const MAX_CONTROL_BATCH_ID_CHARS: usize = 64;
+
+/// Handle the T16 operator control frames: `replay_batch`, `discard_batch`,
+/// `resume_now` and `keep_paused`.
+///
+/// Every one of these reaches the harness only from the agent's owner: the
+/// caller ([`handle_relay_observer_control_event`]) verifies the signature,
+/// rejects a sender that is not the resolved owner, and rejects a frame outside
+/// the freshness window before dispatching here.
+fn handle_reliability_control(
+    command: &str,
+    payload: &serde_json::Value,
+    reliability: Option<&mut reliability::ReliabilityRuntime>,
+    queue: &mut EventQueue,
+    observer: Option<&observer::ObserverHandle>,
+) {
+    let Some(reliability) = reliability else {
+        tracing::warn!(
+            command,
+            "reliability control frame ignored — no state directory"
+        );
+        return;
+    };
+    let now = chrono::Utc::now();
+    let status = match command {
+        "replay_batch" => match control_batch_id(payload) {
+            Some(batch_id) => match reliability.force_replay(batch_id) {
+                Ok(true) => {
+                    // Staging happens on the next successful turn for the
+                    // scope, through the same replay path an automatic replay
+                    // uses, so the ledger record still precedes the send.
+                    tracing::info!(%batch_id, "operator marked a parked batch for replay");
+                    "queued"
+                }
+                Ok(false) => "unknown_batch",
+                Err(error) => {
+                    tracing::error!(%batch_id, error = %error, "replay_batch failed");
+                    "write_failed"
+                }
+            },
+            None => "invalid_batch_id",
+        },
+        "discard_batch" => match control_batch_id(payload) {
+            Some(batch_id) => match reliability.discard(batch_id, "operator", now) {
+                Ok(true) => "discarded",
+                Ok(false) => "unknown_batch",
+                Err(error) => {
+                    tracing::error!(%batch_id, error = %error, "discard_batch failed");
+                    "write_failed"
+                }
+            },
+            None => "invalid_batch_id",
+        },
+        "resume_now" => {
+            if reliability.state().resume_now() {
+                reliability.record(
+                    now,
+                    reliability::ledger::LedgerBody::AgentResumed(
+                        reliability::ledger::AgentResumed {},
+                    ),
+                );
+                // Queued work is now dispatchable; the next dispatch tick picks
+                // it up as the probe.
+                let _ = queue.has_flushable_work();
+                "resumed"
+            } else {
+                "not_paused"
+            }
+        }
+        "keep_paused" => match payload
+            .get("until")
+            .and_then(|value| value.as_str())
+            .and_then(|value| {
+                chrono::DateTime::parse_from_rfc3339(&reliability::error_class::truncate_chars(
+                    value, 64,
+                ))
+                .ok()
+            }) {
+            Some(until) => {
+                let until = reliability
+                    .state()
+                    .keep_paused(until.with_timezone(&chrono::Utc), now);
+                reliability.record(
+                    now,
+                    reliability::ledger::LedgerBody::AgentPaused(
+                        reliability::ledger::AgentPaused {
+                            class: "operator".to_string(),
+                            until,
+                            waiting: 0,
+                        },
+                    ),
+                );
+                "paused"
+            }
+            None => "invalid_until",
+        },
+        _ => "unknown_command",
+    };
+
+    if let Some(observer) = observer {
+        observer.emit(
+            "control_result",
+            None,
+            &observer::ObserverContext::default(),
+            serde_json::json!({ "type": command, "status": status }),
+        );
+    }
+}
+
+/// Read and validate a control frame's `batchId`.
+fn control_batch_id(payload: &serde_json::Value) -> Option<Uuid> {
+    let raw = payload.get("batchId").and_then(|value| value.as_str())?;
+    if raw.len() > MAX_CONTROL_BATCH_ID_CHARS {
+        tracing::warn!(
+            len = raw.len(),
+            "control frame batchId is over the length cap — dropping"
+        );
+        return None;
+    }
+    raw.parse::<Uuid>().ok()
 }
 
 /// Maximum crashes in a 60-second window before a slot's circuit opens.
@@ -2794,6 +2929,45 @@ async fn tokio_main() -> Result<()> {
     let mut queue =
         EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);
 
+    // T16 durable reliability state: the ledger and the park file in this
+    // agent's own state directory. The harness runs without it if the
+    // directory cannot be opened — a broken state directory must not stop the
+    // agent answering — but the failure is loud, because parking is what keeps
+    // messages from being lost.
+    let mut reliability = match reliability::ReliabilityRuntime::open(
+        &config.keys.public_key().to_hex(),
+        chrono::Utc::now(),
+    ) {
+        Ok(mut runtime) => {
+            match runtime.reconcile_on_start(chrono::Utc::now()) {
+                Ok(report) if !report.is_empty() => tracing::warn!(
+                    crashed_mid_replay = report.crashed_mid_replay,
+                    aged_out = report.aged_out,
+                    over_scope_cap = report.over_scope_cap,
+                    "parked batches moved to the review list at start-up"
+                ),
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(error = %error, "park file reconciliation failed at start-up")
+                }
+            }
+            tracing::info!(
+                state_dir = %runtime.dir().display(),
+                parked = runtime.park().batches().len(),
+                "reliability state opened"
+            );
+            Some(runtime)
+        }
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "could not open the agent state directory — parked batches will NOT survive a \
+                 restart; set BUZZ_ACP_STATE_DIR to a writable path"
+            );
+            None
+        }
+    };
+
     // Online means the harness can receive work, not merely that its socket is
     // connected. Publishing after channel subscriptions gives desktop callers
     // a durable readiness boundary before they send a startup mention.
@@ -3106,9 +3280,13 @@ async fn tokio_main() -> Result<()> {
             // called on relay events or pool results, neither of which
             // arrive when the channel is silent.
             if queue.has_flushable_work() {
-                for (scope, thread_tags) in
-                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
-                {
+                for (scope, thread_tags) in dispatch_pending(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut last_activity,
+                    reliability.as_mut(),
+                ) {
                     typing_channels.insert(scope, thread_tags);
                 }
             }
@@ -3158,9 +3336,13 @@ async fn tokio_main() -> Result<()> {
         // this, batches requeued during crash recovery sit idle until the
         // next relay event arrives — which can be minutes on quiet channels.
         if respawn_collected {
-            for (scope, thread_tags) in
-                dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
-            {
+            for (scope, thread_tags) in dispatch_pending(
+                &mut pool,
+                &mut queue,
+                &ctx,
+                &mut last_activity,
+                reliability.as_mut(),
+            ) {
                 typing_channels.insert(scope, thread_tags);
             }
         }
@@ -3245,6 +3427,8 @@ async fn tokio_main() -> Result<()> {
                                     observer.as_ref(),
                                     owner_hex,
                                     relay.event_publisher(),
+                                    reliability.as_mut(),
+                                    &mut queue,
                                 );
                             } else {
                                 tracing::warn!("observer control frame received but no owner resolved — dropping");
@@ -3598,7 +3782,7 @@ async fn tokio_main() -> Result<()> {
                             );
                             if pool_ready {
                                 for (scope, thread_tags) in
-                                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+                                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity, reliability.as_mut())
                                 {
                                     typing_channels.insert(scope, thread_tags);
                                 }
@@ -3698,7 +3882,7 @@ async fn tokio_main() -> Result<()> {
                     } else if queue.has_flushable_work() {
                         tracing::debug!("heartbeat_skipped_events");
                         for (scope, thread_tags) in
-                            dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+                            dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity, reliability.as_mut())
                         {
                             typing_channels.insert(scope, thread_tags);
                         }
@@ -3780,6 +3964,7 @@ async fn tokio_main() -> Result<()> {
                     &mut respawn_tasks,
                     observer.clone(),
                     Some(&ctx.rest_client),
+                    reliability.as_mut(),
                 ) == LoopAction::Exit
                 {
                     break;
@@ -3799,9 +3984,13 @@ async fn tokio_main() -> Result<()> {
                 {
                     break;
                 }
-                for (scope, thread_tags) in
-                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
-                {
+                for (scope, thread_tags) in dispatch_pending(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut last_activity,
+                    reliability.as_mut(),
+                ) {
                     typing_channels.insert(scope, thread_tags);
                 }
             }
@@ -3824,9 +4013,26 @@ async fn tokio_main() -> Result<()> {
                     tracing::error!("all agents dead — exiting");
                     break;
                 }
-                for (scope, thread_tags) in
-                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
-                {
+                // A panicked turn's batch goes through `queue.requeue` too, so
+                // it can reach the park hand-off with no prompt result to drain
+                // it. Drain here rather than leave client messages in memory.
+                if queue.has_parked_handoff() {
+                    if let Some(reliability) = reliability.as_mut() {
+                        drain_park_handoff(
+                            reliability,
+                            &mut queue,
+                            Some(&ctx.rest_client),
+                            chrono::Utc::now(),
+                        );
+                    }
+                }
+                for (scope, thread_tags) in dispatch_pending(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut last_activity,
+                    reliability.as_mut(),
+                ) {
                     typing_channels.insert(scope, thread_tags);
                 }
             }
@@ -3978,9 +4184,13 @@ async fn tokio_main() -> Result<()> {
                 // tear down the in-flight task; on its completion the
                 // queue drains. We still try here in case the in-flight
                 // task has already returned.
-                for (scope, thread_tags) in
-                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
-                {
+                for (scope, thread_tags) in dispatch_pending(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut last_activity,
+                    reliability.as_mut(),
+                ) {
                     typing_channels.insert(scope, thread_tags);
                 }
             }
@@ -4006,9 +4216,13 @@ async fn tokio_main() -> Result<()> {
                             "ready",
                             None,
                         );
-                        for (scope, thread_tags) in
-                            dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
-                        {
+                        for (scope, thread_tags) in dispatch_pending(
+                            &mut pool,
+                            &mut queue,
+                            &ctx,
+                            &mut last_activity,
+                            reliability.as_mut(),
+                        ) {
                             typing_channels.insert(scope, thread_tags);
                         }
                     }
@@ -4397,6 +4611,7 @@ fn dispatch_pending(
     queue: &mut EventQueue,
     ctx: &Arc<PromptContext>,
     last_activity: &mut tokio::time::Instant,
+    mut reliability: Option<&mut reliability::ReliabilityRuntime>,
 ) -> Vec<(scope::SessionScope, ThreadTags)> {
     // Keyed by the exact session scope, not the channel: two threads dispatching
     // concurrently in one channel get distinct typing entries so completing one
@@ -4415,6 +4630,54 @@ fn dispatch_pending(
         };
         let channel_id = batch.channel_id;
         let scope = batch.scope.clone();
+        // T16 gating. While the agent is paused (a provider capacity limit) or
+        // a scope's breaker is open, nothing runs but the probe. Held batches
+        // stay flushed-out so `flush_next` cannot re-pick them in this loop,
+        // and are returned to the queue at the end — the same mechanism the
+        // busy-session-owner hold uses.
+        if let Some(reliability) = reliability.as_deref_mut() {
+            let now = chrono::Utc::now();
+            match reliability.state().pause_gate(now) {
+                reliability::PauseGate::Held { until } => {
+                    tracing::debug!(
+                        channel = %channel_id,
+                        scope = %scope.telemetry_label(),
+                        %until,
+                        "holding batch — agent paused until the provider reset"
+                    );
+                    held.push(batch);
+                    continue;
+                }
+                reliability::PauseGate::Probe => {
+                    tracing::info!(
+                        channel = %channel_id,
+                        scope = %scope.telemetry_label(),
+                        "pause expired — sending one batch as the probe"
+                    );
+                }
+                reliability::PauseGate::Open => {}
+            }
+            match reliability.state().breaker_gate(&scope, now) {
+                reliability::BreakerGate::Held { next_probe } => {
+                    tracing::debug!(
+                        channel = %channel_id,
+                        scope = %scope.telemetry_label(),
+                        %next_probe,
+                        "holding batch — scope breaker open"
+                    );
+                    held.push(batch);
+                    continue;
+                }
+                reliability::BreakerGate::Probe => {
+                    tracing::info!(
+                        channel = %channel_id,
+                        scope = %scope.telemetry_label(),
+                        "breaker probe interval elapsed — sending one batch as the probe"
+                    );
+                }
+                reliability::BreakerGate::Closed => {}
+            }
+        }
         // Authoritative affinity: if the worker that owns this thread's session
         // is checked out (busy on another turn), hold the batch rather than let
         // an idle worker open a second session for the same thread.
@@ -4452,6 +4715,12 @@ fn dispatch_pending(
             DedupMode::Queue => Some(batch.clone()),
             DedupMode::Drop => None,
         };
+        // Captured before the batch moves into the spawned task; the ledger
+        // record is written after the spawn so a failed claim writes nothing.
+        let dispatched_batch_id = batch.batch_id;
+        let dispatched_attempt = queue.retry_count(&scope);
+        let dispatched_event_ids: Vec<String> =
+            batch.events.iter().map(|be| be.event.id.to_hex()).collect();
 
         let result_tx = pool.result_tx();
         let ctx_clone = Arc::clone(ctx);
@@ -4505,6 +4774,20 @@ fn dispatch_pending(
         // Record this worker as the scope's session owner so a later dispatch
         // while it is busy holds instead of forking a duplicate session.
         pool.record_scope_owner(scope.clone(), agent_index);
+        if let Some(reliability) = reliability.as_deref_mut() {
+            reliability.record(
+                chrono::Utc::now(),
+                reliability::ledger::LedgerBody::TurnStarted(
+                    reliability::ledger::TurnStarted::new(
+                        dispatched_batch_id,
+                        channel_id,
+                        &scope.telemetry_label(),
+                        dispatched_event_ids,
+                        dispatched_attempt,
+                    ),
+                ),
+            );
+        }
         dispatched_channels.push((scope, typing_scope));
         *last_activity = tokio::time::Instant::now();
     }
@@ -4551,7 +4834,7 @@ fn is_auth_error(error: &acp::AcpError) -> bool {
     let acp::AcpError::AgentError { message, .. } = error else {
         return false;
     };
-    message.contains("Re-authenticate") || message.contains("API Error: 401")
+    reliability::error_class::is_auth_text(message)
 }
 
 /// Spawn a task that posts a user-visible failure notice to the relay.
@@ -4577,6 +4860,289 @@ fn spawn_failure_notice(
     }
 }
 
+/// What the reliability path did with a failed batch.
+enum Disposition {
+    /// The reliability path took ownership of the batch. Nothing else runs.
+    Handled,
+    /// Not a reliability case; the batch goes back to the pre-existing
+    /// requeue path.
+    Fallthrough(FlushBatch),
+}
+
+/// Drive the pause, breaker and park machinery for one failed batch.
+///
+/// Ordering: the park file is written and fsynced **before** the batch is
+/// dropped, so a crash between the two leaves the batch in the queue's park
+/// hand-off (still in memory, retried on the next tick), never nowhere.
+fn apply_reliability(
+    reliability: &mut reliability::ReliabilityRuntime,
+    queue: &mut EventQueue,
+    batch: FlushBatch,
+    outcome: &PromptOutcome,
+    started: bool,
+    rest_client: Option<&relay::RestClient>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Disposition {
+    use reliability::ledger::{self as led, LedgerBody};
+
+    let scope = batch.scope.clone();
+    match outcome {
+        PromptOutcome::Timeout(pool::TimeoutKind::Hard { recently_active }) => {
+            // A hard cap means the agent process is gone. Nothing about a
+            // retry is safe, so the batch is parked either way; only whether
+            // it can replay on its own depends on the started signal.
+            let started = started || *recently_active;
+            reliability.record(
+                now,
+                LedgerBody::TurnFinished(led::TurnFinished {
+                    batch_id: batch.batch_id,
+                    channel_id: batch.channel_id,
+                    outcome: led::TurnOutcome::timeout("hard", started),
+                }),
+            );
+            park_or_fallthrough(
+                reliability,
+                batch,
+                reliability::ParkReason::HardTimeout,
+                started,
+                rest_client,
+                now,
+            )
+        }
+        PromptOutcome::Error(error) => {
+            let class = reliability::classify_at(error, now);
+            reliability.record(
+                now,
+                LedgerBody::TurnFinished(led::TurnFinished {
+                    batch_id: batch.batch_id,
+                    channel_id: batch.channel_id,
+                    outcome: led::TurnOutcome::error(class.as_str(), &error.to_string()),
+                }),
+            );
+            let action = reliability.state().on_failure(&scope, class.clone(), now);
+            match action {
+                reliability::Action::Retry => Disposition::Fallthrough(batch),
+                reliability::Action::Park => {
+                    // Auth: a re-login fixes it, a retry never does.
+                    park_or_fallthrough(
+                        reliability,
+                        batch,
+                        reliability::ParkReason::Auth,
+                        true,
+                        rest_client,
+                        now,
+                    )
+                }
+                reliability::Action::Pause { until } => {
+                    let waiting = batch.events.len();
+                    reliability.record(
+                        now,
+                        LedgerBody::AgentPaused(led::AgentPaused {
+                            class: class.as_str().to_string(),
+                            until,
+                            waiting,
+                        }),
+                    );
+                    // No retry is spent on a pause: the events go back with
+                    // their original timestamps and no backoff.
+                    let channel_id = batch.channel_id;
+                    let notice_batch = batch.clone();
+                    queue.requeue_preserve_timestamps(batch);
+                    if reliability.state().claim_pause_notice(channel_id) {
+                        spawn_failure_notice(
+                            rest_client,
+                            &notice_batch,
+                            reliability::notices::pause("", until, waiting),
+                        );
+                    }
+                    Disposition::Handled
+                }
+                reliability::Action::OpenBreaker => {
+                    let consecutive = reliability
+                        .state_ref()
+                        .breaker_consecutive(&scope)
+                        .unwrap_or(reliability::state::BREAKER_THRESHOLD);
+                    let first_open = reliability
+                        .state_ref()
+                        .breaker_opened_at(&scope)
+                        .is_some_and(|opened| opened == now);
+                    reliability.record(
+                        now,
+                        LedgerBody::BreakerOpened(led::BreakerOpened {
+                            scope: scope.telemetry_label(),
+                            consecutive,
+                        }),
+                    );
+                    let notice_batch = batch.clone();
+                    queue.requeue_preserve_timestamps(batch);
+                    if first_open {
+                        spawn_failure_notice(
+                            rest_client,
+                            &notice_batch,
+                            reliability::notices::breaker(""),
+                        );
+                    }
+                    Disposition::Handled
+                }
+            }
+        }
+        _ => Disposition::Fallthrough(batch),
+    }
+}
+
+/// Park a batch, or hand it back to the retry path when the park write failed.
+///
+/// A failed park is logged and counted, never swallowed: the batch returns to
+/// the caller so the pre-existing requeue keeps it in the queue.
+fn park_or_fallthrough(
+    reliability: &mut reliability::ReliabilityRuntime,
+    batch: FlushBatch,
+    reason: reliability::ParkReason,
+    started: bool,
+    rest_client: Option<&relay::RestClient>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Disposition {
+    match reliability.park_batch(&batch, reason, started, now) {
+        Ok(()) => {
+            let content = if started {
+                reliability::notices::needs_review()
+            } else {
+                reliability::notices::parked(reason.as_str())
+            };
+            spawn_failure_notice(rest_client, &batch, content);
+            Disposition::Handled
+        }
+        Err(error) => {
+            tracing::error!(
+                channel_id = %batch.channel_id,
+                batch_id = %batch.batch_id,
+                events = batch.events.len(),
+                error = %error,
+                "could not park the batch — keeping it in the queue rather than losing it"
+            );
+            Disposition::Fallthrough(batch)
+        }
+    }
+}
+
+/// Write every batch the queue gave up retrying to the park file.
+///
+/// A batch whose park write fails goes back to the hand-off and is retried on
+/// the next drain; it is never dropped here.
+fn drain_park_handoff(
+    reliability: &mut reliability::ReliabilityRuntime,
+    queue: &mut EventQueue,
+    rest_client: Option<&relay::RestClient>,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    for handoff in queue.take_parked() {
+        let reason = match handoff.reason {
+            queue::ParkHandoffReason::RetriesExhausted => reliability::ParkReason::RetriesExhausted,
+        };
+        match reliability.park_batch(&handoff.batch, reason, false, now) {
+            Ok(()) => {
+                spawn_failure_notice(
+                    rest_client,
+                    &handoff.batch,
+                    reliability::notices::parked(reason.as_str()),
+                );
+            }
+            Err(error) => {
+                tracing::error!(
+                    channel_id = %handoff.batch.channel_id,
+                    batch_id = %handoff.batch.batch_id,
+                    events = handoff.batch.events.len(),
+                    error = %error,
+                    "park file write failed — holding the batch in memory for the next attempt"
+                );
+                if !queue.return_unparked(handoff) {
+                    tracing::error!(
+                        "park hand-off overflowed while the park file was unwritable — \
+                         the operator must fix the state directory"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// After a successful live turn, release any batches that turn replayed and
+/// stage the next parked batches for the same scope.
+///
+/// `batch_replayed` is written **before** the events are staged for sending, so
+/// a crash between the two is visible at the next start and moves the batch to
+/// the review list rather than replaying it twice.
+fn replay_after_success(
+    reliability: &mut reliability::ReliabilityRuntime,
+    queue: &mut EventQueue,
+    scope: &scope::SessionScope,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    use reliability::ledger::{self as led, LedgerBody};
+
+    // A `turn_finished` for every batch this turn replayed: the pair
+    // (`batch_replayed`, `turn_finished`) is what tells a later start-up that
+    // the replay completed and must not run again.
+    match reliability.finish_replay(scope) {
+        Ok(released) => {
+            for batch_id in released {
+                reliability.record(
+                    now,
+                    LedgerBody::TurnFinished(led::TurnFinished {
+                        batch_id,
+                        channel_id: scope.channel_id(),
+                        outcome: led::TurnOutcome::Ok,
+                    }),
+                );
+            }
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "could not clear replayed batches from the park file");
+        }
+    }
+    let (pause_lifted, breaker_closed) = reliability.state().on_success(scope);
+    if pause_lifted {
+        reliability.record(now, LedgerBody::AgentResumed(led::AgentResumed {}));
+    }
+    if breaker_closed {
+        reliability.record(
+            now,
+            LedgerBody::BreakerClosed(led::BreakerClosed {
+                scope: scope.telemetry_label(),
+            }),
+        );
+    }
+
+    let Some(plan) = reliability.plan_replay(scope) else {
+        return;
+    };
+    if !queue.can_stage_replay(scope) {
+        // A real cancel carryover is already staged for this scope; framing a
+        // replay as an interrupted turn would misdescribe both. The batches
+        // stay parked and replay after the next successful turn.
+        return;
+    }
+    let new_batch_id = Uuid::new_v4();
+    if let Err(error) = reliability.commit_replay(&plan, new_batch_id, now) {
+        tracing::error!(
+            error = %error,
+            "could not record the replay durably — not replaying, the batches stay parked"
+        );
+        return;
+    }
+    if queue.stage_replay(plan.scope.clone(), plan.events.clone()) {
+        reliability.mark_replay_in_flight(&plan);
+        tracing::info!(
+            channel_id = %plan.channel_id,
+            batches = plan.batch_ids.len(),
+            events = plan.events.len(),
+            "staged parked messages for replay ahead of newer events"
+        );
+    } else {
+        reliability.abandon_replay(&plan.scope);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_prompt_result(
     pool: &mut AgentPool,
@@ -4590,6 +5156,7 @@ fn handle_prompt_result(
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
     rest_client: Option<&relay::RestClient>,
+    reliability: Option<&mut reliability::ReliabilityRuntime>,
 ) -> LoopAction {
     let before = pool.task_map().len();
     let agent_index = result.agent.index;
@@ -4633,99 +5200,134 @@ fn handle_prompt_result(
     // retry_counts. If mark_complete runs first, retry_counts is cleared and
     // every retry starts at attempt 1 — defeating exponential backoff and
     // dead-letter protection.
+    let now = chrono::Utc::now();
+    let turn_started = result.started;
+    // Ownership note: `reliability` is threaded through as an Option so the
+    // existing unit tests can drive `handle_prompt_result` without a state
+    // directory. Production always passes Some.
+    let mut reliability = reliability;
     if let Some(batch) = result.batch.take() {
         // Don't requeue batches for channels the agent was removed from —
         // those events are stale and should be silently dropped.
         if !removed_channels.contains(&batch.channel_id) {
-            if matches!(
+            // T16: pause, breaker and park run before the pre-existing retry
+            // chain, and take ownership of the batch when they apply. Cancel
+            // and steer keep their existing merge behaviour untouched.
+            let batch = if matches!(
                 result.outcome,
                 PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_)
             ) {
-                // Cancel re-prompt: store as cancelled events so flush_next()
-                // merges them into the next FlushBatch.cancelled_events,
-                // enabling the annotated merged-prompt format. The batch's
-                // cancel_reason (set by the pool task per the control signal)
-                // selects steer vs interrupt framing. It is always set on this
-                // path; if somehow unset, fall back to the gentler Steer framing
-                // — consistent with MergeFraming::for_reason(None) and the
-                // system default — rather than telling the agent to supersede.
-                //
-                // CancelDrainTimeout shares this path with Cancelled: a failed
-                // 5s drain after a control-signal cancel is a cleanup-deadline
-                // problem, not the deterministic hard-cap death below — the
-                // original batch must survive with no retry/dead-letter
-                // accounting, same as a clean cancel.
-                let reason = batch.cancel_reason.unwrap_or(CancelReason::Steer);
-                queue.requeue_as_cancelled(batch, reason);
-            } else if matches!(
-                result.outcome,
-                PromptOutcome::Timeout(TimeoutKind::Hard {
-                    recently_active: false
-                })
-            ) {
-                tracing::error!(
-                    channel_id = %batch.channel_id,
-                    events = batch.events.len(),
-                    "dead-lettering batch after hard-cap timeout (no recent activity) — discarding {} events",
-                    batch.events.len(),
-                );
-                let content = format!(
+                Some(batch)
+            } else if let Some(reliability) = reliability.as_deref_mut() {
+                match apply_reliability(
+                    reliability,
+                    queue,
+                    batch,
+                    &result.outcome,
+                    turn_started,
+                    rest_client,
+                    now,
+                ) {
+                    Disposition::Handled => None,
+                    Disposition::Fallthrough(batch) => Some(batch),
+                }
+            } else {
+                Some(batch)
+            };
+            if let Some(batch) = batch {
+                if matches!(
+                    result.outcome,
+                    PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_)
+                ) {
+                    // Cancel re-prompt: store as cancelled events so flush_next()
+                    // merges them into the next FlushBatch.cancelled_events,
+                    // enabling the annotated merged-prompt format. The batch's
+                    // cancel_reason (set by the pool task per the control signal)
+                    // selects steer vs interrupt framing. It is always set on this
+                    // path; if somehow unset, fall back to the gentler Steer framing
+                    // — consistent with MergeFraming::for_reason(None) and the
+                    // system default — rather than telling the agent to supersede.
+                    //
+                    // CancelDrainTimeout shares this path with Cancelled: a failed
+                    // 5s drain after a control-signal cancel is a cleanup-deadline
+                    // problem, not the deterministic hard-cap death below — the
+                    // original batch must survive with no retry/dead-letter
+                    // accounting, same as a clean cancel.
+                    let reason = batch.cancel_reason.unwrap_or(CancelReason::Steer);
+                    queue.requeue_as_cancelled(batch, reason);
+                } else if matches!(
+                    result.outcome,
+                    PromptOutcome::Timeout(TimeoutKind::Hard {
+                        recently_active: false
+                    })
+                ) {
+                    tracing::error!(
+                        channel_id = %batch.channel_id,
+                        events = batch.events.len(),
+                        "dead-lettering batch after hard-cap timeout (no recent activity) — discarding {} events",
+                        batch.events.len(),
+                    );
+                    let content = format!(
                     "⚠️ I couldn't process the last request (the turn exceeded the maximum duration ({}s)). Please re-send if it's still needed.",
                     config.max_turn_duration_secs
                 );
-                spawn_failure_notice(rest_client, &batch, content);
-                hard_timeout_fate_suffix = Some(" — dead-lettered (no recent activity)");
-            } else if matches!(
-                result.outcome,
-                PromptOutcome::Timeout(TimeoutKind::Hard {
-                    recently_active: true
-                })
-            ) {
-                tracing::warn!(
-                    channel_id = %batch.channel_id,
-                    events = batch.events.len(),
-                    "hard-cap timeout with recent activity — requeueing for retry"
-                );
-                if let Some(dead) = queue.requeue(batch) {
-                    let content = format!(
+                    spawn_failure_notice(rest_client, &batch, content);
+                    hard_timeout_fate_suffix = Some(" — dead-lettered (no recent activity)");
+                } else if matches!(
+                    result.outcome,
+                    PromptOutcome::Timeout(TimeoutKind::Hard {
+                        recently_active: true
+                    })
+                ) {
+                    tracing::warn!(
+                        channel_id = %batch.channel_id,
+                        events = batch.events.len(),
+                        "hard-cap timeout with recent activity — requeueing for retry"
+                    );
+                    if let Some(dead) = queue.requeue(batch) {
+                        let content = format!(
                         "⚠️ I couldn't process the last request after multiple retries (the turn exceeded the maximum duration ({}s)). Please re-send if it's still needed.",
                         config.max_turn_duration_secs
                     );
-                    spawn_failure_notice(rest_client, &dead, content);
-                    hard_timeout_fate_suffix = Some(" — dead-lettered (retry budget exhausted)");
-                } else {
-                    hard_timeout_fate_suffix = Some(" — requeued for retry (recently active)");
-                }
-            } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_auth_error(e)) {
-                // Auth errors are non-retryable: the token won't self-repair
-                // between retries, so requeueing only wastes attempt slots and
-                // delays the visible failure. Dead-letter immediately and tell
-                // the user to re-authenticate the CLI.
-                tracing::warn!(
-                    channel_id = %batch.channel_id,
-                    events = batch.events.len(),
-                    "dead-lettering batch immediately — non-retryable auth error"
-                );
-                let content = "⚠️ I couldn't process the last request: authentication failed. \
+                        spawn_failure_notice(rest_client, &dead, content);
+                        hard_timeout_fate_suffix =
+                            Some(" — dead-lettered (retry budget exhausted)");
+                    } else {
+                        hard_timeout_fate_suffix = Some(" — requeued for retry (recently active)");
+                    }
+                } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_auth_error(e)) {
+                    // Auth errors are non-retryable: the token won't self-repair
+                    // between retries, so requeueing only wastes attempt slots and
+                    // delays the visible failure. Dead-letter immediately and tell
+                    // the user to re-authenticate the CLI.
+                    tracing::warn!(
+                        channel_id = %batch.channel_id,
+                        events = batch.events.len(),
+                        "dead-lettering batch immediately — non-retryable auth error"
+                    );
+                    let content = "⚠️ I couldn't process the last request: authentication failed. \
                     Please re-authenticate the CLI (e.g. run `claude /login` or `codex login`) \
                     and then re-send."
-                    .to_string();
-                spawn_failure_notice(rest_client, &batch, content);
-            } else if let Some(dead) = queue.requeue(batch) {
-                let reason = match &result.outcome {
-                    PromptOutcome::Timeout(TimeoutKind::Idle) => "the turn timed out".to_string(),
-                    PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => {
-                        "the turn exceeded the maximum duration".to_string()
-                    }
-                    PromptOutcome::AgentExited => "the agent process exited".to_string(),
-                    PromptOutcome::Error(e) => format!("{e}"),
-                    PromptOutcome::ProjectContextIndeterminate(reason) => reason.clone(),
-                    _ => "repeated failures".to_string(),
-                };
-                let content = format!(
+                        .to_string();
+                    spawn_failure_notice(rest_client, &batch, content);
+                } else if let Some(dead) = queue.requeue(batch) {
+                    let reason = match &result.outcome {
+                        PromptOutcome::Timeout(TimeoutKind::Idle) => {
+                            "the turn timed out".to_string()
+                        }
+                        PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => {
+                            "the turn exceeded the maximum duration".to_string()
+                        }
+                        PromptOutcome::AgentExited => "the agent process exited".to_string(),
+                        PromptOutcome::Error(e) => format!("{e}"),
+                        PromptOutcome::ProjectContextIndeterminate(reason) => reason.clone(),
+                        _ => "repeated failures".to_string(),
+                    };
+                    let content = format!(
                     "⚠️ I couldn't process the last request after multiple retries ({reason}). Please re-send if it's still needed."
                 );
-                spawn_failure_notice(rest_client, &dead, content);
+                    spawn_failure_notice(rest_client, &dead, content);
+                }
             }
         } else {
             tracing::debug!(
@@ -4737,9 +5339,31 @@ fn handle_prompt_result(
         }
     }
 
+    // Every batch the queue gave up retrying is written durably before the
+    // harness lets go of it.
+    if let Some(reliability) = reliability.as_deref_mut() {
+        drain_park_handoff(reliability, queue, rest_client, now);
+    }
+
     match &result.source {
         PromptSource::Channel(scope) => queue.mark_complete(scope.clone()),
         PromptSource::Heartbeat => *heartbeat_in_flight = false,
+    }
+
+    // A successful live turn is the only thing that resumes a paused agent,
+    // closes a breaker, or releases parked messages for replay. A restart
+    // proves nothing about the provider and never replays anything.
+    if let (Some(reliability), PromptSource::Channel(scope)) =
+        (reliability.as_deref_mut(), &result.source)
+    {
+        if matches!(result.outcome, PromptOutcome::Ok(_)) {
+            replay_after_success(reliability, queue, scope, now);
+        } else {
+            // The replayed batches this turn carried stay parked and become
+            // eligible again: delivery is at least once, never at most once.
+            reliability.abandon_replay(scope);
+        }
+        reliability.maintain(now);
     }
 
     // Strip sessions for channels the agent was removed from while this
@@ -10435,6 +11059,7 @@ mod error_outcome_emission_tests {
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
         let result = PromptResult {
+            started: false,
             agent,
             source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
             turn_id: "test-turn-id".into(),
@@ -10452,6 +11077,7 @@ mod error_outcome_emission_tests {
             &mut crash_history,
             &respawn_tx,
             &mut respawn_tasks,
+            None,
             None,
             None,
         );
@@ -10510,6 +11136,7 @@ mod error_outcome_emission_tests {
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
         let result = PromptResult {
+            started: false,
             agent,
             source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
             turn_id: "test-turn-id".into(),
@@ -10527,6 +11154,7 @@ mod error_outcome_emission_tests {
             &mut crash_history,
             &respawn_tx,
             &mut respawn_tasks,
+            None,
             None,
             None,
         );
@@ -10631,6 +11259,7 @@ mod error_outcome_emission_tests {
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
         let result = PromptResult {
+            started: false,
             agent,
             source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
             turn_id: "test-turn-id".into(),
@@ -10648,6 +11277,7 @@ mod error_outcome_emission_tests {
             &mut crash_history,
             &respawn_tx,
             &mut respawn_tasks,
+            None,
             None,
             None,
         );
@@ -10698,6 +11328,7 @@ mod error_outcome_emission_tests {
         let observer = ObserverHandle::in_process();
 
         let result = PromptResult {
+            started: false,
             agent,
             source: PromptSource::Channel(scope::SessionScope::Conversation {
                 channel_id: Uuid::new_v4(),
@@ -10718,6 +11349,7 @@ mod error_outcome_emission_tests {
             &respawn_tx,
             &mut respawn_tasks,
             Some(observer.clone()),
+            None,
             None,
         );
 
@@ -10967,6 +11599,7 @@ mod error_outcome_emission_tests {
             let mut respawn_tasks = tokio::task::JoinSet::new();
             let observer = ObserverHandle::in_process();
             let result = PromptResult {
+                started: false,
                 agent,
                 source: PromptSource::Channel(scope::SessionScope::Conversation {
                     channel_id: Uuid::new_v4(),
@@ -10986,6 +11619,7 @@ mod error_outcome_emission_tests {
                 &respawn_tx,
                 &mut respawn_tasks,
                 Some(observer.clone()),
+                None,
                 None,
             );
             let events = observer.snapshot();
@@ -11020,6 +11654,7 @@ mod error_outcome_emission_tests {
                 .unwrap();
             let __cid = Uuid::new_v4();
             FlushBatch {
+                batch_id: Uuid::new_v4(),
                 channel_id: __cid,
                 scope: scope::SessionScope::Conversation { channel_id: __cid },
                 events: vec![BatchEvent {
@@ -11063,6 +11698,7 @@ mod error_outcome_emission_tests {
             let (respawn_tx, _respawn_rx) = mpsc::channel(8);
             let mut respawn_tasks = tokio::task::JoinSet::new();
             let result = PromptResult {
+                started: false,
                 agent,
                 source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
                 turn_id: "test-turn-id".to_string(),
@@ -11079,6 +11715,7 @@ mod error_outcome_emission_tests {
                 &mut crash_history,
                 &respawn_tx,
                 &mut respawn_tasks,
+                None,
                 None,
                 None,
             );
@@ -11129,6 +11766,7 @@ mod error_outcome_emission_tests {
                 .sign_with_keys(&keys)
                 .unwrap();
             FlushBatch {
+                batch_id: Uuid::new_v4(),
                 channel_id,
                 scope: scope::SessionScope::Conversation { channel_id },
                 events: vec![BatchEvent {
@@ -11171,6 +11809,7 @@ mod error_outcome_emission_tests {
             let (respawn_tx, _respawn_rx) = mpsc::channel(8);
             let mut respawn_tasks = tokio::task::JoinSet::new();
             let result = PromptResult {
+                started: false,
                 agent,
                 source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
                 turn_id: "test-turn-id".to_string(),
@@ -11187,6 +11826,7 @@ mod error_outcome_emission_tests {
                 &mut crash_history,
                 &respawn_tx,
                 &mut respawn_tasks,
+                None,
                 None,
                 None,
             );
@@ -11250,6 +11890,7 @@ mod error_outcome_emission_tests {
         let mut respawn_tasks = tokio::task::JoinSet::new();
         let observer = ObserverHandle::in_process();
         let batch = FlushBatch {
+            batch_id: Uuid::new_v4(),
             channel_id,
             scope: scope::SessionScope::Conversation { channel_id },
             events: vec![BatchEvent {
@@ -11263,6 +11904,7 @@ mod error_outcome_emission_tests {
             cancel_reason: None,
         };
         let result = PromptResult {
+            started: false,
             agent,
             source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
             turn_id: "test-turn-id".to_string(),
@@ -11282,6 +11924,7 @@ mod error_outcome_emission_tests {
             &respawn_tx,
             &mut respawn_tasks,
             Some(observer.clone()),
+            None,
             None,
         );
 
@@ -11346,6 +11989,7 @@ mod error_outcome_emission_tests {
         let mut respawn_tasks = tokio::task::JoinSet::new();
         let observer = ObserverHandle::in_process();
         let batch = FlushBatch {
+            batch_id: Uuid::new_v4(),
             channel_id,
             scope: scope::SessionScope::Conversation { channel_id },
             events: vec![BatchEvent {
@@ -11359,6 +12003,7 @@ mod error_outcome_emission_tests {
             cancel_reason: None,
         };
         let result = PromptResult {
+            started: false,
             agent,
             source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
             turn_id: "test-turn-id".to_string(),
@@ -11378,6 +12023,7 @@ mod error_outcome_emission_tests {
             &respawn_tx,
             &mut respawn_tasks,
             Some(observer.clone()),
+            None,
             None,
         );
 
@@ -11427,6 +12073,7 @@ mod error_outcome_emission_tests {
         );
         let channel_id = Uuid::new_v4();
         let batch = FlushBatch {
+            batch_id: Uuid::new_v4(),
             channel_id,
             scope: scope::SessionScope::Conversation { channel_id },
             events: vec![BatchEvent {
@@ -11479,6 +12126,7 @@ mod error_outcome_emission_tests {
         let observer = ObserverHandle::in_process();
         let grace = std::time::Duration::from_secs(5);
         let result = PromptResult {
+            started: false,
             agent,
             source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
             turn_id: "test-turn-id".to_string(),
@@ -11497,6 +12145,7 @@ mod error_outcome_emission_tests {
             &respawn_tx,
             &mut respawn_tasks,
             Some(observer.clone()),
+            None,
             None,
         );
 
@@ -11610,6 +12259,7 @@ mod error_outcome_emission_tests {
         let observer = ObserverHandle::in_process();
         let grace = std::time::Duration::from_secs(5);
         let result = PromptResult {
+            started: false,
             agent,
             source: PromptSource::Channel(scope::SessionScope::Conversation {
                 channel_id: Uuid::new_v4(),
@@ -11633,6 +12283,7 @@ mod error_outcome_emission_tests {
             &respawn_tx,
             &mut respawn_tasks,
             Some(observer.clone()),
+            None,
             None,
         );
 
@@ -11698,6 +12349,7 @@ mod error_outcome_emission_tests {
             .sign_with_keys(&Keys::generate())
             .unwrap();
         let batch = FlushBatch {
+            batch_id: Uuid::new_v4(),
             channel_id,
             scope: session_scope.clone(),
             events: vec![BatchEvent {
@@ -11741,6 +12393,7 @@ mod error_outcome_emission_tests {
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
         let result = PromptResult {
+            started: false,
             agent,
             source: PromptSource::Channel(session_scope.clone()),
             turn_id: "indeterminate-project".into(),
@@ -11761,6 +12414,7 @@ mod error_outcome_emission_tests {
                 &mut crash_history,
                 &respawn_tx,
                 &mut respawn_tasks,
+                None,
                 None,
                 None,
             ),
@@ -11851,6 +12505,7 @@ mod error_outcome_emission_tests {
             .unwrap();
         let channel_id = uuid::Uuid::new_v4();
         let batch = FlushBatch {
+            batch_id: Uuid::new_v4(),
             channel_id,
             scope: scope::SessionScope::Conversation { channel_id },
             events: vec![BatchEvent {
@@ -11896,6 +12551,7 @@ mod error_outcome_emission_tests {
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
         let result = PromptResult {
+            started: false,
             agent,
             source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
             turn_id: "test-turn-id".to_string(),
@@ -11912,6 +12568,7 @@ mod error_outcome_emission_tests {
             &mut crash_history,
             &respawn_tx,
             &mut respawn_tasks,
+            None,
             None,
             None,
         );
@@ -11939,6 +12596,7 @@ mod error_outcome_emission_tests {
             .unwrap();
         let channel_id = uuid::Uuid::new_v4();
         let batch = FlushBatch {
+            batch_id: Uuid::new_v4(),
             channel_id,
             scope: scope::SessionScope::Conversation { channel_id },
             events: vec![BatchEvent {
@@ -11984,6 +12642,7 @@ mod error_outcome_emission_tests {
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
         let result = PromptResult {
+            started: false,
             agent,
             source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
             turn_id: "test-turn-id".to_string(),
@@ -12000,6 +12659,7 @@ mod error_outcome_emission_tests {
             &mut crash_history,
             &respawn_tx,
             &mut respawn_tasks,
+            None,
             None,
             None,
         );
