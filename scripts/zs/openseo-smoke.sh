@@ -221,6 +221,11 @@ esac
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 TAURI_MANIFEST="$REPO_ROOT/desktop/src-tauri/Cargo.toml"
+# Two independent Cargo workspaces build in this script (root, Tauri); each
+# gets its own worktree-keyed target dir rather than inheriting an unset or
+# shared CARGO_TARGET_DIR.
+ROOT_TARGET_DIR="$("$REPO_ROOT/scripts/zs/cargo-target-dir.sh" root)"
+DESKTOP_TARGET_DIR="$("$REPO_ROOT/scripts/zs/cargo-target-dir.sh" desktop)"
 SKILL_NAME="openseo-smoke"
 SKILL_FIXTURE="$REPO_ROOT/scripts/zs/fixtures/$SKILL_NAME/SKILL.md"
 SERVER_NAME="openseo-fake"
@@ -390,8 +395,8 @@ if [ "$RUNTIME" = "codex" ] && [ "$STAGE" = "full" ]; then
 fi
 
 echo "== building the fake MCP server fixture =="
-cargo build -q --manifest-path "$REPO_ROOT/Cargo.toml" -p buzz-agent --bin fake-mcp
-TARGET_DIR="$(cargo metadata --manifest-path "$REPO_ROOT/Cargo.toml" --format-version 1 --no-deps | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).target_directory")"
+CARGO_TARGET_DIR="$ROOT_TARGET_DIR" cargo build -q --manifest-path "$REPO_ROOT/Cargo.toml" -p buzz-agent --bin fake-mcp
+TARGET_DIR="$(CARGO_TARGET_DIR="$ROOT_TARGET_DIR" cargo metadata --manifest-path "$REPO_ROOT/Cargo.toml" --format-version 1 --no-deps | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).target_directory")"
 FAKE_MCP="$TARGET_DIR/debug/fake-mcp"
 if [ ! -x "$FAKE_MCP" ]; then
   echo "FAIL: fake-mcp was not built at $FAKE_MCP" >&2
@@ -399,13 +404,13 @@ if [ ! -x "$FAKE_MCP" ]; then
 fi
 
 emit() {
-  cargo run -q --manifest-path "$TAURI_MANIFEST" --example openseo-config-emit -- "$@"
+  CARGO_TARGET_DIR="$DESKTOP_TARGET_DIR" cargo run -q --manifest-path "$TAURI_MANIFEST" --example openseo-config-emit -- "$@"
 }
 
 # Build the generator up front so a cold compile is not folded into the
 # generate step below, whose output the containment guard reads.
 echo "== building the config generator =="
-cargo build -q --manifest-path "$TAURI_MANIFEST" --example openseo-config-emit
+CARGO_TARGET_DIR="$DESKTOP_TARGET_DIR" cargo build -q --manifest-path "$TAURI_MANIFEST" --example openseo-config-emit
 
 # The fake server is started by the runtime, not by this script, so its
 # per-run configuration has to travel in its own argv: the generator writes no

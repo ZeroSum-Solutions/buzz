@@ -207,7 +207,7 @@ _ensure-services:
 
 # Apply database migrations and seed the local dev community if the dev database is running
 _ensure-migrations: _ensure-services
-    cargo run -p buzz-admin -- migrate
+    CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh root)" cargo run -p buzz-admin -- migrate
     ./scripts/seed-local-community.sh
 
 # Run clippy on the desktop Tauri Rust crate

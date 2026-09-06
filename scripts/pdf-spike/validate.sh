@@ -14,6 +14,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 REPO_ROOT="$(cd ../.. && pwd)"
+# Independent Cargo workspace (its own Cargo.toml under scripts/pdf-spike);
+# key it to the same worktree-keyed root subtree the rest of the root
+# workspace uses, rather than the checkout-local default.
+export CARGO_TARGET_DIR="$("$REPO_ROOT/scripts/zs/cargo-target-dir.sh" root)"
 VALIDATE_PDF="$REPO_ROOT/scripts/zs/pdf-validate.sh"
 OUT=out
 SENTINEL_PORT=18391
