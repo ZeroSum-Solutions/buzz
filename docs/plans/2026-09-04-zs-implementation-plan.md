@@ -20,7 +20,8 @@ through. Revision 3 folds in Sol's passes 1 and 2 on this plan (log at the end).
   squash, one entry built at a time, CI on the `merge_group` event). The queue tests each pull
   request against the merged result in order, so the base cannot drift under a tested change and
   nobody re-merges by hand.
-  1. Before enqueueing, run the ticket's gates and the Sol audit on the branch as it stands.
+  1. Before enqueueing, run the ticket's gates (fast set plus its own tests, targeted; never a
+     full suite, see the hard rule under step 1 of the gauntlet) and the Sol audit on the branch.
   2. Open the PR ourselves with the full body (`gh pr create --base zs/main --body-file`):
      gates run and their results, the tested base OID, the Gemini verdict, the Sol verdict.
   3. Overlap rule instead of blanket re-testing: if `origin/zs/main` moved since the branch's
@@ -60,8 +61,15 @@ serial loop and its measurements are in that document.
    just fmt-check clippy desktop-check desktop-tauri-fmt-check desktop-tauri-clippy file-size-check
    ```
    plus the ticket's own test files with enforced counts (`n=$(cargo test <filter> -- --list | grep -c ': test'); test "$n" -ge <N>`).
-   No local `just ci`; CI on Blacksmith is the full gate. At most four builders at once, on a
-   heavy-command semaphore of two for `cargo test`, `desktop-test` and E2E runs.
+   No local `just ci`; CI on Blacksmith is the full gate. **Hard rule (Devin, 2026-09-05): no
+   full suite runs twice.** The merge queue runs the whole smoke project in eight shards, the
+   whole `desktop-test` and every `cargo test`; a builder, tester, critic, fix agent or driver
+   never runs any of those in full before the PR, on the Mac or on the AWS box. The ticket's own
+   test files run targeted: `cargo test <filter>`, the node runner on the file,
+   `cd desktop && pnpm build:e2e && pnpm exec playwright test --project=smoke <spec>.ts`. A
+   queue ejection is read, the one failing spec is rerun locally, fixed, re-enqueued. At most
+   four builders at once, on a heavy-command semaphore of two for targeted `cargo test`,
+   `desktop-test` and E2E runs.
 2. **In parallel after the build**, on the auditor semaphore of two external processes:
    - **Tester** (Gemini 3.8 Flash, `agy -p --model gemini-3.8-flash-high --mode accept-edits`,
      disposable worktree, clean-tree assertion after): reads the diff and acceptance checks,
@@ -129,7 +137,7 @@ the root workspace excludes that manifest (`Cargo.toml:35`).
   ```
   cd desktop && node --import ./test-loader.mjs --experimental-strip-types --test src/features/messages/lib/mentionSuggestionMapping.test.mjs src/features/messages/ui/MentionAutocomplete.test.mjs
   just desktop-test
-  just desktop-e2e-smoke   # output lists mention-descriptions-screenshots
+  cd desktop && pnpm build:e2e && pnpm exec playwright test --project=smoke mention-descriptions-screenshots.spec.ts   # the ticket's spec only; the queue runs the full smoke
   ```
 - Acceptance: typing `@` in a channel shows each agent's `about` under its name; agents with no `about` show none; the hover card still shows `about`.
 - Bar: PR #2706's diff.
@@ -147,7 +155,7 @@ the root workspace excludes that manifest (`Cargo.toml:35`).
   cd desktop/src-tauri && n=$(cargo test commands::media_download_tests -- --list | grep -c ': test'); test "$n" -ge 1
   cd desktop/src-tauri && cargo test commands::media_download_tests
   just desktop-test
-  just desktop-e2e-smoke   # output lists markdown-doc-viewer
+  cd desktop && pnpm build:e2e && pnpm exec playwright test --project=smoke markdown-doc-viewer.spec.ts   # the ticket's spec only; the queue runs the full smoke
   ```
 - Acceptance: clicking an `.md` attachment opens the panel; GFM tables and code render; a fixed 500 KB fixture (`desktop/tests/fixtures/long-doc.md`, hash recorded in the PR) reaches panel-ready in under 1.0 s with no main-thread task over 200 ms, measured three times with the Performance API from the e2e spec.
 - Bar: PR #6731's diff.
@@ -160,7 +168,7 @@ the root workspace excludes that manifest (`Cargo.toml:35`).
   ```
   cd desktop && node --import ./test-loader.mjs --experimental-strip-types --test src/features/channel-files/useChannelFiles.test.mjs src/features/channel-files/useFileFolders.test.mjs
   just desktop-test
-  just desktop-e2e-smoke   # output lists channel-files-tab
+  cd desktop && pnpm build:e2e && pnpm exec playwright test --project=smoke channel-files-tab.spec.ts   # the ticket's spec only; the queue runs the full smoke
   ```
 - Acceptance: the tab lists the attachments in the loaded window with folders, bulk select and drag-drop as in the PR. Bulk upload stays as the PR ships it in this ticket; T3b changes the default.
 - Bar: PR #4316's diff.
@@ -245,7 +253,7 @@ the root workspace excludes that manifest (`Cargo.toml:35`).
   cd desktop/src-tauri && cargo test pdf_export -- --list | grep -c ': test'   # >= 3
   cd desktop/src-tauri && cargo test pdf_export
   just desktop-test
-  just desktop-e2e-smoke   # pdf-export.spec.ts listed
+  cd desktop && pnpm build:e2e && pnpm exec playwright test --project=smoke pdf-export.spec.ts   # the ticket's spec only; the queue runs the full smoke
   ```
 - Acceptance: from the T2 viewer, Export PDF saves a file that opens in Preview with headings, table and code intact; hash of the output for the fixture recorded in the PR.
 - Bar: the same document printed from the macOS Chrome print dialog, compared page by page.
@@ -254,7 +262,7 @@ the root workspace excludes that manifest (`Cargo.toml:35`).
 
 - Branch `feat/assets-facets`, after T3b. Sort by date, name, size, author; filter by type; a Documents facet (md, pdf, html, docx, csv); the channel canvas pinned at the top, opening the existing Canvas surface (`features/canvas/ChannelCanvas.tsx`), not the attachment viewer, so editing keeps working.
 - Tests first: facet classification from `imeta` `filename` and MIME (md-as-octet-stream case), sort stability, pinned canvas present only when the channel has one, pinned row opens the Canvas surface and an edit saves.
-- Eval: `desktop/src/features/channel-files/fileFacets.test.mjs` through the node runner, `just desktop-test`, `just desktop-e2e-smoke` listing `desktop/tests/e2e/channel-files-facets.spec.ts`; sort or filter over the 250-file seed completes in under 100 ms measured in the spec, three runs.
+- Eval: `desktop/src/features/channel-files/fileFacets.test.mjs` through the node runner, `just desktop-test`, `pnpm exec playwright test --project=smoke channel-files-facets.spec.ts` (the ticket's spec only; the queue runs the full smoke); sort or filter over the 250-file seed completes in under 100 ms measured in the spec, three runs.
 - Bar: the T3b tab as the baseline it must not regress.
 
 ### T11 · docs/calendar-authz — calendar authorization contract (S)
@@ -303,7 +311,7 @@ the root workspace excludes that manifest (`Cargo.toml:35`).
   ```
   just desktop-test
   cd desktop/src-tauri && cargo test commands::path_links
-  just desktop-e2e-smoke   # output lists path-links
+  cd desktop && pnpm build:e2e && pnpm exec playwright test --project=smoke path-links.spec.ts   # the ticket's spec only; the queue runs the full smoke
   ```
 - Acceptance: in the Broken English approvals channel, clicking the backticked `.html` path in an existing approval message opens the page in the browser; clicking a `.md` path opens the viewer; a path to a file that does not exist renders as plain text.
 - Bar: T2's viewer contract and Tauri opener scoping.
@@ -420,14 +428,20 @@ Created on the fork only when Devin asks. Titles:
   path, so they stay. PR `ci/merge-gate-time` caches the hermit packages, lifts the compiled-flag
   verification into its own job, and runs eight smoke shards. See
   `docs/plans/2026-09-05-ci-merge-gate-and-runner.md` for the measurement gate and the next step.
-- Heavy local gates go through `scripts/zs/with-gate-lock.sh` (one machine-wide lock, waits up
-  to 45 minutes): `scripts/zs/with-gate-lock.sh just desktop-test`, likewise for
+- **No full suite runs twice (Devin, 2026-09-05).** `just desktop-e2e-smoke`, `just desktop-test`,
+  a bare `cargo test` and `just ci` are merge-queue gates and are never run in full before the PR,
+  locally or on the box. Only the ticket's own test files run before the PR, targeted. The
+  wave-4 and wave-5 gauntlets ran the 45-minute smoke once per agent stage and then again in the
+  queue; that cost more than an hour per ticket for no coverage.
+- Heavy local gates (targeted heavy tests only, per the rule above) go through
+  `scripts/zs/with-gate-lock.sh` (one machine-wide lock, waits up to 45 minutes): `scripts/zs/with-gate-lock.sh just desktop-test`, likewise for
   `just desktop-tauri-test`, `just desktop-tauri-test-compiled-flags` and every `cargo test`
   or `cargo nextest run`. Three worktrees running those at once is what made `buzz-agent`'s
   cancellation test flake locally. Fast gates (fmt, clippy, checks) do not take the lock.
 - Once `scripts/zs/remote-ci/box.env` exists, a builder may run the heavy gates on the
   on-demand AWS Linux box instead of taking the machine-wide gate lock:
-  `scripts/zs/remote-ci.sh <branch> [just targets...]` (default target `ci`). It starts the
+  `scripts/zs/remote-ci.sh <branch> [just targets...]` (default target `ci`; under the no-full-suite
+  rule pass targeted targets, never bare `ci` or a full smoke, before a PR). It starts the
   stopped instance, checks the branch out there, streams the log to the terminal and to
   `~/Inbox/notes/`, copies any Playwright report to `~/Inbox/misc/`, stops the instance again
   and exits with the gate's own exit code — so a green run there means the same thing a green
