@@ -79,11 +79,39 @@ pub(crate) const MENTION_ABOUT_MAX_BYTES: usize = 512;
 /// [`crate::models::UserSearchResultInfo`]); the full, uncapped `about`
 /// remains available on the `get_profile` detail path.
 pub(crate) fn truncate_mention_about(about: Option<String>) -> Option<String> {
-    about.map(|s| {
-        if s.len() <= MENTION_ABOUT_MAX_BYTES {
+    truncate_utf8(about, MENTION_ABOUT_MAX_BYTES)
+}
+
+/// Maximum bytes of a kind-0 `display_name`, `name` or NIP-05 handle carried on
+/// the batch and search DTOs.
+///
+/// Same seam and same reasoning as [`MENTION_ABOUT_MAX_BYTES`]: kind-0
+/// `content` is untrusted, the relay allows 256 KiB of it, and `get_users_batch`
+/// sends a batch filter with no limit — so `about` was not the only field that
+/// could carry hundreds of MiB across the IPC boundary. These names are also
+/// *sorted* downstream (the Files tab's author sort,
+/// `desktop/src/features/channel-files/fileFacets.ts`), which is why the bound
+/// belongs at the boundary and not only at render. 256 bytes is far above any
+/// real display name or NIP-05 address.
+pub(crate) const PROFILE_NAME_MAX_BYTES: usize = 256;
+
+/// Truncate a kind-0 `display_name`, `name` or NIP-05 handle to at most
+/// [`PROFILE_NAME_MAX_BYTES`] bytes on a UTF-8 character boundary. Used by the
+/// batch and search DTOs ([`crate::models::UserProfileSummaryInfo`],
+/// [`crate::models::UserSearchResultInfo`]); the `get_profile` detail path
+/// keeps the full value, exactly as it does for `about`.
+pub(crate) fn truncate_profile_name(name: Option<String>) -> Option<String> {
+    truncate_utf8(name, PROFILE_NAME_MAX_BYTES)
+}
+
+/// Truncate `value` to at most `max_bytes`, cutting on a UTF-8 character
+/// boundary so the result is never a partial scalar.
+fn truncate_utf8(value: Option<String>, max_bytes: usize) -> Option<String> {
+    value.map(|s| {
+        if s.len() <= max_bytes {
             return s;
         }
-        let mut end = MENTION_ABOUT_MAX_BYTES;
+        let mut end = max_bytes;
         while end > 0 && !s.is_char_boundary(end) {
             end -= 1;
         }
@@ -387,17 +415,20 @@ pub fn users_batch_from_events(
         let v: Value = serde_json::from_str(&ev.content).unwrap_or(Value::Null);
         let owner_pubkey = profile_valid_oa_owner_pubkey(ev);
         let summary = UserProfileSummaryInfo {
-            display_name: v
-                .get("display_name")
-                .and_then(Value::as_str)
-                .or_else(|| v.get("name").and_then(Value::as_str))
-                .map(str::to_string),
-            name: v.get("name").and_then(Value::as_str).map(str::to_string),
+            display_name: truncate_profile_name(
+                v.get("display_name")
+                    .and_then(Value::as_str)
+                    .or_else(|| v.get("name").and_then(Value::as_str))
+                    .map(str::to_string),
+            ),
+            name: truncate_profile_name(v.get("name").and_then(Value::as_str).map(str::to_string)),
             avatar_url: v.get("picture").and_then(Value::as_str).map(str::to_string),
             about: truncate_mention_about(
                 v.get("about").and_then(Value::as_str).map(str::to_string),
             ),
-            nip05_handle: v.get("nip05").and_then(Value::as_str).map(str::to_string),
+            nip05_handle: truncate_profile_name(
+                v.get("nip05").and_then(Value::as_str).map(str::to_string),
+            ),
             is_agent: owner_pubkey.is_some(),
             owner_pubkey,
         };

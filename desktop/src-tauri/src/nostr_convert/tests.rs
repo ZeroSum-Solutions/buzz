@@ -327,6 +327,57 @@ fn users_batch_truncates_oversized_about_at_the_seam() {
 }
 
 #[test]
+fn users_batch_truncates_oversized_names_at_the_seam() {
+    // `about` was not the only untrusted kind:0 string on this DTO. The
+    // frontend *sorts* on `display_name` (the Files tab's author sort), so an
+    // uncapped name is comparison work an attacker chooses the length of.
+    let oversized = "n".repeat(PROFILE_NAME_MAX_BYTES * 4);
+    let event = ev(
+        0,
+        &format!(r#"{{"display_name":"{oversized}","name":"{oversized}","nip05":"{oversized}"}}"#),
+        vec![],
+    );
+    let pk = event.pubkey.to_hex();
+
+    let resp = users_batch_from_events(std::slice::from_ref(&event), std::slice::from_ref(&pk));
+    let summary = &resp.profiles[&pk];
+
+    for (field, value) in [
+        ("display_name", summary.display_name.as_deref()),
+        ("name", summary.name.as_deref()),
+        ("nip05_handle", summary.nip05_handle.as_deref()),
+    ] {
+        let capped = value.unwrap_or_else(|| panic!("{field} present"));
+        assert!(
+            capped.len() <= PROFILE_NAME_MAX_BYTES,
+            "capped {field} is {} bytes, expected <= {PROFILE_NAME_MAX_BYTES}",
+            capped.len()
+        );
+        assert!(capped.len() < oversized.len());
+    }
+}
+
+#[test]
+fn truncate_profile_name_cuts_on_a_char_boundary() {
+    // Every grapheme is a 4-byte scalar, so a naive byte slice would land
+    // mid-character.
+    let name = "\u{1F600}".repeat(PROFILE_NAME_MAX_BYTES);
+    let truncated = truncate_profile_name(Some(name)).expect("some");
+    assert!(truncated.len() <= PROFILE_NAME_MAX_BYTES);
+    assert!(truncated.is_char_boundary(truncated.len()));
+    assert!(!truncated.is_empty());
+}
+
+#[test]
+fn truncate_profile_name_leaves_short_strings_untouched() {
+    assert_eq!(
+        truncate_profile_name(Some("Ada Lovelace".to_string())).as_deref(),
+        Some("Ada Lovelace")
+    );
+    assert_eq!(truncate_profile_name(None), None);
+}
+
+#[test]
 fn truncate_mention_about_cuts_on_a_char_boundary() {
     // Every grapheme here is a 4-byte UTF-8 scalar (outside the BMP), chosen
     // so a naive byte-index slice would land mid-character and panic.

@@ -13,16 +13,19 @@ pub fn user_search_result_from_event(ev: &Event) -> UserSearchResultInfo {
     let owner_pubkey = profile_valid_oa_owner_pubkey(ev);
     UserSearchResultInfo {
         pubkey: ev.pubkey.to_hex(),
-        display_name: v
-            .get("display_name")
-            .and_then(Value::as_str)
-            .or_else(|| v.get("name").and_then(Value::as_str))
-            .map(str::to_string),
+        display_name: super::truncate_profile_name(
+            v.get("display_name")
+                .and_then(Value::as_str)
+                .or_else(|| v.get("name").and_then(Value::as_str))
+                .map(str::to_string),
+        ),
         avatar_url: v.get("picture").and_then(Value::as_str).map(str::to_string),
         about: super::truncate_mention_about(
             v.get("about").and_then(Value::as_str).map(str::to_string),
         ),
-        nip05_handle: v.get("nip05").and_then(Value::as_str).map(str::to_string),
+        nip05_handle: super::truncate_profile_name(
+            v.get("nip05").and_then(Value::as_str).map(str::to_string),
+        ),
         is_agent: owner_pubkey.is_some(),
         owner_pubkey,
     }
@@ -270,6 +273,23 @@ mod tests {
             .expect("about present");
         assert!(capped.len() <= super::super::MENTION_ABOUT_MAX_BYTES);
         assert!(capped.len() < oversized_about.len());
+    }
+
+    #[test]
+    fn user_search_result_truncates_oversized_names_at_the_seam() {
+        let oversized = "n".repeat(super::super::PROFILE_NAME_MAX_BYTES * 4);
+        let event = ev(
+            0,
+            &format!(r#"{{"display_name":"{oversized}","nip05":"{oversized}"}}"#),
+            vec![],
+        );
+
+        let result = user_search_result_from_event(&event);
+        let name = result.display_name.expect("display_name present");
+        let handle = result.nip05_handle.expect("nip05 present");
+        assert!(name.len() <= super::super::PROFILE_NAME_MAX_BYTES);
+        assert!(handle.len() <= super::super::PROFILE_NAME_MAX_BYTES);
+        assert!(name.len() < oversized.len());
     }
 
     #[test]
