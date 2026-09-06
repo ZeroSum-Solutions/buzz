@@ -857,8 +857,25 @@ fn mcp_registry_name_bounds_match_the_consumer_on_both_sides() {
             .err()
     };
 
+    // The consumer's cap is *discovered*, not copied: `MAX_MCP_NAME_LEN` is
+    // crate-private, and a second copy of a number is exactly the defect W4
+    // named. Widening the desktop's own cap therefore fails here rather than
+    // silently agreeing with itself.
+    let consumer_cap = (1..=64usize)
+        .take_while(|len| consumer_refuses(&"a".repeat(*len)).is_none())
+        .last()
+        .expect("the harness accepts some name length");
+    assert!(
+        MAX_NAME_LEN <= consumer_cap,
+        "the desktop accepts a {MAX_NAME_LEN}-byte name while the harness refuses anything over \
+         {consumer_cap}, so every registry-enabled agent would fail to start"
+    );
+
     for (name, why) in [
-        ("a".repeat(MAX_NAME_LEN + 1), "a name one byte over the cap"),
+        (
+            "a".repeat(consumer_cap + 1),
+            "a name one byte over the harness's cap",
+        ),
         ("has_underscore".to_string(), "an underscored name"),
     ] {
         let consumer = consumer_refuses(&name)
