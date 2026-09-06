@@ -229,13 +229,19 @@ test("an answer that lands after an edit is dropped, never opened", async () => 
   );
 });
 
-test("a resolver refusal is surfaced and leaves the token as text", async () => {
+test("a resolver failure is surfaced and the token can be retried", async () => {
   const { act } = await import("@testing-library/react");
   const errors = [];
+  let attempts = 0;
   const view = await renderResolution(
     baseProps({
       invoke: async () => {
-        throw new Error("path link candidate exceeds 4096 bytes");
+        attempts += 1;
+        if (attempts === 1) throw new Error("read docs: permission denied");
+        return target(
+          "/root/docs/open-previews.command",
+          "open-previews.command",
+        );
       },
       onError: (message) => errors.push(message),
     }),
@@ -244,8 +250,42 @@ test("a resolver refusal is surfaced and leaves the token as text", async () => 
   await act(async () => {
     view.result.current.resolve();
   });
-  assert.equal(view.result.current.state.status, "text");
-  assert.deepEqual(errors, ["path link candidate exceeds 4096 bytes"]);
+  // A failure is not "not a link": the control stays, so a later hover or
+  // click asks again once the filesystem has recovered.
+  assert.equal(view.result.current.state.status, "idle");
+  assert.deepEqual(errors, ["read docs: permission denied"]);
+
+  await act(async () => {
+    view.result.current.resolve();
+  });
+  assert.equal(attempts, 2);
+  assert.equal(view.result.current.state.status, "link");
+});
+
+test("a click during an in-flight hover resolution opens once it settles", async () => {
+  const { act } = await import("@testing-library/react");
+  const opened = [];
+  const { calls, invoke, settle } = deferredInvoke();
+  const view = await renderResolution(
+    baseProps({ invoke, onOpen: (value) => opened.push(value) }),
+  );
+
+  // Hover starts the resolution; the click lands before the answer.
+  await act(async () => {
+    view.result.current.resolve();
+  });
+  assert.equal(view.result.current.state.status, "pending");
+  await act(async () => {
+    view.result.current.activate();
+  });
+  assert.equal(calls.length, 1, "the click reuses the in-flight resolution");
+  assert.deepEqual(opened, [], "nothing opens before the answer");
+
+  await act(async () => {
+    settle(target("/root/docs/open-previews.command", "open-previews.command"));
+  });
+  assert.equal(view.result.current.state.status, "link");
+  assert.equal(opened.length, 1, "the click is honoured, not dropped");
 });
 
 test("a candidate the shape gate refuses never reaches the resolver", async () => {

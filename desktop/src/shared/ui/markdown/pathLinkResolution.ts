@@ -27,7 +27,7 @@ import {
 export type PathLinkResolution =
   /** Nothing asked yet. No IPC has happened for this token. */
   | { status: "idle" }
-  /** A resolution is in flight; further triggers are ignored. */
+  /** A resolution is in flight; further triggers wait for its answer. */
   | { status: "pending" }
   /** The resolver answered "not a link"; the token stays plain text. */
   | { status: "text" }
@@ -82,6 +82,10 @@ export function usePathLinkResolution({
   // resolution it just triggered without waiting for a render.
   const stateRef = React.useRef<PathLinkResolution>({ status: "idle" });
   const generationRef = React.useRef(0);
+  // The resolution in flight, so a click that lands before the hover's answer
+  // waits for that same answer instead of seeing "pending" and opening
+  // nothing.
+  const inFlightRef = React.useRef<Promise<PathLinkResolution> | null>(null);
 
   // Resolution outlives a hover, so the setter must not write into an
   // unmounted token.
@@ -108,41 +112,55 @@ export function usePathLinkResolution({
   if (candidate.text !== text || candidate.senderPubkey !== senderPubkey) {
     generationRef.current += 1;
     stateRef.current = { status: "idle" };
+    inFlightRef.current = null;
     setCandidate({ text, senderPubkey });
     setState({ status: "idle" });
   }
 
-  const run = React.useCallback(async (): Promise<PathLinkResolution> => {
+  const run = React.useCallback((): Promise<PathLinkResolution> => {
     const current = stateRef.current;
-    if (current.status !== "idle") return current;
+    if (current.status === "pending" && inFlightRef.current) {
+      return inFlightRef.current;
+    }
+    if (current.status !== "idle") return Promise.resolve(current);
     const generation = generationRef.current;
     setState({ status: "pending" });
     stateRef.current = { status: "pending" };
-    try {
-      const target = await resolvePathLink(
-        text,
-        senderPubkey,
-        (command, args) => invokeRef.current(command, args),
-      );
-      // Superseded: the reset during render already returned the token to
-      // `idle` for its new candidate, so this answer is simply dropped.
-      if (generationRef.current !== generation) return { status: "idle" };
-      const settled: PathLinkResolution = target
-        ? { status: "link", target }
-        : { status: "text" };
-      stateRef.current = settled;
-      if (mountedRef.current) setState(settled);
-      return settled;
-    } catch (error) {
-      if (generationRef.current !== generation) return { status: "idle" };
-      // A refusal from the resolver is a real failure, not a "not a link":
-      // say so instead of silently leaving the token as text.
-      const settled: PathLinkResolution = { status: "text" };
-      stateRef.current = settled;
-      if (mountedRef.current) setState(settled);
-      onErrorRef.current(errorMessage(error, "Couldn't check that path."));
-      return settled;
-    }
+    const attempt = (async (): Promise<PathLinkResolution> => {
+      try {
+        const target = await resolvePathLink(
+          text,
+          senderPubkey,
+          (command, args) => invokeRef.current(command, args),
+        );
+        // Superseded: the reset during render already returned the token to
+        // `idle` for its new candidate, so this answer is simply dropped.
+        if (generationRef.current !== generation) return { status: "idle" };
+        const settled: PathLinkResolution = target
+          ? { status: "link", target }
+          : { status: "text" };
+        stateRef.current = settled;
+        if (mountedRef.current) setState(settled);
+        return settled;
+      } catch (error) {
+        if (generationRef.current !== generation) return { status: "idle" };
+        // A failure from the resolver — a refusal, a permission error, a
+        // mount that is away — is not "not a link". Say so, and return the
+        // token to `idle` so the control stays and a later hover or click
+        // asks again, rather than freezing it as text for the life of the
+        // render.
+        const settled: PathLinkResolution = { status: "idle" };
+        stateRef.current = settled;
+        if (mountedRef.current) setState(settled);
+        onErrorRef.current(errorMessage(error, "Couldn't check that path."));
+        return settled;
+      }
+    })();
+    inFlightRef.current = attempt;
+    void attempt.finally(() => {
+      if (inFlightRef.current === attempt) inFlightRef.current = null;
+    });
+    return attempt;
   }, [senderPubkey, text]);
 
   const resolve = React.useCallback(() => {
