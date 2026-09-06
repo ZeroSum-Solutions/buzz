@@ -29,7 +29,10 @@ import {
   type RuntimeCatalogStatus,
 } from "../lib/agentConfigCore";
 
+import { AgentMcpServersSection } from "./AgentMcpServersSection";
+
 export function EditAgentAdvancedFields({
+  agentPubkey,
   acpCommand,
   agentArgs,
   autoRestartOnConfigChange,
@@ -57,6 +60,8 @@ export function EditAgentAdvancedFields({
   onAutoRestartChange,
   onSystemPromptChange,
 }: {
+  /** The agent record this dialog edits; MCP registry toggles write to it. */
+  agentPubkey: string;
   acpCommand: string;
   agentArgs: string;
   autoRestartOnConfigChange: boolean;
@@ -380,6 +385,12 @@ export function EditAgentAdvancedFields({
           provider={provider}
         />
       ) : null}
+
+      <AgentMcpServersSection
+        open
+        pubkey={agentPubkey}
+        runtime={selectedRuntime ?? null}
+      />
     </div>
   );
 }

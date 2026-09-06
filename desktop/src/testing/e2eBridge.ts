@@ -8515,6 +8515,157 @@ let runtimeCatalogDiscoveryCount = 0;
 let mockInstallCompleted = false;
 let mockConnectCompleted = false;
 
+// -- MCP registry (T7c) ------------------------------------------------------
+//
+// The registry document, each agent's selection, and the artefacts a
+// convergence stages. The generation number and the artefact shape mirror the
+// Rust side (`managed_agents::mcp_registry`) closely enough for a spec to
+// assert "the agent's generated config names the launcher and this server, and
+// the next generation drops it"; the byte-level guarantee is bound in Rust by
+// `mcp_registry_a_toggle_change_adopts_a_new_generation`, which reads the file
+// the shipped generator wrote.
+
+/** Absolute path of the bundled launcher, as a real generated config names it. */
+const MOCK_MCP_LAUNCHER =
+  "/Applications/Buzz.app/Contents/MacOS/buzz-mcp-launch";
+
+type MockMcpEnvEntry = {
+  name: string;
+  reference: string | null;
+  literal: string | null;
+};
+
+type MockMcpEntry = {
+  id: string;
+  name: string;
+  transport: "stdio" | "http";
+  command: string | null;
+  args: string[];
+  url: string | null;
+  auth_scheme: string | null;
+  env: MockMcpEnvEntry[];
+  rejection: string | null;
+};
+
+let mockMcpServers: MockMcpEntry[] = [];
+const mockMcpSelections = new Map<string, string[]>();
+/** Reference ids the panel has stored a value for. The values are not kept. */
+const mockMcpStoredReferences = new Set<string>();
+let mockMcpGeneration = 0;
+/** Generated artefacts by agent pubkey, as of the adopted generation. */
+let mockMcpArtefacts = new Map<string, unknown>();
+
+/** Stage and adopt one generation from the document plus every selection. */
+function convergeMockMcpRegistry() {
+  mockMcpGeneration += 1;
+  mockMcpArtefacts = new Map();
+  for (const [pubkey, enabled] of mockMcpSelections) {
+    const servers = mockMcpServers
+      .filter((entry) => enabled.includes(entry.id) && entry.rejection === null)
+      .map((entry) => ({
+        name: entry.name,
+        command: MOCK_MCP_LAUNCHER,
+        args:
+          entry.transport === "stdio"
+            ? [
+                "--service",
+                "buzz-desktop-dev",
+                "launch",
+                "--server",
+                entry.name,
+                ...entry.env.flatMap((variable) => [
+                  variable.reference === null ? "--set" : "--secret",
+                  `${variable.name}=${variable.reference ?? variable.literal ?? ""}`,
+                ]),
+                "--",
+                entry.command ?? "",
+                ...entry.args,
+              ]
+            : [
+                "--service",
+                "buzz-desktop-dev",
+                "proxy",
+                "--url",
+                entry.url ?? "",
+              ],
+      }));
+    if (servers.length === 0) continue;
+    mockMcpArtefacts.set(pubkey, { version: 1, servers });
+  }
+}
+
+function mockMcpRegistryView() {
+  return {
+    servers: mockMcpServers,
+    document_path: "/mock/app-data/agents/mcp_servers.json",
+  };
+}
+
+function handleSaveMcpRegistryServer(payload: {
+  entry?: {
+    id?: string;
+    name?: string;
+    transport?: "stdio" | "http";
+    command?: string;
+    args?: string[];
+    url?: string;
+    auth?: { scheme?: string; secret?: string };
+    env?: Record<string, string>;
+  };
+  secrets?: Record<string, string>;
+}) {
+  const entry = payload.entry ?? {};
+  const next: MockMcpEntry = {
+    id: entry.id ?? "",
+    name: entry.name ?? "",
+    transport: entry.transport ?? "stdio",
+    command: entry.transport === "http" ? null : (entry.command ?? ""),
+    args: entry.transport === "http" ? [] : (entry.args ?? []),
+    url: entry.transport === "http" ? (entry.url ?? "") : null,
+    auth_scheme: entry.auth?.scheme ?? null,
+    env: Object.entries(entry.env ?? {}).map(([name, value]) => ({
+      name,
+      reference: value.startsWith("mcp:") ? value : null,
+      literal: value.startsWith("mcp:") ? null : value,
+    })),
+    rejection: null,
+  };
+  // The value is consumed here and never kept: the mock records only that a
+  // credential exists, exactly as the keychain write side does.
+  for (const reference of Object.keys(payload.secrets ?? {})) {
+    mockMcpStoredReferences.add(reference);
+  }
+  const index = mockMcpServers.findIndex((each) => each.id === next.id);
+  if (index >= 0) {
+    mockMcpServers[index] = next;
+  } else {
+    mockMcpServers.push(next);
+  }
+  convergeMockMcpRegistry();
+  return mockMcpRegistryView();
+}
+
+function handleDeleteMcpRegistryServer(payload: { id?: string }) {
+  mockMcpServers = mockMcpServers.filter((entry) => entry.id !== payload.id);
+  for (const [pubkey, enabled] of mockMcpSelections) {
+    mockMcpSelections.set(
+      pubkey,
+      enabled.filter((each) => each !== payload.id),
+    );
+  }
+  convergeMockMcpRegistry();
+  return mockMcpRegistryView();
+}
+
+function handleSetAgentMcpServers(payload: {
+  pubkey?: string;
+  enabled?: string[];
+}) {
+  mockMcpSelections.set(payload.pubkey ?? "", payload.enabled ?? []);
+  convergeMockMcpRegistry();
+  return mockMcpRegistryView();
+}
+
 async function handleDiscoverAcpRuntimes(
   config: E2eConfig | undefined,
 ): Promise<RawAcpRuntimeCatalogEntry[]> {
@@ -13539,6 +13690,36 @@ export function maybeInstallE2eTauriMocks() {
         return activeConfig?.mock?.relayRequiresMembership ?? false;
       case "discover_acp_providers":
         return handleDiscoverAcpRuntimes(activeConfig);
+      case "list_mcp_registry_servers":
+        return mockMcpRegistryView();
+      case "save_mcp_registry_server":
+        return handleSaveMcpRegistryServer(
+          payload as Parameters<typeof handleSaveMcpRegistryServer>[0],
+        );
+      case "delete_mcp_registry_server":
+        return handleDeleteMcpRegistryServer(payload as { id?: string });
+      case "get_agent_mcp_servers":
+        return (
+          mockMcpSelections.get(
+            (payload as { pubkey?: string }).pubkey ?? "",
+          ) ?? null
+        );
+      case "set_agent_mcp_servers":
+        return handleSetAgentMcpServers(
+          payload as Parameters<typeof handleSetAgentMcpServers>[0],
+        );
+      case "__buzz_e2e_mcp_generation__":
+        // Test-only seam: what a spawn of this agent would read from the
+        // adopted generation, plus the generation number, so a spec can assert
+        // that a toggle moved the pointer and changed the artefact.
+        return {
+          generation: mockMcpGeneration,
+          artefact:
+            mockMcpArtefacts.get(
+              (payload as { pubkey?: string }).pubkey ?? "",
+            ) ?? null,
+          storedReferences: [...mockMcpStoredReferences].sort(),
+        };
       case "save_custom_harness":
         return handleSaveCustomHarness(
           payload as Parameters<typeof handleSaveCustomHarness>[0],
