@@ -30,8 +30,11 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
+use buzz_secret_store_pkg::namespace::{
+    MCP_NAMESPACE_PREFIX, RESERVED_AGENT_KEY_PREFIX, RESERVED_IDENTITY_KEY,
+};
 use serde::{Deserialize, Serialize};
 
 /// Generations kept on disk: the current one plus one to roll back to.
@@ -68,6 +71,50 @@ pub enum Deletion {
     },
 }
 
+impl Deletion {
+    /// Whether this deletion is one the registry is allowed to perform.
+    ///
+    /// The registry owns the reserved `mcp:` namespace and nothing else, but a
+    /// deletion travels through a journal file on disk and back — so the key
+    /// that reaches [`SecretRemover::remove`] is re-derived from a document,
+    /// not from the code that planned it. `identity` is the human nsec and
+    /// `agent:<pubkey>` is an agent's; deleting either would destroy a private
+    /// key no backup on this machine can rebuild. Checked here, at the one
+    /// place a `Deletion` becomes an action, rather than at each caller
+    /// (Sol N8).
+    ///
+    /// # Errors
+    /// A message naming the key when it is outside the `mcp:` namespace.
+    pub fn validate(&self) -> Result<(), String> {
+        let Deletion::Secret { key } = self else {
+            return Ok(());
+        };
+        if key == RESERVED_IDENTITY_KEY || key.starts_with(RESERVED_AGENT_KEY_PREFIX) {
+            return Err(format!(
+                "refusing to delete the reserved secret `{key}`: the mcp registry owns the \
+                 `{MCP_NAMESPACE_PREFIX}` namespace and nothing else"
+            ));
+        }
+        if !key.starts_with(MCP_NAMESPACE_PREFIX) {
+            return Err(format!(
+                "refusing to delete `{key}`: it is outside the `{MCP_NAMESPACE_PREFIX}` namespace \
+                 the mcp registry owns"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Largest number of files one staged generation may carry.
+///
+/// Two per agent — the generated artefact or the refusal — at the convergence
+/// cap of 256 agents, with headroom. It bounds the quantity that costs: the
+/// number of files written and fsynced under one mutation lock.
+pub const MAX_PLAN_FILES: usize = 1024;
+
+/// Largest total staged bytes in one generation.
+pub const MAX_PLAN_BYTES: usize = 64 * 1024 * 1024;
+
 /// The durable record of an in-flight change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Journal {
@@ -102,6 +149,68 @@ pub struct GenerationPlan {
     /// first staged file. A plan builder must not write them itself: a write
     /// the journal does not yet name is a torn prefix nothing can clean up.
     pub secrets: BTreeMap<String, String>,
+}
+
+impl GenerationPlan {
+    /// Whether this plan is one the store may write.
+    ///
+    /// A plan is built by a caller and then written under the mutation lock,
+    /// so every property the store depends on is checked here rather than
+    /// assumed: each file path is relative to the generation directory and
+    /// free of `.` and `..`, so no staged write can leave the tree; the file
+    /// count and the total bytes are bounded, because both are what the write
+    /// actually costs; and every key names the reserved `mcp:` namespace, so a
+    /// plan cannot overwrite the human nsec or an agent key (Sol N8).
+    ///
+    /// # Errors
+    /// [`GenerationError::Plan`] naming the first breach.
+    pub fn validate(&self) -> Result<(), GenerationError> {
+        let plan = |message: String| GenerationError::Plan(message);
+        if self.files.len() > MAX_PLAN_FILES {
+            return Err(plan(format!(
+                "the configuration change stages {} files, over the {MAX_PLAN_FILES} cap",
+                self.files.len()
+            )));
+        }
+        let mut total = 0usize;
+        for (relative, body) in &self.files {
+            if relative.is_absolute()
+                || relative
+                    .components()
+                    .any(|c| !matches!(c, Component::Normal(_)))
+            {
+                return Err(plan(format!(
+                    "the configuration change stages {}, which is not a plain relative path \
+                     inside the generation directory",
+                    relative.display()
+                )));
+            }
+            if body.len() > super::paths::MAX_ARTEFACT_BYTES {
+                return Err(plan(format!(
+                    "the configuration change stages {} at {} bytes, over the {}-byte cap a \
+                     spawn will read",
+                    relative.display(),
+                    body.len(),
+                    super::paths::MAX_ARTEFACT_BYTES
+                )));
+            }
+            total = total.saturating_add(body.len());
+        }
+        if total > MAX_PLAN_BYTES {
+            return Err(plan(format!(
+                "the configuration change stages {total} bytes, over the {MAX_PLAN_BYTES}-byte cap"
+            )));
+        }
+        for key in self.secrets.keys() {
+            Deletion::Secret { key: key.clone() }
+                .validate()
+                .map_err(|e| plan(e.replace("delete", "write")))?;
+        }
+        for deletion in &self.deletions {
+            deletion.validate().map_err(plan)?;
+        }
+        Ok(())
+    }
 }
 
 /// Removes a secret from the durable store.
@@ -376,6 +485,10 @@ impl GenerationStore {
         let base = self.current()?;
         let base_dir = base.map(|number| self.generation_dir(number));
         let plan = build(base, base_dir.as_deref())?;
+        // Before the journal, before any write: a plan that breaches a bound
+        // or names a key outside the registry's namespace is refused with the
+        // previous generation still adopted and nothing staged.
+        plan.validate()?;
         let next = base.map(|number| number + 1).unwrap_or(1);
 
         let mut deletions = plan.deletions.clone();
@@ -422,6 +535,17 @@ impl GenerationStore {
         // obsolete files to agents. It is therefore propagated, never
         // discarded.
         remove_tree(&staged)?;
+        // Created before the first file rather than by it: a plan can
+        // legitimately stage nothing — every agent deselected, which is what
+        // "turn every registry server off" produces — and the directory
+        // `current` is about to name has to exist all the same. Without this
+        // the fsync below fails on a directory that was never created and the
+        // whole change is refused for a state that is perfectly valid.
+        std::fs::create_dir_all(&staged).map_err(|e| GenerationError::Io {
+            operation: "create",
+            path: staged.display().to_string(),
+            reason: e.to_string(),
+        })?;
         for (index, (relative, contents)) in plan.files.iter().enumerate() {
             write_file_synced(&staged.join(relative), contents)?;
             self.inject(hooks, FlipStep::FileWritten(index))?;
@@ -532,11 +656,18 @@ impl GenerationStore {
         let mut remaining = Vec::new();
         let mut first_failure = None;
         for (index, deletion) in deletions.iter().enumerate() {
-            let outcome = match deletion {
-                Deletion::Secret { key } => secrets.remove(key),
-                Deletion::Generation { number } => {
-                    remove_tree(&self.generation_dir(*number)).map_err(|e| e.to_string())
-                }
+            let outcome = match deletion.validate() {
+                // The journal is a file on disk, so the key that reaches the
+                // store is re-read rather than re-derived. Validating here
+                // makes a tampered or corrupted entry a surfaced, retried
+                // failure instead of a delete of the human nsec.
+                Err(reason) => Err(reason),
+                Ok(()) => match deletion {
+                    Deletion::Secret { key } => secrets.remove(key),
+                    Deletion::Generation { number } => {
+                        remove_tree(&self.generation_dir(*number)).map_err(|e| e.to_string())
+                    }
+                },
             };
             match outcome {
                 Ok(()) => {
@@ -645,11 +776,14 @@ fn retry_deletions(
     let mut remaining = Vec::new();
     let mut first_failure = None;
     for deletion in deletions {
-        let outcome = match deletion {
-            Deletion::Secret { key } => secrets.remove(key),
-            Deletion::Generation { number } => {
-                remove_tree(&store.generation_dir(*number)).map_err(|e| e.to_string())
-            }
+        let outcome = match deletion.validate() {
+            Err(reason) => Err(reason),
+            Ok(()) => match deletion {
+                Deletion::Secret { key } => secrets.remove(key),
+                Deletion::Generation { number } => {
+                    remove_tree(&store.generation_dir(*number)).map_err(|e| e.to_string())
+                }
+            },
         };
         if let Err(reason) = outcome {
             first_failure.get_or_insert(reason);
@@ -695,7 +829,43 @@ fn remove_tree(path: &Path) -> Result<(), GenerationError> {
     }
 }
 
-fn write_file_synced(path: &Path, contents: &str) -> Result<(), GenerationError> {
+/// Create `path` for writing without following a symlink at its final
+/// component.
+///
+/// `File::create` follows a link, so a symlink planted at `journal.json.next`
+/// or `current.next` — both fixed names inside a directory the whole user
+/// account can write on a shared machine — would have the staging write
+/// truncate the link's target instead. `O_NOFOLLOW` fails the open with
+/// `ELOOP` instead, so the planted link is a loud error rather than a silent
+/// write somewhere else (Sol N10). Windows has no equivalent open flag, so the
+/// check there is a `symlink_metadata` call before the open.
+pub(super) fn create_no_follow(path: &Path) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "the path is a symbolic link",
+                ))
+            }
+            Ok(_) | Err(_) => {}
+        }
+        File::create(path)
+    }
+}
+
+pub(super) fn write_file_synced(path: &Path, contents: &str) -> Result<(), GenerationError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| GenerationError::Io {
             operation: "create",
@@ -703,7 +873,7 @@ fn write_file_synced(path: &Path, contents: &str) -> Result<(), GenerationError>
             reason: e.to_string(),
         })?;
     }
-    let mut file = File::create(path).map_err(|e| GenerationError::Io {
+    let mut file = create_no_follow(path).map_err(|e| GenerationError::Io {
         operation: "create",
         path: path.display().to_string(),
         reason: e.to_string(),
@@ -718,7 +888,7 @@ fn write_file_synced(path: &Path, contents: &str) -> Result<(), GenerationError>
 }
 
 /// fsync a directory so a rename or a create is durable, not just visible.
-fn sync_dir(path: &Path) -> Result<(), GenerationError> {
+pub(super) fn sync_dir(path: &Path) -> Result<(), GenerationError> {
     #[cfg(unix)]
     {
         let dir = File::open(path).map_err(|e| GenerationError::Io {

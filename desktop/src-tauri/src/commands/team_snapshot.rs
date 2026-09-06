@@ -604,6 +604,7 @@ pub async fn confirm_team_snapshot_import(
             last_exit_code: None,
             last_error: None,
             last_error_code: None,
+            mcp_servers: None,
             respond_to: {
                 use crate::managed_agents::RespondTo;
                 respond_to_wire

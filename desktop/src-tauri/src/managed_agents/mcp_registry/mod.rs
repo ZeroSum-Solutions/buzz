@@ -22,10 +22,13 @@
 //! * [`paths`] — the roots, and the one place an agent id becomes a path.
 //! * [`converge`] — one adopted generation from the document plus each agent's
 //!   selection, with each agent's secrets re-keyed onto it before the flip.
+//! * [`apply`] — the production caller: a registry edit or a toggle change
+//!   becomes one adopted generation, and a start finishes what a crash left.
 //! * [`spawn`] — what one spawn takes from the adopted generation: the
 //!   artefacts at the placement its runtime names, its own working directory
 //!   when that placement needs one, and the capability.
 
+pub mod apply;
 pub mod converge;
 pub mod generate;
 pub mod generation;
@@ -34,6 +37,9 @@ pub mod paths;
 pub mod resolve;
 pub mod schema;
 pub mod spawn;
+
+#[cfg(test)]
+mod apply_tests;
 
 #[cfg(test)]
 mod tests;

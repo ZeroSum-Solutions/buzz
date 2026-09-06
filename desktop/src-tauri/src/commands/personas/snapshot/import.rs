@@ -647,6 +647,7 @@ pub async fn confirm_agent_snapshot_import(
             // Instance-level behavioral defaults agree with the resolved
             // definition: both come from the single minted struct so they
             // are always consistent at mint time.
+            mcp_servers: None,
             respond_to: minted.respond_to,
             respond_to_allowlist: minted.respond_to_allowlist.clone(),
             is_builtin: false,

@@ -148,6 +148,7 @@ impl AgentDefinition {
             last_exit_code: None,
             last_error: None,
             last_error_code: None,
+            mcp_servers: None,
             respond_to: RespondTo::default(),
             respond_to_allowlist: Vec::new(),
             display_name: Some(self.display_name),
@@ -227,6 +228,25 @@ pub struct RelayAgentInfo {
     #[serde(default)]
     pub respond_to_allowlist: Vec<String>,
 }
+/// One agent's MCP registry selection.
+///
+/// Versioned so a later default change is a version bump rather than a
+/// reinterpretation of what is already stored, and separate from the record's
+/// other fields so "never configured" (the whole value absent) stays
+/// distinguishable from "configured with nothing" (`enabled` empty).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentMcpServers {
+    /// Schema version of this selection. Read, never inferred.
+    pub version: u32,
+    /// Registry entry ids, by `RegistryEntry::id`, never by name — renaming a
+    /// server must not silently disable it.
+    #[serde(default)]
+    pub enabled: Vec<String>,
+}
+
+/// Schema version this build writes for [`AgentMcpServers`].
+pub const AGENT_MCP_SERVERS_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ManagedAgentRecord {
     pub pubkey: String,
@@ -361,6 +381,18 @@ pub struct ManagedAgentRecord {
     pub last_error: Option<String>,
     #[serde(default)]
     pub last_error_code: Option<i64>,
+    /// MCP registry servers this agent has enabled, versioned (memo decision
+    /// 8).
+    ///
+    /// `None` means "no registry servers" and is a **distinct** state from
+    /// `Some` with an empty list: absence is a record written before the
+    /// registry existed, while an empty list is an operator who turned every
+    /// server off. A later default change therefore reads the version rather
+    /// than reinterpreting absence. Deliberately not added to the kind:30177
+    /// projection, which is a field-by-field allowlist, so the selection stays
+    /// machine-local.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_servers: Option<AgentMcpServers>,
     /// Inbound author gate mode. Translates to `BUZZ_ACP_RESPOND_TO`.
     #[serde(default)]
     pub respond_to: RespondTo,

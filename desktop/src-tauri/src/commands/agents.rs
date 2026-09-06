@@ -661,6 +661,7 @@ pub async fn create_managed_agent(
             last_exit_code: None,
             last_error: None,
             last_error_code: None,
+            mcp_servers: None,
             respond_to: minted.respond_to,
             respond_to_allowlist: minted.respond_to_allowlist.clone(),
             display_name: None,

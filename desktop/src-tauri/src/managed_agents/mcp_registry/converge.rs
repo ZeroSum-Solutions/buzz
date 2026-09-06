@@ -147,7 +147,33 @@ pub struct Converged {
     pub refused: Vec<(String, String)>,
 }
 
+/// What a convergence needs besides the registry and the agents.
+///
+/// Grouped rather than passed one by one because the three travel together and
+/// only ever come from the same place: the app's own bundle and the operator's
+/// current Settings action.
+pub struct GenerationInputs<'a> {
+    /// Absolute path of the bundled launcher, already checked by
+    /// `apply::checked_launcher`. Every generated stdio and http entry names
+    /// it as its command.
+    pub launcher: &'a str,
+    /// Keychain service the desktop stores its blob under, written into every
+    /// generated argv so the launcher reads the same store the desktop wrote.
+    pub keychain_service: &'a str,
+    /// Secret values the operator entered in this action, keyed by reference
+    /// id. Written into the adopted generation's keyspace and never read back.
+    pub pending: &'a BTreeMap<String, String>,
+}
+
 /// Stage and adopt one generation covering every agent in `agents`.
+///
+/// `pending` carries secret **values** the operator has just entered, keyed by
+/// reference id. They are written into the new generation's keyspace for every
+/// agent that has a server naming them, and are the only channel a value takes:
+/// nothing reads one back, and no generated file or log line holds one. A
+/// reference absent from `pending` is carried forward from the base generation
+/// instead, and a reference in neither simply has no record — the launcher
+/// then refuses to start that server rather than starting it unauthenticated.
 ///
 /// # Errors
 /// [`ConvergeError`]. Nothing is adopted unless the pointer moved; a failure
@@ -157,11 +183,15 @@ pub fn converge<S: SecretStoreIo>(
     paths: &RegistryPaths,
     registry: &LoadedRegistry,
     agents: &[AgentSelection],
-    launcher: &str,
-    keychain_service: &str,
+    generation: &GenerationInputs<'_>,
     secrets: &S,
     nonces: &dyn NonceSource,
 ) -> Result<Converged, ConvergeError> {
+    let GenerationInputs {
+        launcher,
+        keychain_service,
+        pending,
+    } = generation;
     if agents.len() > MAX_CONVERGED_AGENTS {
         return Err(ConvergeError::TooManyAgents {
             count: agents.len(),
@@ -247,6 +277,7 @@ pub fn converge<S: SecretStoreIo>(
                     base,
                     &resolved.servers,
                     &existing,
+                    pending,
                     &mut carried,
                 );
 
@@ -311,13 +342,23 @@ fn carry_secrets(
     base: Option<u64>,
     servers: &[RegistryEntry],
     existing: &BTreeMap<String, String>,
+    pending: &BTreeMap<String, String>,
     carried: &mut BTreeMap<String, String>,
 ) {
-    let Some(base) = base else {
-        return;
-    };
     for entry in servers {
         for reference in entry_references(entry) {
+            // A value the operator has just typed wins over the stored one:
+            // that is what "edit this server's credential" means, and it is
+            // also the only way a first convergence (`base` is `None`) can
+            // have a secret at all. It is never echoed back — the panel sends
+            // it once, this is where it lands, and nothing reads it out again.
+            if let Some(value) = pending.get(reference.id()) {
+                carried.insert(storage_key(capability, &reference), value.clone());
+                continue;
+            }
+            let Some(base) = base else {
+                continue;
+            };
             let from = format!(
                 "{MCP_NAMESPACE_PREFIX}{}:{base}:{}",
                 capability.agent_id(),

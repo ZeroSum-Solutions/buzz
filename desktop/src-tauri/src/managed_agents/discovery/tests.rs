@@ -206,6 +206,7 @@ fn record_with(
     override_cmd: Option<&str>,
 ) -> crate::managed_agents::types::ManagedAgentRecord {
     crate::managed_agents::types::ManagedAgentRecord {
+        mcp_servers: None,
         description: None,
         pubkey: String::new(),
         name: "r".to_string(),
