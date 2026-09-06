@@ -17,20 +17,9 @@ for arg in "$@"; do
     esac
 done
 
-# Step 0: Guard. The canonical main checkout is derived ONLY from git's own
-# porcelain output (always the first `worktree` line) — there is no
-# environment override. An override that a caller can set to "whatever
-# directory I happen to be in" defeats the guard it is supposed to enforce,
-# so it does not exist here.
-main_worktree="$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')"
-current_worktree="$(git rev-parse --show-toplevel)"
-if [[ "$current_worktree" != "$main_worktree" ]]; then
-    echo "Error: cargo-target-gc must be run from main checkout ($main_worktree), currently in $current_worktree" >&2
-    exit 1
-fi
-
-python3 - "$MODE" "$main_worktree" << 'PY'
+python3 - "$MODE" << 'PY'
 import datetime
+import fcntl
 import hashlib
 import json
 import os
@@ -41,7 +30,6 @@ import sys
 import time
 
 mode = sys.argv[1]
-main_worktree = sys.argv[2]
 
 new_cache_root = os.path.expanduser("~/.cache/zs/buzz-cargo-targets")
 legacy_cache_root = os.path.expanduser("~/.cache/zs/buzz-targets")
@@ -73,6 +61,7 @@ KEY_RE = re.compile(r"^[0-9a-f]{12}$")
 BUILD_MARKER_FILES = ("CACHEDIR.TAG",)
 BUILD_SUBDIRS = ("debug", "release")
 FOURTEEN_DAYS = 14 * 86400
+SIDECAR_ALLOWED_NAMES = {"root", "desktop", ".worktree-path"}
 
 
 class StatError(Exception):
@@ -148,10 +137,64 @@ def git_probe(args, timeout=30):
     return p.stdout
 
 
+def worktree_list_z(timeout=30):
+    """`git worktree list --porcelain -z`, parsed NUL-safely. Returns a list
+    of {"path", "head", "branch"} dicts in the order git reports them
+    (element 0 is always the main checkout), or None on any failure — exec
+    error, nonzero exit, or timeout. The non-`-z` porcelain form is
+    newline/whitespace-delimited and silently mis-parses a worktree path
+    that itself contains a space or newline; `-z` NUL-delimits every field
+    so no path content can be confused with a field or record separator."""
+    try:
+        p = subprocess.run(
+            ["git", "worktree", "list", "--porcelain", "-z"],
+            capture_output=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if p.returncode != 0:
+        return None
+    fields = p.stdout.split(b"\x00")
+    if fields and fields[-1] == b"":
+        fields = fields[:-1]
+    worktrees = []
+    current = None
+    for raw in fields:
+        if raw == b"":
+            if current is not None:
+                worktrees.append(current)
+                current = None
+            continue
+        text = raw.decode("utf-8", "surrogateescape")
+        if current is None:
+            current = {"path": None, "head": None, "branch": None}
+        if text.startswith("worktree "):
+            current["path"] = text[len("worktree "):]
+        elif text.startswith("HEAD "):
+            current["head"] = text[len("HEAD "):]
+        elif text.startswith("branch "):
+            ref = text[len("branch "):]
+            if ref.startswith("refs/heads/"):
+                ref = ref[len("refs/heads/"):]
+            current["branch"] = ref
+        elif text == "detached":
+            current["branch"] = "detached"
+        # other fields (bare, locked[, reason], prunable[, reason]) carry no
+        # information this GC uses.
+    if current is not None:
+        worktrees.append(current)
+    return worktrees
+
+
 def lsof_active(path, timeout=30):
     """True if any process has an open file handle under path, OR if that
-    cannot be determined (lsof missing/erroring/timing out) — activity
-    checks fail closed toward "assume active" rather than toward deletion."""
+    cannot be determined — activity checks fail closed toward "assume
+    active" rather than toward deletion. lsof's exit code 1 is documented
+    to mean BOTH "no matches" and "an error occurred" (permission, I/O,
+    a target that vanished mid-scan); the two are told apart only by
+    whether lsof also wrote to stderr. A bare rc=1 with stderr output is
+    therefore treated as "cannot determine" (active), not "no match"."""
     lsof_bin = shutil.which("lsof")
     if not lsof_bin:
         return True
@@ -159,10 +202,14 @@ def lsof_active(path, timeout=30):
         p = subprocess.run([lsof_bin, "+D", path], capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError):
         return True
-    if p.returncode not in (0, 1):
-        # 0 = matches found, 1 = no matches; anything else is an lsof error.
-        return True
-    return bool(p.stdout.strip())
+    if p.returncode == 0:
+        return bool(p.stdout.strip())
+    if p.returncode == 1:
+        if p.stderr.strip():
+            return True
+        return bool(p.stdout.strip())
+    # Any other exit code is an lsof error condition.
+    return True
 
 
 def looks_like_build_output(entry_path):
@@ -200,21 +247,41 @@ def has_unrecognized_content(entry_path, allowed_names):
 
 
 def contains_git(entry_path):
-    """Shallow check for a nested .git at the entry root or its known
-    first-level subtrees — enough to catch a repo or arbitrary directory
-    that landed under the cache root by mistake, without an expensive full
-    walk of a multi-gigabyte build tree."""
-    candidates = [entry_path]
-    for sub in ("root", "desktop"):
-        candidates.append(os.path.join(entry_path, sub))
-    for c in candidates:
-        try:
-            names = os.listdir(c)
-        except OSError:
-            continue
-        if ".git" in names:
-            return True
+    """Full-depth check for a nested .git anywhere under the candidate. The
+    deletion contract is that no .git directory is ever touched; a shallow
+    check of only the entry root and its known root/desktop subtrees misses
+    a repository (or arbitrary directory tree) landed deeper, e.g. under
+    root/debug/scratch/.git. os.walk does not follow symlinked directories
+    by default, so a symlink cycle cannot make this loop forever — the walk
+    is bounded by the real (non-symlink) directory tree, which is finite.
+    Any traversal error (permission, a path vanishing mid-walk) is treated
+    as "contains a .git" — fail closed toward skipping, not deleting."""
+    try:
+        for root, dirs, files in os.walk(entry_path, onerror=_walk_onerror):
+            if ".git" in dirs or ".git" in files:
+                return True
+    except StatError:
+        return True
     return False
+
+
+def marker_valid(entry_path, expected_key):
+    """Read and authenticate this entry's `.worktree-path` sidecar: it must
+    exist, be a regular readable non-empty file, and hash back to the
+    entry's own key. Returns (True, recorded_path) or (False, None)."""
+    sidecar = os.path.join(entry_path, ".worktree-path")
+    if not os.path.isfile(sidecar) or os.path.islink(sidecar):
+        return False, None
+    try:
+        with open(sidecar, "r", encoding="utf-8") as sf:
+            recorded_path = sf.read().strip()
+    except OSError:
+        return False, None
+    if not recorded_path:
+        return False, None
+    if hashlib.sha256(recorded_path.encode()).hexdigest()[:12] != expected_key:
+        return False, None
+    return True, recorded_path
 
 
 def skip_row(cache_key, entry_path, reason, bytes_count=0, iso_mtime=None):
@@ -233,33 +300,31 @@ def skip_row(cache_key, entry_path, reason, bytes_count=0, iso_mtime=None):
     }
 
 
-# Step 1: Forward pass - parse git worktree list --porcelain
-wt_out = git_probe(["git", "worktree", "list", "--porcelain"])
-if wt_out is None:
-    fatal("git worktree list --porcelain failed; cannot safely determine live worktrees.")
+# Step 0: Guard. The canonical main checkout is derived ONLY from git's own
+# NUL-safe porcelain output (always the first worktree entry) — there is no
+# environment override. An override that a caller can set to "whatever
+# directory I happen to be in" defeats the guard it is supposed to enforce,
+# so it does not exist here.
+wt_list = worktree_list_z()
+if wt_list is None:
+    fatal("git worktree list --porcelain -z failed; cannot safely determine live worktrees.")
+if not wt_list or not wt_list[0]["path"]:
+    fatal("git worktree list --porcelain -z returned no worktrees; cannot safely determine the main checkout.")
+main_worktree = wt_list[0]["path"]
 
-worktrees = []
-live_worktrees_by_path = {}
-for block in wt_out.strip().split("\n\n"):
-    lines = block.strip().splitlines()
-    if not lines:
-        continue
-    wt = {"path": None, "head": None, "branch": None}
-    for line in lines:
-        if line.startswith("worktree "):
-            wt["path"] = line[9:].strip()
-        elif line.startswith("HEAD "):
-            wt["head"] = line[5:].strip()
-        elif line.startswith("branch "):
-            ref = line[7:].strip()
-            if ref.startswith("refs/heads/"):
-                ref = ref[11:]
-            wt["branch"] = ref
-        elif line == "detached":
-            wt["branch"] = "detached"
-    if wt["path"]:
-        worktrees.append(wt)
-        live_worktrees_by_path[wt["path"]] = wt
+current_worktree_out = git_probe(["git", "rev-parse", "--show-toplevel"])
+if current_worktree_out is None:
+    fatal("git rev-parse --show-toplevel failed.")
+current_worktree = current_worktree_out.strip()
+if current_worktree != main_worktree:
+    fatal(
+        f"cargo-target-gc must be run from main checkout ({main_worktree}), "
+        f"currently in {current_worktree}"
+    )
+
+# Step 1: Forward pass — worktrees already parsed above (NUL-safe).
+worktrees = wt_list
+live_worktrees_by_path = {wt["path"]: wt for wt in worktrees if wt["path"]}
 
 legacy_basenames_live = {}
 for wt in worktrees:
@@ -292,7 +357,7 @@ for entry in sorted(os.listdir(new_cache_root)):
         rows.append(skip_row(entry, entry_path, "path-escape"))
         continue
 
-    if has_unrecognized_content(entry_path, {"root", "desktop", ".worktree-path"}):
+    if has_unrecognized_content(entry_path, SIDECAR_ALLOWED_NAMES):
         rows.append(skip_row(entry, entry_path, "unrecognized-content"))
         continue
 
@@ -300,27 +365,12 @@ for entry in sorted(os.listdir(new_cache_root)):
         rows.append(skip_row(entry, entry_path, "contains-git"))
         continue
 
-    sidecar = os.path.join(entry_path, ".worktree-path")
-    recorded_path = None
-    if os.path.isfile(sidecar) and not os.path.islink(sidecar):
-        try:
-            with open(sidecar, "r", encoding="utf-8") as sf:
-                recorded_path = sf.read().strip()
-        except OSError:
-            recorded_path = None
-
-    if not recorded_path:
-        # Missing, unreadable, or empty marker: a build in progress can
-        # leave exactly this state (the sidecar is written right after
-        # mkdir). Never treat it as orphaned — fail closed.
+    marker_ok, recorded_path = marker_valid(entry_path, entry)
+    if not marker_ok:
+        # Missing, unreadable, empty, or hash-mismatched marker: a build in
+        # progress (or an interrupted sidecar write) can leave exactly this
+        # state. Never treat it as orphaned — fail closed.
         rows.append(skip_row(entry, entry_path, "missing-marker"))
-        continue
-
-    expected_key = hashlib.sha256(recorded_path.encode()).hexdigest()[:12]
-    if expected_key != entry:
-        # The marker doesn't hash back to this directory's own key: don't
-        # trust it to authenticate anything about this entry.
-        rows.append(skip_row(entry, entry_path, "marker-mismatch"))
         continue
 
     if not looks_like_build_output(entry_path):
@@ -332,7 +382,7 @@ for entry in sorted(os.listdir(new_cache_root)):
         continue
 
     try:
-        bytes_count, iso_mtime, _mtime_epoch = get_dir_stats(entry_path)
+        bytes_count, iso_mtime, mtime_epoch = get_dir_stats(entry_path)
     except StatError:
         rows.append(skip_row(entry, entry_path, "stat-error"))
         continue
@@ -352,6 +402,7 @@ for entry in sorted(os.listdir(new_cache_root)):
         "cache_key": entry,
         "cache_bytes": bytes_count,
         "last_mtime": iso_mtime,
+        "mtime_epoch": mtime_epoch,
         "size_flag": bytes_count > 5 * 1024 * 1024 * 1024,
         "delete_path": canonical_entry,
     })
@@ -513,6 +564,7 @@ for wt in worktrees:
                 "cache_key": c_key,
                 "cache_bytes": c_bytes,
                 "last_mtime": c_iso_mtime,
+                "mtime_epoch": c_mtime,
                 "size_flag": c_bytes > 5 * 1024 * 1024 * 1024,
                 "delete_path": delete_target,
             })
@@ -568,11 +620,42 @@ if mode == "dry-run":
     print("Dry-run complete: no files deleted. Use --apply to execute deletion.")
     sys.exit(0)
 
-# --- Apply: revalidate each candidate immediately before removing it -------
+# --- Apply: fence the whole pass, then revalidate each candidate immediately
+# before removing it -----------------------------------------------------
 # The scan above can be arbitrarily stale by the time we get here (this loop
 # itself takes time, and nothing but this same process's own sequencing
-# stands between "scanned" and "deleted"). Re-check live state, right before
-# each individual rm, rather than trusting the earlier snapshot.
+# stands between "scanned" and "deleted"). Two defenses, neither of which
+# alone is sufficient:
+#
+#   1. An exclusive lock over the cache root for the ENTIRE apply pass, so
+#      two `cargo-target-gc.sh --apply` invocations (including one that
+#      bypasses the Justfile's broader with-gate-lock.sh wrapper via direct
+#      invocation) can never revalidate-then-delete the same entries at
+#      once.
+#   2. A full re-authentication of each candidate immediately before its own
+#      deletion — not just "is it still there", but every check that made it
+#      eligible in the first place (marker, content allowlist, nested-.git,
+#      build-output marker, byte/mtime identity since the scan) — because an
+#      ordinary `cargo build` takes none of this GC's locks and can start
+#      writing into a candidate at any point between the scan and the
+#      delete. This narrows that race to the gap between the last
+#      revalidation check and the `rmtree` call itself, which is the
+#      smallest window achievable without making Cargo itself lock-aware
+#      (out of scope here — see storage-build-spec.md).
+
+APPLY_LOCK_PATH = os.path.join(new_cache_root, ".gc-apply.lock")
+_lock_fd = os.open(APPLY_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o644)
+try:
+    fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    fatal(
+        f"another cargo-target-gc.sh --apply is already running ({APPLY_LOCK_PATH} "
+        "is held); refusing to run concurrently."
+    )
+os.ftruncate(_lock_fd, 0)
+os.write(_lock_fd, f"{os.getpid()}\n".encode())
+# _lock_fd is intentionally never closed: the flock is held until this
+# process exits, which is the entire remaining apply pass.
 
 
 def revalidate(row, path):
@@ -592,13 +675,34 @@ def revalidate(row, path):
     if lsof_active(path):
         return False, "active-use-detected"
 
+    # Refuse if the entry's content changed since it was scanned: an
+    # unrelated size/mtime shift under a cache dir this GC is about to
+    # delete means something (almost certainly a build) wrote to it after
+    # the plan was made.
+    try:
+        bytes_now, _iso_now, mtime_now = get_dir_stats(path)
+    except StatError:
+        return False, "stat-error"
+    if bytes_now != row.get("cache_bytes") or mtime_now != row.get("mtime_epoch"):
+        return False, "changed-since-plan"
+
+    if contains_git(path):
+        return False, "contains-git-at-apply"
+    if not looks_like_build_output(path):
+        return False, "no-build-marker-at-apply"
+
     if row["status"] == "orphaned":
-        wt_out_now = git_probe(["git", "worktree", "list", "--porcelain"])
-        if wt_out_now is None:
+        cache_key = row.get("cache_key")
+        if cache_key:
+            marker_ok, _recorded = marker_valid(path, cache_key)
+            if not marker_ok:
+                return False, "marker-invalid-at-apply"
+        if has_unrecognized_content(path, SIDECAR_ALLOWED_NAMES):
+            return False, "unrecognized-content-at-apply"
+        wt_list_now = worktree_list_z()
+        if wt_list_now is None:
             return False, "probe-failed"
-        live_now = {
-            line[9:].strip() for line in wt_out_now.splitlines() if line.startswith("worktree ")
-        }
+        live_now = {wt["path"] for wt in wt_list_now if wt["path"]}
         wt_path = row.get("worktree_path")
         if wt_path and wt_path in live_now:
             return False, "worktree-reappeared"
@@ -621,11 +725,7 @@ def revalidate(row, path):
     rev_out = git_probe(["git", "-C", wt_path, "rev-list", "@{u}..HEAD"])
     if rev_out is None or rev_out.strip():
         return False, "now-unpushed-or-probe-failed"
-    try:
-        _, _, mtime_epoch = get_dir_stats(path)
-    except StatError:
-        return False, "stat-error"
-    if mtime_epoch >= time.time() - FOURTEEN_DAYS:
+    if mtime_now >= time.time() - FOURTEEN_DAYS:
         return False, "now-recent"
     return True, "ok"
 
