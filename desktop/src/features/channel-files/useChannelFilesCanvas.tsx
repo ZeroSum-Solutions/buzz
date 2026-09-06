@@ -52,12 +52,15 @@ export function useChannelFilesCanvas({
   // not only when the body changes.
   const rawContent = canvasQuery.data?.content ?? "";
   const failed = canvasQuery.error != null;
+  const hasMetadata =
+    canvasQuery.data?.updatedAt != null || canvasQuery.data?.author != null;
 
   return React.useMemo(() => {
     if (!enabled || channelId === null) return null;
-    // `\S` stops at the first non-blank character instead of allocating a
-    // trimmed copy of the body just to ask whether it has one.
-    if (!failed && !/\S/.test(rawContent)) return null;
+    // Bounded metadata carries presence: a channel with a canvas has a
+    // non-null author or updatedAt timestamp. We avoid scanning rawContent,
+    // which is relay-sourced and unbounded.
+    if (!failed && !hasMetadata) return null;
     return {
       preview: failed
         ? CANVAS_UNAVAILABLE_PREVIEW
@@ -70,5 +73,13 @@ export function useChannelFilesCanvas({
         />
       ),
     };
-  }, [canEdit, channelId, enabled, failed, isArchived, rawContent]);
+  }, [
+    canEdit,
+    channelId,
+    enabled,
+    failed,
+    hasMetadata,
+    isArchived,
+    rawContent,
+  ]);
 }
