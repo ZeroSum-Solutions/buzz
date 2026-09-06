@@ -78,7 +78,11 @@ pub(crate) const MENTION_ABOUT_MAX_BYTES: usize = 512;
 /// ([`crate::models::UserProfileSummaryInfo`],
 /// [`crate::models::UserSearchResultInfo`]); the full, uncapped `about`
 /// remains available on the `get_profile` detail path.
-pub(crate) fn truncate_mention_about(about: Option<String>) -> Option<String> {
+///
+/// Takes a borrowed `&str` so the caller never allocates the untrusted,
+/// full-size kind-0 field before it is bounded — only the truncated prefix
+/// is cloned into an owned `String`.
+pub(crate) fn truncate_mention_about(about: Option<&str>) -> Option<String> {
     truncate_utf8(about, MENTION_ABOUT_MAX_BYTES)
 }
 
@@ -100,16 +104,38 @@ pub(crate) const PROFILE_NAME_MAX_BYTES: usize = 256;
 /// batch and search DTOs ([`crate::models::UserProfileSummaryInfo`],
 /// [`crate::models::UserSearchResultInfo`]); the `get_profile` detail path
 /// keeps the full value, exactly as it does for `about`.
-pub(crate) fn truncate_profile_name(name: Option<String>) -> Option<String> {
+///
+/// Takes a borrowed `&str` — see [`truncate_mention_about`] for why.
+pub(crate) fn truncate_profile_name(name: Option<&str>) -> Option<String> {
     truncate_utf8(name, PROFILE_NAME_MAX_BYTES)
 }
 
+/// Maximum bytes of a kind-0 `picture` URL carried on the batch DTO.
+///
+/// Same seam as [`MENTION_ABOUT_MAX_BYTES`] and [`PROFILE_NAME_MAX_BYTES`]:
+/// `get_users_batch` clones `picture` into the response with no cap of its
+/// own, so an untrusted kind-0 event can still carry up to 256 KiB into a
+/// field the frontend only ever renders as an `<img>` `src`. 2 KiB is far
+/// above any real avatar URL (including a typical Blossom blob reference)
+/// while cutting the untrusted payload down at the boundary.
+pub(crate) const PROFILE_PICTURE_MAX_BYTES: usize = 2 * 1024;
+
+/// Truncate a kind-0 `picture` URL to at most [`PROFILE_PICTURE_MAX_BYTES`]
+/// bytes on a UTF-8 character boundary. Used by the batch DTO
+/// ([`crate::models::UserProfileSummaryInfo`]); the `get_profile` detail
+/// path keeps the full value, exactly as it does for `about`.
+pub(crate) fn truncate_profile_picture(picture: Option<&str>) -> Option<String> {
+    truncate_utf8(picture, PROFILE_PICTURE_MAX_BYTES)
+}
+
 /// Truncate `value` to at most `max_bytes`, cutting on a UTF-8 character
-/// boundary so the result is never a partial scalar.
-fn truncate_utf8(value: Option<String>, max_bytes: usize) -> Option<String> {
+/// boundary so the result is never a partial scalar. Only the bounded
+/// prefix is ever allocated into an owned `String` — the untrusted input is
+/// never cloned in full before this runs.
+fn truncate_utf8(value: Option<&str>, max_bytes: usize) -> Option<String> {
     value.map(|s| {
         if s.len() <= max_bytes {
-            return s;
+            return s.to_string();
         }
         let mut end = max_bytes;
         while end > 0 && !s.is_char_boundary(end) {
@@ -418,17 +444,12 @@ pub fn users_batch_from_events(
             display_name: truncate_profile_name(
                 v.get("display_name")
                     .and_then(Value::as_str)
-                    .or_else(|| v.get("name").and_then(Value::as_str))
-                    .map(str::to_string),
+                    .or_else(|| v.get("name").and_then(Value::as_str)),
             ),
-            name: truncate_profile_name(v.get("name").and_then(Value::as_str).map(str::to_string)),
-            avatar_url: v.get("picture").and_then(Value::as_str).map(str::to_string),
-            about: truncate_mention_about(
-                v.get("about").and_then(Value::as_str).map(str::to_string),
-            ),
-            nip05_handle: truncate_profile_name(
-                v.get("nip05").and_then(Value::as_str).map(str::to_string),
-            ),
+            name: truncate_profile_name(v.get("name").and_then(Value::as_str)),
+            avatar_url: truncate_profile_picture(v.get("picture").and_then(Value::as_str)),
+            about: truncate_mention_about(v.get("about").and_then(Value::as_str)),
+            nip05_handle: truncate_profile_name(v.get("nip05").and_then(Value::as_str)),
             is_agent: owner_pubkey.is_some(),
             owner_pubkey,
         };

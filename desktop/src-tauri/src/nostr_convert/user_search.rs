@@ -16,16 +16,11 @@ pub fn user_search_result_from_event(ev: &Event) -> UserSearchResultInfo {
         display_name: super::truncate_profile_name(
             v.get("display_name")
                 .and_then(Value::as_str)
-                .or_else(|| v.get("name").and_then(Value::as_str))
-                .map(str::to_string),
+                .or_else(|| v.get("name").and_then(Value::as_str)),
         ),
         avatar_url: v.get("picture").and_then(Value::as_str).map(str::to_string),
-        about: super::truncate_mention_about(
-            v.get("about").and_then(Value::as_str).map(str::to_string),
-        ),
-        nip05_handle: super::truncate_profile_name(
-            v.get("nip05").and_then(Value::as_str).map(str::to_string),
-        ),
+        about: super::truncate_mention_about(v.get("about").and_then(Value::as_str)),
+        nip05_handle: super::truncate_profile_name(v.get("nip05").and_then(Value::as_str)),
         is_agent: owner_pubkey.is_some(),
         owner_pubkey,
     }
