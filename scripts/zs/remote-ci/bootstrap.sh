@@ -153,7 +153,7 @@ export PNPM_HOME="$HOME/.local/share/pnpm"
 export BUZZ_TEST_POSTGRES_PASSWORD=buzz_dev
 export CMAKE_POLICY_VERSION_MINIMUM=3.5
 export DEBIAN_FRONTEND=noninteractive
-export PATH="$HOME/.cargo/bin:$PNPM_HOME:$PATH"
+export PATH="$HOME/.cargo/bin:$PNPM_HOME/bin:$PNPM_HOME:$PATH"
 ENVFILE
 chown "${CI_USER}:${CI_USER}" "${CI_HOME}/.buzz-ci-env"
 if ! grep -q buzz-ci-env "${CI_HOME}/.bashrc" 2>/dev/null; then
