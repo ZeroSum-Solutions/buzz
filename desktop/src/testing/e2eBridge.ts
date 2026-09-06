@@ -553,6 +553,23 @@ type E2eConfig = {
      */
     snapshotFetchError?: string;
     uploadDescriptors?: RawBlobDescriptor[];
+    /**
+     * Local files the mocked path-link resolver can find. A candidate that is
+     * not listed resolves to `null` — the same "not a link" answer the real
+     * command gives for a missing file or one outside every allowed root.
+     * Containment itself is proven natively (`commands/path_links_tests.rs`);
+     * the bridge only stands in for the filesystem.
+     */
+    pathLinkFiles?: Array<{
+      /** The token text as written in the message. */
+      candidate: string;
+      /** Canonical path the resolver answers with. */
+      path: string;
+      filename: string;
+      kind: "markdown" | "file";
+      /** Body returned by `read_path_link_markdown` for a markdown file. */
+      text?: string;
+    }>;
     // Seed rows returned by `list_save_subscriptions`. Each entry uses the same
     // snake_case wire shape the Rust backend returns so tests can drive the
     // LocalArchiveSettingsCard without a real SQLite database.
@@ -14521,6 +14538,44 @@ export function maybeInstallE2eTauriMocks() {
           payload as { requestId?: string; url: string },
           { maxBytes: 2 * 1024 * 1024 },
         );
+      case "resolve_path_link":
+      case "open_path_link":
+      case "read_path_link_markdown": {
+        const { candidate, senderPubkey } = payload as {
+          candidate?: string;
+          senderPubkey?: string | null;
+        };
+        const text = typeof candidate === "string" ? candidate : "";
+        // Mirrors the native DTO cap so a spec can prove the refusal shape
+        // without a Rust process.
+        if (new TextEncoder().encode(text).length > 4096) {
+          throw new Error("path link candidate exceeds 4096 bytes");
+        }
+        if (typeof senderPubkey === "string" && senderPubkey.length > 128) {
+          throw new Error("sender pubkey exceeds 128 bytes");
+        }
+        const entry = (activeConfig?.mock?.pathLinkFiles ?? []).find(
+          (file) => file.candidate === text || file.path === text,
+        );
+        if (command === "resolve_path_link") {
+          return entry
+            ? {
+                path: entry.path,
+                filename: entry.filename,
+                kind: entry.kind,
+                sizeBytes: (entry.text ?? "").length,
+              }
+            : null;
+        }
+        if (!entry) throw new Error("That file is no longer on this Mac.");
+        if (command === "open_path_link") return null;
+        if (entry.kind !== "markdown") {
+          throw new Error(
+            "That file is not a markdown document the viewer can render.",
+          );
+        }
+        return entry.text ?? "";
+      }
       case "fetch_snapshot_bytes": {
         // The real command fetches + validates a snapshot attachment in memory
         // (size cap, SHA-256, decode). In E2E the bridge returns a minimal
