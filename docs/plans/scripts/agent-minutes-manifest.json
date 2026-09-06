@@ -43,7 +43,43 @@
         "wf_2f417f8f-23a": "T15 CLI document attachments: concurrent load, not part of the cohort",
         "wf_a2bacbdf-50f": "studio-kb: concurrent load, not part of the cohort"
       },
-      "expected_agent_minutes": null
+      "expected_agent_minutes": 760,
+      "supplement_plain_agents": {
+        "_comment": "Fix rounds, blind critics and PR openers for T3b and T7b ran as plain Agent-tool subagents in session 75634317-85c8-4ede-83c6-1be19d75b218 (not workflows), so agent-minutes.py cannot count them; minutes are last minus first transcript timestamp, same method.",
+        "agent-a85c616fa0ab7c8e2": {
+          "ticket": "T3b",
+          "stage": "fix (two rounds, one continuation)",
+          "agent_minutes": 98
+        },
+        "agent-aa38bfa0bb1f92f83": {
+          "ticket": "T3b",
+          "stage": "critic (fail, then recheck pass)",
+          "agent_minutes": 46
+        },
+        "agent-a5f3795c58922b012": {
+          "ticket": "T3b",
+          "stage": "pr opener",
+          "agent_minutes": 8
+        },
+        "agent-abc2069ca28de50be": {
+          "ticket": "T7b",
+          "stage": "fix",
+          "agent_minutes": 69
+        },
+        "agent-a45a13127fb82bbea": {
+          "ticket": "T7b",
+          "stage": "critic",
+          "agent_minutes": 9
+        },
+        "agent-a6364262e0f47b85b": {
+          "ticket": "T7b",
+          "stage": "pr opener",
+          "agent_minutes": 21
+        },
+        "total_agent_minutes": 251
+      },
+      "measured_workflow_agent_minutes": 760,
+      "measured_total_agent_minutes": 1011
     }
   }
 }
