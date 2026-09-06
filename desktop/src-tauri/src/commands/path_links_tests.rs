@@ -8,10 +8,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::path_links::{
-    is_lexically_refused, open_resolved_path_link, path_link_roots, read_bounded,
+    canonical_roots, is_lexically_refused, open_resolved_path_link, path_link_roots, read_bounded,
     read_markdown_path_link, read_markdown_within_cap, resolve_blocking, resolve_within_roots,
-    sender_workdir_root, PathLinkKind, PathLinkTarget, MAX_PATH_LINK_BYTES,
-    MAX_PATH_LINK_MARKDOWN_BYTES,
+    root_candidates_for, sender_workdir_root, PathLinkKind, PathLinkTarget, RootCandidate,
+    MAX_PATH_LINK_BYTES, MAX_PATH_LINK_MARKDOWN_BYTES,
 };
 
 /// A canonical root plus a canonical sibling directory outside it.
@@ -573,11 +573,11 @@ fn the_roots_are_the_nest_and_projects_never_the_home_directory() {
         "$HOME itself must never be a path-link root: {roots:?}"
     );
     for root in &roots {
-        assert!(
-            root.starts_with(&home),
-            "every root lives under $HOME: {root:?}"
-        );
         assert!(root != &home);
+        assert!(
+            !home.starts_with(root),
+            "no root may contain $HOME: {root:?}"
+        );
     }
     // Whichever of the two exists on this machine is present; a root that
     // does not exist is dropped rather than erroring.
@@ -591,4 +591,136 @@ fn the_roots_are_the_nest_and_projects_never_the_home_directory() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Failures that are not "not a link".
+// ---------------------------------------------------------------------------
+
+/// A directory the resolver cannot look into is an error the user can act on
+/// (a toast, and the control stays for a retry), not a silent "not a link":
+/// only absence is absence.
+#[cfg(unix)]
+#[test]
+fn a_permission_error_propagates_instead_of_becoming_not_a_link() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = fixture();
+    let locked = fixture.root.join("locked");
+    write(&locked.join("note.md"), "# hidden\n");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+    // Root reads through any mode bits, so the probe proves nothing there.
+    if fs::read_dir(&locked).is_ok() {
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("chmod back");
+        return;
+    }
+
+    let result = resolve_within_roots("locked/note.md", std::slice::from_ref(&fixture.root));
+
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("chmod back");
+    let error = result.expect_err("a permission failure is an error, not None");
+    assert!(
+        error.contains("locked"),
+        "the error names what could not be read: {error}"
+    );
+}
+
+/// A candidate missing under the first root and present under the second
+/// still resolves: absence under one root is never the final answer.
+#[test]
+fn absence_under_one_root_still_tries_the_next_root() {
+    let fixture = fixture();
+    write(&fixture.outside.join("docs/report.md"), "# report\n");
+    let roots = [fixture.root.clone(), fixture.outside.clone()];
+
+    let target = resolve_within_roots("docs/report.md", &roots)
+        .expect("resolution succeeds")
+        .expect("the file resolves under the second root");
+    assert_eq!(
+        target.path,
+        fixture.outside.join("docs/report.md").display().to_string()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Which candidate directories become roots.
+// ---------------------------------------------------------------------------
+
+/// The nest is a root only when it is a real directory, matching
+/// `managed_agents::default_agent_workdir`: a `~/.buzz` that is a symlink is
+/// refused there as a redirect, so it must not become a link root here.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_nest_is_refused_as_a_root() {
+    let fixture = fixture();
+    let real_nest = fixture.root.join("real-nest");
+    fs::create_dir_all(&real_nest).expect("real nest");
+    let linked_nest = fixture.root.join("linked-nest");
+    std::os::unix::fs::symlink(&fixture.outside, &linked_nest).expect("nest symlink");
+
+    let roots = canonical_roots(vec![
+        RootCandidate::real_dir_only(linked_nest.clone()),
+        RootCandidate::real_dir_only(real_nest.clone()),
+    ]);
+
+    assert_eq!(
+        roots,
+        vec![real_nest],
+        "only the real nest survives: {roots:?}"
+    );
+}
+
+/// `~/.buzz/REPOS` may be a symlink to a user-configured `repos_dir`
+/// (`managed_agents::repos`), and that target is where agents write. The
+/// canonical target is a root, so a candidate spelled `REPOS/repo/report.md`
+/// resolves even when the configured directory lies outside the nest and
+/// outside `$HOME/projects`.
+#[cfg(unix)]
+#[test]
+fn the_repos_link_target_is_a_root() {
+    let fixture = fixture();
+    let nest = fixture.root.join("nest");
+    fs::create_dir_all(&nest).expect("nest");
+    let repos_target = fixture.outside.join("checkouts");
+    write(&repos_target.join("repo/report.md"), "# report\n");
+    std::os::unix::fs::symlink(&repos_target, nest.join("REPOS")).expect("REPOS symlink");
+
+    let roots = canonical_roots(root_candidates_for(Some(nest.clone()), None));
+
+    assert!(
+        roots.contains(&repos_target),
+        "REPOS target is a root: {roots:?}"
+    );
+    let target = resolve_within_roots("REPOS/repo/report.md", &roots)
+        .expect("resolution succeeds")
+        .expect("the report resolves through the REPOS link");
+    assert_eq!(
+        target.path,
+        repos_target.join("repo/report.md").display().to_string()
+    );
+}
+
+/// A candidate that is missing, or a file rather than a directory, is dropped
+/// rather than erroring, and a real directory reached through a symlink is
+/// accepted when the candidate is not marked real-dir-only (`$HOME/projects`
+/// on an external volume is a legitimate setup).
+#[cfg(unix)]
+#[test]
+fn root_candidates_are_filtered_to_directories_that_exist() {
+    let fixture = fixture();
+    write(&fixture.root.join("a-file.md"), "x");
+    let linked_projects = fixture.root.join("projects-link");
+    std::os::unix::fs::symlink(&fixture.outside, &linked_projects).expect("projects symlink");
+
+    let roots = canonical_roots(vec![
+        RootCandidate::any_dir(fixture.root.join("missing")),
+        RootCandidate::any_dir(fixture.root.join("a-file.md")),
+        RootCandidate::any_dir(linked_projects),
+        RootCandidate::any_dir(fixture.outside.clone()),
+    ]);
+
+    assert_eq!(
+        roots,
+        vec![fixture.outside.clone()],
+        "one canonical root, once: {roots:?}"
+    );
 }

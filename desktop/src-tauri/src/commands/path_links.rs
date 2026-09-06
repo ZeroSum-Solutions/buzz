@@ -123,26 +123,92 @@ fn projects_root() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join("projects"))
 }
 
-/// The canonical roots a candidate from `sender_pubkey` may resolve inside.
+/// A directory that may become a root, and how strictly it is admitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RootCandidate {
+    path: PathBuf,
+    /// Refuse the candidate when it is itself a symlink. The nest is admitted
+    /// this way, matching `managed_agents::default_agent_workdir`, which
+    /// rejects a symlinked `~/.buzz` as a redirect: a nest pointing at `/`
+    /// must not make the whole disk a link root. `$HOME/projects` on an
+    /// external volume, or the `REPOS` link, are legitimately symlinks and
+    /// are admitted by their canonical target.
+    real_dir_only: bool,
+}
+
+impl RootCandidate {
+    pub(super) fn real_dir_only(path: PathBuf) -> Self {
+        Self {
+            path,
+            real_dir_only: true,
+        }
+    }
+
+    pub(super) fn any_dir(path: PathBuf) -> Self {
+        Self {
+            path,
+            real_dir_only: false,
+        }
+    }
+}
+
+/// The directories that may be roots, given the nest and `$HOME/projects`.
 ///
-/// A root that does not exist, or cannot be canonicalized, is dropped: on a
-/// machine with neither `~/.buzz` nor `$HOME/projects` the list is empty and
-/// every candidate is "not a link", which is the correct answer rather than
-/// an error. `$HOME` itself is never a root.
-pub(super) fn path_link_roots(sender_pubkey: Option<&str>) -> Vec<PathBuf> {
+/// The nest's `REPOS` entry is listed on its own: it is either a real
+/// directory inside the nest (already covered by the nest root) or a symlink
+/// to a user-configured `repos_dir` (`managed_agents::repos`), in which case
+/// the canonical target is where agents actually write and must be a root
+/// even though it lies outside the nest and outside `$HOME/projects`.
+pub(super) fn root_candidates_for(
+    nest: Option<PathBuf>,
+    projects: Option<PathBuf>,
+) -> Vec<RootCandidate> {
+    let mut candidates = Vec::new();
+    if let Some(nest) = nest {
+        candidates.push(RootCandidate::any_dir(nest.join("REPOS")));
+        candidates.push(RootCandidate::real_dir_only(nest));
+    }
+    if let Some(projects) = projects {
+        candidates.push(RootCandidate::any_dir(projects));
+    }
+    candidates
+}
+
+/// Canonicalize the candidates that exist as directories, in order, once each.
+///
+/// A candidate that does not exist, is not a directory, or cannot be
+/// canonicalized is dropped: on a machine with neither `~/.buzz` nor
+/// `$HOME/projects` the list is empty and every candidate is "not a link",
+/// which is the correct answer rather than an error.
+pub(super) fn canonical_roots(candidates: Vec<RootCandidate>) -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    for root in sender_workdir_root(sender_pubkey)
-        .into_iter()
-        .chain(nest_root())
-        .chain(projects_root())
-    {
-        if let Ok(canonical) = root.canonicalize() {
+    for candidate in candidates {
+        if candidate.real_dir_only {
+            let Ok(metadata) = std::fs::symlink_metadata(&candidate.path) else {
+                continue;
+            };
+            if !metadata.is_dir() {
+                continue;
+            }
+        }
+        if let Ok(canonical) = candidate.path.canonicalize() {
             if canonical.is_dir() && !roots.contains(&canonical) {
                 roots.push(canonical);
             }
         }
     }
     roots
+}
+
+/// The canonical roots a candidate from `sender_pubkey` may resolve inside.
+/// `$HOME` itself is never a root.
+pub(super) fn path_link_roots(sender_pubkey: Option<&str>) -> Vec<PathBuf> {
+    let mut candidates: Vec<RootCandidate> = sender_workdir_root(sender_pubkey)
+        .map(RootCandidate::any_dir)
+        .into_iter()
+        .collect();
+    candidates.extend(root_candidates_for(nest_root(), projects_root()));
+    canonical_roots(candidates)
 }
 
 /// Refuse a sender pubkey longer than the DTO admits.
@@ -223,11 +289,14 @@ pub(super) fn is_lexically_refused(candidate: &str) -> bool {
 
 /// Resolve `candidate` against already-canonical `roots`.
 ///
-/// `Err` means the candidate was refused outright (over the byte cap).
-/// `Ok(None)` means "not a link" — a missing file, a directory, a path
-/// outside every root, a symlink whose target leaves its root, or a file the
-/// OS handler would run rather than display. `Ok(Some(_))` is an inert,
-/// non-executable regular file inside a root, named by its canonical path.
+/// `Err` means the candidate was refused outright (over the byte cap), or the
+/// filesystem failed for a reason other than absence — a permission error, an
+/// I/O error, a mount that is away. Those are surfaced so the user can retry;
+/// only absence is "not a link". `Ok(None)` means "not a link" — a missing
+/// file, a directory, a path outside every root, a symlink whose target leaves
+/// its root, or a file the OS handler would run rather than display.
+/// `Ok(Some(_))` is an inert, non-executable regular file inside a root, named
+/// by its canonical path.
 pub(super) fn resolve_within_roots(
     candidate: &str,
     roots: &[PathBuf],
@@ -250,6 +319,15 @@ pub(super) fn resolve_within_roots(
 
     let candidate_path = Path::new(candidate);
     let absolute = candidate_path.is_absolute();
+    // The first failure that is not absence. Every root is still tried, so a
+    // file that is unreadable under one root and present under another
+    // resolves; the error is returned only when nothing resolved.
+    let mut failure: Option<String> = None;
+    let mut note_failure = |what: &Path, error: std::io::Error| {
+        if !is_absence(&error) && failure.is_none() {
+            failure = Some(format!("read {}: {error}", what.display()));
+        }
+    };
     for root in roots {
         let joined = if absolute {
             // Lexical containment, again before any filesystem call: an
@@ -264,16 +342,26 @@ pub(super) fn resolve_within_roots(
         };
         // Canonicalizing resolves every symlink, so a candidate that leaves
         // its root — however it left — fails the prefix check below.
-        let Ok(canonical) = joined.canonicalize() else {
-            continue;
+        let canonical = match joined.canonicalize() {
+            Ok(canonical) => canonical,
+            Err(error) => {
+                note_failure(&joined, error);
+                continue;
+            }
         };
         // Component-wise: `/a/bc` does not start with `/a/b`, so the prefix is
-        // always a whole path segment.
-        if !canonical.starts_with(root) {
+        // always a whole path segment. Any root will do, not only the one the
+        // candidate was joined onto: `~/.buzz/REPOS` is a symlink whose target
+        // is itself a root, so a candidate spelled from the nest lands there.
+        if !roots.iter().any(|allowed| canonical.starts_with(allowed)) {
             continue;
         }
-        let Ok(metadata) = canonical.metadata() else {
-            continue;
+        let metadata = match canonical.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                note_failure(&canonical, error);
+                continue;
+            }
         };
         if !metadata.is_file() {
             continue;
@@ -307,7 +395,19 @@ pub(super) fn resolve_within_roots(
             size_bytes,
         }));
     }
-    Ok(None)
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(None),
+    }
+}
+
+/// True for the errors that mean "there is no such file": a missing entry,
+/// or a path that runs through a file as if it were a directory.
+fn is_absence(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
 }
 
 /// Read at most `limit` bytes from `path`.
