@@ -444,6 +444,22 @@ type MockBridgeOptions = {
    * message — lets specs prove malformed/hash/size-mismatch error paths.
    */
   snapshotFetchError?: string;
+  /**
+   * Local files the mocked path-link resolver can find. Anything not listed
+   * answers "not a link", so a spec can prove both branches.
+   */
+  pathLinkFiles?: Array<{
+    candidate: string;
+    path: string;
+    filename: string;
+    kind: "markdown" | "file";
+    text?: string;
+    /**
+     * When set, `read_path_link_markdown` throws this message so a spec can
+     * drive the viewer panel's local (not relay) error branch.
+     */
+    readError?: string;
+  }>;
   uploadDescriptors?: {
     url: string;
     sha256: string;

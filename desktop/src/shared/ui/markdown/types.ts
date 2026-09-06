@@ -47,6 +47,15 @@ export type MarkdownRuntime = {
   onOpenEntityLink: (link: ParsedEntityLink) => void;
   onOpenMessageLink: (link: ParsedMessageLink) => void;
   /**
+   * Pubkey of the message's sender, enabling local path links on this surface.
+   *
+   * `undefined` (every non-message surface) leaves inline code inert: no token
+   * is a path candidate and no resolver command can run. `null` enables path
+   * links for a message whose signer is unknown; the resolver then falls back
+   * to `$HOME/projects` as the only allowed root.
+   */
+  pathLinkSenderPubkey?: string | null;
+  /**
    * The resolved relay origin (e.g. `https://buzz.block.builderlab.xyz`),
    * or `null` when not yet resolved. Used by the anchor component to
    * validate that clone-URL rewrites point to the active relay only.
@@ -93,6 +102,13 @@ export type MarkdownProps = {
   mentionNames?: string[];
   mentionPubkeysByName?: Record<string, string>;
   mediaInset?: boolean;
+  /**
+   * Pubkey of the message's sender. Set it (possibly to `null`) only on
+   * message surfaces: its presence is what makes a path-shaped inline-code
+   * token resolvable at all, so leaving it `undefined` keeps every other
+   * Markdown surface — previews, repository READMEs, PR bodies — inert.
+   */
+  pathLinkSenderPubkey?: string | null;
   /** Event/message identity used only for local preview-image visibility. */
   messageId?: string;
   linkPreviewsSuppressed?: boolean;
