@@ -86,6 +86,36 @@ pub fn managed_agent_log_path(app: &AppHandle, pubkey: &str) -> Result<PathBuf, 
     Ok(managed_agents_logs_dir(app)?.join(format!("{pubkey}.log")))
 }
 
+/// Harness reliability state directory for one agent (T16):
+/// `<app data>/agents/state/<pubkey>/`.
+///
+/// The harness writes its ledger and its park file here, and the park file
+/// carries client messages — so the directory is created owner-only and its
+/// path is handed to the child explicitly through `BUZZ_ACP_STATE_DIR` rather
+/// than left to the harness's `~/.buzz` fallback.
+///
+/// The pubkey is validated, not sanitised: it names a directory, and a `/` or
+/// a `..` in it would place one agent's parked messages outside its own state
+/// directory. A rejected pubkey means no state directory, which the harness
+/// reports and continues without.
+pub fn managed_agent_state_dir(app: &AppHandle, pubkey: &str) -> Result<PathBuf, String> {
+    if pubkey.is_empty() || !pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "unsafe agent pubkey for a state directory: {pubkey}"
+        ));
+    }
+    let dir = managed_agents_base_dir(app)?.join("state").join(pubkey);
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("failed to create agent state dir: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("failed to lock down agent state dir: {error}"))?;
+    }
+    Ok(dir)
+}
+
 /// Pair-scoped log path for a managed runtime. The relay URL never appears in
 /// the filename; the suffix is a hash of the canonical URL.
 pub fn managed_agent_runtime_log_path(

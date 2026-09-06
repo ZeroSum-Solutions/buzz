@@ -1008,6 +1008,25 @@ pub fn spawn_agent_child(
         }
     }
 
+    // Harness reliability state (T16). Applied AFTER the `descriptor.env` loop,
+    // like the replay floor and the registry env above, so a saved user value
+    // can never redirect an agent's park file. The key is reserved, so the
+    // layered env never carries one anyway; this is the belt to that braces.
+    // A directory we cannot create is not fatal — the agent still answers, and
+    // the harness logs that parked batches will not survive a restart.
+    match super::managed_agent_state_dir(app, &record.pubkey) {
+        Ok(state_dir) => {
+            command.env("BUZZ_ACP_STATE_DIR", &state_dir);
+        }
+        Err(error) => {
+            command.env_remove("BUZZ_ACP_STATE_DIR");
+            eprintln!(
+                "buzz-desktop: no reliability state dir for agent {}: {error}",
+                record.name,
+            );
+        }
+    }
+
     // Stamp desktop ownership and an unpredictable harness-generation identity.
     let start_nonce = uuid::Uuid::new_v4().simple().to_string();
     command
