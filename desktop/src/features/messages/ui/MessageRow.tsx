@@ -440,6 +440,14 @@ export const MessageRow = React.memo(
               )}
               content={message.body}
               messageId={message.id}
+              // Enables local path links for this message. The value only
+              // widens the allowed roots when the desktop can map a sender to
+              // a working directory; `null` still resolves against
+              // `$HOME/projects`, which is what makes an unsigned or
+              // relay-delegated message behave the same as a signed one.
+              pathLinkSenderPubkey={
+                message.signerPubkey ?? message.pubkey ?? null
+              }
               linkPreviewsSuppressed={linkPreviewsSuppressed}
               linkPreviewTags={message.tags}
               leadingInlineContent={agentAddressPrefix}

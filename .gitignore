@@ -72,3 +72,6 @@ identity.key
 
 # Helm dependency tarballs — regenerable from Chart.lock via `helm dependency build`
 deploy/charts/*/charts/*.tgz
+
+# zs fork: written by scripts/zs/remote-ci/provision.sh; holds one instance id
+scripts/zs/remote-ci/box.env
