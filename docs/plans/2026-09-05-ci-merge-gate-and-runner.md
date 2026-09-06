@@ -264,6 +264,14 @@ the MishMash setup and AWS allows one open case per quota. Until it lands, provi
 Security group, key pair, role and instance profile from the first attempt are tagged and adopted
 on rerun.
 
+First real run (2026-09-06, Buzz account 702617649747, box i-0ef87bf1645fb35ba as c7a.2xlarge,
+8 vCPU): `scripts/zs/remote-ci.sh ci/remote-test-box-account desktop-tauri-test` took 3 minutes
+wall from `start-instances` to `stopped`, including ssh wait and the cargo test build reusing the
+bootstrap's cache (52 s); the Tauri crate's 3,408 tests ran in 81 s; lane total 3,509 passed,
+0 failed, 22 ignored. On the Mac the same gate takes 2 to 4 minutes when idle and much longer
+under gauntlet load, so at 8 vCPUs the box already offloads it; the 32-vCPU size is for the
+full pre-push suite and parallel gauntlets once the quota case lands.
+
 1. Put the AWS admin key in ZS Vault as `aws_buzz_ci_admin_key_id` and
    `aws_buzz_ci_admin_secret` (billing lane: AWS, approved 2026-09-05).
 2. Run `provision.sh`. It stores the runner key in ZS Vault itself; no manual key handling.
