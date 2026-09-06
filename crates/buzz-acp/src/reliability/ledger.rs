@@ -71,6 +71,11 @@ impl LedgerRecord {
         self.body.batch_id()
     }
 
+    /// The channel this record is about, when it is about one.
+    pub fn channel_id(&self) -> Option<Uuid> {
+        self.body.channel_id()
+    }
+
     /// The record kind, as written to the `kind` field.
     pub fn kind(&self) -> &'static str {
         self.body.kind()
@@ -106,6 +111,24 @@ impl LedgerBody {
             Self::BatchReplayed(r) => Some(r.batch_id),
             Self::BatchNeedsReview(r) => Some(r.batch_id),
             Self::BatchDiscarded(r) => Some(r.batch_id),
+            Self::AgentPaused(_)
+            | Self::AgentResumed(_)
+            | Self::BreakerOpened(_)
+            | Self::BreakerClosed(_)
+            | Self::RelayReconnected(_) => None,
+        }
+    }
+
+    /// The channel this record is about, when it is about one.
+    pub fn channel_id(&self) -> Option<Uuid> {
+        match self {
+            Self::TurnStarted(r) => Some(r.channel_id),
+            Self::TurnActivity(r) => Some(r.channel_id),
+            Self::TurnFinished(r) => Some(r.channel_id),
+            Self::BatchParked(r) => Some(r.channel_id),
+            Self::BatchReplayed(r) => Some(r.channel_id),
+            Self::BatchNeedsReview(r) => Some(r.channel_id),
+            Self::BatchDiscarded(r) => Some(r.channel_id),
             Self::AgentPaused(_)
             | Self::AgentResumed(_)
             | Self::BreakerOpened(_)

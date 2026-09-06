@@ -2937,7 +2937,9 @@ async fn tokio_main() -> Result<()> {
     let mut reliability = match reliability::ReliabilityRuntime::open(
         &config.keys.public_key().to_hex(),
         chrono::Utc::now(),
-    ) {
+    )
+    .map(|runtime| runtime.with_observer(observer.clone()))
+    {
         Ok(mut runtime) => {
             match runtime.reconcile_on_start(chrono::Utc::now()) {
                 Ok(report) if !report.is_empty() => tracing::warn!(

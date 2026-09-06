@@ -46,6 +46,7 @@ pub struct ReliabilityRuntime {
     ledger: Ledger,
     park: ParkFile,
     state: ReliabilityState,
+    observer: Option<crate::observer::ObserverHandle>,
     /// Batches whose replay prompt has been staged but whose turn has not
     /// finished, keyed by the scope carrying them. Bounded by the number of
     /// scopes with a turn in flight, which the pool already caps.
@@ -71,8 +72,15 @@ impl ReliabilityRuntime {
             ledger,
             park,
             state: ReliabilityState::default(),
+            observer: None,
             in_flight_replays: HashMap::new(),
         })
+    }
+
+    /// Attach an observer handle to mirror health-relevant ledger records as live observer frames.
+    pub fn with_observer(mut self, observer: impl IntoObserverHandle) -> Self {
+        self.observer = observer.into_observer();
+        self
     }
 
     /// The state directory.
@@ -114,8 +122,18 @@ impl ReliabilityRuntime {
     /// the next notice. The return value says whether the record landed.
     pub fn record(&mut self, now: DateTime<Utc>, body: LedgerBody) -> bool {
         let kind = body.kind();
+        let body_for_observer = if self.observer.is_some() {
+            Some(body.clone())
+        } else {
+            None
+        };
         match self.ledger.append(now, body) {
-            Ok(()) => true,
+            Ok(()) => {
+                if let (Some(observer), Some(body)) = (&self.observer, body_for_observer) {
+                    Self::emit_health_frame(observer, &self.agent, now, &body);
+                }
+                true
+            }
             Err(error) => {
                 tracing::error!(
                     kind,
@@ -126,6 +144,84 @@ impl ReliabilityRuntime {
                 false
             }
         }
+    }
+
+    fn emit_health_frame(
+        observer: &crate::observer::ObserverHandle,
+        agent: &str,
+        now: DateTime<Utc>,
+        body: &LedgerBody,
+    ) {
+        let (emit_kind, is_turn_failed) = match body {
+            LedgerBody::BatchParked(_) => ("batch_parked", false),
+            LedgerBody::BatchReplayed(_) => ("batch_replayed", false),
+            LedgerBody::BatchNeedsReview(_) => ("batch_needs_review", false),
+            LedgerBody::AgentPaused(_) => ("agent_paused", false),
+            LedgerBody::AgentResumed(_) => ("agent_resumed", false),
+            LedgerBody::BreakerOpened(_) => ("breaker_opened", false),
+            LedgerBody::BreakerClosed(_) => ("breaker_closed", false),
+            LedgerBody::RelayReconnected(_) => ("relay_reconnected", false),
+            LedgerBody::TurnFinished(finished) => {
+                if matches!(finished.outcome, ledger::TurnOutcome::Error { .. }) {
+                    ("turn_failed", true)
+                } else {
+                    return;
+                }
+            }
+            _ => return,
+        };
+
+        let record = ledger::LedgerRecord {
+            at: now,
+            agent: agent.to_string(),
+            body: body.clone(),
+        };
+
+        let mut payload = match serde_json::to_value(&record) {
+            Ok(v) => v,
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    "failed to serialize ledger record for health observer frame"
+                );
+                return;
+            }
+        };
+
+        if is_turn_failed {
+            payload["kind"] = serde_json::Value::String("turn_failed".to_string());
+            if let Some(outcome) = payload.get_mut("outcome").and_then(|v| v.as_object_mut()) {
+                outcome.remove("raw");
+                if let Some(class) = outcome.get("class").cloned() {
+                    payload["class"] = class;
+                }
+            }
+            if let Some(obj) = payload.as_object_mut() {
+                obj.remove("raw");
+            }
+        }
+
+        if let Some(batch_id) = payload.get("batch_id").cloned() {
+            payload["batchId"] = batch_id;
+        }
+        if let Some(channel_id) = payload.get("channel_id").cloned() {
+            payload["channelId"] = channel_id;
+        }
+        if let Some(replay_of) = payload.get("replay_of").cloned() {
+            payload["replayOf"] = replay_of;
+        }
+        if let Some(after_secs) = payload.get("after_secs").cloned() {
+            payload["afterSecs"] = after_secs;
+        }
+
+        let context = crate::observer::ObserverContext {
+            channel_id: body.channel_id().map(|id| id.to_string()),
+            session_id: None,
+            turn_id: None,
+            started_at: None,
+        };
+
+        observer.emit(emit_kind, None, &context, payload);
     }
 
     /// Park a batch: the park file is written and fsynced first, then the
@@ -323,5 +419,185 @@ impl ReliabilityRuntime {
                 TruncateReport::default()
             }
         }
+    }
+}
+
+/// Helper trait allowing [`ReliabilityRuntime::with_observer`] to accept either an
+/// [`ObserverHandle`](crate::observer::ObserverHandle) or an `Option<ObserverHandle>`.
+pub trait IntoObserverHandle {
+    fn into_observer(self) -> Option<crate::observer::ObserverHandle>;
+}
+
+impl IntoObserverHandle for crate::observer::ObserverHandle {
+    fn into_observer(self) -> Option<crate::observer::ObserverHandle> {
+        Some(self)
+    }
+}
+
+impl IntoObserverHandle for Option<crate::observer::ObserverHandle> {
+    fn into_observer(self) -> Option<crate::observer::ObserverHandle> {
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::observer::ObserverHandle;
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    #[test]
+    fn record_mirrors_health_kinds_to_observer() {
+        let temp = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let agent = "test_agent_pk";
+        let observer = ObserverHandle::in_process();
+        let mut rx = observer.subscribe();
+
+        let mut runtime = ReliabilityRuntime::open_in(temp.path(), agent, now)
+            .unwrap()
+            .with_observer(observer);
+
+        let batch_id = Uuid::new_v4();
+        let channel_id = Uuid::new_v4();
+        let body = LedgerBody::BatchParked(ledger::BatchParked {
+            batch_id,
+            channel_id,
+            reason: "retries_exhausted".to_string(),
+            started: false,
+            events: 3,
+        });
+
+        assert!(runtime.record(now, body));
+
+        let event = rx.try_recv().expect("should receive observer frame");
+        assert_eq!(event.kind, "batch_parked");
+        assert_eq!(event.channel_id, Some(channel_id.to_string()));
+        assert_eq!(event.payload["batchId"], batch_id.to_string());
+        assert_eq!(event.payload["events"], 3);
+        assert_eq!(event.payload["at"], serde_json::to_value(now).unwrap());
+        assert_eq!(event.payload["reason"], "retries_exhausted");
+        assert_eq!(event.payload["started"], false);
+
+        // batch_replayed
+        let replay_id = Uuid::new_v4();
+        let replayed = LedgerBody::BatchReplayed(ledger::BatchReplayed {
+            batch_id,
+            channel_id,
+            replay_of: replay_id,
+        });
+        assert!(runtime.record(now, replayed));
+        let event = rx.try_recv().expect("should receive batch_replayed frame");
+        assert_eq!(event.kind, "batch_replayed");
+        assert_eq!(event.payload["replayOf"], replay_id.to_string());
+
+        // agent_paused
+        let paused = LedgerBody::AgentPaused(ledger::AgentPaused {
+            class: "capacity_exhausted".to_string(),
+            until: now,
+            waiting: 2,
+        });
+        assert!(runtime.record(now, paused));
+        let event = rx.try_recv().expect("should receive agent_paused frame");
+        assert_eq!(event.kind, "agent_paused");
+        assert_eq!(event.payload["class"], "capacity_exhausted");
+        assert_eq!(event.channel_id, None);
+
+        // breaker_opened
+        let breaker = LedgerBody::BreakerOpened(ledger::BreakerOpened {
+            scope: "scope1".to_string(),
+            consecutive: 3,
+        });
+        assert!(runtime.record(now, breaker));
+        let event = rx.try_recv().expect("should receive breaker_opened frame");
+        assert_eq!(event.kind, "breaker_opened");
+        assert_eq!(event.payload["consecutive"], 3);
+    }
+
+    #[test]
+    fn turn_failed_frame_carries_class_but_never_raw() {
+        let temp = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let agent = "test_agent_pk";
+        let observer = ObserverHandle::in_process();
+        let mut rx = observer.subscribe();
+
+        let mut runtime = ReliabilityRuntime::open_in(temp.path(), agent, now)
+            .unwrap()
+            .with_observer(observer);
+
+        let batch_id = Uuid::new_v4();
+        let channel_id = Uuid::new_v4();
+        let raw_secret = "secret provider raw error stack trace";
+        let body = LedgerBody::TurnFinished(ledger::TurnFinished {
+            batch_id,
+            channel_id,
+            outcome: ledger::TurnOutcome::error("capacity_exhausted", raw_secret),
+        });
+
+        assert!(runtime.record(now, body));
+
+        let event = rx.try_recv().expect("should receive observer frame");
+        assert_eq!(event.kind, "turn_failed");
+        assert_eq!(event.payload["class"], "capacity_exhausted");
+        assert!(event.payload.get("raw").is_none());
+        if let Some(outcome) = event.payload.get("outcome") {
+            assert!(outcome.get("raw").is_none());
+        }
+        let serialized = event.payload.to_string();
+        assert!(!serialized.contains(raw_secret));
+        assert!(!serialized.contains("\"raw\""));
+    }
+
+    #[test]
+    fn turn_ok_and_turn_started_emit_no_frame() {
+        let temp = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let agent = "test_agent_pk";
+        let observer = ObserverHandle::in_process();
+        let mut rx = observer.subscribe();
+
+        let mut runtime = ReliabilityRuntime::open_in(temp.path(), agent, now)
+            .unwrap()
+            .with_observer(observer);
+
+        let batch_id = Uuid::new_v4();
+        let channel_id = Uuid::new_v4();
+
+        let started = LedgerBody::TurnStarted(ledger::TurnStarted::new(
+            batch_id,
+            channel_id,
+            "test_scope",
+            vec!["e1".to_string()],
+            1,
+        ));
+        assert!(runtime.record(now, started));
+        assert!(
+            rx.try_recv().is_err(),
+            "turn_started must not emit health frame"
+        );
+
+        let ok = LedgerBody::TurnFinished(ledger::TurnFinished {
+            batch_id,
+            channel_id,
+            outcome: ledger::TurnOutcome::Ok,
+        });
+        assert!(runtime.record(now, ok));
+        assert!(
+            rx.try_recv().is_err(),
+            "turn_finished Ok must not emit health frame"
+        );
+
+        let discarded = LedgerBody::BatchDiscarded(ledger::BatchDiscarded {
+            batch_id,
+            channel_id,
+            by: "operator".to_string(),
+        });
+        assert!(runtime.record(now, discarded));
+        assert!(
+            rx.try_recv().is_err(),
+            "batch_discarded must not emit health frame"
+        );
     }
 }
