@@ -465,13 +465,30 @@ export type SwitchManagedAgentModelStatus =
   | "failure";
 
 export type ControlResultFrame = {
-  type: "cancel_turn" | "switch_model";
+  type:
+    | "cancel_turn"
+    | "switch_model"
+    | "replay_batch"
+    | "discard_batch"
+    | "resume_now"
+    | "keep_paused";
   status: string;
   modelId?: string;
   /** Opaque per-pick id echoed from the request; correlates late frames. */
   requestId?: string;
   /** Buzz channel UUID from the observer envelope; disambiguates channels. */
   channelId?: string | null;
+};
+
+export type ParkedBatchView = {
+  batchId: string;
+  channelId: string;
+  reason: string;
+  started: boolean;
+  needsReview: boolean;
+  parkedAt: string;
+  events: number;
+  excerpt: string;
 };
 
 export type GitBashPrerequisite = {

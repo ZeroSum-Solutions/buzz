@@ -611,6 +611,54 @@ pub(crate) async fn ingest_agent_health_frame(
     .await
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ParkedBatchView {
+    pub batch_id: String,
+    pub channel_id: String,
+    pub reason: String,
+    pub started: bool,
+    pub needs_review: bool,
+    pub parked_at: String,
+    pub events: usize,
+    pub excerpt: String,
+}
+
+pub(crate) fn read_parked_batches(dir: &Path) -> Result<Vec<ParkedBatchView>, String> {
+    let park_file = buzz_acp_pkg::reliability::park::ParkFile::open(dir)
+        .map_err(|e| format!("open agent park file: {e}"))?;
+    Ok(park_file
+        .batches()
+        .iter()
+        .map(|batch| ParkedBatchView {
+            batch_id: batch.batch_id.to_string(),
+            channel_id: batch.channel_id.to_string(),
+            reason: batch.reason.as_str().to_string(),
+            started: batch.started,
+            needs_review: batch.needs_review,
+            parked_at: batch.parked_at.to_rfc3339(),
+            events: batch.events.len(),
+            excerpt: batch
+                .events
+                .first()
+                .map(|e| e.excerpt())
+                .unwrap_or_default(),
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub(crate) async fn get_parked_batches(
+    agent: String,
+    app: AppHandle,
+) -> Result<Vec<ParkedBatchView>, String> {
+    blocking::run(move |_proof| {
+        let dir = managed_agent_state_dir(&app, &agent)?;
+        read_parked_batches(&dir)
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1159,5 +1207,76 @@ mod tests {
         )
         .unwrap();
         assert_eq!(capped.len(), 200, "query must cap results to at most 200");
+    }
+
+    #[test]
+    fn parked_batches_excerpt_is_cut_to_120_chars_and_carries_no_full_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut park_file = buzz_acp_pkg::reliability::park::ParkFile::open(dir.path()).unwrap();
+
+        let author = nostr::Keys::generate();
+        let full_text = "This is a very long message that definitely exceeds one hundred and twenty characters in total length. \
+            We want to verify that the excerpt in the parked batch view is strictly capped at 120 characters and does not leak the full message content anywhere in the returned structure.";
+        assert!(full_text.chars().count() > 120);
+
+        let event = nostr::EventBuilder::text_note(full_text)
+            .sign_with_keys(&author)
+            .unwrap();
+
+        let batch_id = Uuid::new_v4();
+        let channel_id = Uuid::new_v4();
+        let now = Utc::now();
+        let parked_batch = buzz_acp_pkg::reliability::park::ParkedBatch {
+            batch_id,
+            channel_id,
+            scope: buzz_acp_pkg::reliability::park::ScopeRef {
+                channel_id,
+                root_event_id: None,
+            },
+            reason: buzz_acp_pkg::reliability::park::ParkReason::RetriesExhausted,
+            started: true,
+            needs_review: true,
+            needs_review_reason: Some("retries exhausted".to_string()),
+            replayed_at: None,
+            forced: false,
+            parked_at: now,
+            events: vec![buzz_acp_pkg::reliability::park::ParkedEvent {
+                event: event.clone(),
+                prompt_tag: "prompt".to_string(),
+                received_at: now,
+            }],
+        };
+
+        park_file.park(parked_batch).unwrap();
+
+        let views = read_parked_batches(dir.path()).unwrap();
+        assert_eq!(views.len(), 1);
+        let view = &views[0];
+
+        assert_eq!(view.batch_id, batch_id.to_string());
+        assert_eq!(view.channel_id, channel_id.to_string());
+        assert_eq!(view.reason, "retries_exhausted");
+        assert!(view.started);
+        assert!(view.needs_review);
+        assert_eq!(view.events, 1);
+        assert_eq!(view.excerpt.chars().count(), 120);
+        assert_eq!(view.excerpt, event.content[..120]);
+        assert_ne!(view.excerpt, full_text);
+
+        // Verify that the serialized view carries no full text
+        let serialized = serde_json::to_string(view).unwrap();
+        assert!(!serialized.contains(full_text));
+        assert!(!serialized.contains("content"));
+
+        // Check field names in serialized JSON
+        let val: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert!(val.get("batchId").is_some());
+        assert!(val.get("channelId").is_some());
+        assert!(val.get("reason").is_some());
+        assert!(val.get("started").is_some());
+        assert!(val.get("needsReview").is_some());
+        assert!(val.get("parkedAt").is_some());
+        assert!(val.get("events").is_some());
+        assert!(val.get("excerpt").is_some());
     }
 }

@@ -757,6 +757,7 @@ pub fn run() {
             agent_health::get_agent_health_events,
             agent_health::sync_agent_health,
             agent_health::ingest_agent_health_frame,
+            agent_health::get_parked_batches,
             channel_head_cache::channel_head_cache_load,
             channel_head_cache::channel_head_cache_store,
             channel_head_cache::channel_head_cache_clear,
