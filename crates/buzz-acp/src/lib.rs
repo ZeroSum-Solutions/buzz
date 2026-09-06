@@ -4,6 +4,11 @@ mod acp;
 mod config;
 mod engram_fetch;
 mod filter;
+/// The `BUZZ_ACP_MCP_REGISTRY` handover file the Buzz desktop writes.
+///
+/// Public so the end-to-end test in `buzz-agent` can build the exact path and
+/// launcher name this module accepts, instead of restating them and drifting.
+pub mod mcp_registry;
 mod observer;
 mod pool;
 mod pool_lifecycle;
@@ -5904,7 +5909,7 @@ const MCP_TOOL_NAME_RESERVE: usize = 32;
 /// [`MAX_MCP_QNAME_LEN`], so a name cut to 128 bytes leaves no room for the
 /// tools the server exists to offer. Budgeting against the qualified name is
 /// what makes a generated name usable.
-const MAX_MCP_NAME_LEN: usize = MAX_MCP_QNAME_LEN - MCP_TOOL_NAME_RESERVE;
+pub(crate) const MAX_MCP_NAME_LEN: usize = MAX_MCP_QNAME_LEN - MCP_TOOL_NAME_RESERVE;
 
 /// `buzz-agent`'s cap on how many MCP servers one `session/new` may carry,
 /// mirrored from `buzz_agent::MAX_MCP_SERVERS`.
@@ -5925,9 +5930,24 @@ pub const MAX_MCP_SERVERS: usize = 16;
 /// process that inherited this one's environment — including
 /// `BUZZ_PRIVATE_KEY`. Extras are therefore refused at startup under any other
 /// adapter (see [`append_extra_mcp_servers`]).
-const EXTRA_MCP_ADAPTER: &str = "buzz-agent";
+pub(crate) const EXTRA_MCP_ADAPTER: &str = "buzz-agent";
 
 fn build_mcp_servers(config: &Config) -> Result<Vec<McpServer>, ConfigError> {
+    // `None`: the registry path resolves its capability and its launcher from
+    // this process, which is the only source production may use.
+    build_mcp_servers_with(config, None)
+}
+
+/// [`build_mcp_servers`] with the registry file's process-supplied inputs
+/// given explicitly.
+///
+/// `registry_source` is `None` in production. A test passes one so it can
+/// exercise the registry path without a capability in the runner's environment
+/// and without a launcher binary beside the test executable.
+fn build_mcp_servers_with(
+    config: &Config,
+    registry_source: Option<&mcp_registry::RegistrySource>,
+) -> Result<Vec<McpServer>, ConfigError> {
     let mut servers: Vec<McpServer> = Vec::new();
     // The primary server is optional: `BUZZ_ACP_MCP_COMMAND` defaults to empty
     // and Desktop writes an empty string whenever the runtime has no MCP
@@ -5986,10 +6006,16 @@ fn build_mcp_servers(config: &Config) -> Result<Vec<McpServer>, ConfigError> {
                 env
             },
             trusted: true,
+            registry_launched: false,
         });
     }
 
     append_extra_mcp_servers(config, &mut servers)?;
+    // The registry file lands after the extras array, so an operator's own
+    // `BUZZ_ACP_EXTRA_MCP_COMMANDS` entries keep the names they had before the
+    // desktop wrote a registry, and a registry entry that would collide with
+    // one is refused rather than silently renamed.
+    mcp_registry::append_registry_mcp_servers(config, &mut servers, registry_source)?;
     Ok(servers)
 }
 
@@ -6223,6 +6249,7 @@ fn append_extra_mcp_servers(
             args: extra.args.clone(),
             env: vec![],
             trusted: false,
+            registry_launched: false,
         });
     }
     Ok(())
@@ -9382,6 +9409,7 @@ mod build_mcp_servers_tests {
             agent_args: vec!["acp".into()],
             mcp_command: "test-mcp-server".into(),
             extra_mcp_commands: vec![],
+            mcp_registry: None,
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
@@ -9433,6 +9461,159 @@ mod build_mcp_servers_tests {
         let mut config = test_config();
         config.agent_command = "buzz-agent".into();
         config
+    }
+
+    /// The agent id and generation every registry fixture below uses.
+    const REGISTRY_AGENT: &str = "agent-a";
+    const REGISTRY_GENERATION: u64 = 3;
+
+    /// A registry file declaring one server named `name`, written at the exact
+    /// staged path `confine_registry_path` accepts, beside a stand-in for the
+    /// bundled launcher.
+    ///
+    /// Returns the path and the [`mcp_registry::RegistrySource`] that matches
+    /// it, so the caller drives the production checks rather than skipping
+    /// them.
+    fn registry_file(dir: &std::path::Path, name: &str) -> (String, mcp_registry::RegistrySource) {
+        let launcher = dir.join(mcp_registry::LAUNCHER_FILE_NAME);
+        std::fs::write(&launcher, b"#!/bin/sh\n").expect("write the stand-in launcher");
+        let staged = dir
+            .join(mcp_registry::GENERATIONS_DIR)
+            .join(REGISTRY_GENERATION.to_string())
+            .join(mcp_registry::AGENTS_DIR)
+            .join(REGISTRY_AGENT);
+        std::fs::create_dir_all(&staged).expect("create the staged directory");
+        let path = staged.join(mcp_registry::REGISTRY_FILE_NAME);
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"version\":1,\"servers\":[{{\"name\":\"{name}\",\
+                 \"command\":\"{}\",\
+                 \"args\":[\"launch\",\"--server\",\"{name}\",\"--secret\",\
+                 \"TOKEN=mcp:{name}-token\"]}}]}}",
+                launcher.display()
+            ),
+        )
+        .expect("write registry file");
+        let capability = buzz_secret_store::AgentCapability::bind(
+            REGISTRY_AGENT,
+            REGISTRY_GENERATION,
+            &"ab".repeat(16),
+        )
+        .expect("a valid capability");
+        (
+            path.display().to_string(),
+            mcp_registry::RegistrySource::for_test(capability, launcher),
+        )
+    }
+
+    /// The T4 mechanism keeps working beside the registry file: both paths
+    /// append to one array, and the extras entries keep the names they had.
+    #[test]
+    fn mcp_registry_file_and_extra_commands_coexist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = extras_config();
+        config.extra_mcp_commands = vec!["memory=memory-mcp --db /tmp/m".into()];
+        let (path, source) = registry_file(dir.path(), "github");
+        config.mcp_registry = Some(path);
+
+        let servers = build_mcp_servers_with(&config, Some(&source)).expect("both paths load");
+        let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["test-mcp-server", "memory", "github"]);
+
+        let memory = &servers[1];
+        assert!(memory.env.is_empty());
+        assert!(!memory.trusted);
+
+        // The registry entry names the bundled launcher, carries its declared
+        // reference in the launcher's own argv, declares no environment at all,
+        // and stays untrusted like any third-party server.
+        let github = &servers[2];
+        // The launcher this process derived, canonicalized — not the string
+        // the document declared.
+        assert_eq!(
+            github.command,
+            std::fs::canonicalize(dir.path().join(mcp_registry::LAUNCHER_FILE_NAME))
+                .expect("the stand-in launcher canonicalizes")
+                .display()
+                .to_string()
+        );
+        assert!(github.env.is_empty());
+        assert!(github
+            .args
+            .iter()
+            .any(|arg| arg == "TOKEN=mcp:github-token"));
+        assert!(!github.trusted);
+        assert!(github.registry_launched);
+    }
+
+    /// Production takes the capability from the process, and there is none in
+    /// a test runner — so the registry path refuses rather than reading the
+    /// file with no way to authenticate what it names.
+    ///
+    /// This is the half `build_mcp_servers_with` skips: it drives the real
+    /// `build_mcp_servers`, which passes `None`.
+    #[test]
+    fn mcp_registry_file_refused_without_a_capability() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = extras_config();
+        let (path, _source) = registry_file(dir.path(), "github");
+        config.mcp_registry = Some(path);
+        let error = build_mcp_servers(&config).expect_err("no capability must be refused");
+        assert!(
+            format!("{error}").contains("no usable MCP capability"),
+            "{error}"
+        );
+    }
+
+    /// A path outside this agent's directory in the adopted generation is
+    /// refused, even with a valid capability and the right launcher.
+    #[test]
+    fn mcp_registry_file_outside_the_adopted_generation_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = extras_config();
+        let (path, source) = registry_file(dir.path(), "github");
+        // Same document, reachable at a path the desktop never writes.
+        let elsewhere = dir.path().join("registry.json");
+        std::fs::copy(&path, &elsewhere).expect("copy");
+        config.mcp_registry = Some(elsewhere.display().to_string());
+        let error = build_mcp_servers_with(&config, Some(&source))
+            .expect_err("an unconfined path must be refused");
+        assert!(
+            format!("{error}").contains("adopted configuration generation"),
+            "{error}"
+        );
+    }
+
+    /// The registry file draws the same adapter boundary the extras path does.
+    /// Every other adapter ignores `trusted` and spawns the declared servers
+    /// from a process holding BUZZ_PRIVATE_KEY.
+    #[test]
+    fn mcp_registry_file_refused_under_another_adapter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config();
+        let (path, source) = registry_file(dir.path(), "github");
+        config.mcp_registry = Some(path);
+        let error =
+            build_mcp_servers_with(&config, Some(&source)).expect_err("goose must be refused");
+        assert!(
+            format!("{error}").contains("BUZZ_ACP_MCP_REGISTRY"),
+            "{error}"
+        );
+    }
+
+    /// Both native config formats key servers by name, so a collision would
+    /// leave one command silently holding the other's credential.
+    #[test]
+    fn mcp_registry_file_name_colliding_with_an_extra_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = extras_config();
+        config.extra_mcp_commands = vec!["github=github-mcp".into()];
+        let (path, source) = registry_file(dir.path(), "github");
+        config.mcp_registry = Some(path);
+        let error = build_mcp_servers_with(&config, Some(&source))
+            .expect_err("a collision must be refused");
+        assert!(format!("{error}").contains("same name"), "{error}");
     }
 
     #[test]
@@ -10122,6 +10303,7 @@ mod error_outcome_emission_tests {
             agent_args: vec![],
             mcp_command: "test-mcp-server".into(),
             extra_mcp_commands: vec![],
+            mcp_registry: None,
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,

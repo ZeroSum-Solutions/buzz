@@ -51,6 +51,7 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         mcp_config_placement: McpConfigPlacement::Unsupported,
         mcp_transports: &[],
         mcp_native_transports: &[],
+        mcp_registry_available: false,
     },
     KnownAcpRuntime {
         id: "claude",
@@ -91,6 +92,7 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         mcp_config_placement: McpConfigPlacement::ProjectFileInWorkdir { file: ".mcp.json" },
         mcp_transports: &[McpTransport::Stdio, McpTransport::Http],
         mcp_native_transports: &[McpTransport::Stdio, McpTransport::Http],
+        mcp_registry_available: false,
     },
     KnownAcpRuntime {
         id: "codex",
@@ -133,6 +135,7 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         },
         mcp_transports: &[McpTransport::Stdio, McpTransport::Http],
         mcp_native_transports: &[McpTransport::Stdio, McpTransport::Http],
+        mcp_registry_available: false,
     },
     KnownAcpRuntime {
         id: "buzz-agent",
@@ -174,5 +177,9 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         mcp_config_placement: McpConfigPlacement::Unsupported,
         mcp_transports: &[McpTransport::Stdio],
         mcp_native_transports: &[],
+        // The one runtime the registry may configure today (memo
+        // decision 9): its placement hands over a file and leaves the nest as
+        // the working directory, so nothing about its login or its cwd moves.
+        mcp_registry_available: true,
     },
 ];

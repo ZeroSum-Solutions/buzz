@@ -288,6 +288,24 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_EXTRA_MCP_COMMANDS", value_delimiter = '\n')]
     pub extra_mcp_commands: Vec<String>,
 
+    /// Path to the MCP registry file the Buzz desktop generated for this
+    /// agent. Requires `--agent-command buzz-agent`, for the same reason
+    /// `--extra-mcp-commands` does: the servers it declares are untrusted, and
+    /// only that adapter acts on the marker.
+    ///
+    /// No registry server may carry an `env` block: a document declaring one
+    /// is refused, because `buzz-agent` applies that block to the launcher's
+    /// own process, where a loader variable would run before `main` while the
+    /// agent's capability is in its environment. A declared variable travels
+    /// in the launcher's own argv instead, as a `--set` value or an `mcp:`
+    /// reference behind `--secret`. The bundled `buzz-mcp-launch`, which is
+    /// the command on every generated entry, is the side that resolves those
+    /// references and the side that applies them to the server it starts — so
+    /// no credential reaches this process, the ACP wire, or a `ps` listing.
+    /// Written by the desktop; not meant to be hand-edited.
+    #[arg(long, env = "BUZZ_ACP_MCP_REGISTRY")]
+    pub mcp_registry: Option<String>,
+
     /// Idle timeout: max seconds of silence before killing a turn.
     /// Resets on any agent stdout activity.
     #[arg(long, env = "BUZZ_ACP_IDLE_TIMEOUT")]
@@ -565,6 +583,10 @@ pub struct Config {
     pub agent_args: Vec<String>,
     pub mcp_command: String,
     pub extra_mcp_commands: Vec<String>,
+    /// Path of the desktop-generated MCP registry file, when one was handed
+    /// over. `None` leaves the registry path unused; `BUZZ_ACP_EXTRA_MCP_COMMANDS`
+    /// keeps working either way.
+    pub mcp_registry: Option<String>,
     pub idle_timeout_secs: u64,
     pub max_turn_duration_secs: u64,
     pub agents: u32,
@@ -1179,6 +1201,7 @@ impl Config {
             agent_args,
             mcp_command: args.mcp_command,
             extra_mcp_commands: args.extra_mcp_commands,
+            mcp_registry: args.mcp_registry,
             idle_timeout_secs,
             max_turn_duration_secs,
             agents: args.agents,
@@ -1564,6 +1587,7 @@ mod tests {
             agent_args: vec!["acp".into()],
             mcp_command: "".into(),
             extra_mcp_commands: vec![],
+            mcp_registry: None,
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,

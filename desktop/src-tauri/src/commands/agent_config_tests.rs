@@ -67,6 +67,7 @@ fn goose_runtime() -> &'static KnownAcpRuntime {
         mcp_config_placement: McpConfigPlacement::Unsupported,
         mcp_transports: &[],
         mcp_native_transports: &[],
+        mcp_registry_available: false,
     };
     &RUNTIME
 }

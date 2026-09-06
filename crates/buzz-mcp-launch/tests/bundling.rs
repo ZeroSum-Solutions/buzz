@@ -83,3 +83,32 @@ fn every_sidecar_placeholder_site_names_the_launcher() {
         );
     }
 }
+
+/// The dev recipe that replaces the placeholders with real binaries has to
+/// replace this one too.
+///
+/// `_ensure-sidecar-stubs` `touch`es a 0-byte `buzz-mcp-launch` so the Tauri
+/// crate compiles; `desktop-standalone` then overwrites each stub it names
+/// with the built binary. A stub it does not name stays 0 bytes, and generated
+/// MCP configuration names the launcher by absolute path — so every registry
+/// server on a standalone run would fail to execute, with no build error to
+/// say why. The recipe has to both build the crate and copy it.
+#[test]
+fn desktop_standalone_copies_the_real_launcher() {
+    const BINARY: &str = "buzz-mcp-launch";
+    let text = read("Justfile");
+    let recipe = section(&text, "Justfile", "\ndesktop-standalone *ARGS:", "\n\n");
+
+    assert!(
+        recipe.contains(&format!("-p {BINARY}")),
+        "the desktop-standalone recipe does not build {BINARY}, so the copy below \
+         it has nothing to copy"
+    );
+    let copy_loop = section(recipe, "Justfile", "for bin in ", ";");
+    assert!(
+        copy_loop.contains(BINARY),
+        "the desktop-standalone recipe leaves the {BINARY} sidecar as the 0-byte \
+         placeholder _ensure-sidecar-stubs created; every generated MCP server \
+         would fail to execute on a standalone run"
+    );
+}

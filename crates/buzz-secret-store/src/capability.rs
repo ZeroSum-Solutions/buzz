@@ -111,6 +111,30 @@ impl AgentCapability {
         })
     }
 
+    /// Rebuild a capability from a stored binding record.
+    ///
+    /// The spawn side reads the nonce [`Self::binding_value`] wrote and needs
+    /// the capability back; going through the wire spelling would put the
+    /// format in two places. `nonce` is validated exactly as [`Self::parse`]
+    /// validates it, so a corrupt record is refused rather than minted into a
+    /// capability nothing can resolve.
+    ///
+    /// # Errors
+    /// [`CapabilityError::InvalidAgentId`] or [`CapabilityError::InvalidNonce`].
+    pub fn bind(agent_id: &str, generation: u64, nonce: &str) -> Result<Self, CapabilityError> {
+        if !is_valid_agent_id(agent_id) {
+            return Err(CapabilityError::InvalidAgentId);
+        }
+        if !is_valid_nonce(nonce) {
+            return Err(CapabilityError::InvalidNonce);
+        }
+        Ok(Self {
+            agent_id: agent_id.to_string(),
+            generation,
+            nonce: nonce.to_string(),
+        })
+    }
+
     /// Parse the wire spelling `v1.<agent>.<generation>.<nonce-hex>`.
     ///
     /// # Errors
@@ -138,11 +162,7 @@ impl AgentCapability {
         let generation: u64 = generation
             .parse()
             .map_err(|_| CapabilityError::InvalidGeneration)?;
-        if nonce.len() != NONCE_LEN * 2
-            || !nonce
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
+        if !is_valid_nonce(nonce) {
             return Err(CapabilityError::InvalidNonce);
         }
         Ok(Self {
@@ -224,6 +244,14 @@ impl fmt::Debug for AgentCapability {
             .field("nonce", &"<redacted>")
             .finish()
     }
+}
+
+/// Whether `nonce` is exactly `2 * NONCE_LEN` lowercase hex characters.
+fn is_valid_nonce(nonce: &str) -> bool {
+    nonce.len() == NONCE_LEN * 2
+        && nonce
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn is_valid_agent_id(id: &str) -> bool {
