@@ -113,7 +113,7 @@ jobs:
 
   windows-rust:
     name: Windows Rust (x86_64-pc-windows-msvc)
-    runs-on: windows-latest
+    runs-on: blacksmith-8vcpu-windows-2025  # zs fork: was windows-latest (24 to 26 min per queue entry, the long pole)
     # Windows runners are slow and this compiles the workspace + Tauri crate
     # cold across four steps; budget generously.
     timeout-minutes: 45

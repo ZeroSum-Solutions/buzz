@@ -23,7 +23,7 @@ env:
 jobs:
   desktop-build-macos:
     name: Desktop Build (macOS)
-    runs-on: macos-latest
+    runs-on: blacksmith-6vcpu-macos-latest  # zs fork: M4 Pro runner; was macos-latest (Desktop Build 15 to 20 min per queue entry)
     timeout-minutes: 45
     if: github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust
     permissions:
