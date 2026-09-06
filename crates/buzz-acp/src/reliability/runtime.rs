@@ -325,3 +325,208 @@ impl ReliabilityRuntime {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DedupMode;
+    use crate::queue::{CancelReason, EventQueue, QueuedEvent};
+    use nostr::{EventBuilder, Keys, Kind};
+    use std::time::Instant;
+
+    fn make_test_event(content: &str) -> (nostr::Event, nostr::EventId) {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(9), content)
+            .sign_with_keys(&keys)
+            .unwrap();
+        let id = event.id;
+        (event, id)
+    }
+
+    fn make_flush_batch(
+        channel_id: Uuid,
+        scope: SessionScope,
+        content: &str,
+    ) -> (FlushBatch, nostr::EventId) {
+        let (event, id) = make_test_event(content);
+        (
+            FlushBatch {
+                batch_id: Uuid::new_v4(),
+                channel_id,
+                scope,
+                events: vec![BatchEvent {
+                    event,
+                    prompt_tag: "test".into(),
+                    received_at: Instant::now(),
+                }],
+                cancelled_events: vec![],
+                cancel_reason: None,
+            },
+            id,
+        )
+    }
+
+    // Fixture #5: after a successful probe, a parked batch with started=true is
+    // NOT replayed and one with started=false IS, before newer events of the same scope.
+    #[test]
+    fn test_fixture_5_successful_probe_replays_not_started_before_newer_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let now = Utc::now();
+        let mut runtime = ReliabilityRuntime::open_in(dir.path(), pubkey, now).unwrap();
+
+        let channel_id = Uuid::new_v4();
+        let scope = SessionScope::Conversation { channel_id };
+
+        // 1. Parked batch with started = true
+        let (batch_started, _) = make_flush_batch(channel_id, scope.clone(), "started msg");
+        let batch_started_id = batch_started.batch_id;
+        runtime
+            .park_batch(&batch_started, ParkReason::HardTimeout, true, now)
+            .unwrap();
+
+        // 2. Parked batch with started = false
+        let (batch_not_started, not_started_event_id) =
+            make_flush_batch(channel_id, scope.clone(), "not started msg");
+        let batch_not_started_id = batch_not_started.batch_id;
+        runtime
+            .park_batch(&batch_not_started, ParkReason::RetriesExhausted, false, now)
+            .unwrap();
+
+        // Verify initial parked state
+        assert!(runtime.park().get(batch_started_id).unwrap().needs_review);
+        assert!(!runtime
+            .park()
+            .get(batch_started_id)
+            .unwrap()
+            .replay_eligible());
+        assert!(
+            !runtime
+                .park()
+                .get(batch_not_started_id)
+                .unwrap()
+                .needs_review
+        );
+        assert!(runtime
+            .park()
+            .get(batch_not_started_id)
+            .unwrap()
+            .replay_eligible());
+
+        // 3. A newer event arrives for the same scope in the queue
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let (newer_event, newer_event_id) = make_test_event("newer msg");
+        queue.push(QueuedEvent {
+            channel_id,
+            scope: scope.clone(),
+            event: newer_event,
+            received_at: Instant::now(),
+            prompt_tag: "newer".into(),
+        });
+
+        // 4. A probe succeeds! Bind the production function `replay_after_success`.
+        crate::replay_after_success(&mut runtime, &mut queue, &scope, now);
+
+        // Assert that started=true was NOT replayed
+        let parked_started = runtime.park().get(batch_started_id).unwrap();
+        assert!(
+            parked_started.replayed_at.is_none(),
+            "batch with started=true must NOT be marked replayed"
+        );
+        assert!(
+            parked_started.needs_review,
+            "batch with started=true must stay on needs_review list"
+        );
+
+        // Assert that started=false WAS replayed
+        let parked_not_started = runtime.park().get(batch_not_started_id).unwrap();
+        assert!(
+            parked_not_started.replayed_at.is_some(),
+            "batch with started=false IS replayed (replayed_at stamped)"
+        );
+
+        // Assert replay ordering: staged before newer events of the same scope
+        let flushed = queue.flush_next().expect("flushed batch");
+        assert_eq!(flushed.scope, scope);
+        assert_eq!(
+            flushed.cancel_reason,
+            Some(CancelReason::DeliveredLate),
+            "replayed events staged with DeliveredLate framing"
+        );
+        assert_eq!(flushed.cancelled_events.len(), 1);
+        assert_eq!(
+            flushed.cancelled_events[0].event.id, not_started_event_id,
+            "replayed not-started event is in cancelled_events (preceding newer events)"
+        );
+        assert_eq!(flushed.events.len(), 1);
+        assert_eq!(
+            flushed.events[0].event.id, newer_event_id,
+            "newer event is in events (after replayed events)"
+        );
+    }
+
+    // Fixture #6: a `batch_replayed` ledger record with no matching `turn_finished`
+    // at start moves the batch to needs_review (reconcile_on_start).
+    #[test]
+    fn test_fixture_6_batch_replayed_without_turn_finished_moves_to_needs_review_on_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let now = Utc::now();
+        let mut runtime = ReliabilityRuntime::open_in(dir.path(), pubkey, now).unwrap();
+
+        let channel_id = Uuid::new_v4();
+        let scope = SessionScope::Conversation { channel_id };
+        let (batch, _) = make_flush_batch(channel_id, scope.clone(), "crashed mid-replay");
+        let batch_id = batch.batch_id;
+
+        // Park the batch (not started -> replay-eligible)
+        runtime
+            .park_batch(&batch, ParkReason::RetriesExhausted, false, now)
+            .unwrap();
+        assert!(!runtime.park().get(batch_id).unwrap().needs_review);
+        assert!(runtime.park().get(batch_id).unwrap().replay_eligible());
+
+        // Stage and commit replay: this writes `batch_replayed` to the ledger and stamps the park file
+        let plan = runtime.plan_replay(&scope).expect("replay plan");
+        assert_eq!(plan.batch_ids, vec![batch_id]);
+        runtime.commit_replay(&plan, Uuid::new_v4(), now).unwrap();
+
+        // Simulate crash mid-replay: process exits WITHOUT writing `turn_finished`.
+        drop(runtime);
+
+        // Process restarts at a later time
+        let restart_now = now + chrono::Duration::seconds(30);
+        let mut restarted = ReliabilityRuntime::open_in(dir.path(), pubkey, restart_now).unwrap();
+
+        // Run start-up reconciliation using the production function
+        let report = restarted.reconcile_on_start(restart_now).unwrap();
+        assert_eq!(
+            report.crashed_mid_replay, 1,
+            "reconcile_on_start must report the crashed mid-replay batch"
+        );
+
+        // The batch must now be in needs_review, never to be automatically replayed
+        let parked = restarted.park().get(batch_id).expect("batch still parked");
+        assert!(
+            parked.needs_review,
+            "crashed mid-replay batch must have needs_review = true"
+        );
+        assert_eq!(
+            parked.needs_review_reason.as_deref(),
+            Some("replay was sent but the turn never finished")
+        );
+        assert!(
+            !parked.replay_eligible(),
+            "batch in needs_review must not be replay-eligible"
+        );
+
+        // A BatchNeedsReview record must have been appended to the ledger
+        let records = restarted.ledger.read_all().unwrap();
+        assert!(
+            records.iter().any(
+                |r| matches!(&r.body, LedgerBody::BatchNeedsReview(nr) if nr.batch_id == batch_id)
+            ),
+            "ledger must contain a batch_needs_review record for the crashed batch"
+        );
+    }
+}

@@ -98,12 +98,17 @@ pub fn managed_agent_log_path(app: &AppHandle, pubkey: &str) -> Result<PathBuf, 
 /// a `..` in it would place one agent's parked messages outside its own state
 /// directory. A rejected pubkey means no state directory, which the harness
 /// reports and continues without.
-pub fn managed_agent_state_dir(app: &AppHandle, pubkey: &str) -> Result<PathBuf, String> {
+pub(crate) fn validate_state_dir_pubkey(pubkey: &str) -> Result<(), String> {
     if pubkey.is_empty() || !pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(format!(
             "unsafe agent pubkey for a state directory: {pubkey}"
         ));
     }
+    Ok(())
+}
+
+pub fn managed_agent_state_dir(app: &AppHandle, pubkey: &str) -> Result<PathBuf, String> {
+    validate_state_dir_pubkey(pubkey)?;
     let dir = managed_agents_base_dir(app)?.join("state").join(pubkey);
     fs::create_dir_all(&dir)
         .map_err(|error| format!("failed to create agent state dir: {error}"))?;

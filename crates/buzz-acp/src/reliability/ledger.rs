@@ -543,3 +543,82 @@ fn read_records(path: &Path) -> io::Result<Vec<LedgerRecord>> {
     }
     Ok(records)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ledger_append_and_read_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let mut ledger = Ledger::open(dir.path(), "agent-pubkey", now).unwrap();
+        let batch_id = Uuid::new_v4();
+        let ch = Uuid::new_v4();
+
+        ledger
+            .append(
+                now,
+                LedgerBody::BatchParked(BatchParked {
+                    batch_id,
+                    channel_id: ch,
+                    reason: "retries_exhausted".to_string(),
+                    started: false,
+                    events: 1,
+                }),
+            )
+            .unwrap();
+
+        let records = ledger.read_all().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].batch_id(), Some(batch_id));
+        assert_eq!(records[0].kind(), "batch_parked");
+    }
+
+    #[test]
+    fn test_replays_without_finish_detects_unmatched_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let mut ledger = Ledger::open(dir.path(), "agent-pubkey", now).unwrap();
+        let batch_id1 = Uuid::new_v4();
+        let batch_id2 = Uuid::new_v4();
+        let ch = Uuid::new_v4();
+
+        // batch 1: replayed with matching turn_finished
+        ledger
+            .append(
+                now,
+                LedgerBody::BatchReplayed(BatchReplayed {
+                    batch_id: batch_id1,
+                    channel_id: ch,
+                    replay_of: Uuid::new_v4(),
+                }),
+            )
+            .unwrap();
+        ledger
+            .append(
+                now,
+                LedgerBody::TurnFinished(TurnFinished {
+                    batch_id: batch_id1,
+                    channel_id: ch,
+                    outcome: TurnOutcome::Ok,
+                }),
+            )
+            .unwrap();
+
+        // batch 2: replayed without turn_finished
+        ledger
+            .append(
+                now,
+                LedgerBody::BatchReplayed(BatchReplayed {
+                    batch_id: batch_id2,
+                    channel_id: ch,
+                    replay_of: Uuid::new_v4(),
+                }),
+            )
+            .unwrap();
+
+        let crashed = ledger.replays_without_finish().unwrap();
+        assert_eq!(crashed, vec![batch_id2]);
+    }
+}

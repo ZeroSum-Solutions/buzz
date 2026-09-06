@@ -576,3 +576,111 @@ fn read_batches(path: &Path) -> io::Result<Vec<ParkedBatch>> {
     batches.sort_by_key(|b| b.parked_at);
     Ok(batches)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr::{EventBuilder, Keys, Kind};
+
+    fn dummy_event(content: &str) -> nostr::Event {
+        let keys = Keys::generate();
+        EventBuilder::new(Kind::Custom(9), content)
+            .sign_with_keys(&keys)
+            .unwrap()
+    }
+
+    fn dummy_batch(
+        channel_id: Uuid,
+        batch_id: Uuid,
+        scope: SessionScope,
+        content: &str,
+    ) -> FlushBatch {
+        FlushBatch {
+            batch_id,
+            channel_id,
+            scope,
+            events: vec![BatchEvent {
+                event: dummy_event(content),
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        }
+    }
+
+    #[test]
+    fn test_park_file_basic_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut park = ParkFile::open(dir.path()).unwrap();
+        let ch = Uuid::new_v4();
+        let b_id = Uuid::new_v4();
+        let scope = SessionScope::Conversation { channel_id: ch };
+        let batch = dummy_batch(ch, b_id, scope, "payload");
+        let parked =
+            ParkedBatch::from_batch(&batch, ParkReason::RetriesExhausted, false, Utc::now())
+                .unwrap();
+        park.park(parked).unwrap();
+        assert!(park.contains(b_id));
+        assert_eq!(park.batches().len(), 1);
+
+        // Reopen from disk
+        let reopened = ParkFile::open(dir.path()).unwrap();
+        assert!(reopened.contains(b_id));
+        assert_eq!(reopened.batches().len(), 1);
+    }
+
+    #[test]
+    fn test_reconcile_on_start_crashed_mid_replay_moves_to_needs_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut park = ParkFile::open(dir.path()).unwrap();
+        let ch = Uuid::new_v4();
+        let b_id = Uuid::new_v4();
+        let scope = SessionScope::Conversation { channel_id: ch };
+        let batch = dummy_batch(ch, b_id, scope, "payload");
+        let parked =
+            ParkedBatch::from_batch(&batch, ParkReason::RetriesExhausted, false, Utc::now())
+                .unwrap();
+        park.park(parked).unwrap();
+        assert!(!park.get(b_id).unwrap().needs_review);
+
+        let report = park.reconcile_on_start(&[b_id], Utc::now()).unwrap();
+        assert_eq!(report.crashed_mid_replay, 1);
+        let updated = park.get(b_id).unwrap();
+        assert!(updated.needs_review);
+        assert!(!updated.replay_eligible());
+        assert_eq!(
+            updated.needs_review_reason.as_deref(),
+            Some("replay was sent but the turn never finished")
+        );
+    }
+
+    #[test]
+    fn test_replay_candidates_filters_started_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut park = ParkFile::open(dir.path()).unwrap();
+        let ch = Uuid::new_v4();
+        let scope = SessionScope::Conversation { channel_id: ch };
+        let b_started = dummy_batch(ch, Uuid::new_v4(), scope.clone(), "started");
+        let b_not_started = dummy_batch(ch, Uuid::new_v4(), scope.clone(), "not started");
+
+        park.park(
+            ParkedBatch::from_batch(&b_started, ParkReason::HardTimeout, true, Utc::now()).unwrap(),
+        )
+        .unwrap();
+        park.park(
+            ParkedBatch::from_batch(
+                &b_not_started,
+                ParkReason::RetriesExhausted,
+                false,
+                Utc::now(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let candidates = park.replay_candidates(&scope);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].batch_id, b_not_started.batch_id);
+    }
+}

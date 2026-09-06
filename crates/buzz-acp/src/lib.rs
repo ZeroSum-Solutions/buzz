@@ -5072,7 +5072,7 @@ fn drain_park_handoff(
 /// `batch_replayed` is written **before** the events are staged for sending, so
 /// a crash between the two is visible at the next start and moves the batch to
 /// the review list rather than replaying it twice.
-fn replay_after_success(
+pub(crate) fn replay_after_success(
     reliability: &mut reliability::ReliabilityRuntime,
     queue: &mut EventQueue,
     scope: &scope::SessionScope,
@@ -5353,9 +5353,7 @@ fn handle_prompt_result(
     // A successful live turn is the only thing that resumes a paused agent,
     // closes a breaker, or releases parked messages for replay. A restart
     // proves nothing about the provider and never replays anything.
-    if let (Some(reliability), PromptSource::Channel(scope)) =
-        (reliability.as_deref_mut(), &result.source)
-    {
+    if let (Some(reliability), PromptSource::Channel(scope)) = (reliability, &result.source) {
         if matches!(result.outcome, PromptOutcome::Ok(_)) {
             replay_after_success(reliability, queue, scope, now);
         } else {
@@ -11949,11 +11947,10 @@ mod error_outcome_emission_tests {
 
     /// Same recently-active hard timeout, but the channel has already
     /// exhausted its retry budget ([`crate::queue::MAX_RETRIES`] prior
-    /// attempts) — `queue.requeue()` dead-letters instead of requeueing, and
-    /// the observer payload must report that fate, not the requeue wording
-    /// above.
+    /// attempts) — `queue.requeue()` parks instead of discarding, and the
+    /// observer payload reports the requeued-for-retry wording.
     #[tokio::test]
-    async fn hard_timeout_recently_active_budget_exhausted_reports_dead_lettered() {
+    async fn hard_timeout_recently_active_budget_exhausted_reports_requeued_for_retry() {
         let channel_id = Uuid::new_v4();
         let mut queue = EventQueue::new(config::DedupMode::Queue);
         // Simulate MAX_RETRIES prior failed attempts on this channel so the
@@ -12035,14 +12032,18 @@ mod error_outcome_emission_tests {
         assert_eq!(
             turn_error.payload["error"].as_str().unwrap(),
             format!(
-                "Agent turn exceeded the maximum duration ({}s) — dead-lettered (retry budget exhausted)",
+                "Agent turn exceeded the maximum duration ({}s) — requeued for retry (recently active)",
                 config.max_turn_duration_secs
             ),
         );
         assert_eq!(
             queue.queued_event_count(channel_id),
             0,
-            "batch with an exhausted retry budget must be dead-lettered, not requeued"
+            "batch with an exhausted retry budget must be parked, not requeued in memory"
+        );
+        assert!(
+            queue.has_parked_handoff(),
+            "batch with an exhausted retry budget must be handed off to be parked"
         );
     }
 

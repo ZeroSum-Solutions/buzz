@@ -746,7 +746,7 @@ impl EventQueue {
         // Replayed events are older than anything already staged, so they go
         // first — the conversation stays in order.
         let mut merged = events;
-        merged.extend(entry.drain(..));
+        merged.append(entry);
         merged.truncate(MAX_BATCH_EVENTS);
         *entry = merged;
         self.cancel_reasons
@@ -3951,30 +3951,52 @@ mod tests {
     }
 
     #[test]
-    fn test_requeue_dead_letters_after_max_retries() {
+    fn test_requeue_parks_batch_after_max_retries() {
         let mut q = EventQueue::new(DedupMode::Queue);
         let ch = Uuid::new_v4();
 
-        q.push(make_queued(ch, "poison"));
+        let queued = make_queued(ch, "poison");
+        let expected_event_id = queued.event.id;
+        q.push(queued);
         for attempt in 1..=MAX_RETRIES {
             q.retry_after
                 .insert(conv(ch), Instant::now() - Duration::from_secs(1));
             let batch = q.flush_next().expect("flush");
             assert!(
                 q.requeue(batch).is_none(),
-                "attempt {attempt} should requeue, not dead-letter"
+                "attempt {attempt} should requeue, not park"
+            );
+            assert!(
+                !q.has_parked_handoff(),
+                "attempt {attempt} should not produce a park handoff"
             );
             q.mark_complete(ch);
         }
 
-        // The MAX_RETRIES+1'th failure dead-letters: batch is returned.
+        // The MAX_RETRIES+1'th failure parks instead of discarding:
+        // requeue() returns None (nothing returned for discard) and hands the
+        // batch off to parked_out via the production seam.
         q.retry_after
             .insert(conv(ch), Instant::now() - Duration::from_secs(1));
         let batch = q.flush_next().expect("flush");
-        let dead = q.requeue(batch).expect("should dead-letter");
-        assert_eq!(dead.channel_id, ch);
-        assert_eq!(dead.events.len(), 1);
+        let ret = q.requeue(batch);
+        assert!(
+            ret.is_none(),
+            "requeue must return None (nothing returned for discard)"
+        );
+        assert!(q.has_parked_handoff(), "park handoff must be recorded");
+        let mut parked = q.take_parked();
+        assert_eq!(parked.len(), 1, "exactly one batch must be parked");
+        let handoff = parked.pop().unwrap();
+        assert_eq!(handoff.batch.channel_id, ch);
+        assert_eq!(handoff.batch.events.len(), 1, "no event was dropped");
+        assert_eq!(handoff.batch.events[0].event.id, expected_event_id);
+        assert_eq!(handoff.reason, ParkHandoffReason::RetriesExhausted);
         q.mark_complete(ch);
+        // The queue holds zero events, and no event was dropped.
+        assert_eq!(q.queued_event_count(ch), 0);
+        assert!(!q.has_undispatched_work());
+        assert!(!q.has_in_flight());
         // Retry state is cleared so fresh traffic isn't throttled.
         assert!(!q.retry_counts.contains_key(&conv(ch)));
         assert!(!q.retry_after.contains_key(&conv(ch)));
