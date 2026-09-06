@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 import type { Page } from "@playwright/test";
 
+import { CANVAS_UNAVAILABLE_PREVIEW } from "../../src/features/channel-files/canvasPreview";
 import { installMockBridge } from "../helpers/bridge";
 
 const CHANNEL_NAME = "general";
@@ -52,8 +53,8 @@ async function listedNames(page: Page): Promise<string[]> {
 }
 
 /**
- * Time one facet or sort change *inside the page*: from the event the control
- * dispatches to the first mutation of the list. Measuring here rather than
+ * Time one facet or sort change *inside the page*: from just before the control
+ * fires its event to the first mutation of the list. Measuring here rather than
  * across the Playwright bridge keeps IPC round-trips out of the number, so the
  * budget is the tab's own filter-and-sort cost over the loaded index.
  */
@@ -73,6 +74,12 @@ async function measureListUpdate(
 
     const before = rendered();
     if (before === "") throw new Error("The file list is empty.");
+
+    // The clock starts *before* the dispatch. React flushes a discrete event's
+    // update synchronously inside `dispatchEvent`, so a clock started after it
+    // measures a list that has already re-rendered — every sort would read
+    // 0 ms and the budget below could never fail.
+    const started = performance.now();
 
     if (input.kind === "sort") {
       const select = document.querySelector<HTMLSelectElement>(
@@ -97,7 +104,6 @@ async function measureListUpdate(
       (button as HTMLButtonElement).click();
     }
 
-    const started = performance.now();
     for (;;) {
       const elapsed = performance.now() - started;
       if (rendered() !== before) return elapsed;
@@ -302,6 +308,22 @@ test.describe("channel files facets", () => {
     await expect(page.getByTestId("channel-canvas-content")).toContainText(
       "Edited from the Files tab.",
     );
+  });
+
+  test("a canvas that could not be read still pins a row naming the failure", async ({
+    page,
+  }) => {
+    // A read failure must not read as "this channel has no canvas": the row is
+    // the only route back to the surface that reports the failure and retries.
+    await installMockBridge(page, { canvasReadError: "relay unavailable" });
+    await page.goto("/");
+    await page.getByTestId(`channel-${CHANNEL_NAME}`).click();
+    await expect(page.getByTestId("chat-title")).toHaveText(CHANNEL_NAME);
+    await page.getByRole("tab", { name: "Files" }).click();
+
+    const canvasRow = page.getByTestId("channel-files-canvas-row");
+    await expect(canvasRow).toBeVisible({ timeout: 15_000 });
+    await expect(canvasRow).toContainText(CANVAS_UNAVAILABLE_PREVIEW);
   });
 
   test("a channel with no canvas pins no canvas row", async ({ page }) => {

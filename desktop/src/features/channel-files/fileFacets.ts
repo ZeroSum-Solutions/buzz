@@ -8,11 +8,12 @@
  * - **One array.** Filtering allocates exactly one array and the sort runs in
  *   place on it, so a facet change costs one copy of the *references*, never a
  *   second copy of the entries.
- * - **Every string it reads is capped.** The filename arrives from a relay
- *   event and the author name from a relay profile; both are compared through
- *   capped sort keys, so no comparison cost rides on an attacker-chosen
- *   length. The caps here are the ones `boundedImeta.ts` already applies —
- *   this module never widens one.
+ * - **Every string it reads is capped before it is read.** The filename arrives
+ *   from a relay event and the author name from a relay profile; each sort key
+ *   slices the raw value to its cap *first* and only then trims and lowercases
+ *   it, so no string work — not just no comparison — rides on an
+ *   attacker-chosen length. The filename cap is the one `boundedImeta.ts`
+ *   already applies; this module never widens one.
  */
 
 import { MAX_FILENAME_LENGTH, attachmentLabel } from "./boundedImeta";
@@ -156,16 +157,20 @@ function nameSortKey(file: ChannelFile): string {
 }
 
 /**
- * The capped, lowercased display name, or `null` when this author has no
- * usable name. A blank name is not a name.
+ * The capped, lowercased display name, or `null` when this author has no usable
+ * name. A blank name is not a name.
+ *
+ * The cap is applied to the raw relay string **before** any other string work.
+ * `display_name` reaches this map from a kind:0 event whose `content` the relay
+ * accepts up to 256 KiB of, so trimming or lowercasing the whole value first
+ * would put the attacker-chosen length back into the very work the cap exists
+ * to bound — the cap would then bound only the comparison, not the cost.
  */
-function authorSortKey(
-  file: ChannelFile,
-  authorNames: ReadonlyMap<string, string> | undefined,
-): string | null {
-  const name = authorNames?.get(file.pubkey)?.trim();
-  if (!name) return null;
-  return cap(name, MAX_AUTHOR_SORT_KEY_LENGTH).toLowerCase();
+function authorSortKey(name: string | undefined): string | null {
+  if (name === undefined) return null;
+  const capped = cap(name, MAX_AUTHOR_SORT_KEY_LENGTH).trim();
+  if (capped === "") return null;
+  return capped.toLowerCase();
 }
 
 /**
@@ -214,12 +219,16 @@ export function applyFileFacets(
       );
       break;
     case "author": {
-      const keys = new Map<ChannelFile, string | null>();
-      for (const file of result)
-        keys.set(file, authorSortKey(file, authorNames));
+      // Keyed by pubkey, not by row: one author who posted every file pays for
+      // one capped key, not one per attachment.
+      const keys = new Map<string, string | null>();
+      for (const file of result) {
+        if (keys.has(file.pubkey)) continue;
+        keys.set(file.pubkey, authorSortKey(authorNames?.get(file.pubkey)));
+      }
       result.sort((a, b) => {
-        const left = keys.get(a) ?? null;
-        const right = keys.get(b) ?? null;
+        const left = keys.get(a.pubkey) ?? null;
+        const right = keys.get(b.pubkey) ?? null;
         if (left !== null && right !== null) {
           const byName = left.localeCompare(right);
           if (byName !== 0) return byName;

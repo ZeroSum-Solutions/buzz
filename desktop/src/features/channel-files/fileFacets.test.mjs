@@ -293,6 +293,69 @@ test("author sort caps the relay-sourced display name it compares", () => {
   );
 });
 
+test("the author cap is applied before the name is trimmed", () => {
+  // A relay display name may be 256 KiB of kind:0 content. Trimming first and
+  // capping second bounds the comparison but not the string work, so the cap
+  // has to bite on the raw value: everything past it, whitespace included, is
+  // never examined.
+  const padded = `${" ".repeat(MAX_AUTHOR_SORT_KEY_LENGTH / 2)}${"B".repeat(
+    MAX_AUTHOR_SORT_KEY_LENGTH + 10,
+  )}`;
+  const rows = [
+    fileRow({ key: "k-1", pubkey: "pk-padded" }),
+    fileRow({ key: "k-2", pubkey: "pk-plain" }),
+  ];
+  assert.deepEqual(
+    applyFileFacets(rows, {
+      sort: "author",
+      // Capped first, the padded name keeps only the 50 B's that fit past its
+      // 50 leading spaces, so it sorts before the 55 B's. Trimmed first, it
+      // would keep 110 B's and sort after them.
+      authorNames: new Map([
+        ["pk-padded", padded],
+        ["pk-plain", "B".repeat(MAX_AUTHOR_SORT_KEY_LENGTH / 2 + 5)],
+      ]),
+    }).map((f) => f.key),
+    ["k-1", "k-2"],
+  );
+
+  // A name that is only whitespace up to the cap has no name at all, so it
+  // sorts last as an unknown author instead of by the text hiding past it.
+  assert.deepEqual(
+    applyFileFacets(rows, {
+      sort: "author",
+      authorNames: new Map([
+        ["pk-padded", `${" ".repeat(MAX_AUTHOR_SORT_KEY_LENGTH + 20)}aaa`],
+        ["pk-plain", "zzz"],
+      ]),
+    }).map((f) => f.key),
+    ["k-2", "k-1"],
+  );
+});
+
+test("the author sort key is derived once per author, not once per row", () => {
+  class CountingMap extends Map {
+    lookups = 0;
+    get(key) {
+      this.lookups += 1;
+      return super.get(key);
+    }
+  }
+  const authorNames = new CountingMap([
+    ["pk-a", "Ada"],
+    ["pk-b", "Bo"],
+  ]);
+  const rows = Array.from({ length: 12 }, (_, index) =>
+    fileRow({ key: `k-${index}`, pubkey: index % 2 === 0 ? "pk-a" : "pk-b" }),
+  );
+  applyFileFacets(rows, { sort: "author", authorNames });
+  assert.equal(
+    authorNames.lookups,
+    2,
+    "12 rows from 2 authors must cost 2 name lookups, not 12",
+  );
+});
+
 test("name sort caps the relay-sourced filename it compares", () => {
   const shared = "a".repeat(MAX_FILENAME_LENGTH);
   const rows = [

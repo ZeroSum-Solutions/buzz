@@ -6,22 +6,10 @@ import {
 } from "@/features/channels/hooks";
 import { ChannelCanvas } from "@/features/channels/ui/ChannelCanvas";
 import { useChannelModerationCapabilities } from "@/features/channels/ui/ChannelManagementModerationActions";
-import { getMarkdownPreviewText } from "@/features/channels/ui/ChannelManagementSheetRows";
 import type { Channel } from "@/shared/api/types";
 
+import { CANVAS_UNAVAILABLE_PREVIEW, canvasPreviewText } from "./canvasPreview";
 import type { ChannelFilesCanvas } from "./ChannelFilesTab";
-
-/**
- * Characters of the canvas body read to build the pinned row's preview.
- *
- * The body is relay-sourced and `getMarkdownPreviewText` walks every line of
- * whatever it is handed, so the bound sits on the input to that walk — the
- * work, not the rendered result, which the tab caps separately.
- */
-export const MAX_CANVAS_PREVIEW_SOURCE_LENGTH = 2_000;
-
-/** Shown on the row when the canvas exists but could not be read. */
-export const CANVAS_UNAVAILABLE_PREVIEW = "This canvas could not be loaded.";
 
 export type UseChannelFilesCanvasInput = {
   /** The channel whose canvas to pin, or null when none is open. */
@@ -59,18 +47,21 @@ export function useChannelFilesCanvas({
     canManageChannel &&
     channel?.channelType !== "dm" &&
     (channel?.isMember ?? false);
-  const content = canvasQuery.data?.content?.trim() ?? "";
+  // The raw body, not a trimmed copy of it: trimming here would rescan the
+  // whole relay-sourced body on every render of the screen that owns this hook,
+  // not only when the body changes.
+  const rawContent = canvasQuery.data?.content ?? "";
   const failed = canvasQuery.error != null;
 
   return React.useMemo(() => {
     if (!enabled || channelId === null) return null;
-    if (!failed && content === "") return null;
+    // `\S` stops at the first non-blank character instead of allocating a
+    // trimmed copy of the body just to ask whether it has one.
+    if (!failed && !/\S/.test(rawContent)) return null;
     return {
       preview: failed
         ? CANVAS_UNAVAILABLE_PREVIEW
-        : getMarkdownPreviewText(
-            content.slice(0, MAX_CANVAS_PREVIEW_SOURCE_LENGTH),
-          ),
+        : canvasPreviewText(rawContent),
       surface: (
         <ChannelCanvas
           canEdit={canEdit}
@@ -79,5 +70,5 @@ export function useChannelFilesCanvas({
         />
       ),
     };
-  }, [canEdit, channelId, content, enabled, failed, isArchived]);
+  }, [canEdit, channelId, enabled, failed, isArchived, rawContent]);
 }
