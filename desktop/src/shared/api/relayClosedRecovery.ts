@@ -110,6 +110,27 @@ export function handleRelayClosed({
   });
 }
 
+/**
+ * Tell a live subscription's owner that the relay ended it for good.
+ *
+ * Fired at most once per subscription, and never allowed to throw: this runs
+ * inside the inbound frame dispatch, so an exception here would abandon the
+ * rest of that frame's handling for every other subscription on the socket.
+ */
+function notifyTerminalClose(
+  subscription: LiveSubscription,
+  message: string,
+): void {
+  const notify = subscription.onTerminalClose;
+  if (!notify) return;
+  subscription.onTerminalClose = undefined;
+  try {
+    notify(message);
+  } catch (error) {
+    console.error("Live subscription terminal-close handler failed", error);
+  }
+}
+
 function recoverLiveSubscriptionFromClosed({
   subscriptions,
   subId,
@@ -132,6 +153,7 @@ function recoverLiveSubscriptionFromClosed({
     // Auth/access/filter failure — permanently remove the subscription so it
     // doesn't silently loop.
     subscriptions.delete(subId);
+    notifyTerminalClose(subscription, message);
     return;
   }
 
