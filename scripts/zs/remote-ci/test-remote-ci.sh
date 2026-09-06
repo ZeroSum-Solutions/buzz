@@ -686,6 +686,8 @@ check_contains "provision requires the owner tag on the security group" "$PROVIS
   "assert_owner_tag \"security group"
 check_contains "provision revokes every unexpected ingress rule" "$PROVISION" \
   "revoking every existing ingress rule"
+check_contains "provision ensures the CloudWatch Events service-linked role before the alarm" "$PROVISION" \
+  "create-service-linked-role --aws-service-name events.amazonaws.com"
 check_contains "provision deletes the IAM key when the vault write fails" "$PROVISION" \
   "iam delete-access-key"
 check_absent "provision writes no credential file" "$PROVISION" \

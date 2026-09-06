@@ -609,6 +609,14 @@ aws_do iam put-role-policy --role-name "$ROLE_NAME" --policy-name "$ROLE_POLICY_
   >/dev/null
 
 # ── idle alarm: CPU < 5% for 30 minutes stops the box ────────────────────────
+# The alarm's EC2 stop action needs the CloudWatch Events service-linked role.
+# A new account does not have it, and put-metric-alarm fails without it.
+if iam_lookup iam get-role --role-name AWSServiceRoleForCloudWatchEvents --query 'Role.Arn'; then
+  :
+else
+  log "creating the CloudWatch Events service-linked role"
+  aws_do iam create-service-linked-role --aws-service-name events.amazonaws.com >/dev/null
+fi
 log "putting CloudWatch alarm ${BOX_NAME}-idle"
 aws_do cloudwatch put-metric-alarm \
   --alarm-name "${BOX_NAME}-idle" \
