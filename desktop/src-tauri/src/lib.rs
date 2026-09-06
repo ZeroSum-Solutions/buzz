@@ -14,6 +14,7 @@ mod events;
 // the event contract. Nothing here is wired to a command, the webview or the
 // sidebar yet — that is slice two — so the items below have no in-tree caller
 // and would read as dead code until they do.
+mod agent_health;
 #[allow(dead_code)]
 mod google_calendar;
 mod huddle;
