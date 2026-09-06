@@ -182,10 +182,26 @@ test("a malformed resolver answer is rejected at the boundary", () => {
   );
 });
 
-test("the local-document panel URI round-trips exactly one path", () => {
-  const path = "/Users/example/projects/notes and drafts/a b.md";
-  const url = localMarkdownDocUrl(path);
-  assert.equal(parseLocalMarkdownDocUrl(url), path);
+test("the local-document panel URI round-trips the candidate and its sender", () => {
+  // The panel re-resolves what the chip resolved: the token as the sender
+  // wrote it, under the sender's roots. A canonical path would not survive
+  // the trip on Windows (`\\?\C:\...` is refused by inspection), and a
+  // null sender would resolve under different roots than the chip did.
+  const candidate = "notes and drafts/a b.md";
+  const sender = "ab12".repeat(16);
+  const url = localMarkdownDocUrl(candidate, sender);
+  assert.deepEqual(parseLocalMarkdownDocUrl(url), {
+    candidate,
+    senderPubkey: sender,
+  });
+  assert.deepEqual(
+    parseLocalMarkdownDocUrl(localMarkdownDocUrl(candidate, null)),
+    {
+      candidate,
+      senderPubkey: null,
+    },
+  );
   assert.equal(parseLocalMarkdownDocUrl("https://relay/media/a.bin"), null);
   assert.equal(parseLocalMarkdownDocUrl(""), null);
+  assert.equal(parseLocalMarkdownDocUrl("buzz-local-file:"), null);
 });

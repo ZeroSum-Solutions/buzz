@@ -197,20 +197,49 @@ export async function resolvePathLink(
   return parsePathLinkTarget(answer);
 }
 
-/** The `?doc=` panel target for a locally resolved markdown document. */
-export function localMarkdownDocUrl(path: string): string {
-  return `${LOCAL_DOC_SCHEME}${encodeURIComponent(path)}`;
+/** What a `buzz-local-file:` panel target names: the token and its sender. */
+export type LocalMarkdownDoc = {
+  /** The path candidate as the sender wrote it, never a canonical path. */
+  candidate: string;
+  /** The message sender, which selects the roots the candidate may live in. */
+  senderPubkey: string | null;
+};
+
+/**
+ * The `?doc=` panel target for a locally resolved markdown document.
+ *
+ * It carries the *candidate* and the sender, not the canonical path the
+ * resolver answered with: the panel re-resolves natively, and it must do so
+ * with the same inputs the chip used. A canonical path would not survive the
+ * round trip on Windows (`\\?\C:\...` is refused by inspection before any
+ * filesystem call), and a null sender would select different roots.
+ */
+export function localMarkdownDocUrl(
+  candidate: string,
+  senderPubkey: string | null,
+): string {
+  const sender =
+    senderPubkey === null ? "" : `#${encodeURIComponent(senderPubkey)}`;
+  return `${LOCAL_DOC_SCHEME}${encodeURIComponent(candidate)}${sender}`;
 }
 
 /**
- * The local path behind a `?doc=` panel target, or `null` when the target is
- * a relay media URL (which the panel fetches over the authenticated path).
+ * The candidate and sender behind a `?doc=` panel target, or `null` when the
+ * target is a relay media URL (which the panel fetches over the authenticated
+ * path).
  */
-export function parseLocalMarkdownDocUrl(url: string): string | null {
+export function parseLocalMarkdownDocUrl(url: string): LocalMarkdownDoc | null {
   if (!url.startsWith(LOCAL_DOC_SCHEME)) return null;
   try {
-    const path = decodeURIComponent(url.slice(LOCAL_DOC_SCHEME.length));
-    return path.length > 0 ? path : null;
+    const rest = url.slice(LOCAL_DOC_SCHEME.length);
+    const hash = rest.indexOf("#");
+    const candidate = decodeURIComponent(
+      hash === -1 ? rest : rest.slice(0, hash),
+    );
+    if (candidate.length === 0) return null;
+    const senderPubkey =
+      hash === -1 ? null : decodeURIComponent(rest.slice(hash + 1)) || null;
+    return { candidate, senderPubkey };
   } catch {
     // A malformed percent-escape is not a path; the panel shows its load
     // error rather than sending the raw text to the filesystem.

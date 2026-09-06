@@ -88,7 +88,7 @@ export function MarkdownDocPanel({
   const [view, setView] = React.useState<MarkdownDocView>("preview");
   // A local document opened from a path link. `null` for a relay attachment,
   // which keeps the authenticated media fetch and the Download action.
-  const localPath = React.useMemo(() => parseLocalMarkdownDocUrl(url), [url]);
+  const localDoc = React.useMemo(() => parseLocalMarkdownDocUrl(url), [url]);
 
   // Opening can unmount the section holding the focused attachment card
   // (narrow layout swaps the whole channel out), and closing unmounts this
@@ -110,12 +110,12 @@ export function MarkdownDocPanel({
       // A local document is read through `read_path_link_markdown`, which
       // re-resolves the path against the allowed roots and enforces the same
       // 2 MiB cap natively — the panel never reads a path it was handed.
-      if (localPath !== null) {
+      if (localDoc !== null) {
         return {
           kind: "ok",
           text: await invokeTauri<string>("read_path_link_markdown", {
-            candidate: localPath,
-            senderPubkey: null,
+            candidate: localDoc.candidate,
+            senderPubkey: localDoc.senderPubkey,
           }),
         };
       }
@@ -129,7 +129,9 @@ export function MarkdownDocPanel({
         throw err;
       }
     },
-    staleTime: Number.POSITIVE_INFINITY,
+    // A relay blob never changes under its URL; a local document is a
+    // mutable file an agent may rewrite, so it is re-read on every open.
+    staleTime: localDoc !== null ? 0 : Number.POSITIVE_INFINITY,
     retry: 1,
   });
 
@@ -137,19 +139,19 @@ export function MarkdownDocPanel({
   // OS default handler instead of downloading it from the relay. Either way
   // the failure is surfaced, never swallowed.
   const handleDownload = React.useCallback(() => {
-    const command = localPath !== null ? "open_path_link" : "download_file";
+    const command = localDoc !== null ? "open_path_link" : "download_file";
     const args =
-      localPath !== null
-        ? { candidate: localPath, senderPubkey: null }
+      localDoc !== null
+        ? { candidate: localDoc.candidate, senderPubkey: localDoc.senderPubkey }
         : { url, filename };
     invokeTauri(command, args).catch((err: unknown) => {
-      const fallback = localPath !== null ? "Open failed" : "Download failed";
+      const fallback = localDoc !== null ? "Open failed" : "Download failed";
       toast.error(err instanceof Error ? err.message : fallback);
     });
-  }, [filename, localPath, url]);
+  }, [filename, localDoc, url]);
   const primaryActionLabel =
-    localPath !== null ? `Open ${filename}` : `Download ${filename}`;
-  const primaryActionText = localPath !== null ? "Open file" : "Download file";
+    localDoc !== null ? `Open ${filename}` : `Download ${filename}`;
+  const primaryActionText = localDoc !== null ? "Open file" : "Download file";
 
   const decoded = docQuery.data;
   const [isExportingPdf, setIsExportingPdf] = React.useState(false);
@@ -193,7 +195,7 @@ export function MarkdownDocPanel({
   }, [documentText, filename]);
 
   const errorMessage = docQuery.isError
-    ? localPath !== null
+    ? localDoc !== null
       ? docQuery.error instanceof Error && docQuery.error.message
         ? docQuery.error.message
         : "Couldn't open this file."

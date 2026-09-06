@@ -1285,6 +1285,12 @@ declare global {
     /** Last payload written through the native clipboard command. */
     __BUZZ_E2E_LAST_CLIPBOARD__?: { html: string | null; text: string };
     __BUZZ_E2E_COMMANDS__?: string[];
+    /** Every path-link IPC call with its payload, for seam-binding specs. */
+    __BUZZ_E2E_PATH_LINK_CALLS__?: Array<{
+      command: string;
+      candidate: string;
+      senderPubkey: string | null;
+    }>;
     /** Which outcome the mocked `export_document_pdf` returns. */
     __BUZZ_E2E_PDF_EXPORT_MODE__?: "saved" | "cancelled" | "failed";
     __BUZZ_E2E_COMMAND_PAYLOADS__?: Array<{
@@ -11499,6 +11505,7 @@ export function maybeInstallE2eTauriMocks() {
   }
   mockWindows(config.mock?.windowLabel ?? "main");
   window.__BUZZ_E2E_COMMANDS__ = [];
+  window.__BUZZ_E2E_PATH_LINK_CALLS__ = [];
   window.__BUZZ_E2E_COMMAND_PAYLOADS__ = [];
   window.__BUZZ_E2E_COMMAND_LOG__ = [];
   window.__BUZZ_E2E_OBSERVER_CONTROLS__ = [];
@@ -14552,6 +14559,11 @@ export function maybeInstallE2eTauriMocks() {
           senderPubkey?: string | null;
         };
         const text = typeof candidate === "string" ? candidate : "";
+        window.__BUZZ_E2E_PATH_LINK_CALLS__?.push({
+          command,
+          candidate: text,
+          senderPubkey: typeof senderPubkey === "string" ? senderPubkey : null,
+        });
         // Mirrors the native DTO cap so a spec can prove the refusal shape
         // without a Rust process.
         if (new TextEncoder().encode(text).length > 4096) {

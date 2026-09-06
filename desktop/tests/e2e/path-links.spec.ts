@@ -23,6 +23,7 @@ const FIXTURE_TEXT = readFileSync(FIXTURE_PATH, "utf8");
 const CANDIDATE = "docs/path-link-note.md";
 const RESOLVED_PATH = "/Users/example/projects/buzz/docs/path-link-note.md";
 const MISSING_CANDIDATE = "docs/not-here.md";
+const SENDER_PUBKEY = "9a5c".repeat(16);
 
 async function waitForMockLiveSubscription(page: Page, channelName: string) {
   await page.waitForFunction(
@@ -41,6 +42,20 @@ async function commands(page: Page) {
     () =>
       (window as Window & { __BUZZ_E2E_COMMANDS__?: string[] })
         .__BUZZ_E2E_COMMANDS__ ?? [],
+  );
+}
+
+type PathLinkCall = {
+  command: string;
+  candidate: string;
+  senderPubkey: string | null;
+};
+
+async function pathLinkCalls(page: Page) {
+  return page.evaluate(
+    () =>
+      (window as Window & { __BUZZ_E2E_PATH_LINK_CALLS__?: PathLinkCall[] })
+        .__BUZZ_E2E_PATH_LINK_CALLS__ ?? [],
   );
 }
 
@@ -65,12 +80,16 @@ async function seedMessage(
   await page.getByTestId("channel-general").click();
   await expect(page.getByTestId("chat-title")).toHaveText("general");
   await waitForMockLiveSubscription(page, "general");
-  await page.evaluate((body) => {
-    window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
-      channelName: "general",
-      content: body,
-    });
-  }, content);
+  await page.evaluate(
+    ({ body, pubkey }) => {
+      window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
+        channelName: "general",
+        content: body,
+        pubkey,
+      });
+    },
+    { body: content, pubkey: SENDER_PUBKEY },
+  );
 }
 
 test("a backticked markdown path opens the viewer panel", async ({ page }) => {
@@ -118,6 +137,36 @@ test("a path that resolves to nothing stays plain text", async ({ page }) => {
   await expect(page.getByTestId("markdown-doc-panel")).toHaveCount(0);
 });
 
+test("a keyboard user whose focus lands on a token that resolves to nothing is not stranded", async ({
+  page,
+}) => {
+  // Focus is the keyboard's hover: it resolves the token, and a token that
+  // resolves to nothing drops its button. Removing the focused element would
+  // send focus to <body>, so the next Tab restarts from the top of the page
+  // instead of continuing from the message.
+  await seedMessage(page, `Missing: \`${MISSING_CANDIDATE}\``);
+
+  const token = page
+    .locator(`[data-path-link]`, { hasText: MISSING_CANDIDATE })
+    .last();
+  await token.getByRole("button").focus();
+  await expect(token).toHaveAttribute("data-path-link", "text");
+  await expect(token.getByRole("button")).toHaveCount(0);
+
+  const focusStayed = await page.evaluate(
+    () => document.activeElement?.closest("[data-path-link]") !== null,
+  );
+  expect(focusStayed, "focus stays on the token").toBe(true);
+
+  await page.keyboard.press("Tab");
+  const landedOnBody = await page.evaluate(
+    () => document.activeElement === document.body,
+  );
+  expect(landedOnBody, "Tab continues from the message, not from <body>").toBe(
+    false,
+  );
+});
+
 test("a bare word is never treated as a path", async ({ page }) => {
   await seedMessage(page, "Run `cargo` and then `SIGKILL`");
 
@@ -149,6 +198,24 @@ test("the viewer's primary action opens a local document, never the relay downlo
 
   await expect.poll(() => commands(page)).toContain("open_path_link");
   expect(await commands(page)).not.toContain("download_file");
+
+  // Every native call re-resolves the token as the sender wrote it, under
+  // the sender's roots — never the canonical path the chip was handed back
+  // (which would not survive the trip on Windows), and never a null sender.
+  const calls = await pathLinkCalls(page);
+  for (const command of [
+    "resolve_path_link",
+    "read_path_link_markdown",
+    "open_path_link",
+  ]) {
+    const call = calls.find((entry) => entry.command === command);
+    expect(call, `${command} was called`).toBeDefined();
+    expect(call).toEqual({
+      command,
+      candidate: CANDIDATE,
+      senderPubkey: SENDER_PUBKEY,
+    });
+  }
 });
 
 test("a local document that fails to read says so without blaming the relay", async ({

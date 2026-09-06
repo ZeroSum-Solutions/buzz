@@ -44,23 +44,26 @@ export function PathLinkChip({
   const openMarkdownDoc = useMarkdownDocViewer();
   const senderPubkey = pathLinkSenderPubkey ?? null;
 
+  // Opening re-resolves the token as the sender wrote it, under the sender's
+  // roots — the same inputs the resolution used, never the canonical path it
+  // answered with (see `localMarkdownDocUrl`).
   const open = React.useCallback(
     (target: PathLinkTarget) => {
       if (target.kind === "markdown" && openMarkdownDoc) {
         openMarkdownDoc({
-          url: localMarkdownDocUrl(target.path),
+          url: localMarkdownDocUrl(text, senderPubkey),
           filename: target.filename,
         });
         return;
       }
       invokeTauri("open_path_link", {
-        candidate: target.path,
+        candidate: text,
         senderPubkey,
       }).catch((error: unknown) => {
         toast.error(errorMessage(error, `Couldn't open ${target.filename}.`));
       });
     },
-    [openMarkdownDoc, senderPubkey],
+    [openMarkdownDoc, senderPubkey, text],
   );
 
   const { state, resolve, activate } = usePathLinkResolution({
@@ -72,12 +75,33 @@ export function PathLinkChip({
   });
 
   const isLink = state.status === "link";
+
+  // Focus is the keyboard's hover. When the token it is on resolves to
+  // nothing, the button below unmounts; without this the browser would drop
+  // focus to <body> and the next Tab would restart from the top of the page.
+  // The plain code element takes the focus instead (out of the tab order, so
+  // it is never a stop that does nothing), and Tab continues from here.
+  const buttonFocusedRef = React.useRef(false);
+  const textRef = React.useRef<HTMLElement>(null);
+  React.useLayoutEffect(() => {
+    if (state.status === "text" && buttonFocusedRef.current) {
+      buttonFocusedRef.current = false;
+      textRef.current?.focus();
+    }
+  }, [state.status]);
+
   // Resolution said "not a link": the token is ordinary text from here on, so
   // it drops its control and leaves the tab order rather than staying a focus
   // stop that does nothing.
   if (state.status === "text") {
     return (
-      <code {...props} className={className} data-path-link="text">
+      <code
+        {...props}
+        className={className}
+        data-path-link="text"
+        ref={textRef}
+        tabIndex={-1}
+      >
         {children}
       </code>
     );
@@ -96,8 +120,14 @@ export function PathLinkChip({
           isLink &&
             "cursor-pointer underline decoration-dotted underline-offset-2",
         )}
+        onBlur={() => {
+          buttonFocusedRef.current = false;
+        }}
         onClick={activate}
-        onFocus={resolve}
+        onFocus={() => {
+          buttonFocusedRef.current = true;
+          resolve();
+        }}
         onPointerEnter={resolve}
         title={isLink ? state.target.path : undefined}
         type="button"
