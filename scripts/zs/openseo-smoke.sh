@@ -391,7 +391,8 @@ fi
 
 echo "== building the fake MCP server fixture =="
 cargo build -q --manifest-path "$REPO_ROOT/Cargo.toml" -p buzz-agent --bin fake-mcp
-FAKE_MCP="$REPO_ROOT/target/debug/fake-mcp"
+TARGET_DIR="$(cargo metadata --manifest-path "$REPO_ROOT/Cargo.toml" --format-version 1 --no-deps | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).target_directory")"
+FAKE_MCP="$TARGET_DIR/debug/fake-mcp"
 if [ ! -x "$FAKE_MCP" ]; then
   echo "FAIL: fake-mcp was not built at $FAKE_MCP" >&2
   exit 1

@@ -15,8 +15,6 @@ set -euo pipefail
 cd "$(dirname "$0")"
 REPO_ROOT="$(cd ../.. && pwd)"
 VALIDATE_PDF="$REPO_ROOT/scripts/zs/pdf-validate.sh"
-BIN=./target/release/render_headless_chrome
-SENTINEL_BIN=./target/release/sentinel
 OUT=out
 SENTINEL_PORT=18391
 mkdir -p "$OUT"
@@ -28,6 +26,9 @@ mkdir -p "$OUT"
 # this reproducible against the committed Cargo.lock.
 echo "building release binaries..."
 cargo build --release --locked
+TARGET_DIR="$(cargo metadata --format-version 1 --no-deps | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).target_directory")"
+BIN="$TARGET_DIR/release/render_headless_chrome"
+SENTINEL_BIN="$TARGET_DIR/release/sentinel"
 
 fail=0
 
