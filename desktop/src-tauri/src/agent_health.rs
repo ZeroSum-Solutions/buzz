@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use buzz_acp_pkg::reliability::ledger::{read_ledger_file, LedgerBody, LedgerRecord, TurnOutcome};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
@@ -114,9 +115,132 @@ pub(crate) fn prune(conn: &Connection, now: i64) -> Result<usize, String> {
         .map_err(|e| format!("prune agent-health events: {e}"))
 }
 
+/// Map one ledger record to a health event, or `None` when the record
+/// carries no health signal (`turn_activity`).
+///
+/// `turn_finished` with an error outcome becomes kind `turn_failed` with
+/// `raw` dropped; every other outcome (and `turn_started`) keeps its ledger
+/// kind so `sync_ledger` can feed the turns-24h/7d counters.
+fn ledger_record_to_health_event(agent: &str, record: &LedgerRecord) -> Option<HealthEvent> {
+    let at_rfc3339 = record.at.to_rfc3339();
+    let batch_id = record.batch_id().map(|id| id.to_string());
+    let channel_id = record.channel_id().map(|id| id.to_string());
+
+    let (kind, class, payload): (&str, Option<String>, serde_json::Value) = match &record.body {
+        LedgerBody::TurnStarted(r) => (
+            "turn_started",
+            None,
+            serde_json::json!({"scope": r.scope, "attempt": r.attempt}),
+        ),
+        LedgerBody::TurnActivity(_) => return None,
+        LedgerBody::TurnFinished(r) => match &r.outcome {
+            TurnOutcome::Ok => ("turn_finished", None, serde_json::json!({"result": "ok"})),
+            TurnOutcome::Error { class, .. } => (
+                "turn_failed",
+                Some(class.clone()),
+                serde_json::json!({"result": "error", "class": class}),
+            ),
+            TurnOutcome::Timeout { kind, started } => (
+                "turn_finished",
+                Some(kind.clone()),
+                serde_json::json!({"result": "timeout", "kind": kind, "started": started}),
+            ),
+            TurnOutcome::Cancelled => (
+                "turn_finished",
+                None,
+                serde_json::json!({"result": "cancelled"}),
+            ),
+            TurnOutcome::Exited => (
+                "turn_finished",
+                None,
+                serde_json::json!({"result": "exited"}),
+            ),
+        },
+        LedgerBody::BatchParked(r) => (
+            "batch_parked",
+            None,
+            serde_json::json!({"reason": r.reason, "started": r.started, "events": r.events}),
+        ),
+        LedgerBody::BatchReplayed(r) => (
+            "batch_replayed",
+            None,
+            serde_json::json!({"replayOf": r.replay_of}),
+        ),
+        LedgerBody::BatchNeedsReview(r) => (
+            "batch_needs_review",
+            None,
+            serde_json::json!({"reason": r.reason}),
+        ),
+        LedgerBody::BatchDiscarded(r) => ("batch_discarded", None, serde_json::json!({"by": r.by})),
+        LedgerBody::AgentPaused(r) => (
+            "agent_paused",
+            Some(r.class.clone()),
+            serde_json::json!({"class": r.class, "until": r.until, "waiting": r.waiting}),
+        ),
+        LedgerBody::AgentResumed(_) => ("agent_resumed", None, serde_json::json!({})),
+        LedgerBody::BreakerOpened(r) => (
+            "breaker_opened",
+            None,
+            serde_json::json!({"scope": r.scope, "consecutive": r.consecutive}),
+        ),
+        LedgerBody::BreakerClosed(r) => (
+            "breaker_closed",
+            None,
+            serde_json::json!({"scope": r.scope}),
+        ),
+        LedgerBody::RelayReconnected(r) => (
+            "relay_reconnected",
+            None,
+            serde_json::json!({"afterSecs": r.after_secs}),
+        ),
+    };
+
+    let target = batch_id.clone().or_else(|| match &record.body {
+        LedgerBody::BreakerOpened(r) => Some(r.scope.clone()),
+        LedgerBody::BreakerClosed(r) => Some(r.scope.clone()),
+        _ => None,
+    });
+
+    Some(HealthEvent {
+        agent: agent.to_string(),
+        at: record.at.timestamp(),
+        kind: kind.to_string(),
+        event_key: compute_event_key(&at_rfc3339, kind, target.as_deref()),
+        batch_id,
+        channel_id,
+        class,
+        payload: Some(payload.to_string()),
+    })
+}
+
+/// Read `ledger_path` (through the read-only reader, never `Ledger::open`,
+/// which would rewrite the harness's own file) and insert every record not
+/// already stored. Safe to call repeatedly: duplicates are ignored by the
+/// `(agent, event_key)` primary key.
+#[allow(dead_code)]
+pub(crate) fn sync_ledger(
+    conn: &Connection,
+    agent: &str,
+    ledger_path: &Path,
+) -> Result<usize, String> {
+    let records = read_ledger_file(ledger_path).map_err(|e| format!("read agent ledger: {e}"))?;
+    let mut inserted = 0usize;
+    for record in &records {
+        if let Some(event) = ledger_record_to_health_event(agent, record) {
+            if insert_event(conn, &event)? {
+                inserted += 1;
+            }
+        }
+    }
+    Ok(inserted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buzz_acp_pkg::reliability::ledger::{AgentPaused, BatchParked, Ledger, TurnStarted};
+    use chrono::Utc;
+    use uuid::Uuid;
 
     fn db() -> (tempfile::TempDir, Connection) {
         let dir = tempfile::tempdir().unwrap();
@@ -209,5 +333,63 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM health_events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count_after, 2, "2 events should remain");
+    }
+
+    #[test]
+    fn sync_is_idempotent_and_inserts_only_missing_records() {
+        let (_d, conn) = db();
+        let ledger_dir = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let mut ledger = Ledger::open(ledger_dir.path(), "agent_alpha", now).unwrap();
+
+        let batch_id = Uuid::new_v4();
+        let channel_id = Uuid::new_v4();
+        ledger
+            .append(
+                now,
+                LedgerBody::TurnStarted(TurnStarted::new(
+                    batch_id,
+                    channel_id,
+                    "scope-1",
+                    vec!["event-1".to_string()],
+                    1,
+                )),
+            )
+            .unwrap();
+        ledger
+            .append(
+                now,
+                LedgerBody::BatchParked(BatchParked {
+                    batch_id,
+                    channel_id,
+                    reason: "retries_exhausted".to_string(),
+                    started: true,
+                    events: 3,
+                }),
+            )
+            .unwrap();
+        ledger
+            .append(
+                now,
+                LedgerBody::AgentPaused(AgentPaused {
+                    class: "capacity_exhausted".to_string(),
+                    until: now,
+                    waiting: 2,
+                }),
+            )
+            .unwrap();
+
+        let ledger_path = ledger.path().to_path_buf();
+
+        let first = sync_ledger(&conn, "agent_alpha", &ledger_path).unwrap();
+        assert_eq!(first, 3, "all three ledger records must be inserted once");
+
+        let second = sync_ledger(&conn, "agent_alpha", &ledger_path).unwrap();
+        assert_eq!(second, 0, "a repeat sync must insert nothing new");
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM health_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 3, "row count must not double after a second sync");
     }
 }
