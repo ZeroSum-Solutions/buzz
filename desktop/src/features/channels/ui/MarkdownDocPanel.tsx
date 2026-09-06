@@ -30,12 +30,16 @@ import {
   decodeMarkdownDocBytes,
   type MarkdownDocDecodeResult,
 } from "@/shared/ui/markdown/markdownDocFile";
+import { parseLocalMarkdownDocUrl } from "@/shared/ui/markdown/pathLinks";
 import { SegmentedControl } from "@/shared/ui/segmented-control";
 
 type MarkdownDocView = "preview" | "code";
 
 type MarkdownDocPanelProps = {
-  /** Raw relay `/media/` URL of the attachment. */
+  /**
+   * Raw relay `/media/` URL of the attachment, or a `buzz-local-file:` target
+   * naming a local document resolved by the path-link resolver.
+   */
   url: string;
   /** Human-readable filename from the imeta `filename` field. */
   filename: string;
@@ -82,6 +86,9 @@ export function MarkdownDocPanel({
   const isOverlay = useIsThreadPanelOverlay();
   useEscapeKey(onClose, isOverlay || isSinglePanelView);
   const [view, setView] = React.useState<MarkdownDocView>("preview");
+  // A local document opened from a path link. `null` for a relay attachment,
+  // which keeps the authenticated media fetch and the Download action.
+  const localPath = React.useMemo(() => parseLocalMarkdownDocUrl(url), [url]);
 
   // Opening can unmount the section holding the focused attachment card
   // (narrow layout swaps the whole channel out), and closing unmounts this
@@ -100,6 +107,18 @@ export function MarkdownDocPanel({
   const docQuery = useQuery<MarkdownDocDecodeResult>({
     queryKey: ["markdown-doc", url],
     queryFn: async ({ signal }) => {
+      // A local document is read through `read_path_link_markdown`, which
+      // re-resolves the path against the allowed roots and enforces the same
+      // 2 MiB cap natively — the panel never reads a path it was handed.
+      if (localPath !== null) {
+        return {
+          kind: "ok",
+          text: await invokeTauri<string>("read_path_link_markdown", {
+            candidate: localPath,
+            senderPubkey: null,
+          }),
+        };
+      }
       try {
         return decodeMarkdownDocBytes(await fetchMarkdownDocBytes(url, signal));
       } catch (err) {
@@ -114,12 +133,23 @@ export function MarkdownDocPanel({
     retry: 1,
   });
 
+  // A local document is already on this Mac: the same action hands it to the
+  // OS default handler instead of downloading it from the relay. Either way
+  // the failure is surfaced, never swallowed.
   const handleDownload = React.useCallback(() => {
-    invokeTauri("download_file", { url, filename }).catch((err: unknown) => {
-      const msg = err instanceof Error ? err.message : "Download failed";
-      toast.error(msg);
+    const command = localPath !== null ? "open_path_link" : "download_file";
+    const args =
+      localPath !== null
+        ? { candidate: localPath, senderPubkey: null }
+        : { url, filename };
+    invokeTauri(command, args).catch((err: unknown) => {
+      const fallback = localPath !== null ? "Open failed" : "Download failed";
+      toast.error(err instanceof Error ? err.message : fallback);
     });
-  }, [url, filename]);
+  }, [filename, localPath, url]);
+  const primaryActionLabel =
+    localPath !== null ? `Open ${filename}` : `Download ${filename}`;
+  const primaryActionText = localPath !== null ? "Open file" : "Download file";
 
   const decoded = docQuery.data;
   const [isExportingPdf, setIsExportingPdf] = React.useState(false);
@@ -163,7 +193,11 @@ export function MarkdownDocPanel({
   }, [documentText, filename]);
 
   const errorMessage = docQuery.isError
-    ? "Couldn't load this file from the relay."
+    ? localPath !== null
+      ? docQuery.error instanceof Error && docQuery.error.message
+        ? docQuery.error.message
+        : "Couldn't open this file."
+      : "Couldn't load this file from the relay."
     : decoded && decoded.kind !== "ok"
       ? decodeErrorMessage(decoded.kind)
       : null;
@@ -204,7 +238,7 @@ export function MarkdownDocPanel({
               </Button>
             ) : null}
             <Button
-              aria-label={`Download ${filename}`}
+              aria-label={primaryActionLabel}
               data-testid="markdown-doc-download"
               onClick={handleDownload}
               size="icon"
@@ -247,7 +281,7 @@ export function MarkdownDocPanel({
               <p className="text-sm text-muted-foreground">{errorMessage}</p>
               <Button onClick={handleDownload} size="sm" variant="secondary">
                 <Download className="mr-1.5 h-4 w-4" />
-                Download file
+                {primaryActionText}
               </Button>
             </div>
           ) : decoded?.kind === "ok" ? (
@@ -266,7 +300,7 @@ export function MarkdownDocPanel({
                     variant="secondary"
                   >
                     <Download className="mr-1.5 h-4 w-4" />
-                    Download file
+                    {primaryActionText}
                   </Button>
                 </div>
               ) : (

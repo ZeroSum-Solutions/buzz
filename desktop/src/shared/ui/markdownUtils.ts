@@ -122,6 +122,7 @@ export function markdownPropsAreEqual(
     shallowArrayEqual(prev.channelNames, next.channelNames) &&
     prev.imetaByUrl === next.imetaByUrl &&
     prev.configNudgeAuthorPubkey === next.configNudgeAuthorPubkey &&
+    prev.pathLinkSenderPubkey === next.pathLinkSenderPubkey &&
     prev.searchQuery === next.searchQuery &&
     prev.snapshotSharedBy === next.snapshotSharedBy &&
     prev.videoReviewContext === next.videoReviewContext
