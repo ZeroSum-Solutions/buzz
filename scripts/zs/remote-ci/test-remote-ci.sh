@@ -21,6 +21,17 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 FAILURES=0
 
+# Every provisioning run in this suite writes its box facts here, never to the
+# real box.env next to provision.sh. remote-ci.sh checks below set their own
+# REMOTE_CI_BOX_ENV explicitly, which takes precedence over this default.
+export REMOTE_CI_BOX_ENV="${WORK}/provision-box.env"
+REAL_BOX_ENV="${DIR}/box.env"
+if [ -f "$REAL_BOX_ENV" ]; then
+  REAL_BOX_ENV_BEFORE="$(cat "$REAL_BOX_ENV")"
+else
+  REAL_BOX_ENV_BEFORE="<absent>"
+fi
+
 pass() { printf 'ok   %s\n' "$1"; }
 fail() { printf 'FAIL %s\n     %s\n' "$1" "${2-}"; FAILURES=$((FAILURES + 1)); }
 
@@ -716,6 +727,23 @@ check_contains "provision records the new key as a cleanup obligation" "$PROVISI
   'PENDING_KEY_ID="$key_id"'
 check_contains "provision revokes a pending key from its trap" "$PROVISION" \
   "revoke_pending_key || true"
+
+# The suite drives the real provision.sh many times against a stubbed aws. If
+# any of those runs wrote the operator's box.env, the next real gate would read
+# a stub instance id and a private key path inside this suite's deleted temp
+# directory. Compare the file, not a flag: the check fails when provision.sh
+# stops honouring REMOTE_CI_BOX_ENV.
+if [ -f "$REAL_BOX_ENV" ]; then
+  REAL_BOX_ENV_AFTER="$(cat "$REAL_BOX_ENV")"
+else
+  REAL_BOX_ENV_AFTER="<absent>"
+fi
+if [ "$REAL_BOX_ENV_BEFORE" = "$REAL_BOX_ENV_AFTER" ]; then
+  pass "the suite never writes the operator's real box.env"
+else
+  fail "the suite never writes the operator's real box.env" \
+    "${REAL_BOX_ENV} changed during the suite; restore it from provision.sh output"
+fi
 
 printf '\n%s\n' "-----"
 if [ "$FAILURES" -eq 0 ]; then

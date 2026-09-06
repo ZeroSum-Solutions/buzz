@@ -57,7 +57,11 @@ AMI_SSM_PARAM="/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/h
 KEY_PATH="${BUZZ_CI_KEY_PATH:-$HOME/.ssh/${BOX_NAME}.pem}"
 KNOWN_HOSTS="${BUZZ_CI_KNOWN_HOSTS:-$HOME/.ssh/known_hosts.${BOX_NAME}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BOX_ENV="${SCRIPT_DIR}/box.env"
+# Where the box facts are written. The test suite points this at its own
+# scratch file: a stubbed provisioning run must never overwrite the operator's
+# real box.env (it did once, and every later remote gate then looked for a
+# private key in a deleted temp directory).
+BOX_ENV="${REMOTE_CI_BOX_ENV:-${SCRIPT_DIR}/box.env}"
 BOOTSTRAP="${SCRIPT_DIR}/bootstrap.sh"
 BOOTSTRAP_WAIT="${BUZZ_CI_BOOTSTRAP_WAIT:-3600}"
 SSH_WAIT="${BUZZ_CI_SSH_WAIT:-300}"
@@ -117,6 +121,7 @@ Environment:
   AWS_REGION            Region (default us-west-2).
   BUZZ_CI_INSTANCE_TYPE Instance type (default c7a.8xlarge).
   BUZZ_CI_KEY_PATH      Private key path (default ~/.ssh/buzz-ci-box.pem).
+  REMOTE_CI_BOX_ENV     Where to write box.env (default: next to this script).
   BUZZ_CI_BOOTSTRAP_WAIT  Seconds to wait for cloud-init (default 3600).
 EOF
 }
