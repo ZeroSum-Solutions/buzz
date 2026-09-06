@@ -407,7 +407,7 @@ impl Ledger {
     /// [`MAX_LINE_BYTES`] per line. Malformed lines are counted and skipped,
     /// never propagated as a parse failure for the whole file.
     pub fn read_all(&self) -> io::Result<Vec<LedgerRecord>> {
-        read_records(&self.path)
+        read_ledger_file(&self.path)
     }
 
     /// Batch ids with a `batch_replayed` record and no later `turn_finished`.
@@ -520,9 +520,13 @@ fn fit_to_budget(
     Ok((remaining, dropped))
 }
 
-/// Read a JSONL ledger file with a hard byte cap on the input and a hard cap
-/// per line.
-fn read_records(path: &Path) -> io::Result<Vec<LedgerRecord>> {
+/// Read a JSONL ledger file in a read-only manner with a hard byte cap on the
+/// input and a hard cap per line.
+///
+/// Returns all parsed records. Lines that are malformed or exceed
+/// [`MAX_LINE_BYTES`] are skipped without modifying or rewriting the file on
+/// disk. If the file does not exist, returns an empty vector.
+pub fn read_ledger_file(path: &Path) -> io::Result<Vec<LedgerRecord>> {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -565,4 +569,59 @@ fn read_records(path: &Path) -> io::Result<Vec<LedgerRecord>> {
         );
     }
     Ok(records)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_ledger_file_skips_malformed_lines_and_does_not_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+
+        let batch_1 = Uuid::new_v4();
+        let channel_1 = Uuid::new_v4();
+        let rec_1 = LedgerRecord {
+            at: Utc::now(),
+            agent: "test_agent".to_string(),
+            body: LedgerBody::TurnActivity(TurnActivity {
+                batch_id: batch_1,
+                channel_id: channel_1,
+            }),
+        };
+
+        let batch_2 = Uuid::new_v4();
+        let channel_2 = Uuid::new_v4();
+        let rec_2 = LedgerRecord {
+            at: Utc::now(),
+            agent: "test_agent".to_string(),
+            body: LedgerBody::TurnFinished(TurnFinished {
+                batch_id: batch_2,
+                channel_id: channel_2,
+                outcome: TurnOutcome::Ok,
+            }),
+        };
+
+        let line_1 = serde_json::to_string(&rec_1).unwrap();
+        let malformed = "{\"invalid\":json broken line";
+        let line_2 = serde_json::to_string(&rec_2).unwrap();
+
+        let contents = format!("{line_1}\n{malformed}\n{line_2}\n");
+        std::fs::write(&path, contents.as_bytes()).unwrap();
+
+        let original_bytes = std::fs::read(&path).unwrap();
+
+        let records = read_ledger_file(&path).expect("read_ledger_file should succeed");
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0], rec_1);
+        assert_eq!(records[1], rec_2);
+
+        let bytes_after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            bytes_after, original_bytes,
+            "file bytes must remain unchanged"
+        );
+    }
 }
