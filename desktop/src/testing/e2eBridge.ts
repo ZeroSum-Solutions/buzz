@@ -371,6 +371,8 @@ type E2eConfig = {
     deepHistoryMessageCount?: number;
     feedReadError?: string;
     canvasReadError?: string;
+    /** Seeds every channel's canvas body until a `set_canvas` overwrites it. */
+    canvasContent?: string;
     /** Delay (ms) for `apply_workspace` so e2e tests can observe the
      *  community-switch gate. 0/undefined = instant. */
     applyCommunityDelayMs?: number;
@@ -3557,6 +3559,18 @@ function mockObservedUnreadProjections(
 
 function resetMockObservedUnread() {
   mockObservedUnreadScopes.clear();
+}
+
+// Mock canvas bodies, keyed by channel id. `mock.canvasContent` seeds every
+// channel; `set_canvas` overwrites one, exactly as the relay-backed command
+// would, so a spec can drive the write-then-read path an immutable stub
+// cannot represent.
+let mockCanvasByChannel = new Map<string, string>();
+let mockCanvasSeed: string | null = null;
+
+function resetMockCanvas(config: E2eConfig | undefined) {
+  mockCanvasByChannel = new Map();
+  mockCanvasSeed = config?.mock?.canvasContent ?? null;
 }
 
 function resetMockSaveSubscriptions(config: E2eConfig | undefined) {
@@ -11495,6 +11509,7 @@ export function maybeInstallE2eTauriMocks() {
   resetMockObservedUnread();
   resetMockTeamCatalogEvents(config);
   resetMockSaveSubscriptions(config);
+  resetMockCanvas(config);
   resetMockPendingCommunityDeepLinks(config);
   resetMockPendingNavigationDeepLinks(config);
   resetMockPendingEntityDeepLinks(config);
@@ -14891,15 +14906,31 @@ export function maybeInstallE2eTauriMocks() {
         // The spec only verifies UI state, not the submitted request shape;
         // returning null mirrors the Rust submit_event success path.
         return null;
-      case "set_canvas":
+      case "set_canvas": {
+        const input = payload as { channelId?: string; content?: string };
+        // Write before reporting success: a spec that reads the canvas back
+        // after `set_canvas` resolves must never see the pre-write body.
+        mockCanvasByChannel.set(
+          input?.channelId ?? "",
+          typeof input?.content === "string" ? input.content : "",
+        );
         return { ok: true, event_id: mockEventId() };
+      }
       case "get_canvas": {
         const canvasReadError = activeConfig?.mock?.canvasReadError;
         if (canvasReadError) {
           throw new Error(canvasReadError);
         }
-        // Return the no-canvas success shape — content null means no canvas set.
-        return { content: null, updated_at: null, author: null };
+        const input = payload as { channelId?: string };
+        // A body written by `set_canvas` wins over the seed; with neither,
+        // content null is the no-canvas success shape.
+        const content =
+          mockCanvasByChannel.get(input?.channelId ?? "") ?? mockCanvasSeed;
+        return {
+          content: content ?? null,
+          updated_at: null,
+          author: null,
+        };
       }
       // ── Local-save archive ──────────────────────────────────────────────
       // These stubs drive the LocalArchiveSettingsCard in screenshot / UI tests

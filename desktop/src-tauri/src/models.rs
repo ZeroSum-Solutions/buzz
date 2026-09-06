@@ -43,6 +43,10 @@ pub struct ProfileInfo {
 
 #[derive(Serialize, Deserialize)]
 pub struct UserProfileSummaryInfo {
+    /// Kind-0 `display_name` (falling back to `name`). Untrusted, and capped to
+    /// `nostr_convert::PROFILE_NAME_MAX_BYTES` bytes where it is built from the
+    /// event — the frontend sorts on this value, so the bound belongs at the
+    /// seam and not only at render.
     pub display_name: Option<String>,
     /// Kind-0 `name` field, carried separately from `display_name` so clients
     /// can match @mention text against either alias (agents and the CLI
@@ -57,6 +61,9 @@ pub struct UserProfileSummaryInfo {
     /// merely at render — see that constant's doc comment.
     #[serde(default)]
     pub about: Option<String>,
+    /// Kind-0 `nip05` handle. Untrusted, and capped to
+    /// `nostr_convert::PROFILE_NAME_MAX_BYTES` bytes at the same seam as
+    /// `display_name`.
     pub nip05_handle: Option<String>,
     pub owner_pubkey: Option<String>,
     #[serde(default)]
@@ -72,6 +79,9 @@ pub struct UsersBatchResponse {
 #[derive(Serialize, Deserialize)]
 pub struct UserSearchResultInfo {
     pub pubkey: String,
+    /// Kind-0 `display_name` (falling back to `name`). Untrusted, and capped to
+    /// `nostr_convert::PROFILE_NAME_MAX_BYTES` bytes where it is built from the
+    /// event.
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
     /// Kind-0 `about` field — one-line role/description surfaced in the
@@ -81,6 +91,9 @@ pub struct UserSearchResultInfo {
     /// not merely at render — see that constant's doc comment.
     #[serde(default)]
     pub about: Option<String>,
+    /// Kind-0 `nip05` handle. Untrusted, and capped to
+    /// `nostr_convert::PROFILE_NAME_MAX_BYTES` bytes at the same seam as
+    /// `display_name`.
     pub nip05_handle: Option<String>,
     pub owner_pubkey: Option<String>,
     #[serde(default)]
