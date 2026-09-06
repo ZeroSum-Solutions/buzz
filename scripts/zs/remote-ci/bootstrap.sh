@@ -62,6 +62,7 @@ for attempt in 1 2 3 4 5; do
   # leaves dpkg interrupted, and every later apt call refuses until it is
   # configured; the rerun over ssh must heal that itself.
   dpkg --configure -a || true
+  apt-get -y -f install || true
   if apt-get update \
       -o Acquire::Retries=3 \
       -o Acquire::http::Timeout=30 \
