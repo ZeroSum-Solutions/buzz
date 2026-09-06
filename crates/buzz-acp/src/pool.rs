@@ -5160,6 +5160,7 @@ mod tests {
             args: vec![],
             env: vec![],
             trusted: true,
+            registry_launched: false,
         }
     }
 
@@ -5217,6 +5218,7 @@ mod tests {
             args: vec![],
             env: vec![],
             trusted: false,
+            registry_launched: false,
         }
     }
 

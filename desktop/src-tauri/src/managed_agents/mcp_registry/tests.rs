@@ -23,6 +23,10 @@ use crate::managed_agents::McpTransport;
 
 const LAUNCHER: &str = "/Applications/Buzz.app/Contents/MacOS/buzz-mcp-launch";
 
+/// The keychain service a generated argv names. In production this is the
+/// desktop's own `keyring_service()`; here it is a fixed stand-in.
+const SERVICE: &str = "buzz-desktop-dev";
+
 /// Where the fixtures put a server binary.
 ///
 /// The loader refuses a command the host calls relative, and `is_absolute` is
@@ -341,7 +345,7 @@ fn mcp_registry_generated_config_names_the_launcher_and_carries_no_value() {
     let generated: Vec<_> = resolved
         .servers
         .iter()
-        .map(|entry| generate_server(LAUNCHER, entry))
+        .map(|entry| generate_server(LAUNCHER, SERVICE, entry))
         .collect();
 
     let acp = render_buzz_acp_registry(&generated).expect("renders");
@@ -377,8 +381,6 @@ fn mcp_registry_generated_config_names_the_launcher_and_carries_no_value() {
     let claude: serde_json::Value = serde_json::from_str(&claude).expect("valid json");
     let github = &claude["mcpServers"]["github"];
     assert_eq!(github["command"], LAUNCHER);
-    assert_eq!(github["env"]["GITHUB_TOKEN"], "mcp:github-token");
-    assert_eq!(github["env"]["GITHUB_HOST"], "github.example");
     let codex: toml::Value = toml::from_str(&codex).expect("valid toml");
     assert_eq!(
         codex["mcp_servers"]["linear"]["command"].as_str(),
@@ -386,16 +388,27 @@ fn mcp_registry_generated_config_names_the_launcher_and_carries_no_value() {
     );
 }
 
+/// A declared variable travels in the launcher's argv and in no `env` block.
+///
+/// `buzz-agent` applies `McpServer.env` to the **launcher's** own `Command`
+/// (`crates/buzz-agent/src/mcp.rs`), so a duplicated block would put a
+/// declared `DYLD_INSERT_LIBRARIES` or `LD_PRELOAD` into the process that
+/// holds the agent's capability — before `main`, and before the launcher can
+/// clear anything. The launcher applies `--set`/`--secret` to its child
+/// instead, after it strips the capability.
+///
+/// Restoring the duplication fails this in all three artefacts.
 #[test]
-fn mcp_registry_generated_env_block_and_launcher_flags_agree() {
-    // The reference appears twice by design — the `env` block is what the
-    // runtime hands the launcher process, the `--secret` flag is the channel
-    // the launcher actually reads, because it builds its environment from
-    // empty. Both come from one source, and this binds them.
-    let entry = "{\"id\":\"a\",\"name\":\"github\",\"transport\":\"stdio\",\"command\":\"/usr/local/bin/x\",\"env\":{\"GITHUB_TOKEN\":\"mcp:github-token\",\"GITHUB_HOST\":\"github.example\"}}";
+fn mcp_registry_generated_entries_carry_no_env_block() {
+    let entry = "{\"id\":\"a\",\"name\":\"github\",\"transport\":\"stdio\",\"command\":\"/usr/local/bin/x\",\"env\":{\"DYLD_INSERT_LIBRARIES\":\"/tmp/evil.dylib\",\"GITHUB_TOKEN\":\"mcp:github-token\",\"GITHUB_HOST\":\"github.example\"}}";
     let registry = parse_registry(document(entry).as_bytes()).expect("loads");
-    let generated = generate_server(LAUNCHER, &registry.by_id("a").expect("present").entry);
+    let generated = generate_server(
+        LAUNCHER,
+        SERVICE,
+        &registry.by_id("a").expect("present").entry,
+    );
 
+    // Every declared pair reaches the launcher, and only through argv.
     let mut from_args = BTreeMap::new();
     let mut arguments = generated.args.iter();
     while let Some(argument) = arguments.next() {
@@ -405,9 +418,47 @@ fn mcp_registry_generated_env_block_and_launcher_flags_agree() {
             from_args.insert(name.to_string(), value.to_string());
         }
     }
-    assert_eq!(from_args, generated.env);
+    assert_eq!(
+        from_args,
+        BTreeMap::from([
+            (
+                "DYLD_INSERT_LIBRARIES".to_string(),
+                "/tmp/evil.dylib".to_string()
+            ),
+            ("GITHUB_TOKEN".to_string(), "mcp:github-token".to_string()),
+            ("GITHUB_HOST".to_string(), "github.example".to_string()),
+        ])
+    );
     assert!(generated.args.contains(&"--secret".to_string()));
     assert!(generated.args.contains(&"--set".to_string()));
+
+    // No artefact declares an environment for the launcher process.
+    let servers = [generated];
+    let acp: serde_json::Value =
+        serde_json::from_str(&render_buzz_acp_registry(&servers).expect("renders"))
+            .expect("valid json");
+    assert_eq!(
+        acp["servers"][0].get("env"),
+        None,
+        "the buzz-acp handover file declared an env block: {acp}"
+    );
+    let claude: serde_json::Value =
+        serde_json::from_str(&render_claude_project_config(&servers).expect("renders"))
+            .expect("valid json");
+    assert_eq!(
+        claude["mcpServers"]["github"].get("env"),
+        None,
+        "the claude config declared an env block: {claude}"
+    );
+    let codex: toml::Value =
+        toml::from_str(&render_codex_config(&servers).expect("renders")).expect("valid toml");
+    assert!(
+        codex["mcp_servers"]["github"].get("env").is_none(),
+        "the codex config declared an env block: {codex}"
+    );
+    // And the loader variable is nowhere but the launcher's own argument list.
+    let claude_args = claude["mcpServers"]["github"]["args"].to_string();
+    assert!(claude_args.contains("DYLD_INSERT_LIBRARIES=/tmp/evil.dylib"));
 }
 
 // ── The staged generation and its journal ─────────────────────────────────
@@ -441,6 +492,8 @@ impl FlipHooks for FailAt {
 struct FakeSecrets {
     removed: Mutex<Vec<String>>,
     failing: Mutex<bool>,
+    written: Mutex<BTreeMap<String, String>>,
+    write_fails: Mutex<bool>,
 }
 
 impl SecretRemover for FakeSecrets {
@@ -454,6 +507,17 @@ impl SecretRemover for FakeSecrets {
             .push(key.to_string());
         Ok(())
     }
+
+    fn write_all(&self, entries: &BTreeMap<String, String>) -> Result<(), String> {
+        if *self.write_fails.lock().unwrap_or_else(|e| e.into_inner()) {
+            return Err("keychain unavailable".to_string());
+        }
+        let mut written = self.written.lock().unwrap_or_else(|e| e.into_inner());
+        for (key, value) in entries {
+            written.insert(key.clone(), value.clone());
+        }
+        Ok(())
+    }
 }
 
 fn plan(files: &[(&str, &str)], deletions: Vec<Deletion>) -> GenerationPlan {
@@ -463,7 +527,179 @@ fn plan(files: &[(&str, &str)], deletions: Vec<Deletion>) -> GenerationPlan {
             .map(|(path, body)| (PathBuf::from(path), (*body).to_string()))
             .collect(),
         deletions,
+        secrets: BTreeMap::new(),
     }
+}
+
+fn plan_with_secrets(files: &[(&str, &str)], secrets: &[(&str, &str)]) -> GenerationPlan {
+    GenerationPlan {
+        secrets: secrets
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect(),
+        ..plan(files, vec![])
+    }
+}
+
+/// A secret write is a durable mutation, so the journal that names it has to
+/// be durable first.
+///
+/// Two injected failures bracket the write. Failing immediately **before** it
+/// must leave the store untouched and a `PREPARED` journal already naming the
+/// key as rollback debt; failing immediately **after** it must leave the key
+/// written and the same journal, so the discard has something to remove. In
+/// both cases the pointer never moved and reconcile removes what the journal
+/// named. Writing the secrets from inside the plan builder — the order this
+/// replaces — fails the first case, because the store already holds the key
+/// when the journal is still absent.
+#[test]
+fn mcp_registry_secret_writes_are_journalled_before_they_happen() {
+    for (step, written_before_the_crash) in [
+        (FlipStep::JournalPrepared, false),
+        (FlipStep::SecretsWritten, true),
+    ] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = GenerationStore::open(dir.path()).expect("opens");
+        let secrets = FakeSecrets::default();
+
+        let error = store
+            .commit(
+                |_, _| {
+                    Ok(plan_with_secrets(
+                        &[("a.json", "one")],
+                        &[("mcp:a:1:tok", "v")],
+                    ))
+                },
+                &secrets,
+                &FailAt::new(step),
+            )
+            .expect_err("the injected failure must abort the commit");
+        assert!(
+            matches!(error, GenerationError::Injected { .. }),
+            "{error:?}"
+        );
+
+        assert_eq!(
+            secrets
+                .written
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key("mcp:a:1:tok"),
+            written_before_the_crash,
+            "{step:?}: the secret write is on the wrong side of the journal"
+        );
+        assert_eq!(store.current().expect("pointer readable"), None, "{step:?}");
+
+        let journal = store
+            .journal()
+            .expect("journal readable")
+            .unwrap_or_else(|| panic!("{step:?}: no journal names the write"));
+        assert_eq!(journal.phase, JournalPhase::Prepared, "{step:?}");
+        assert_eq!(
+            journal.rollback,
+            vec![Deletion::Secret {
+                key: "mcp:a:1:tok".to_string()
+            }],
+            "{step:?}: the journal does not name the secret it owes"
+        );
+
+        // The discard removes exactly what the journal named, and only then
+        // clears it.
+        let reconciled = store.reconcile(&secrets, &NoHooks).expect("reconciles");
+        assert_eq!(reconciled, Reconciled::DiscardedStaging { generation: 1 });
+        assert!(secrets
+            .removed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&"mcp:a:1:tok".to_string()));
+        assert_eq!(store.journal().expect("journal readable"), None);
+    }
+}
+
+/// A rollback the keychain refuses is owed, not forgotten.
+#[test]
+fn mcp_registry_a_failed_rollback_keeps_the_prepared_journal() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = GenerationStore::open(dir.path()).expect("opens");
+    let secrets = FakeSecrets::default();
+    let _ = store.commit(
+        |_, _| {
+            Ok(plan_with_secrets(
+                &[("a.json", "one")],
+                &[("mcp:a:1:tok", "v")],
+            ))
+        },
+        &secrets,
+        &FailAt::new(FlipStep::SecretsWritten),
+    );
+
+    *secrets.failing.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    let error = store
+        .reconcile(&secrets, &NoHooks)
+        .expect_err("a refused rollback is an error");
+    assert!(
+        matches!(
+            error,
+            GenerationError::CleanupPending { outstanding: 1, .. }
+        ),
+        "{error:?}"
+    );
+    let journal = store
+        .journal()
+        .expect("journal readable")
+        .expect("the debt is still recorded");
+    assert_eq!(journal.phase, JournalPhase::Prepared);
+    assert_eq!(journal.rollback.len(), 1);
+}
+
+/// The journal is replaced by a rename, never rewritten in place.
+///
+/// `File::create` truncates, so an in-place write puts the only record of an
+/// owed deletion through a window in which it is neither entry. This drives
+/// that window deterministically: a directory sitting on the staging name
+/// makes the write fail, and the previous journal must survive it intact. An
+/// in-place implementation writes straight onto `journal.json` and never
+/// touches the staging name, so it reports `CleanupPending` instead — which is
+/// what makes this test falsifiable.
+#[test]
+fn mcp_registry_a_failed_journal_write_leaves_the_previous_journal_intact() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = GenerationStore::open(dir.path()).expect("opens");
+    let secrets = FakeSecrets::default();
+    *secrets.failing.lock().unwrap_or_else(|e| e.into_inner()) = true;
+
+    let owed = vec![Deletion::Secret {
+        key: "mcp:a:1:tok".to_string(),
+    }];
+    let error = store
+        .commit(
+            |_, _| Ok(plan(&[("a.json", "one")], owed.clone())),
+            &secrets,
+            &NoHooks,
+        )
+        .expect_err("the refused deletion is owed");
+    assert!(
+        matches!(error, GenerationError::CleanupPending { .. }),
+        "{error:?}"
+    );
+    let before = store
+        .journal()
+        .expect("journal readable")
+        .expect("the debt is recorded");
+
+    std::fs::create_dir(dir.path().join("journal.json.next")).expect("occupy the staging name");
+    let error = store
+        .reconcile(&secrets, &NoHooks)
+        .expect_err("the journal write cannot succeed");
+    assert!(
+        matches!(error, GenerationError::Io { .. }),
+        "the journal was written in place: {error:?}"
+    );
+    assert_eq!(
+        store.journal().expect("journal still parses"),
+        Some(before),
+        "a torn journal write destroyed the deletion debt"
+    );
 }
 
 fn read_current(store: &GenerationStore, relative: &str) -> Option<String> {

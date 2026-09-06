@@ -23,10 +23,10 @@ pub(crate) mod effective_config;
 mod env_vars;
 pub(crate) mod git_bash;
 pub(crate) mod global_config;
-// Slice one of the MCP registry: the backend core. Nothing here is wired to
-// the spawn path yet — that is slice two — so the items below have no in-tree
-// caller and would read as dead code until they do.
 mod managed_node_paths;
+// The Settings panel and the per-agent toggles are a separate change, so the
+// convergence entry point and the loader still have no in-tree caller; the
+// spawn path uses the rest.
 #[allow(dead_code)]
 pub(crate) mod mcp_registry;
 mod nest;

@@ -1,7 +1,5 @@
-import { useMemo } from "react";
-import { useChannelMessagesQuery } from "@/features/messages/hooks";
 import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
-import type { Channel, RelayEvent } from "@/shared/api/types";
+import type { RelayEvent } from "@/shared/api/types";
 import { extractCaption, parseBoundedImeta } from "./boundedImeta";
 import { fileKeyFor } from "./folderStore";
 
@@ -37,10 +35,20 @@ export type ChannelFile = {
 };
 
 /**
- * Total attachments the Files tab will hold for one channel. The projection
- * runs over the whole loaded message window, which grows as the user pages
- * back, so the bound has to sit on the thing that costs — rows produced —
- * rather than on any single event.
+ * The fields {@link parseChannelFiles} reads. A {@link RelayEvent} satisfies
+ * it, and so does the capped copy the attachment index keeps, so both project
+ * through the same code.
+ */
+export type ChannelFileSourceEvent = Pick<
+  RelayEvent,
+  "id" | "pubkey" | "created_at" | "content" | "tags"
+>;
+
+/**
+ * Total attachments one projection will produce for a channel. The projection
+ * runs over every attachment-bearing event the index holds, which grows as the
+ * backfill pages back, so the bound has to sit on the thing that costs — rows
+ * produced — rather than on any single event.
  */
 export const MAX_CHANNEL_FILES = 2_000;
 
@@ -92,12 +100,12 @@ export function sortFiles(files: ChannelFile[], sort: FileSort): ChannelFile[] {
  * Project a list of channel message events into a flat, newest-first list of
  * {@link ChannelFile} rows. Pure, bounded, and exported so the parsing rules
  * (caption extraction, filename-over-".bin" labelling, field caps, the total
- * row cap) are tested against the code path {@link useChannelFiles} calls.
+ * row cap) are tested against the code path the Files tab renders from.
  *
  * Returns `truncated: true` when the row cap stopped the projection, so the
  * UI can say the list is partial instead of presenting it as the whole set.
  */
-export function parseChannelFiles(events: RelayEvent[]): {
+export function parseChannelFiles(events: readonly ChannelFileSourceEvent[]): {
   files: ChannelFile[];
   truncated: boolean;
 } {
@@ -140,54 +148,4 @@ export function parseChannelFiles(events: RelayEvent[]): {
   }
 
   return { files, truncated: false };
-}
-
-/**
- * The projection the Files tab consumes, with the "has the tab ever been
- * opened for this channel" gate applied. Exported and pure so the gate is
- * bound by a test: without it, a Chat-only session re-parses the whole loaded
- * message window on every incoming live message.
- */
-export function projectChannelFiles(
-  events: RelayEvent[],
-  enabled: boolean,
-): { files: ChannelFile[]; truncated: boolean } {
-  return enabled ? parseChannelFiles(events) : { files: [], truncated: false };
-}
-
-/**
- * Attachments in the currently loaded window of a channel, newest first.
- *
- * `enabled` gates the projection: it is only ever run for a channel whose
- * Files tab has been opened, so a Chat-only session never re-parses the whole
- * loaded window on every incoming live message.
- */
-export function useChannelFiles(
-  activeChannel: Channel | null,
-  enabled = true,
-): {
-  files: ChannelFile[];
-  truncated: boolean;
-  isLoading: boolean;
-  isError: boolean;
-  error: unknown;
-  refetch: () => void;
-} {
-  const messagesQuery = useChannelMessagesQuery(activeChannel);
-
-  const projection = useMemo(
-    () => projectChannelFiles(messagesQuery.data ?? [], enabled),
-    [enabled, messagesQuery.data],
-  );
-
-  return {
-    files: projection.files,
-    truncated: projection.truncated,
-    isLoading: messagesQuery.isPending,
-    isError: messagesQuery.isError,
-    error: messagesQuery.error,
-    refetch: () => {
-      void messagesQuery.refetch();
-    },
-  };
 }

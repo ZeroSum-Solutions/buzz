@@ -43,6 +43,10 @@ name = "auth-worker"
 path = "tests/bin/auth_worker.rs"
 
 [dependencies]
+# The name of the MCP capability variable, so the forwarding in `mcp.rs` and
+# the launcher's own read cannot drift. Default features only: no keyring
+# backend is built here.
+buzz-secret-store = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "process", "time", "net"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

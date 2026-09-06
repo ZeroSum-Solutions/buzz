@@ -49,7 +49,10 @@
 //!                              environment variables this process was spawned
 //!                              with, one per line, as its text result. Names
 //!                              only, never values, so a test can assert on the
-//!                              spawn boundary without echoing a secret.
+//!                              spawn boundary without echoing a secret. The
+//!                              argv flag `--env-report` does the same, for a
+//!                              test that must configure this binary without
+//!                              putting anything in its environment.
 //!   FAKE_MCP_NAMED_TOOLS=a,b — expose one no-arg tool per comma-separated bare
 //!                              name (each registered as `<server>__<name>`), in
 //!                              addition to any `FAKE_MCP_TOOL_COUNT` tools. Lets
@@ -179,7 +182,12 @@ fn main() {
     let mut stop_calls_seen: usize = 0;
     let post_compact_hook = env_flag("FAKE_MCP_POSTCOMPACT_HOOK");
     let shell_tool = env_flag("FAKE_MCP_SHELL_TOOL");
-    let env_report = env_flag("FAKE_MCP_ENV_REPORT");
+    // `--env-report` is the argv spelling of FAKE_MCP_ENV_REPORT. A test that
+    // stands this binary in for `buzz-mcp-launch` cannot configure it through
+    // the environment: the whole point of that seam is that the launcher
+    // process receives no declared variables at all.
+    let env_report = env_flag("FAKE_MCP_ENV_REPORT")
+        || std::env::args().any(|argument| argument == "--env-report");
     let post_compact_text = std::env::var("FAKE_MCP_POSTCOMPACT_TEXT").unwrap_or_default();
     // One extra no-arg tool per comma-separated bare name.
     let named_tools: Vec<String> = std::env::var("FAKE_MCP_NAMED_TOOLS")
