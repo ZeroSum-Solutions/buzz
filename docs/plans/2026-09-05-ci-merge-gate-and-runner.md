@@ -209,12 +209,12 @@ the target and removes untracked files while keeping ignored ones (`node_modules
 1. **Put the admin credential in ZS Vault** (once, by Devin). Two entries, so the script can map
    them into its own `aws` child processes without writing anything to `~/.aws`:
    ```
-   zsvault add aws_admin_access_key_id     --type api_key --env-name AWS_ADMIN_ACCESS_KEY_ID
-   zsvault add aws_admin_secret_access_key --type api_key --env-name AWS_ADMIN_SECRET_ACCESS_KEY
+   zsvault add aws_buzz_ci_admin_key_id --type api_key --env-name ZS_AWS_BUZZ_CI_ADMIN_KEY_ID
+   zsvault add aws_buzz_ci_admin_secret --type api_key --env-name ZS_AWS_BUZZ_CI_ADMIN_SECRET
    ```
    `provision.sh` reads those two env names and passes them to `aws` as child-process
    environment only — never exported, never printed, never written to disk. If they are unset it
-   falls back to `AWS_PROFILE` (default `zs-admin`), so an SSO or assume-role profile also works.
+   falls back to `AWS_PROFILE` (default `buzz-ci-admin`, which must exist; the root login profile `zerosum` is never used implicitly), so an SSO or assume-role profile also works.
 2. **Dry-run, then provision.**
    ```
    scripts/zs/remote-ci/provision.sh --dry-run    # prints every aws call, changes nothing
@@ -222,8 +222,8 @@ the target and removes untracked files while keeping ignored ones (`node_modules
    ```
    It writes `~/.ssh/buzz-ci-box.pem` (0600) and `scripts/zs/remote-ci/box.env`. Once the box
    has proved it bootstrapped, it creates the scoped runner access key and hands both halves
-   straight to ZS Vault as `aws_ci_runner_access_key_id` (env `AWS_ACCESS_KEY_ID`) and
-   `aws_ci_runner_secret_access_key` (env `AWS_SECRET_ACCESS_KEY`). **The runner secret never
+   straight to ZS Vault as `aws_buzz_ci_runner_key_id` (env `ZS_AWS_BUZZ_CI_RUNNER_KEY_ID`) and
+   `aws_buzz_ci_runner_secret` (env `ZS_AWS_BUZZ_CI_RUNNER_SECRET`). **The runner secret never
    touches the disk and is never printed**; if either vault write fails, the IAM key is deleted
    again and provisioning exits non-zero. `zsvault` must therefore be on `PATH` — the script
    checks before it creates the key. A named profile `buzz-ci-runner` with the same credentials
@@ -253,8 +253,8 @@ removing it and watching the matching check fail.
 
 Three things, all credential work no agent may do:
 
-1. Put the AWS admin key in ZS Vault as `aws_admin_access_key_id` and
-   `aws_admin_secret_access_key` (billing lane: AWS, approved 2026-09-05).
+1. Put the AWS admin key in ZS Vault as `aws_buzz_ci_admin_key_id` and
+   `aws_buzz_ci_admin_secret` (billing lane: AWS, approved 2026-09-05).
 2. Run `provision.sh`. It stores the runner key in ZS Vault itself; no manual key handling.
 3. Deactivate the admin access key in IAM once provisioning has succeeded.
 

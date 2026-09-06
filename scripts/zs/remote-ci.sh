@@ -84,11 +84,13 @@ Flags:
   -h, --help       This text.
 
 Environment:
-  AWS_PROFILE            Profile used for the EC2 calls. Default
-                         buzz-ci-runner. The scoped key also works straight
-                         from ZS Vault: the two entries export
-                         AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, and this
-                         script uses them when AWS_PROFILE is unset.
+  ZS_AWS_BUZZ_CI_RUNNER_KEY_ID / ZS_AWS_BUZZ_CI_RUNNER_SECRET
+                         The scoped runner key from ZS Vault (entries
+                         aws_buzz_ci_runner_key_id and aws_buzz_ci_runner_secret,
+                         written by provision.sh). Preferred. They are mapped
+                         into the aws child environment only, never exported.
+  AWS_PROFILE            Profile used for the EC2 calls when the vault pair is
+                         unset (default buzz-ci-runner, which must exist).
   REMOTE_CI_BOX_ENV      Path to box.env (default scripts/zs/remote-ci/box.env).
   REMOTE_CI_LEASE        Lease file (default ~/.cache/zs/buzz-remote-ci.lock).
   REMOTE_CI_SSH_WAIT     Seconds to wait for SSH after start (default 300).
@@ -243,16 +245,30 @@ esac
 KEY_PATH="${BUZZ_CI_KEY_PATH/#\~/$HOME}"
 KNOWN_HOSTS="${REMOTE_CI_KNOWN_HOSTS:-$HOME/.ssh/known_hosts.buzz-ci-box}"
 
-AWS=(aws --region "$BUZZ_CI_REGION" --output text)
+# The runner key from ZS Vault is injected into the aws child environment only:
+# it is never exported from this script and never appears in argv.
+VAULT_RUNNER=0
 if [ -n "${AWS_PROFILE-}" ]; then
   AWS=(aws --profile "$AWS_PROFILE" --region "$BUZZ_CI_REGION" --output text)
-elif [ -z "${AWS_ACCESS_KEY_ID-}" ]; then
+elif [ -n "${ZS_AWS_BUZZ_CI_RUNNER_KEY_ID-}" ] && [ -n "${ZS_AWS_BUZZ_CI_RUNNER_SECRET-}" ]; then
+  VAULT_RUNNER=1
+  AWS=(aws --region "$BUZZ_CI_REGION" --output text)
+else
   AWS=(aws --profile buzz-ci-runner --region "$BUZZ_CI_REGION" --output text)
 fi
+run_aws() {
+  if [ "$VAULT_RUNNER" = 1 ]; then
+    AWS_ACCESS_KEY_ID="$ZS_AWS_BUZZ_CI_RUNNER_KEY_ID" \
+    AWS_SECRET_ACCESS_KEY="$ZS_AWS_BUZZ_CI_RUNNER_SECRET" \
+      "${AWS[@]}" "$@"
+  else
+    "${AWS[@]}" "$@"
+  fi
+}
 command -v aws >/dev/null 2>&1 || die "aws CLI not on PATH"
 
 ec2_field() { # ec2_field <jmespath>
-  "${AWS[@]}" ec2 describe-instances --instance-ids "$BUZZ_CI_INSTANCE_ID" --query "$1" \
+  run_aws ec2 describe-instances --instance-ids "$BUZZ_CI_INSTANCE_ID" --query "$1" \
     || die "describe-instances failed (is the AWS credential set up?)"
 }
 instance_state() { ec2_field 'Reservations[0].Instances[0].State.Name'; }
@@ -348,8 +364,8 @@ STOP_FAILED=0
 stop_box() {
   local attempt
   for attempt in 1 2 3 4 5; do
-    if "${AWS[@]}" ec2 stop-instances --instance-ids "$BUZZ_CI_INSTANCE_ID" >/dev/null 2>&1 \
-       && "${AWS[@]}" ec2 wait instance-stopped --instance-ids "$BUZZ_CI_INSTANCE_ID" >/dev/null 2>&1; then
+    if run_aws ec2 stop-instances --instance-ids "$BUZZ_CI_INSTANCE_ID" >/dev/null 2>&1 \
+       && run_aws ec2 wait instance-stopped --instance-ids "$BUZZ_CI_INSTANCE_ID" >/dev/null 2>&1; then
       STOPPED=1
       log "stopped ${BUZZ_CI_INSTANCE_ID}"
       return 0
@@ -428,7 +444,7 @@ it finishes)."
     ;;
   stopped)
     log "starting ${BUZZ_CI_INSTANCE_ID}"
-    "${AWS[@]}" ec2 start-instances --instance-ids "$BUZZ_CI_INSTANCE_ID" >/dev/null \
+    run_aws ec2 start-instances --instance-ids "$BUZZ_CI_INSTANCE_ID" >/dev/null \
       || die "start-instances failed"
     WE_STARTED=1
     ;;
@@ -438,7 +454,7 @@ it finishes)."
 esac
 
 log "waiting for the instance to run"
-"${AWS[@]}" ec2 wait instance-running --instance-ids "$BUZZ_CI_INSTANCE_ID" \
+run_aws ec2 wait instance-running --instance-ids "$BUZZ_CI_INSTANCE_ID" \
   || die "instance did not reach running"
 IP="$(instance_ip)"
 [ -n "$IP" ] && [ "$IP" != None ] || die "instance has no public IP"
