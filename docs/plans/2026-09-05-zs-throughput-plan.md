@@ -346,3 +346,47 @@ and the first wave-5 ticket (T15) were still running when this was measured and 
   proposes dropping it. Settled by Grok: no discovery-free deltas, no port-only self-checklists,
   no standing rerun list, `xhigh` by files touched, separate semaphores, fast local gates only,
   FAIL means one fix and one retest, T5-class is the wave clock, the merge queue is done.
+
+## Wave 4 measurement (T3b, T12, T7b): the first like-for-like test
+
+Status: observational. All three tickets landed on zs/main (T12 slice one as PR 21, T7b as PR 23, T3b as PR 25).
+Measured 2026-09-06T01:40Z with `docs/plans/scripts/agent-minutes.py --wave wave-4` for the three
+workflows, plus six plain Agent-tool subagents (fix rounds, blind critics, PR openers for T3b and T7b)
+that ran outside a workflow after the first session hit its context limit; those are listed in the
+manifest under `supplement_plain_agents` and measured by the same method (last minus first transcript
+timestamp). Wall clock is the span from the workflow's first agent to the PR opener's last timestamp,
+excluding the gap between the two sessions.
+
+### Per ticket
+
+| Ticket | Kind | Agents | Agent-min | Wall clock | Sol runs (full + delta) |
+|---|---|---|---|---|---|
+| T3b files index | feature | 14 | 424 (272 workflow + 152 plain) | 6.1 h (4.0 + 2.1) | 3 (cap) |
+| T12 google calendar, slice one | feature | 10 | 261 | 4.1 h | 3 (cap) |
+| T7b registry wiring | feature | 13 | 326 (227 workflow + 99 plain) | 5.2 h (3.5 + 1.7) | 3 (cap) |
+| Total | | 37 | 1,011 | | |
+
+### Agent time by stage (workflow agents only, 760 min)
+
+| Stage | Wave 4 |
+|---|---|
+| Builder (first build) | 293 min in 5 runs |
+| Fix rounds | 163 min in 6 runs (plus 167 min in 2 plain runs) |
+| Critic | 102 min in 7 runs (plus 55 min in 2 plain runs) |
+| Sol delta pass | 102 min in 6 runs |
+| Sol audit, full pass | 84 min in 3 runs |
+| Gemini tester | 10 min in 3 runs |
+| PR opener | 6 min in 1 run (plus 29 min in 2 plain runs) |
+
+### Reading against the plan's expectations
+
+- The plan expected a single feature ticket at 5 to 8 h wall and 250 to 350 agent-minutes. T12 (261)
+  and T7b (326) are inside the band. T3b (424) is over it: its first fix round replaced cap refusal
+  with recency eviction, the blind critic found that evicting the oldest deletion un-hid a retained
+  file, and a repair round plus a critic recheck were needed. The over-run is the cost of a real
+  defect caught before the PR, not loop overhead.
+- Sol stayed at the three-run cap on T3b and T7b and did not refute the final state of either;
+  the last open BLOCK on each was closed by the fresh-context critic instead of a fourth Sol run.
+- Wave 4 per ticket (337 agent-minutes average) sits between wave 1 (370 per ticket) and waves 2
+  and 3 (206 per ticket, smaller tickets). This is the first comparable number for full feature
+  tickets under the revised loop; one wave is not a trend.

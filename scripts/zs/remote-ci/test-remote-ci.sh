@@ -8,6 +8,7 @@
 #
 #   scripts/zs/remote-ci/test-remote-ci.sh
 set -euo pipefail
+ORIG_PATH="$PATH"
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REMOTE_CI="${DIR}/../remote-ci.sh"
@@ -19,6 +20,17 @@ WORK="$(mktemp -d)"
 [ -n "$WORK" ] && [ -d "$WORK" ] || { echo "mktemp -d failed" >&2; exit 1; }
 trap 'rm -rf "$WORK"' EXIT
 FAILURES=0
+
+# Every provisioning run in this suite writes its box facts here, never to the
+# real box.env next to provision.sh. remote-ci.sh checks below set their own
+# REMOTE_CI_BOX_ENV explicitly, which takes precedence over this default.
+export REMOTE_CI_BOX_ENV="${WORK}/provision-box.env"
+REAL_BOX_ENV="${DIR}/box.env"
+if [ -f "$REAL_BOX_ENV" ]; then
+  REAL_BOX_ENV_BEFORE="$(cat "$REAL_BOX_ENV")"
+else
+  REAL_BOX_ENV_BEFORE="<absent>"
+fi
 
 pass() { printf 'ok   %s\n' "$1"; }
 fail() { printf 'FAIL %s\n     %s\n' "$1" "${2-}"; FAILURES=$((FAILURES + 1)); }
@@ -33,6 +45,7 @@ cat > "${WORK}/bin/aws" <<'STUB'
 #   AWS_STUB_INSTANCES=<ids>    what describe-instances reports for InstanceId
 #   AWS_STUB_STATE=<state>      what describe-instances reports for State.Name
 printf '%s\n' "$*" >> "${AWS_STUB_LOG:?}"
+printf 'ENV_KEY=%s\n' "${AWS_ACCESS_KEY_ID:-}" >> "${AWS_STUB_ENV_LOG:-/dev/null}"
 if [ -n "${AWS_STUB_FAIL:-}" ]; then
   case "$*" in
     *"$AWS_STUB_FAIL"*)
@@ -102,7 +115,7 @@ chmod +x "${WORK}/bin/aws"
 
 run_provision() {
   PATH="${WORK}/bin:$PATH" \
-  AWS_PROFILE=stub-admin AWS_REGION=us-east-1 \
+  AWS_PROFILE=stub-admin AWS_REGION=us-west-2 \
   BUZZ_CI_KEY_PATH="${WORK}/should-not-exist.pem" \
   BUZZ_CI_STOP_BACKOFF=0 \
     "$PROVISION" "$@"
@@ -146,7 +159,7 @@ for expect in \
   "iam put-user-policy" \
   "iam create-access-key" \
   "ec2 stop-instances" \
-  "zsvault add aws_ci_runner_secret_access_key"
+  "zsvault add aws_buzz_ci_runner_secret"
 do
   case "$dry_out" in
     *"$expect"*) pass "dry-run plans: ${expect}" ;;
@@ -208,7 +221,7 @@ adopt_provision() { # adopt_provision <log> [args...]
   # PEM left by a previous check. Each run starts without one.
   rm -f "${WORK}/adopt.pem"
   AWS_STUB_LOG="$log" AWS_STUB_INSTANCES="i-0123456789abcdef0" \
-  PATH="${EXTRA_PATH:-}${WORK}/bin:$PATH" AWS_PROFILE=stub-admin AWS_REGION=us-east-1 \
+  PATH="${EXTRA_PATH:-}${WORK}/bin:$PATH" AWS_PROFILE=stub-admin AWS_REGION=us-west-2 \
   BUZZ_CI_KEY_PATH="${WORK}/adopt.pem" BUZZ_CI_STOP_BACKOFF=0 \
     "$PROVISION" "$@"
 }
@@ -287,8 +300,8 @@ if grep -q 'iam delete-access-key' "${WORK}/vault-aws.log"; then
 else
   fail "a failed vault write deletes the IAM access key again" "$(cat "${WORK}/vault-aws.log")"
 fi
-if grep -q 'aws_ci_runner_secret_access_key' "$ZSVAULT_STUB_LOG" \
-   || grep -q 'aws_ci_runner_access_key_id' "$ZSVAULT_STUB_LOG"; then
+if grep -q 'aws_buzz_ci_runner_secret' "$ZSVAULT_STUB_LOG" \
+   || grep -q 'aws_buzz_ci_runner_key_id' "$ZSVAULT_STUB_LOG"; then
   pass "the runner key is handed to zsvault"
 else
   fail "the runner key is handed to zsvault" "$(cat "$ZSVAULT_STUB_LOG")"
@@ -321,9 +334,9 @@ fi
 : > "${WORK}/xtrace-aws.log"
 xtrace_err="${WORK}/xtrace.err"
 AWS_STUB_LOG="${WORK}/xtrace-aws.log" \
-AWS_ADMIN_ACCESS_KEY_ID=AKIAFAKEADMINKEYID \
-AWS_ADMIN_SECRET_ACCESS_KEY=s3cr3t-admin-value-never-print \
-PATH="${WORK}/bin:$PATH" AWS_REGION=us-east-1 \
+ZS_AWS_BUZZ_CI_ADMIN_KEY_ID=AKIAFAKEADMINKEYID \
+ZS_AWS_BUZZ_CI_ADMIN_SECRET=s3cr3t-admin-value-never-print \
+PATH="${WORK}/bin:$PATH" AWS_REGION=us-west-2 \
 BUZZ_CI_KEY_PATH="${WORK}/xtrace.pem" \
   bash -x "$PROVISION" --dry-run >/dev/null 2>"$xtrace_err" || true
 if grep -q 's3cr3t-admin-value-never-print' "$xtrace_err"; then
@@ -342,7 +355,7 @@ fi
 relaunch_rc=0
 relaunch_out="$(export AWS_STUB_RUN_ID='None'
   AWS_STUB_LOG="${WORK}/relaunch-aws.log" AWS_STUB_INSTANCES="" \
-  PATH="${WORK}/bin:$PATH" AWS_PROFILE=stub-admin AWS_REGION=us-east-1 \
+  PATH="${WORK}/bin:$PATH" AWS_PROFILE=stub-admin AWS_REGION=us-west-2 \
   BUZZ_CI_KEY_PATH="${WORK}/relaunch.pem" BUZZ_CI_STOP_BACKOFF=0 \
     "$PROVISION" --no-wait-bootstrap 2>&1)" || relaunch_rc=$?
 case "$relaunch_out" in
@@ -366,6 +379,61 @@ for flag in --push-local --keep --join --status REMOTE_CI_LEASE REMOTE_CI_GATE_T
   esac
 done
 
+# ── 5b. the vault runner key reaches aws through the child environment only ──
+export AWS_STUB_LOG="${WORK}/vault-runner-aws.log"
+export AWS_STUB_ENV_LOG="${WORK}/vault-runner-env.log"
+: > "$AWS_STUB_LOG"; : > "$AWS_STUB_ENV_LOG"
+vr_env="${WORK}/vault-runner-box.env"
+cat > "$vr_env" <<EOF
+BUZZ_CI_INSTANCE_ID=i-0123456789abcdef0
+BUZZ_CI_REGION=us-west-2
+BUZZ_CI_KEY_PATH=${WORK}/fake-key.pem
+BUZZ_CI_SSH_USER=ci
+EOF
+touch "${WORK}/fake-key.pem"
+vr_out="$(env -u AWS_PROFILE ZS_AWS_BUZZ_CI_RUNNER_KEY_ID=AKIAFAKERUNNERKEYID \
+  ZS_AWS_BUZZ_CI_RUNNER_SECRET=runner-value-never-print \
+  PATH="${WORK}/bin:$PATH" REMOTE_CI_BOX_ENV="$vr_env" REMOTE_CI_LEASE="${WORK}/vr.lock" \
+  REMOTE_CI_NOTES_DIR="${WORK}/notes" REMOTE_CI_MISC_DIR="${WORK}/misc" \
+  "$REMOTE_CI" --status 2>&1)" || true
+if grep -q 'ENV_KEY=AKIAFAKERUNNERKEYID' "$AWS_STUB_ENV_LOG"; then
+  pass "remote-ci uses the vault runner key when AWS_PROFILE is unset"
+else
+  fail "remote-ci uses the vault runner key when AWS_PROFILE is unset" "$(cat "$AWS_STUB_ENV_LOG")"
+fi
+if grep -q -- '--profile' "$AWS_STUB_LOG"; then
+  fail "remote-ci passes no --profile alongside the vault key" "$(cat "$AWS_STUB_LOG")"
+else
+  pass "remote-ci passes no --profile alongside the vault key"
+fi
+if grep -q 'runner-value-never-print' "$AWS_STUB_LOG" || printf '%s' "$vr_out" | grep -q 'runner-value-never-print'; then
+  fail "the runner key value never reaches argv or the output" "$vr_out"
+else
+  pass "the runner key value never reaches argv or the output"
+fi
+unset AWS_STUB_ENV_LOG
+
+# ── 5c. every aws subcommand the scripts name exists in the installed CLI ────
+# The stub above answers any subcommand, so a misspelled one (the adoption path
+# once called ec2 revoke-security-group-rules, which does not exist) only fails
+# against the real CLI. Ask the real CLI for each one when it is installed.
+REAL_AWS="$(PATH="${ORIG_PATH:-$PATH}" command -v aws 2>/dev/null || true)"
+case "$REAL_AWS" in ""|"${WORK}"/*) REAL_AWS="";; esac
+if [ -n "$REAL_AWS" ]; then
+  unknown=""
+  while read -r svc sub; do
+    [ "$sub" = "wait" ] && continue
+    "$REAL_AWS" "$svc" "$sub" help >/dev/null 2>&1 || unknown="${unknown} ${svc} ${sub}"
+  done < <(grep -ohE '\b(ec2|iam|cloudwatch|ssm|sts|service-quotas) [a-z-]+' "$PROVISION" "$REMOTE_CI" | sort -u)
+  if [ -z "$unknown" ]; then
+    pass "every aws subcommand the scripts name exists in the installed CLI"
+  else
+    fail "every aws subcommand the scripts name exists in the installed CLI" "unknown:${unknown}"
+  fi
+else
+  pass "every aws subcommand the scripts name exists in the installed CLI (skipped: no real aws on PATH)"
+fi
+
 # ── 6. box.env parsing ───────────────────────────────────────────────────────
 export AWS_STUB_LOG="${WORK}/status-aws.log"
 : > "$AWS_STUB_LOG"
@@ -373,7 +441,7 @@ good="${WORK}/box.env"
 cat > "$good" <<EOF
 # fixture
 BUZZ_CI_INSTANCE_ID=i-0123456789abcdef0
-BUZZ_CI_REGION=us-east-1
+BUZZ_CI_REGION=us-west-2
 BUZZ_CI_KEY_PATH=${WORK}/fake-key.pem
 BUZZ_CI_SSH_USER=ci
 EOF
@@ -421,7 +489,7 @@ fi
 bad_id="${WORK}/box.env.badid"
 cat > "$bad_id" <<EOF
 BUZZ_CI_INSTANCE_ID=not-an-instance
-BUZZ_CI_REGION=us-east-1
+BUZZ_CI_REGION=us-west-2
 BUZZ_CI_KEY_PATH=${WORK}/fake-key.pem
 BUZZ_CI_SSH_USER=ci
 EOF
@@ -629,6 +697,8 @@ check_contains "provision requires the owner tag on the security group" "$PROVIS
   "assert_owner_tag \"security group"
 check_contains "provision revokes every unexpected ingress rule" "$PROVISION" \
   "revoking every existing ingress rule"
+check_contains "provision ensures the CloudWatch Events service-linked role before the alarm" "$PROVISION" \
+  "create-service-linked-role --aws-service-name events.amazonaws.com"
 check_contains "provision deletes the IAM key when the vault write fails" "$PROVISION" \
   "iam delete-access-key"
 check_absent "provision writes no credential file" "$PROVISION" \
@@ -657,6 +727,23 @@ check_contains "provision records the new key as a cleanup obligation" "$PROVISI
   'PENDING_KEY_ID="$key_id"'
 check_contains "provision revokes a pending key from its trap" "$PROVISION" \
   "revoke_pending_key || true"
+
+# The suite drives the real provision.sh many times against a stubbed aws. If
+# any of those runs wrote the operator's box.env, the next real gate would read
+# a stub instance id and a private key path inside this suite's deleted temp
+# directory. Compare the file, not a flag: the check fails when provision.sh
+# stops honouring REMOTE_CI_BOX_ENV.
+if [ -f "$REAL_BOX_ENV" ]; then
+  REAL_BOX_ENV_AFTER="$(cat "$REAL_BOX_ENV")"
+else
+  REAL_BOX_ENV_AFTER="<absent>"
+fi
+if [ "$REAL_BOX_ENV_BEFORE" = "$REAL_BOX_ENV_AFTER" ]; then
+  pass "the suite never writes the operator's real box.env"
+else
+  fail "the suite never writes the operator's real box.env" \
+    "${REAL_BOX_ENV} changed during the suite; restore it from provision.sh output"
+fi
 
 printf '\n%s\n' "-----"
 if [ "$FAILURES" -eq 0 ]; then

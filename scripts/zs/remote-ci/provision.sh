@@ -21,20 +21,20 @@
 # This script is the only consumer of the AWS admin credential. ZS Vault is the
 # source of truth for it, as for every credential on this machine. Two entries:
 #
-#   aws_admin_access_key_id       env AWS_ADMIN_ACCESS_KEY_ID
-#   aws_admin_secret_access_key   env AWS_ADMIN_SECRET_ACCESS_KEY
+#   aws_buzz_ci_admin_key_id        env ZS_AWS_BUZZ_CI_ADMIN_KEY_ID
+#   aws_buzz_ci_admin_secret     env ZS_AWS_BUZZ_CI_ADMIN_SECRET
 #
 # The vault env file exports those two names into the shell. This script maps
 # them into the environment of its own `aws` child processes only: they are
 # never exported, never written to ~/.aws, and never printed. If they are unset
-# it falls back to AWS_PROFILE (default zs-admin) so an SSO or assume-role
+# it falls back to AWS_PROFILE (default buzz-ci-admin, which must exist; the root login profile is never used implicitly) so an SSO or assume-role
 # profile also works.
 #
 # Deactivate the admin access key in IAM once provisioning has succeeded; the
 # day-to-day lane uses the scoped buzz-ci-runner key instead.
 #
 # The scoped runner key this script creates goes straight into ZS Vault as
-# aws_ci_runner_access_key_id and aws_ci_runner_secret_access_key. It is created
+# aws_buzz_ci_runner_key_id and aws_buzz_ci_runner_secret. It is created
 # only after the box has proved it bootstrapped, it never touches the disk, and
 # a failed vault write deletes it again.
 #
@@ -57,7 +57,11 @@ AMI_SSM_PARAM="/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/h
 KEY_PATH="${BUZZ_CI_KEY_PATH:-$HOME/.ssh/${BOX_NAME}.pem}"
 KNOWN_HOSTS="${BUZZ_CI_KNOWN_HOSTS:-$HOME/.ssh/known_hosts.${BOX_NAME}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BOX_ENV="${SCRIPT_DIR}/box.env"
+# Where the box facts are written. The test suite points this at its own
+# scratch file: a stubbed provisioning run must never overwrite the operator's
+# real box.env (it did once, and every later remote gate then looked for a
+# private key in a deleted temp directory).
+BOX_ENV="${REMOTE_CI_BOX_ENV:-${SCRIPT_DIR}/box.env}"
 BOOTSTRAP="${SCRIPT_DIR}/bootstrap.sh"
 BOOTSTRAP_WAIT="${BUZZ_CI_BOOTSTRAP_WAIT:-3600}"
 SSH_WAIT="${BUZZ_CI_SSH_WAIT:-300}"
@@ -69,15 +73,15 @@ MARKER=/var/lib/buzz-ci-bootstrap-done
 # off here and never turned back on. Trace the lines above this one if you need
 # it; below it, --dry-run and the ==> log lines already narrate every aws call.
 set +x
-AWS_REGION_NAME="${AWS_REGION:-us-east-1}"
-if [ -n "${AWS_ADMIN_ACCESS_KEY_ID-}" ] && [ -n "${AWS_ADMIN_SECRET_ACCESS_KEY-}" ]; then
+AWS_REGION_NAME="${AWS_REGION:-us-west-2}"
+if [ -n "${ZS_AWS_BUZZ_CI_ADMIN_KEY_ID-}" ] && [ -n "${ZS_AWS_BUZZ_CI_ADMIN_SECRET-}" ]; then
   VAULT_ADMIN=1
   AWS=(aws --region "$AWS_REGION_NAME" --output text)
-  ADMIN_SOURCE="ZS Vault (AWS_ADMIN_ACCESS_KEY_ID)"
+  ADMIN_SOURCE="ZS Vault (ZS_AWS_BUZZ_CI_ADMIN_KEY_ID)"
 else
   VAULT_ADMIN=0
-  AWS=(aws --profile "${AWS_PROFILE:-zs-admin}" --region "$AWS_REGION_NAME" --output text)
-  ADMIN_SOURCE="profile ${AWS_PROFILE:-zs-admin}"
+  AWS=(aws --profile "${AWS_PROFILE:-buzz-ci-admin}" --region "$AWS_REGION_NAME" --output text)
+  ADMIN_SOURCE="profile ${AWS_PROFILE:-buzz-ci-admin}"
 fi
 
 DRY_RUN=0
@@ -111,12 +115,13 @@ Flags:
   -h, --help            This text.
 
 Environment:
-  AWS_ADMIN_ACCESS_KEY_ID / AWS_ADMIN_SECRET_ACCESS_KEY
+  ZS_AWS_BUZZ_CI_ADMIN_KEY_ID / ZS_AWS_BUZZ_CI_ADMIN_SECRET
                         Admin credential from ZS Vault; preferred.
-  AWS_PROFILE           Fallback admin profile (default zs-admin).
-  AWS_REGION            Region (default us-east-1).
+  AWS_PROFILE           Fallback admin profile (default buzz-ci-admin, which must exist; the root login profile is never used implicitly).
+  AWS_REGION            Region (default us-west-2).
   BUZZ_CI_INSTANCE_TYPE Instance type (default c7a.8xlarge).
   BUZZ_CI_KEY_PATH      Private key path (default ~/.ssh/buzz-ci-box.pem).
+  REMOTE_CI_BOX_ENV     Where to write box.env (default: next to this script).
   BUZZ_CI_BOOTSTRAP_WAIT  Seconds to wait for cloud-init (default 3600).
 EOF
 }
@@ -128,8 +133,8 @@ die() { printf 'provision: %s\n' "$*" >&2; exit 1; }
 # Runs aws with the admin credential injected into the child environment only.
 run_aws() {
   if [ "$VAULT_ADMIN" = 1 ]; then
-    AWS_ACCESS_KEY_ID="$AWS_ADMIN_ACCESS_KEY_ID" \
-    AWS_SECRET_ACCESS_KEY="$AWS_ADMIN_SECRET_ACCESS_KEY" \
+    AWS_ACCESS_KEY_ID="$ZS_AWS_BUZZ_CI_ADMIN_KEY_ID" \
+    AWS_SECRET_ACCESS_KEY="$ZS_AWS_BUZZ_CI_ADMIN_SECRET" \
       "${AWS[@]}" "$@"
   else
     "${AWS[@]}" "$@"
@@ -425,7 +430,7 @@ refresh_ssh_rule() {
   if [ -n "$rule_ids" ] && [ "$rule_ids" != "None" ]; then
     log "revoking every existing ingress rule on ${SG_ID}"
     # shellcheck disable=SC2086 # rule ids are a space-separated list by design
-    aws_do ec2 revoke-security-group-rules --group-id "$SG_ID" \
+    aws_do ec2 revoke-security-group-ingress --group-id "$SG_ID" \
       --security-group-rule-ids $rule_ids >/dev/null
   fi
   log "allowing SSH from ${cidr}"
@@ -609,6 +614,14 @@ aws_do iam put-role-policy --role-name "$ROLE_NAME" --policy-name "$ROLE_POLICY_
   >/dev/null
 
 # ── idle alarm: CPU < 5% for 30 minutes stops the box ────────────────────────
+# The alarm's EC2 stop action needs the CloudWatch Events service-linked role.
+# A new account does not have it, and put-metric-alarm fails without it.
+if iam_lookup iam get-role --role-name AWSServiceRoleForCloudWatchEvents --query 'Role.Arn'; then
+  :
+else
+  log "creating the CloudWatch Events service-linked role"
+  aws_do iam create-service-linked-role --aws-service-name events.amazonaws.com >/dev/null
+fi
 log "putting CloudWatch alarm ${BOX_NAME}-idle"
 aws_do cloudwatch put-metric-alarm \
   --alarm-name "${BOX_NAME}-idle" \
@@ -735,8 +748,8 @@ zsvault, then re-run: everything else is already in place."
   if [ "$DRY_RUN" = 1 ]; then
     aws_do iam create-access-key --user-name "$RUNNER_USER" \
       --query 'AccessKey.[AccessKeyId,SecretAccessKey]'
-    printf 'DRY-RUN: zsvault add aws_ci_runner_access_key_id --type api_key --env-name AWS_ACCESS_KEY_ID --yes --value-stdin\n' >&3
-    printf 'DRY-RUN: zsvault add aws_ci_runner_secret_access_key --type api_key --env-name AWS_SECRET_ACCESS_KEY --yes --value-stdin\n' >&3
+    printf 'DRY-RUN: zsvault add aws_buzz_ci_runner_key_id --type api_key --env-name ZS_AWS_BUZZ_CI_RUNNER_KEY_ID --yes --value-stdin\n' >&3
+    printf 'DRY-RUN: zsvault add aws_buzz_ci_runner_secret --type api_key --env-name ZS_AWS_BUZZ_CI_RUNNER_SECRET --yes --value-stdin\n' >&3
   else
     key_line="$(run_aws iam create-access-key --user-name "$RUNNER_USER" \
       --query 'AccessKey.[AccessKeyId,SecretAccessKey]')"
@@ -748,12 +761,12 @@ zsvault, then re-run: everything else is already in place."
     PENDING_KEY_ID="$key_id"
     vault_ok=1
     printf '%s' "$key_line" | awk '{printf "%s", $1}' \
-      | zsvault add aws_ci_runner_access_key_id --type api_key \
-          --env-name AWS_ACCESS_KEY_ID --yes --value-stdin >/dev/null || vault_ok=0
+      | zsvault add aws_buzz_ci_runner_key_id --type api_key \
+          --env-name ZS_AWS_BUZZ_CI_RUNNER_KEY_ID --yes --value-stdin >/dev/null || vault_ok=0
     if [ "$vault_ok" = 1 ]; then
       printf '%s' "$key_line" | awk '{printf "%s", $2}' \
-        | zsvault add aws_ci_runner_secret_access_key --type api_key \
-            --env-name AWS_SECRET_ACCESS_KEY --yes --value-stdin >/dev/null || vault_ok=0
+        | zsvault add aws_buzz_ci_runner_secret --type api_key \
+            --env-name ZS_AWS_BUZZ_CI_RUNNER_SECRET --yes --value-stdin >/dev/null || vault_ok=0
     fi
     key_line=""
     if [ "$vault_ok" = 0 ]; then
@@ -763,7 +776,7 @@ zsvault, then re-run: everything else is already in place."
 Fix zsvault, then re-run this script."
     fi
     PENDING_KEY_ID=""   # both halves are in the vault; the obligation is met
-    log "runner key ${key_id} stored as aws_ci_runner_access_key_id and aws_ci_runner_secret_access_key"
+    log "runner key ${key_id} stored as aws_buzz_ci_runner_key_id and aws_buzz_ci_runner_secret"
   fi
 fi
 
