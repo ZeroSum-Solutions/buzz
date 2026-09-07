@@ -92,6 +92,12 @@ pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
     // for same-session sweep decisions.
     "BUZZ_MANAGED_AGENT",
     "BUZZ_MANAGED_AGENT_START_NONCE",
+    // Harness reliability state directory (T16). It holds the park file, which
+    // carries client messages, and the ledger. The desktop owns the location:
+    // a user-supplied path would place another agent's parked messages under
+    // this agent's control, or point the state at a directory the desktop
+    // cannot lock down to 0700.
+    "BUZZ_ACP_STATE_DIR",
 ];
 
 pub(crate) fn is_reserved_env_key(key: &str) -> bool {

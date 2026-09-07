@@ -324,6 +324,13 @@ impl OwnedAgent {
     }
 }
 
+/// Acknowledgment that a failure notice was successfully submitted to the relay.
+#[derive(Debug, Clone)]
+pub enum NoticeAck {
+    Pause(Uuid),
+    Breaker(SessionScope),
+}
+
 /// Pool of agents with take-and-return ownership semantics.
 ///
 /// Agents are either idle (sitting in `agents[i]`) or checked out
@@ -342,6 +349,7 @@ pub struct AgentPool {
     /// Best-effort: stale entries (rotation, crash/respawn) self-heal on the
     /// next dispatch and are pruned on channel-wide session invalidation.
     session_owners: HashMap<SessionScope, usize>,
+    notice_ack_tx: Option<mpsc::UnboundedSender<NoticeAck>>,
 }
 
 /// Result returned by a completed prompt task.
@@ -353,6 +361,11 @@ pub struct PromptResult {
     pub outcome: PromptOutcome,
     /// Present on failure in Queue mode, for requeue.
     pub batch: Option<FlushBatch>,
+    /// Whether the harness saw agent output or a tool call for this turn.
+    ///
+    /// A batch whose turn started is never replayed automatically: the agent
+    /// may already have acted on it, so it waits for an operator instead.
+    pub started: bool,
 }
 
 /// Whether the prompt came from a channel event or a heartbeat.
@@ -833,7 +846,18 @@ impl AgentPool {
             join_set: JoinSet::new(),
             task_map: HashMap::new(),
             session_owners: HashMap::new(),
+            notice_ack_tx: None,
         }
+    }
+
+    /// Clone the notice ack sender if one was registered with the pool.
+    pub fn notice_ack_tx(&self) -> Option<mpsc::UnboundedSender<NoticeAck>> {
+        self.notice_ack_tx.clone()
+    }
+
+    /// Register a notice ack channel sender with the pool.
+    pub fn set_notice_ack_tx(&mut self, tx: mpsc::UnboundedSender<NoticeAck>) {
+        self.notice_ack_tx = Some(tx);
     }
 
     /// Record which worker is handling `scope` so a later dispatch can detect a
@@ -2015,12 +2039,17 @@ fn send_prompt_result(
     batch: Option<FlushBatch>,
 ) {
     agent.acp.clear_steer_rx();
+    agent.acp.set_started_signal(None);
+    // Read the started signal here, in the one place every prompt outcome
+    // passes through, so no exit path can forget to report it.
+    let started = agent.acp.turn_saw_output();
     let _ = result_tx.send(PromptResult {
         agent,
         source,
         turn_id: turn_id.to_owned(),
         outcome,
         batch,
+        started,
     });
 }
 
@@ -2047,7 +2076,10 @@ pub async fn run_prompt_task(
 ) {
     // Is this a channel prompt or a heartbeat?
     let source = match &batch {
-        Some(b) => PromptSource::Channel(b.scope.clone()),
+        Some(b) => {
+            agent.acp.set_started_signal(Some(b.started.clone()));
+            PromptSource::Channel(b.scope.clone())
+        }
         None => PromptSource::Heartbeat,
     };
     let observer_channel_id = source.channel_id();
@@ -4982,7 +5014,7 @@ pub(crate) async fn post_failure_notice(
     channel_id: Uuid,
     thread_tags: &ThreadTags,
     content: &str,
-) {
+) -> bool {
     let thread_ref = thread_tags.root_event_id.as_deref().and_then(|root| {
         let root_id = nostr::EventId::from_hex(root).ok()?;
         let parent_id = thread_tags
@@ -5007,21 +5039,51 @@ pub(crate) async fn post_failure_notice(
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(channel = %channel_id, "failure notice: build failed: {e}");
-            return;
+            return false;
         }
     };
     let event = match builder.sign_with_keys(&rest.keys) {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!(channel = %channel_id, "failure notice: sign failed: {e}");
-            return;
+            return false;
         }
     };
-    match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => tracing::warn!(channel = %channel_id, "failure notice failed: {e}"),
-        Err(_) => tracing::warn!(channel = %channel_id, "failure notice timed out"),
+    // T16 delta 1, finding 14 (prior #15): 3 attempts spanning well under a
+    // minute gives up long before a typical relay blip (seconds to several
+    // minutes) recovers, so a channel/scope going through an outage at the
+    // same moment the relay itself is degraded is simply never told. This is
+    // a detached `tokio::spawn`ed task (see `spawn_failure_notice[_with_ack]`
+    // in lib.rs) — it costs nothing to keep retrying here; it only blocks
+    // itself, never the main loop. This still does not survive a process
+    // restart mid-retry (a genuinely durable, cross-restart outbox is a
+    // larger follow-up), but it closes the much more common case of the
+    // relay recovering while the harness keeps running.
+    const MAX_NOTICE_ATTEMPTS: usize = 12;
+    const MAX_NOTICE_DELAY: Duration = Duration::from_secs(60);
+    let mut delay = Duration::from_secs(1);
+    for attempt in 1..=MAX_NOTICE_ATTEMPTS {
+        match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
+            Ok(Ok(_)) => return true,
+            Ok(Err(e)) => {
+                tracing::warn!(channel = %channel_id, attempt, "failure notice failed: {e}");
+            }
+            Err(_) => {
+                tracing::warn!(channel = %channel_id, attempt, "failure notice timed out");
+            }
+        }
+        if attempt < MAX_NOTICE_ATTEMPTS {
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(MAX_NOTICE_DELAY);
+        }
     }
+    tracing::error!(
+        channel = %channel_id,
+        attempts = MAX_NOTICE_ATTEMPTS,
+        "failure notice exhausted every retry — the channel was never told; \
+         this does not persist across a process restart"
+    );
+    false
 }
 
 /// Best-effort: remove a reaction via a signed kind:5 (NIP-09) deletion event.
@@ -6416,6 +6478,7 @@ mod tests {
         let author_hex = event.pubkey.to_hex();
         let channel_id = Uuid::new_v4();
         let batch = FlushBatch {
+            batch_id: Uuid::new_v4(),
             channel_id,
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
@@ -6425,6 +6488,7 @@ mod tests {
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let context = ConversationContext::Thread {
             messages: vec![ContextMessage {
@@ -6668,6 +6732,7 @@ done"#
                 .unwrap();
             let event_id = event.id.to_hex();
             let batch = FlushBatch {
+                batch_id: Uuid::new_v4(),
                 channel_id,
                 scope: SessionScope::Conversation { channel_id },
                 events: vec![crate::queue::BatchEvent {
@@ -6677,6 +6742,7 @@ done"#
                 }],
                 cancelled_events: vec![],
                 cancel_reason: None,
+                started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };
             run_prompt_task(
                 agent,
@@ -6751,6 +6817,7 @@ done"#
             .sign_with_keys(&keys)
             .unwrap();
         let merged_batch = FlushBatch {
+            batch_id: Uuid::new_v4(),
             channel_id,
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
@@ -6764,8 +6831,10 @@ done"#
                 received_at: std::time::Instant::now(),
             }],
             cancel_reason: Some(crate::queue::CancelReason::Steer),
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let next_batch = FlushBatch {
+            batch_id: Uuid::new_v4(),
             channel_id,
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
@@ -6775,6 +6844,7 @@ done"#
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         // Return both merged events as DM history. They must be excluded from
@@ -6922,6 +6992,7 @@ done"#
             .sign_with_keys(&keys)
             .unwrap();
         let batch = FlushBatch {
+            batch_id: Uuid::new_v4(),
             channel_id,
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
@@ -6931,6 +7002,7 @@ done"#
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         // The local REST bridge returns the already-delivered steer as DM
@@ -7279,6 +7351,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
     fn batch_with_scope(scope: SessionScope, event: nostr::Event) -> FlushBatch {
         FlushBatch {
+            batch_id: Uuid::new_v4(),
             channel_id: scope.channel_id(),
             scope,
             events: vec![crate::queue::BatchEvent {
@@ -7288,6 +7361,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -7641,6 +7715,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             .sign_with_keys(&keys)
             .unwrap();
         FlushBatch {
+            batch_id: Uuid::new_v4(),
             channel_id,
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
@@ -7650,6 +7725,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -9389,6 +9465,7 @@ done"#
             .unwrap();
         let event_id = event.id.to_hex();
         let batch = FlushBatch {
+            batch_id: Uuid::new_v4(),
             channel_id,
             scope: conv(channel_id),
             events: vec![crate::queue::BatchEvent {
@@ -9398,6 +9475,7 @@ done"#
             }],
             cancelled_events: vec![],
             cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let mut ctx = make_prompt_context_no_owner();
@@ -10699,6 +10777,49 @@ done"#
         assert!(
             cap["configOptions"].is_null(),
             "an optionless switch caches the target's (empty) options, never the pre-switch model-a options with a patched effort"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_post_failure_notice_retries_on_failure_and_succeeds() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = vec![0; 8192];
+                let _ = socket.read(&mut buf).await;
+                let req_count = server_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if req_count == 0 {
+                    // Fail first attempt with HTTP 500
+                    let response = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = socket.write_all(response.as_bytes()).await;
+                } else {
+                    // Succeed on retry with HTTP 200
+                    let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnull";
+                    let _ = socket.write_all(response.as_bytes()).await;
+                }
+            }
+        });
+
+        let keys = nostr::Keys::generate();
+        let rest = crate::relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url,
+            keys,
+            auth_tag_json: None,
+        };
+
+        let channel_id = uuid::Uuid::new_v4();
+        let ok =
+            post_failure_notice(&rest, channel_id, &ThreadTags::default(), "notice content").await;
+        assert!(ok, "post_failure_notice should succeed on retry");
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "must have made 2 requests (1 failure + 1 retry)"
         );
     }
 }

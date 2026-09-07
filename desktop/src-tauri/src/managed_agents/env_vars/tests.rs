@@ -206,6 +206,18 @@ fn reserved_keys_include_relay_url() {
     assert!(merged.is_empty());
 }
 
+#[test]
+fn reserved_keys_include_state_dir() {
+    // Harness reliability state directory (T16): a user-supplied override
+    // could place another agent's parked messages under this agent's
+    // control, or point the state dir somewhere the desktop cannot lock
+    // down to 0700.
+    assert!(is_reserved_env_key("BUZZ_ACP_STATE_DIR"));
+    let agent = map(&[("BUZZ_ACP_STATE_DIR", "/tmp/attacker-controlled")]);
+    let merged = merged_user_env(&BTreeMap::new(), &agent);
+    assert!(merged.is_empty());
+}
+
 // ── validate_user_env_keys ─────────────────────────────────────────
 
 #[test]

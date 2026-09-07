@@ -55,6 +55,7 @@ serde_json = { workspace = true }
 # IDs
 uuid = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
 
 # URL parsing
 url = { workspace = true }
