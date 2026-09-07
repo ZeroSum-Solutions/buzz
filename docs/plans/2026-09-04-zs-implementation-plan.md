@@ -331,6 +331,43 @@ the root workspace excludes that manifest (`Cargo.toml:35`).
 - Acceptance: agents can attach markdown, HTML, PDF, CSV and JSON reports with `--file`; images and video behave exactly as before; the desktop opens the `.md` from the imeta filename; nothing on the deny list leaves the machine.
 - Bar: the desktop's own upload path in `desktop/src-tauri/src/commands/media.rs:425-475` (declared MIME, `/upload` first, legacy fallback only on 404 or 405) and the relay's `process_file_upload` contract.
 
+### T16 · feat/harness-reliability — park, pause, breaker, replay in the agent harness (M)
+
+- Design: `docs/plans/2026-09-06-harness-reliability-design.md` (approved for spec 2026-09-06; decisions: pause on session limit, no seat rotation; only never-started batches replay automatically; nothing is discarded). Crate `buzz-acp` only. Error classes on the real log lines, a harness-owned ledger and park file in a per-agent state dir, a per-agent pause state with a parsed reset time, a per-scope breaker after three consecutive provider errors, replay after a successful probe, control frames `replay_batch` / `discard_batch` / `resume_now` / `keep_paused`, CLI `buzz agents parked|replay|discard`.
+- Tests: fixture tests already on `feat/harness-reliability-fixtures` (`#[ignore]`, run with `--ignored`); they must pass un-ignored before the PR is ready. Six cases listed in the design.
+- Eval:
+  ```
+  just fmt-check clippy
+  cargo test -p buzz-acp reliability
+  cargo test -p buzz-acp queue
+  ```
+- Acceptance: with the Claude login at its session limit, an agent posts one pause notice with the reset time, keeps every message, answers them in order after the reset, and the ledger shows `agent_paused`, `agent_resumed`, `batch_replayed` with no `batch_discarded`.
+- Bar: Sol's audit of 2026-09-06 (at-least-once, stable ids, no replay of started batches, ledger as source of truth).
+
+### T17 · feat/agent-health — health store, Health tab, alerts, CLI (M)
+
+- Design: `docs/plans/2026-09-06-agent-health-design.md`. After T16. Harness observer frames for the ledger kinds; desktop `agent-health.db` rebuilt from the ledger by `sync_health_ledger`; Agents screen Health tab with per-agent counters, failed-task list with Retry / Discard, pause card with Resume now; alerts local first (macOS notification) then Buzz DM, one per condition per agent per hour; `buzz agents health`.
+- Tests: Rust store and sync idempotence, retention, alert rules on fixtures; Node summary reducer; one smoke spec `agent-health.spec.ts`.
+- Eval:
+  ```
+  just desktop-check
+  cd desktop/src-tauri && cargo test agent_health
+  cd desktop && pnpm build:e2e && pnpm exec playwright test --project=smoke agent-health.spec.ts
+  ```
+- Acceptance: the four incidents of 2026-09-02/03 (session limit, dropped batches, Critic errors) would each have produced one alert and one row in the failed-task list.
+- Bar: `observed_unread.rs` for the store contract; the workflow lists for focus refetch.
+
+### T18 · feat/agent-curator — work logs, weekly retro, prompt PRs (S now, M later)
+
+- Design: `docs/plans/2026-09-06-agent-self-improvement-design.md`. Phase 0 is a prompt PR to the Broken English repo (house rule 8, work logs) and needs no Buzz code. Phase 1 after T17: a Curator managed agent on Sonnet 5, a weekly scheduled run, lessons files under `GUIDES/`, prompt edits only as PRs Devin merges.
+- Tests: Phase 1 dry run on a fixture week checked by Critic.
+- Acceptance: after four weekly runs, at least one merged prompt PR cites a ledger batch id.
+
+### Client-side tickets outside this repo
+
+- W1 · Broken English `feat/wiki` — shared markdown wiki, design at `~/projects/clients/broken-english/docs/plans/2026-09-06-client-wiki-design.md`; reference system still to be named by Devin.
+- P1 · Broken English as a Buzz Project — Devin flips Projects / Workflows / Pulse in Settings → Experimental Features and creates the project (owner-signed). Repo home decided: private GitHub repo under ZeroSum-Solutions; creation and the first push wait for Devin's explicit go after a secret scan.
+
 ## Order and parallelism
 
 Wave 1 (parallel build; serialized landing): T1 (landed, PR #6), T2 (landed, PR #5), T4 (landed,

@@ -16,6 +16,7 @@ mod prompt_framing;
 mod prompt_project;
 mod queue;
 mod relay;
+mod reliability;
 mod scope;
 mod setup_mode;
 mod usage;
