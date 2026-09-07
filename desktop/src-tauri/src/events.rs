@@ -20,7 +20,13 @@ use message_tags::{
 // ── Constants ────────────────────────────────────────────────────────────────
 
 /// Maximum content size — matches buzz-sdk (64 KiB).
-const MAX_CONTENT_BYTES: usize = 64 * 1024;
+///
+/// `pub(crate)` so `commands::canvas::get_canvas` can enforce the same
+/// ceiling on the read path: this constant already bounds what a
+/// well-behaved client publishes via `build_set_canvas`, but a hostile or
+/// nonconforming relay peer can still return an oversized kind:40100 body to
+/// a read, which this constant alone does not stop.
+pub(crate) const MAX_CONTENT_BYTES: usize = 64 * 1024;
 
 /// Maximum mention count — matches buzz-sdk.
 const MAX_MENTIONS: usize = 50;
