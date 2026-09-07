@@ -20,6 +20,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+export CARGO_TARGET_DIR="$("${REPO_ROOT}/scripts/zs/cargo-target-dir.sh" root)"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
@@ -134,14 +135,16 @@ ok "Community seeded"
 
 # ── Build relay ──────────────────────────────────────────────────────────────
 
+TARGET_DIR="$(cargo metadata --format-version 1 --no-deps | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).target_directory")"
+
 if [[ "${SKIP_BUILD}" == "true" ]]; then
   for bin in buzz-relay git-credential-nostr; do
-    if [[ ! -x "./target/${CARGO_PROFILE}/${bin}" ]]; then
-      err "--no-build: ./target/${CARGO_PROFILE}/${bin} missing or not executable"
+    if [[ ! -x "${TARGET_DIR}/${CARGO_PROFILE}/${bin}" ]]; then
+      err "--no-build: ${TARGET_DIR}/${CARGO_PROFILE}/${bin} missing or not executable"
       exit 1
     fi
   done
-  log "Skipping relay build (--no-build); using existing target/${CARGO_PROFILE}/ binaries"
+  log "Skipping relay build (--no-build); using existing ${TARGET_DIR}/${CARGO_PROFILE}/ binaries"
 else
   log "Building relay (profile: ${CARGO_PROFILE})..."
   cargo build --profile "${CARGO_PROFILE}" -p buzz-relay -p git-credential-nostr
@@ -177,7 +180,7 @@ nohup env \
   BUZZ_RECONCILE_CHANNELS=true \
   BUZZ_GIT_PROBE_WRITERS=8 \
   ${MEMBERSHIP_ENV[@]+"${MEMBERSHIP_ENV[@]}"} \
-  "./target/${CARGO_PROFILE}/buzz-relay" > /tmp/buzz-relay.log 2>&1 &
+  "${TARGET_DIR}/${CARGO_PROFILE}/buzz-relay" > /tmp/buzz-relay.log 2>&1 &
 echo $! > /tmp/buzz-relay.pid
 
 # ── Poll readiness ───────────────────────────────────────────────────────────

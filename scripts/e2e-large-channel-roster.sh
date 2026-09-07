@@ -5,6 +5,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+TARGET_DIR="$(cargo metadata --format-version 1 --no-deps | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).target_directory")"
 
 : "${DATABASE_URL:?set DATABASE_URL to the isolated relay database}"
 : "${BUZZ_RELAY_URL:=http://localhost:3030}"
@@ -15,8 +16,8 @@ unset BUZZ_AUTH_TAG
 
 for binary in buzz buzz-admin; do
   resolved="$(command -v "$binary" || true)"
-  [[ "$resolved" == "$REPO_ROOT/target/release/$binary" ]] || {
-    echo "error: $binary must resolve to $REPO_ROOT/target/release/$binary (got ${resolved:-not found})" >&2
+  [[ "$resolved" == "$TARGET_DIR/release/$binary" ]] || {
+    echo "error: $binary must resolve to $TARGET_DIR/release/$binary (got ${resolved:-not found})" >&2
     exit 1
   }
 done
