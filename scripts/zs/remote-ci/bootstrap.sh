@@ -58,6 +58,11 @@ export DEBIAN_FRONTEND=noninteractive
 # three retries do not cover it, so re-run the whole update+install five times.
 apt_ok=0
 for attempt in 1 2 3 4 5; do
+  # A stop that lands mid-install (the provisioner's own trap, an idle alarm)
+  # leaves dpkg interrupted, and every later apt call refuses until it is
+  # configured; the rerun over ssh must heal that itself.
+  dpkg --configure -a || true
+  apt-get -y -f install || true
   if apt-get update \
       -o Acquire::Retries=3 \
       -o Acquire::http::Timeout=30 \
@@ -148,7 +153,7 @@ export PNPM_HOME="$HOME/.local/share/pnpm"
 export BUZZ_TEST_POSTGRES_PASSWORD=buzz_dev
 export CMAKE_POLICY_VERSION_MINIMUM=3.5
 export DEBIAN_FRONTEND=noninteractive
-export PATH="$HOME/.cargo/bin:$PNPM_HOME:$PATH"
+export PATH="$HOME/.cargo/bin:$PNPM_HOME/bin:$PNPM_HOME:$PATH"
 ENVFILE
 chown "${CI_USER}:${CI_USER}" "${CI_HOME}/.buzz-ci-env"
 if ! grep -q buzz-ci-env "${CI_HOME}/.bashrc" 2>/dev/null; then
