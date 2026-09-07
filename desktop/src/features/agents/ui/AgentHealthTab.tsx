@@ -9,7 +9,7 @@ import {
 import { useManagedAgentsQuery } from "@/features/agents/hooks";
 import { useManagedAgentRuntimesQuery } from "@/features/agents/managedAgentRuntimeHooks";
 import { cn } from "@/shared/lib/cn";
-import { normalizePubkey } from "@/shared/lib/pubkey";
+import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
 import { AgentHealthDrawer } from "./AgentHealthDrawer";
@@ -183,7 +183,7 @@ export function AgentHealthTab() {
                             </span>
                           ) : (
                             <span className="max-w-[12rem] truncate font-mono text-2xs text-muted-foreground">
-                              {row.pubkey.slice(0, 16)}...
+                              {truncatePubkey(row.pubkey)}
                             </span>
                           )}
                         </div>

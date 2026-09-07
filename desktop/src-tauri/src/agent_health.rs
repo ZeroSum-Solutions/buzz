@@ -1436,160 +1436,17 @@ pub(crate) async fn ingest_agent_health_frame(
     .await
 }
 
-/// Most acknowledgements one `record_delivered_alerts` call may carry.
-/// `evaluate` only ever produces a handful of alerts per sync/frame, so a
-/// call this large cannot come from a legitimate delivery batch.
-pub(crate) const MAX_ALERTS_PER_ACK: usize = 50;
+#[path = "agent_health/acks.rs"]
+mod acks;
+#[path = "agent_health/parked.rs"]
+mod parked;
 
-fn validate_alert_ack_count(count: usize) -> Result<(), String> {
-    if count > MAX_ALERTS_PER_ACK {
-        return Err(format!(
-            "record_delivered_alerts accepts at most {MAX_ALERTS_PER_ACK} alerts, got {count}"
-        ));
-    }
-    Ok(())
-}
-
-/// Drop any acknowledgement whose `agent` is not a currently locally managed
-/// agent, or whose `rule` is not one of the canonical rule identifiers
-/// `evaluate` emits.
-///
-/// `record_delivered_alerts` is a renderer-facing command: nothing ties its
-/// `alerts` argument to alerts this backend actually produced and delivered.
-/// Without this check, an arbitrary (agent, rule) pair reaches
-/// `record_alerts` and suppresses that rule for that agent for the next
-/// hour — a real future alert for a real agent silently never fires.
-pub(crate) fn filter_valid_alert_acks(
-    known: &[ManagedAgentRecord],
-    alerts: Vec<crate::agent_health_alerts::Alert>,
-) -> Vec<crate::agent_health_alerts::Alert> {
-    alerts
-        .into_iter()
-        .filter(|a| {
-            agent_may_have_local_state(known, &a.agent)
-                && crate::agent_health_alerts::is_known_rule(&a.rule)
-        })
-        .collect()
-}
-
-#[tauri::command]
-pub(crate) async fn record_delivered_alerts(
-    alerts: Vec<crate::agent_health_alerts::Alert>,
-    app: AppHandle,
-    store: State<'_, AgentHealthStore>,
-    app_state: State<'_, crate::app_state::AppState>,
-) -> Result<(), String> {
-    if alerts.is_empty() {
-        return Ok(());
-    }
-    validate_alert_ack_count(alerts.len())?;
-    let (relay_url, owner_pubkey) = resolve_health_db_scope(&app_state)?;
-    let write_lock = Arc::clone(&store.write_lock);
-    blocking::run(move |_proof| {
-        let _guard = write_lock.lock().map_err(|e| e.to_string())?;
-        let known = load_managed_agents(&app)?;
-        let valid = filter_valid_alert_acks(&known, alerts);
-        if valid.is_empty() {
-            return Ok(());
-        }
-        let conn = open_db(&db_path(&app, &relay_url, &owner_pubkey)?)?;
-        let now = chrono::Utc::now().timestamp();
-        record_alerts(&conn, &valid, now)
-    })
-    .await
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct ParkedBatchView {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent: Option<String>,
-    pub batch_id: String,
-    pub channel_id: String,
-    pub reason: String,
-    pub started: bool,
-    pub needs_review: bool,
-    pub parked_at: String,
-    pub events: usize,
-    pub excerpt: String,
-}
-
-pub(crate) fn read_parked_batches(dir: &Path) -> Result<Vec<ParkedBatchView>, String> {
-    use buzz_acp_pkg::reliability::park::{MAX_PARKED_TOTAL, MAX_PARK_BYTES};
-
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let park_path = dir.join(buzz_acp_pkg::reliability::park::PARK_FILE);
-    if !park_path.exists() {
-        return Ok(Vec::new());
-    }
-    let file = std::fs::File::open(&park_path).map_err(|e| format!("open agent park file: {e}"))?;
-    use std::io::{BufRead, Read};
-    // Bounded exactly like the harness's own park-file reader
-    // (`buzz_acp::reliability::park::read_batches`): a total-byte cap via
-    // `.take`, and an explicit per-line-length and total-record-count cap —
-    // an untrusted park file must not be able to exhaust memory or CPU
-    // before a single record is even validated.
-    let reader = std::io::BufReader::new(file.take(MAX_PARK_BYTES));
-    let mut views = Vec::new();
-    for (line_idx, line_res) in reader.lines().enumerate() {
-        if views.len() >= MAX_PARKED_TOTAL {
-            return Err(format!(
-                "park file holds more than {MAX_PARKED_TOTAL} batches"
-            ));
-        }
-        let line = line_res.map_err(|e| format!("read park file line {line_idx}: {e}"))?;
-        if line.len() > buzz_acp_pkg::reliability::park::MAX_LINE_BYTES {
-            return Err(format!(
-                "park file line {line_idx} exceeds the line size cap"
-            ));
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let batch: buzz_acp_pkg::reliability::park::ParkedBatch = serde_json::from_str(trimmed)
-            .map_err(|e| format!("parse park file line {line_idx}: {e}"))?;
-        views.push(ParkedBatchView {
-            agent: None,
-            batch_id: batch.batch_id.to_string(),
-            channel_id: batch.channel_id.to_string(),
-            reason: batch.reason.as_str().to_string(),
-            started: batch.started,
-            needs_review: batch.needs_review,
-            parked_at: batch.parked_at.to_rfc3339(),
-            events: batch.events.len(),
-            excerpt: batch
-                .events
-                .first()
-                .map(|e| e.excerpt())
-                .unwrap_or_default(),
-        });
-    }
-    Ok(views)
-}
-
-#[tauri::command]
-pub(crate) async fn get_parked_batches(
-    agent: String,
-    app: AppHandle,
-) -> Result<Vec<ParkedBatchView>, String> {
-    blocking::run(move |_proof| {
-        let known = load_managed_agents(&app)?;
-        if !agent_may_have_local_state(&known, &agent) {
-            return Err(format!("agent {agent} is not a locally managed agent"));
-        }
-        let dir = managed_agent_state_dir(&app, &agent)?;
-        let mut batches = read_parked_batches(&dir)?;
-        for b in &mut batches {
-            b.agent = Some(agent.clone());
-        }
-        Ok(batches)
-    })
-    .await
-}
+pub(crate) use acks::*;
+pub(crate) use parked::*;
 
 #[cfg(test)]
 #[path = "agent_health/tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "agent_health/tests_ingest.rs"]
+mod tests_ingest;
