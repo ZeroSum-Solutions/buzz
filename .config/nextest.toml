@@ -53,3 +53,11 @@ run-wrapper = "postgres-isolation"
 [[profile.default.overrides]]
 filter = "test(=cancelled_turn_with_usage_emits_notification_before_response)"
 retries = 2
+
+# zs fork: the empty-steer rejection test reads at most 40 frames and stops at
+# the prompt's own response; under load that response can land before the
+# steer rejection and the test fails without a code change (merge-queue run
+# 34090515497 ejected PR #35 this way). Same remedy as above.
+[[profile.default.overrides]]
+filter = "test(=steer_rejected_on_empty_prompt)"
+retries = 2
