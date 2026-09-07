@@ -21,6 +21,7 @@
 use chrono::{DateTime, Utc};
 
 pub mod error_class;
+pub mod health;
 pub mod ledger;
 pub mod notices;
 pub mod park;

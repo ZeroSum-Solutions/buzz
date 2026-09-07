@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use buzz_core::kind::KIND_IA_ARCHIVED_LIST;
 use buzz_sdk::builders::{build_archive_identity_request, build_unarchive_identity_request};
 use nostr::PublicKey;
@@ -11,6 +13,11 @@ use crate::{AgentsCmd, RespondToArg};
 
 pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), CliError> {
     match command {
+        AgentsCmd::Health {
+            since,
+            json,
+            state_root,
+        } => cmd_health(&since, json, state_root.as_deref()),
         AgentsCmd::DraftCreate {
             channel,
             display_name,
@@ -458,6 +465,184 @@ async fn cmd_archived(client: &BuzzClient) -> Result<(), CliError> {
     let archived = fetch_archived_snapshot(client).await?;
     println!("{}", json!({"archived": archived}));
     Ok(())
+}
+
+/// View agent health counters and state from local ledgers.
+pub fn cmd_health(since: &str, json: bool, state_root: Option<&Path>) -> Result<(), CliError> {
+    cmd_health_to_writer(&mut std::io::stdout(), since, json, state_root)
+}
+
+/// Inner implementation of `cmd_health` allowing writer injection for testing.
+pub fn cmd_health_to_writer<W: std::io::Write>(
+    writer: &mut W,
+    since: &str,
+    json: bool,
+    state_root: Option<&Path>,
+) -> Result<(), CliError> {
+    let duration = match since.to_ascii_lowercase().as_str() {
+        "24h" => chrono::Duration::hours(24),
+        "7d" => chrono::Duration::days(7),
+        _ => {
+            return Err(CliError::Usage(format!(
+                "invalid --since '{since}': expected '24h' or '7d'"
+            )));
+        }
+    };
+
+    let state_dirs = discover_state_dirs(state_root);
+    let now = chrono::Utc::now();
+    let mut rows = Vec::new();
+
+    for dir in state_dirs {
+        let ledger_path = dir.join(buzz_acp::reliability::ledger::LEDGER_FILE);
+        let records =
+            buzz_acp::reliability::ledger::read_ledger_file(&ledger_path).unwrap_or_default();
+        let mut row = buzz_acp::reliability::health::summarize(&records, duration, now);
+        if row.agent.is_empty() {
+            if let Some(name) = dir.file_name().and_then(|s| s.to_str()) {
+                row.agent = name.to_string();
+            }
+        }
+        rows.push(row);
+    }
+
+    rows.sort_by(|a, b| a.agent.cmp(&b.agent));
+
+    if json {
+        let json_str =
+            serde_json::to_string_pretty(&rows).map_err(|e| CliError::Other(e.to_string()))?;
+        writeln!(writer, "{json_str}").map_err(|e| CliError::Other(e.to_string()))?;
+    } else {
+        if rows.is_empty() {
+            writeln!(writer, "No agent state directories found.")
+                .map_err(|e| CliError::Other(e.to_string()))?;
+            return Ok(());
+        }
+
+        writeln!(
+            writer,
+            "{:<18} {:<10} {:>6} {:>6} {:>6} {:>12} {:>10} {}",
+            "AGENT",
+            "STATE",
+            "TURNS",
+            "FAILED",
+            "PARKED",
+            "NEEDS_REVIEW",
+            "RECONNECTS",
+            "LAST_ERROR"
+        )
+        .map_err(|e| CliError::Other(e.to_string()))?;
+
+        for row in &rows {
+            let agent_prefix = if row.agent.len() > 16 {
+                &row.agent[..16]
+            } else {
+                &row.agent
+            };
+            let last_error = row.last_error_class.as_deref().unwrap_or("-");
+            writeln!(
+                writer,
+                "{:<18} {:<10} {:>6} {:>6} {:>6} {:>12} {:>10} {}",
+                agent_prefix,
+                row.state,
+                row.turns,
+                row.failed,
+                row.parked,
+                row.needs_review,
+                row.reconnects,
+                last_error
+            )
+            .map_err(|e| CliError::Other(e.to_string()))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Find agent state directories to inspect.
+fn discover_state_dirs(state_root: Option<&Path>) -> Vec<PathBuf> {
+    let mut state_dirs = Vec::new();
+
+    if let Some(root) = state_root {
+        if root.is_dir() {
+            if root
+                .join(buzz_acp::reliability::ledger::LEDGER_FILE)
+                .is_file()
+            {
+                state_dirs.push(root.to_path_buf());
+            }
+            if let Ok(entries) = std::fs::read_dir(root) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        state_dirs.push(path);
+                    }
+                }
+            }
+        }
+    } else if let Ok(env_dir) = std::env::var(buzz_acp::reliability::state_dir::STATE_DIR_ENV) {
+        let trimmed = env_dir.trim();
+        if !trimmed.is_empty() {
+            let p = PathBuf::from(trimmed);
+            if p.is_dir() {
+                if p.join(buzz_acp::reliability::ledger::LEDGER_FILE).is_file() {
+                    state_dirs.push(p.clone());
+                }
+                let mut found_sub = false;
+                if let Ok(entries) = std::fs::read_dir(&p) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            state_dirs.push(path);
+                            found_sub = true;
+                        }
+                    }
+                }
+                if !found_sub && !state_dirs.contains(&p) {
+                    state_dirs.push(p);
+                }
+            }
+        }
+    } else {
+        let mut candidate_roots = Vec::new();
+        if let Some(home) = dirs::home_dir() {
+            candidate_roots.push(home.join(".buzz").join(".state"));
+        }
+        if let Some(data_dir) = dirs::data_dir() {
+            candidate_roots.push(
+                data_dir
+                    .join("xyz.block.buzz.app")
+                    .join("agents")
+                    .join("state"),
+            );
+        }
+        if let Some(home) = dirs::home_dir() {
+            candidate_roots.push(
+                home.join("Library")
+                    .join("Application Support")
+                    .join("xyz.block.buzz.app")
+                    .join("agents")
+                    .join("state"),
+            );
+        }
+
+        for root in candidate_roots {
+            if root.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(&root) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            state_dirs.push(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    state_dirs.sort();
+    state_dirs.dedup();
+    state_dirs
 }
 
 /// Pure verification of a kind:13535 archived-identities event.
@@ -1273,5 +1458,54 @@ mod tests {
             .expect("sign");
         let result = verify_archived_event(&event, &self_hex).expect("should pass");
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn health_json_lists_one_row_per_state_dir() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let agent1_dir = tmp.path().join("agent_alpha");
+        let agent2_dir = tmp.path().join("agent_beta");
+        std::fs::create_dir(&agent1_dir).expect("create agent1 dir");
+        std::fs::create_dir(&agent2_dir).expect("create agent2 dir");
+
+        let ledger1_path = agent1_dir.join("ledger.jsonl");
+        let now = chrono::Utc::now();
+        let record = buzz_acp::reliability::ledger::LedgerRecord {
+            at: now,
+            agent: "agent_alpha".to_string(),
+            body: buzz_acp::reliability::ledger::LedgerBody::TurnFinished(
+                buzz_acp::reliability::ledger::TurnFinished {
+                    batch_id: uuid::Uuid::new_v4(),
+                    channel_id: uuid::Uuid::new_v4(),
+                    outcome: buzz_acp::reliability::ledger::TurnOutcome::Ok,
+                },
+            ),
+        };
+        let line = serde_json::to_string(&record).expect("serialize record");
+        std::fs::write(&ledger1_path, format!("{line}\n")).expect("write ledger");
+
+        let mut out = Vec::new();
+        cmd_health_to_writer(&mut out, "24h", true, Some(tmp.path())).expect("cmd_health succeeds");
+
+        let json_str = String::from_utf8(out).expect("valid utf-8 output");
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(&json_str).expect("valid json output");
+
+        assert_eq!(parsed.len(), 2, "must list one row per state dir");
+
+        let agents: Vec<&str> = parsed
+            .iter()
+            .map(|r| r["agent"].as_str().expect("agent field is string"))
+            .collect();
+        assert!(agents.contains(&"agent_alpha"));
+        assert!(agents.contains(&"agent_beta"));
+
+        let alpha = parsed.iter().find(|r| r["agent"] == "agent_alpha").unwrap();
+        assert_eq!(alpha["turns"], 1);
+        assert_eq!(alpha["state"], "active");
+
+        let beta = parsed.iter().find(|r| r["agent"] == "agent_beta").unwrap();
+        assert_eq!(beta["turns"], 0);
+        assert_eq!(beta["state"], "offline");
     }
 }
