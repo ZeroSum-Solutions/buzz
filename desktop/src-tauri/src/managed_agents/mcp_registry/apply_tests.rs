@@ -40,6 +40,16 @@ const SERVER_BIN: &str = "/usr/local/bin";
 #[cfg(windows)]
 const SERVER_BIN: &str = "C:/buzz/bin";
 
+/// An absolute, credential-shaped command path. `/tmp/...` alone is not an
+/// absolute path on Windows (no drive letter, no verbatim prefix), so a
+/// unix-only literal here would trip `load.rs`'s absolute-path check before
+/// ever reaching the credential scan — refusing for the wrong reason, with
+/// the raw path still embedded in that refusal's message.
+#[cfg(unix)]
+const CREDENTIAL_SHAPED_COMMAND: &str = "/tmp/sk-live-secret123/server";
+#[cfg(windows)]
+const CREDENTIAL_SHAPED_COMMAND: &str = "C:/tmp/sk-live-secret123/server";
+
 const AGENT: &str = "aaaabbbbccccdddd";
 
 /// A store a test drives instead of the machine keychain.
@@ -1174,10 +1184,10 @@ fn mcp_registry_a_credential_shaped_command_is_refused_and_never_reaches_generat
     let temporary = tempfile::tempdir().expect("tempdir");
     let root = temporary.path();
     let store = FakeStore::default();
-    let body = document(
-        "{\"id\":\"cred\",\"name\":\"cred\",\"transport\":\"stdio\",\
-          \"command\":\"/tmp/sk-live-secret123/server\",\"args\":[]}",
-    );
+    let body = document(&format!(
+        "{{\"id\":\"cred\",\"name\":\"cred\",\"transport\":\"stdio\",\
+          \"command\":\"{CREDENTIAL_SHAPED_COMMAND}\",\"args\":[]}}"
+    ));
 
     let converged = converge_with(
         root,
@@ -1443,12 +1453,19 @@ fn mcp_registry_a_corrupt_personas_store_is_propagated_and_leaves_the_generation
     std::fs::write(base.join("managed-agents.json"), b"{ not json")
         .expect("write a corrupt agent store");
 
+    // `generations_root` is rooted at `managed_agents_base_dir`, i.e. Tauri's
+    // real `app_data_dir()` — `dirs::data_dir()` on Windows resolves via
+    // `SHGetKnownFolderPath`, a Win32 call that reads neither `HOME` nor
+    // `XDG_DATA_HOME`, so `SandboxedHome` cannot isolate this path on that
+    // platform the way it does on unix. What this test can still assert
+    // platform-independently — and what its guard actually protects — is
+    // that the pointer this convergence attempt found is exactly the pointer
+    // it leaves behind, whatever value that happens to be.
     let generations_root = RegistryPaths::new(base, sandbox.home()).generations_root();
     let before = GenerationStore::open(&generations_root)
         .expect("open")
         .current()
         .expect("readable");
-    assert_eq!(before, None, "nothing has converged yet");
 
     let error = super::apply::converge_now_with_records(app.handle(), &[], &BTreeMap::new())
         .expect_err("a corrupt personas store must be propagated, not defaulted away");

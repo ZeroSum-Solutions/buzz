@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use tauri::Manager;
 
 use super::*;
 use crate::app_state::{build_app_state, AppState};
+use crate::managed_agents::mcp_registry::generation::SecretRemover;
 use crate::managed_agents::mcp_registry::load::LoadedEntry;
 use crate::managed_agents::mcp_registry::schema::{
     RegistryDocument, RegistryEntry, RegistryTransport, MAX_DOCUMENT_BYTES, MAX_SERVERS_PER_AGENT,
@@ -14,6 +16,37 @@ use crate::managed_agents::{
     save_managed_agents, AgentMcpServers, BackendKind, ManagedAgentRecord, RespondTo,
     AGENT_MCP_SERVERS_VERSION,
 };
+
+/// A secret store a test drives instead of the machine keychain — the same
+/// pattern `managed_agents::mcp_registry::apply_tests::FakeStore` uses one
+/// module over, needed here because these tests exercise the real
+/// `save_mcp_registry_server_internal` / `delete_mcp_registry_server_internal`
+/// convergence path, which reads and writes a secret store.
+#[derive(Default)]
+struct FakeStore {
+    records: Mutex<BTreeMap<String, String>>,
+}
+
+impl SecretRemover for FakeStore {
+    fn remove(&self, key: &str) -> Result<(), String> {
+        self.records.lock().unwrap().remove(key);
+        Ok(())
+    }
+
+    fn write_all(&self, entries: &BTreeMap<String, String>) -> Result<(), String> {
+        let mut guard = self.records.lock().unwrap();
+        for (key, value) in entries {
+            guard.insert(key.clone(), value.clone());
+        }
+        Ok(())
+    }
+}
+
+impl SecretStoreIo for FakeStore {
+    fn read_all(&self) -> Result<BTreeMap<String, String>, String> {
+        Ok(self.records.lock().unwrap().clone())
+    }
+}
 
 struct EnvGuard {
     _path_guard: std::sync::MutexGuard<'static, ()>,
@@ -248,6 +281,10 @@ fn mcp_registry_save_refuses_a_document_over_the_byte_cap() {
     );
 }
 
+// Creating a symlink on Windows CI runners requires a privilege the runner
+// account does not hold, so this test only runs on unix (matching the other
+// symlink-creating tests in this crate).
+#[cfg(unix)]
 #[test]
 fn mcp_registry_save_does_not_follow_a_symlinked_document() {
     let (_guard, _home) = EnvGuard::new();
@@ -258,10 +295,7 @@ fn mcp_registry_save_does_not_follow_a_symlinked_document() {
     let target = doc_path.parent().unwrap().join("real_document.json");
     fs::write(&target, b"{\"version\":1,\"servers\":[]}").unwrap();
 
-    #[cfg(unix)]
     std::os::unix::fs::symlink(&target, &doc_path).unwrap();
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_file(&target, &doc_path).unwrap();
 
     let entry = RegistryEntry {
         id: "server1".to_string(),
@@ -321,9 +355,12 @@ fn mcp_registry_delete_server_leaves_consistent_state_on_agent_save_failure() {
     // Agent selections are written FIRST now, so an injected failure there
     // must leave the registry document untouched — the reverse of the old
     // (torn) behaviour this test used to assert (Sol T7c round 2, item 4).
-    let err = delete_mcp_registry_server_internal(app.handle(), "srv1", |_| {
-        Err("injected agent write failure".to_string())
-    })
+    let err = delete_mcp_registry_server_internal(
+        app.handle(),
+        "srv1",
+        |_| Err("injected agent write failure".to_string()),
+        &FakeStore::default(),
+    )
     .unwrap_err();
 
     assert!(
@@ -385,15 +422,20 @@ fn mcp_registry_delete_server_writes_agent_selections_before_the_document() {
     });
     save_managed_agents(app.handle(), &[record]).unwrap();
 
-    delete_mcp_registry_server_internal(app.handle(), "srv1", |records| {
-        // At the moment `save_records` runs, the document must still
-        // declare srv1 — proof this closure is invoked before the document
-        // write, not after.
-        let doc_mid = read_document(&doc_path).unwrap();
-        assert_eq!(doc_mid.servers.len(), 1, "document written too early");
-        assert_eq!(doc_mid.servers[0].id, "srv1");
-        save_managed_agents(app.handle(), records)
-    })
+    delete_mcp_registry_server_internal(
+        app.handle(),
+        "srv1",
+        |records| {
+            // At the moment `save_records` runs, the document must still
+            // declare srv1 — proof this closure is invoked before the
+            // document write, not after.
+            let doc_mid = read_document(&doc_path).unwrap();
+            assert_eq!(doc_mid.servers.len(), 1, "document written too early");
+            assert_eq!(doc_mid.servers[0].id, "srv1");
+            save_managed_agents(app.handle(), records)
+        },
+        &FakeStore::default(),
+    )
     .expect("delete succeeds");
 }
 
@@ -452,8 +494,13 @@ fn mcp_registry_save_surfaces_a_refused_agent_not_just_an_error() {
         env: BTreeMap::new(),
     };
 
-    let view = save_mcp_registry_server(app.handle().clone(), http_entry, BTreeMap::new())
-        .expect("save succeeds with refused agent in view");
+    let view = save_mcp_registry_server_internal(
+        app.handle(),
+        http_entry,
+        BTreeMap::new(),
+        &FakeStore::default(),
+    )
+    .expect("save succeeds with refused agent in view");
 
     assert!(
         !view.refused.is_empty(),
@@ -616,6 +663,10 @@ fn mcp_registry_set_agent_servers_rejects_an_id_the_registry_does_not_declare() 
 
 // ── Item 2: the document write refuses a symlink swapped in before it ──────
 
+// Creating a symlink on Windows CI runners requires a privilege the runner
+// account does not hold, so this test only runs on unix (matching the other
+// symlink-creating tests in this crate).
+#[cfg(unix)]
 #[test]
 fn mcp_registry_write_document_refuses_a_symlink_swapped_in_before_write() {
     let (_guard, _home) = EnvGuard::new();
@@ -638,10 +689,7 @@ fn mcp_registry_write_document_refuses_a_symlink_swapped_in_before_write() {
     let outside_target = doc_path.parent().unwrap().join("outside.json");
     fs::write(&outside_target, b"{\"totally\":\"unrelated\"}").unwrap();
     fs::remove_file(&doc_path).unwrap();
-    #[cfg(unix)]
     std::os::unix::fs::symlink(&outside_target, &doc_path).unwrap();
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_file(&outside_target, &doc_path).unwrap();
 
     let new_doc = RegistryDocument {
         version: 1,

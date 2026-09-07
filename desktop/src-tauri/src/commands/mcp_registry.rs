@@ -20,6 +20,7 @@ use tauri::AppHandle;
 use crate::app_state::AppState;
 use crate::managed_agents::mcp_registry::apply;
 use crate::managed_agents::mcp_registry::apply::converge_now;
+use crate::managed_agents::mcp_registry::converge::SecretStoreIo;
 use crate::managed_agents::mcp_registry::load::{load_registry, LoadedEntry};
 use crate::managed_agents::mcp_registry::schema::{
     RegistryDocument, RegistryEntry, RegistryTransport, MAX_ARGS, MAX_ARG_LEN, MAX_DOCUMENT_BYTES,
@@ -397,6 +398,20 @@ pub fn save_mcp_registry_server<R: tauri::Runtime>(
     entry: RegistryEntry,
     secrets: BTreeMap<String, String>,
 ) -> Result<McpRegistryView, String> {
+    let secret_store = apply::DesktopSecrets::new(crate::app_state::keyring_service());
+    save_mcp_registry_server_internal(&app, entry, secrets, &secret_store)
+}
+
+/// Internal implementation of `save_mcp_registry_server` taking the
+/// convergence's secret store as a parameter, so a test can drive real
+/// convergence (refusal detection, one-pointer-rename adoption) with a fake
+/// store instead of the platform keyring.
+pub fn save_mcp_registry_server_internal<R: tauri::Runtime, S: SecretStoreIo>(
+    app: &AppHandle<R>,
+    entry: RegistryEntry,
+    secrets: BTreeMap<String, String>,
+    secret_store: &S,
+) -> Result<McpRegistryView, String> {
     use tauri::Manager;
     let state = app.state::<AppState>();
     let _lock = state
@@ -415,7 +430,7 @@ pub fn save_mcp_registry_server<R: tauri::Runtime>(
         McpSecretRef::parse(&format!("mcp:{id}"))
             .map_err(|e| format!("`{id}` is not a usable secret name: {e}"))?;
     }
-    let path = document_path(&app)?;
+    let path = document_path(app)?;
     let mut document = read_document(&path)?;
     match document.servers.iter().position(|e| e.id == entry.id) {
         Some(index) => document.servers[index] = entry,
@@ -442,18 +457,23 @@ pub fn save_mcp_registry_server<R: tauri::Runtime>(
         ));
     }
     write_document(&path, &document)?;
-    let converged = converge_now(&app, &secrets)?;
+    let records = crate::managed_agents::load_managed_agents(app)?;
+    let converged =
+        apply::converge_now_with_records_and_secrets(app, &records, &secrets, secret_store)?;
     let mut view = list_mcp_registry_servers(app.clone())?;
     view.refused = converged.refused;
     Ok(view)
 }
 
 /// Internal implementation of delete_mcp_registry_server taking an injectable
-/// save closure for testing.
-pub fn delete_mcp_registry_server_internal<R: tauri::Runtime, F>(
+/// save closure and the convergence's secret store for testing — the latter
+/// so a test can drive the delete's real write order (agent selections before
+/// the document) without ever reaching the platform keyring.
+pub fn delete_mcp_registry_server_internal<R: tauri::Runtime, F, S: SecretStoreIo>(
     app: &AppHandle<R>,
     id: &str,
     save_records: F,
+    secret_store: &S,
 ) -> Result<McpRegistryView, String>
 where
     F: FnOnce(&[ManagedAgentRecord]) -> Result<(), String>,
@@ -506,7 +526,13 @@ where
     document.servers.retain(|entry| entry.id != id);
     write_document(&path, &document)?;
 
-    let converged = converge_now(app, &BTreeMap::new())?;
+    let records = crate::managed_agents::load_managed_agents(app)?;
+    let converged = apply::converge_now_with_records_and_secrets(
+        app,
+        &records,
+        &BTreeMap::new(),
+        secret_store,
+    )?;
     let mut view = list_mcp_registry_servers(app.clone())?;
     view.refused = converged.refused;
     Ok(view)
@@ -533,9 +559,13 @@ pub fn delete_mcp_registry_server<R: tauri::Runtime>(
         .mcp_registry_store_lock
         .lock()
         .map_err(|e| format!("cannot acquire mcp registry lock: {e}"))?;
-    delete_mcp_registry_server_internal(&app, &id, |records| {
-        crate::managed_agents::save_managed_agents(&app, records)
-    })
+    let secret_store = apply::DesktopSecrets::new(crate::app_state::keyring_service());
+    delete_mcp_registry_server_internal(
+        &app,
+        &id,
+        |records| crate::managed_agents::save_managed_agents(&app, records),
+        &secret_store,
+    )
 }
 
 /// Set one agent's enabled registry servers, then adopt a new generation.

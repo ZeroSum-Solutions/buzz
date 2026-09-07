@@ -273,6 +273,23 @@ pub fn converge_now_with_records<R: tauri::Runtime>(
     records: &[ManagedAgentRecord],
     pending: &std::collections::BTreeMap<String, String>,
 ) -> Result<Converged, String> {
+    let secrets = DesktopSecrets::new(crate::app_state::keyring_service());
+    converge_now_with_records_and_secrets(app, records, pending, &secrets)
+}
+
+/// Stage and adopt one generation, taking the secret store as a parameter
+/// rather than always binding to the platform keyring.
+///
+/// This is the seam a test uses to drive real convergence — refusal
+/// detection, write ordering — without ever reaching the OS keyring.
+/// Production callers go through [`converge_now_with_records`], which binds
+/// `secrets` to [`DesktopSecrets`].
+pub fn converge_now_with_records_and_secrets<R: tauri::Runtime, S: SecretStoreIo>(
+    app: &AppHandle<R>,
+    records: &[ManagedAgentRecord],
+    pending: &std::collections::BTreeMap<String, String>,
+    secrets: &S,
+) -> Result<Converged, String> {
     let Some(paths) = crate::managed_agents::runtime::mcp_registry_paths(app)? else {
         return Err(
             "this build cannot resolve the agent working directory, so mcp server settings \
@@ -310,9 +327,8 @@ pub fn converge_now_with_records<R: tauri::Runtime>(
              agent's effective runtime: {e}"
         )
     })?;
-    let secrets = DesktopSecrets::new(crate::app_state::keyring_service());
 
-    let selections = selections_for_records(records, &personas, &global, &secrets);
+    let selections = selections_for_records(records, &personas, &global, secrets);
 
     converge(
         &paths,
@@ -323,7 +339,7 @@ pub fn converge_now_with_records<R: tauri::Runtime>(
             keychain_service: crate::app_state::keyring_service(),
             pending,
         },
-        &secrets,
+        secrets,
         &UuidNonces,
     )
     .map_err(|e| e.to_string())
