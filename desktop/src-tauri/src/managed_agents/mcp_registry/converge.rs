@@ -147,7 +147,33 @@ pub struct Converged {
     pub refused: Vec<(String, String)>,
 }
 
+/// What a convergence needs besides the registry and the agents.
+///
+/// Grouped rather than passed one by one because the three travel together and
+/// only ever come from the same place: the app's own bundle and the operator's
+/// current Settings action.
+pub struct GenerationInputs<'a> {
+    /// Absolute path of the bundled launcher, already checked by
+    /// `apply::checked_launcher`. Every generated stdio and http entry names
+    /// it as its command.
+    pub launcher: &'a str,
+    /// Keychain service the desktop stores its blob under, written into every
+    /// generated argv so the launcher reads the same store the desktop wrote.
+    pub keychain_service: &'a str,
+    /// Secret values the operator entered in this action, keyed by reference
+    /// id. Written into the adopted generation's keyspace and never read back.
+    pub pending: &'a BTreeMap<String, String>,
+}
+
 /// Stage and adopt one generation covering every agent in `agents`.
+///
+/// `pending` carries secret **values** the operator has just entered, keyed by
+/// reference id. They are written into the new generation's keyspace for every
+/// agent that has a server naming them, and are the only channel a value takes:
+/// nothing reads one back, and no generated file or log line holds one. A
+/// reference absent from `pending` is carried forward from the base generation
+/// instead, and a reference in neither simply has no record — the launcher
+/// then refuses to start that server rather than starting it unauthenticated.
 ///
 /// # Errors
 /// [`ConvergeError`]. Nothing is adopted unless the pointer moved; a failure
@@ -157,11 +183,15 @@ pub fn converge<S: SecretStoreIo>(
     paths: &RegistryPaths,
     registry: &LoadedRegistry,
     agents: &[AgentSelection],
-    launcher: &str,
-    keychain_service: &str,
+    generation: &GenerationInputs<'_>,
     secrets: &S,
     nonces: &dyn NonceSource,
 ) -> Result<Converged, ConvergeError> {
+    let GenerationInputs {
+        launcher,
+        keychain_service,
+        pending,
+    } = generation;
     if agents.len() > MAX_CONVERGED_AGENTS {
         return Err(ConvergeError::TooManyAgents {
             count: agents.len(),
@@ -247,6 +277,7 @@ pub fn converge<S: SecretStoreIo>(
                     base,
                     &resolved.servers,
                     &existing,
+                    pending,
                     &mut carried,
                 );
 
@@ -260,6 +291,36 @@ pub fn converge<S: SecretStoreIo>(
                 }
             }
 
+            let declared_refs: std::collections::BTreeSet<String> = registry
+                .entries
+                .iter()
+                .flat_map(|entry| entry_references(&entry.entry))
+                .map(|r| r.id().to_string())
+                .collect();
+
+            for (ref_id, value) in *pending {
+                if !is_carried(&carried, ref_id) && declared_refs.contains(ref_id) {
+                    carried.insert(holding_key(ref_id), value.clone());
+                }
+            }
+
+            // A holding key stores a pending secret only until some selected
+            // agent's own (agent, generation) key carries it forward — from
+            // this round's pending value, from the holding key itself, or
+            // from the agent's own prior generation. Once that has happened
+            // the holding key is stale: left in place, it would let a later
+            // convergence with no new pending value read it ahead of the
+            // agent's own carried-forward value, silently rolling a
+            // subsequent rotation back. Consume it the moment any agent
+            // carries the reference, even though the reference is still
+            // declared in the registry.
+            let consumed_holding_refs: std::collections::BTreeSet<String> = existing
+                .keys()
+                .filter_map(|key| key.strip_prefix(HOLDING_KEY_PREFIX))
+                .filter(|ref_id| is_carried(&carried, ref_id))
+                .map(str::to_string)
+                .collect();
+
             // Handed to the store rather than written here: `commit` names
             // every one of these keys in the `PREPARED` journal before it
             // writes any of them, so a crash mid-write leaves debt the next
@@ -267,7 +328,12 @@ pub fn converge<S: SecretStoreIo>(
             // the mutation ahead of its own record.
             Ok(GenerationPlan {
                 files,
-                deletions: stale_secret_deletions(&existing, next),
+                deletions: stale_secret_deletions(
+                    &existing,
+                    next,
+                    &declared_refs,
+                    &consumed_holding_refs,
+                ),
                 secrets: carried,
             })
         },
@@ -291,9 +357,25 @@ pub fn converge<S: SecretStoreIo>(
     })
 }
 
+/// Holding key prefix for staged, generation-independent secrets.
+pub const HOLDING_KEY_PREFIX: &str = "mcp:#holding:";
+
+/// Blob key holding an unassigned pending secret for a declared registry reference.
+pub fn holding_key(ref_id: &str) -> String {
+    format!("{HOLDING_KEY_PREFIX}{ref_id}")
+}
+
+/// Whether `key` is a holding key for an unassigned pending secret.
+pub fn is_holding_key(key: &str) -> bool {
+    key.starts_with(HOLDING_KEY_PREFIX)
+}
+
 /// The agent id in an `mcp:<agent>:<generation>:<rest>` blob key, or `None`
 /// when the key is not one.
-fn agent_of_key(key: &str) -> Option<&str> {
+pub(crate) fn agent_of_key(key: &str) -> Option<&str> {
+    if is_holding_key(key) {
+        return None;
+    }
     let rest = key.strip_prefix(MCP_NAMESPACE_PREFIX)?;
     let agent = rest.split(':').next()?;
     (!agent.is_empty()).then_some(agent)
@@ -311,13 +393,28 @@ fn carry_secrets(
     base: Option<u64>,
     servers: &[RegistryEntry],
     existing: &BTreeMap<String, String>,
+    pending: &BTreeMap<String, String>,
     carried: &mut BTreeMap<String, String>,
 ) {
-    let Some(base) = base else {
-        return;
-    };
     for entry in servers {
         for reference in entry_references(entry) {
+            // A value the operator has just typed wins over the stored one:
+            // that is what "edit this server's credential" means, and it is
+            // also the only way a first convergence (`base` is `None`) can
+            // have a secret at all. It is never echoed back — the panel sends
+            // it once, this is where it lands, and nothing reads it out again.
+            if let Some(value) = pending.get(reference.id()) {
+                carried.insert(storage_key(capability, &reference), value.clone());
+                continue;
+            }
+            // An unassigned pending secret held across convergences:
+            if let Some(value) = existing.get(&holding_key(reference.id())) {
+                carried.insert(storage_key(capability, &reference), value.clone());
+                continue;
+            }
+            let Some(base) = base else {
+                continue;
+            };
             let from = format!(
                 "{MCP_NAMESPACE_PREFIX}{}:{base}:{}",
                 capability.agent_id(),
@@ -332,13 +429,24 @@ fn carry_secrets(
 
 /// Every `mcp:` reference one entry names, in its `env` block and its HTTP
 /// auth. A literal value is not a reference and is skipped.
+///
+/// An http entry's `env` is never a reference channel: `generate_server`'s
+/// http branch has no child process to hand it to, so an env-declared
+/// reference on an http entry is refused at load (`load::validate_entry`) and
+/// must never be treated as declared here either — otherwise a pending value
+/// for it would still be held (as an unassigned holding-key secret, see
+/// `holding_key`) even though nothing will ever consume it.
 fn entry_references(entry: &RegistryEntry) -> Vec<McpSecretRef> {
-    let mut references: Vec<McpSecretRef> = entry
-        .env
-        .values()
-        .filter(|value| looks_like_reference(value))
-        .filter_map(|value| McpSecretRef::parse(value).ok())
-        .collect();
+    let mut references: Vec<McpSecretRef> = Vec::new();
+    if matches!(entry.transport, RegistryTransport::Stdio { .. }) {
+        references.extend(
+            entry
+                .env
+                .values()
+                .filter(|value| looks_like_reference(value))
+                .filter_map(|value| McpSecretRef::parse(value).ok()),
+        );
+    }
     if let RegistryTransport::Http {
         auth: Some(auth), ..
     } = &entry.transport
@@ -350,17 +458,40 @@ fn entry_references(entry: &RegistryEntry) -> Vec<McpSecretRef> {
     references
 }
 
+/// Whether some carried record's key ends in `:<ref_id>` — i.e. some selected
+/// agent's own (agent, generation) storage key already names this reference,
+/// so a holding key for it is no longer the only place its value lives.
+fn is_carried(carried: &BTreeMap<String, String>, ref_id: &str) -> bool {
+    carried
+        .keys()
+        .any(|key| key.ends_with(&format!(":{ref_id}")))
+}
+
 /// Every `mcp:` record that does not belong to the adopted generation.
 ///
 /// These are the post-flip deletions the journal retries until they succeed.
 /// Retention keeps one rollback *generation directory*, but not its secrets: a
 /// rollback that could still authenticate a deleted server is the thing this
 /// convergence exists to prevent.
-fn stale_secret_deletions(existing: &BTreeMap<String, String>, adopted: u64) -> Vec<Deletion> {
+fn stale_secret_deletions(
+    existing: &BTreeMap<String, String>,
+    adopted: u64,
+    declared_refs: &std::collections::BTreeSet<String>,
+    consumed_holding_refs: &std::collections::BTreeSet<String>,
+) -> Vec<Deletion> {
     let keep = format!(":{adopted}:");
     existing
         .keys()
-        .filter(|key| key.starts_with(MCP_NAMESPACE_PREFIX) && !key.contains(&keep))
+        .filter(|key| {
+            if !key.starts_with(MCP_NAMESPACE_PREFIX) {
+                return false;
+            }
+            if is_holding_key(key) {
+                let ref_id = key.strip_prefix(HOLDING_KEY_PREFIX).unwrap_or("");
+                return !declared_refs.contains(ref_id) || consumed_holding_refs.contains(ref_id);
+            }
+            !key.contains(&keep)
+        })
         .map(|key| Deletion::Secret { key: key.clone() })
         .collect()
 }

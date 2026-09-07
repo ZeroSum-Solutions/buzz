@@ -793,6 +793,7 @@ impl Drop for EnvVarGuard {
 fn linked_record(persona_id: &str) -> crate::managed_agents::ManagedAgentRecord {
     use crate::managed_agents::{BackendKind, ManagedAgentRecord, RespondTo};
     ManagedAgentRecord {
+        mcp_servers: None,
         description: None,
         pubkey: "agent-pk".to_string(),
         name: "PM".to_string(),

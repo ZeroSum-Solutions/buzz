@@ -661,6 +661,7 @@ pub async fn create_managed_agent(
             last_exit_code: None,
             last_error: None,
             last_error_code: None,
+            mcp_servers: None,
             respond_to: minted.respond_to,
             respond_to_allowlist: minted.respond_to_allowlist.clone(),
             display_name: None,
@@ -1056,6 +1057,41 @@ pub async fn stop_managed_agent(
 
 // Async so the blocking body (disk reads/writes, process termination, keyring
 // delete, nest regeneration) runs off the main UI thread via spawn_blocking.
+/// Converge the mcp registry against `records` (which already omit the
+/// just-deleted agent) and turn a convergence failure into a propagated
+/// error instead of a printed-and-swallowed one.
+///
+/// A deleted agent's `mcp:` state (selections, and any credentials keyed to
+/// it) is only actually retired by this convergence. Catching the failure
+/// here and returning `Ok` anyway — the prior behaviour — reported a clean
+/// delete while the agent's registry state and credentials could be left
+/// stale, which is exactly the catch-log-and-return-success pattern
+/// AGENTS.md Review-Proven Rule 1 forbids (Sol T7c round 2, item 7).
+///
+/// # Errors
+/// A message naming the agent and the convergence failure. The agent record
+/// itself has already been removed by the time this runs; the error tells
+/// the caller its mcp state may not have followed.
+fn propagate_mcp_convergence_after_deletion<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    pubkey: &str,
+    records: &[ManagedAgentRecord],
+) -> Result<(), String> {
+    crate::managed_agents::mcp_registry::apply::converge_now_with_records(
+        app,
+        records,
+        &std::collections::BTreeMap::new(),
+    )
+    .map(|_| ())
+    .map_err(|e| {
+        format!(
+            "agent {pubkey} was removed, but its mcp registry state could not be converged \
+             afterward: {e}; its mcp registry selection and any credentials may be stale until \
+             a later registry edit or toggle retries convergence"
+        )
+    })
+}
+
 fn run_managed_agent_deletion<T>(
     base_dir: &std::path::Path,
     pubkey: &str,
@@ -1133,7 +1169,9 @@ pub async fn delete_managed_agent(
                 }
                 state.clear_agent_session_caches(&pubkey);
                 records.retain(|record| record.pubkey != pubkey);
-                save_managed_agents(&app, records)
+                save_managed_agents(&app, records)?;
+                propagate_mcp_convergence_after_deletion(&app, &pubkey, records)?;
+                Ok(())
             })?;
             crate::managed_agents::delete_agent_key(&pubkey);
             // Tombstone after confirmed removal (inside lock; every published

@@ -36,6 +36,16 @@ export const ADVANCED_FIELDS_MOTION_TRANSITION = {
   ease: [0.23, 1, 0.32, 1],
 } as const;
 
+/**
+ * The advanced-fields transition for one dialog, honouring reduced motion.
+ *
+ * Both agent dialogs made the same choice inline; this is the second
+ * repetition, so it moves here beside the easing it selects.
+ */
+export function advancedFieldsMotion(reduceMotion: boolean | null) {
+  return reduceMotion ? { duration: 0 } : ADVANCED_FIELDS_MOTION_TRANSITION;
+}
+
 export const AUTO_MODEL_DROPDOWN_VALUE = "__auto_model__";
 export const CUSTOM_MODEL_DROPDOWN_VALUE = "__custom_model__";
 export const AUTO_PROVIDER_DROPDOWN_VALUE = "__auto_provider__";

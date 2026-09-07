@@ -546,7 +546,7 @@ pub(crate) fn spawn_with_effort_proof(
 /// `None` when the nest cannot be resolved, which is the same sandboxed case
 /// `default_agent_workdir` already returns `None` for; a spawn there gets no
 /// registry servers rather than a directory outside the nest.
-fn mcp_registry_paths<R: tauri::Runtime>(
+pub(crate) fn mcp_registry_paths<R: tauri::Runtime>(
     app: &AppHandle<R>,
 ) -> Result<Option<super::mcp_registry::paths::RegistryPaths>, String> {
     let Some(nest) = super::default_agent_workdir() else {

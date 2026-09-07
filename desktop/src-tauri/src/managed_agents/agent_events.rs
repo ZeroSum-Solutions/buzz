@@ -164,6 +164,7 @@ mod tests {
 
     fn sample_agent() -> ManagedAgentRecord {
         ManagedAgentRecord {
+            mcp_servers: None,
             description: None,
             pubkey: "agentpubkeyhex".to_string(),
             name: "Test Agent".to_string(),

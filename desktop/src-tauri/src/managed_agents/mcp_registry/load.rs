@@ -22,10 +22,12 @@ use std::path::Path;
 use buzz_secret_store_pkg::sentinel::{is_credential_name, scan_argv, scan_value};
 use buzz_secret_store_pkg::McpSecretRef;
 
+use super::generate::generated_arg_count;
 use super::schema::{
     RegistryDocument, RegistryEntry, RegistryTransport, BUILTIN_SERVER_NAMES, MAX_ARGS,
     MAX_ARG_LEN, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_SERVERS, MAX_ENTRY_BYTES, MAX_ENV_ENTRIES,
-    MAX_ENV_VALUE_LEN, MAX_NAME_LEN, RESERVED_NAME_PREFIX,
+    MAX_ENV_NAME_LEN, MAX_ENV_VALUE_LEN, MAX_GENERATED_ARGS, MAX_ID_LEN, MAX_NAME_LEN,
+    RESERVED_NAME_PREFIX,
 };
 
 /// The pinned auth schemes an HTTP entry may name.
@@ -191,7 +193,7 @@ pub fn parse_registry(bytes: &[u8]) -> Result<LoadedRegistry, RegistryError> {
 /// plus one byte.
 ///
 /// `Ok(None)` when the file does not exist.
-fn read_bounded_no_follow(path: &Path) -> Result<Option<Vec<u8>>, RegistryError> {
+pub(crate) fn read_bounded_no_follow(path: &Path) -> Result<Option<Vec<u8>>, RegistryError> {
     let io_error = |reason: String| RegistryError::Io {
         path: path.display().to_string(),
         reason,
@@ -233,8 +235,8 @@ fn read_bounded_no_follow(path: &Path) -> Result<Option<Vec<u8>>, RegistryError>
 
 /// Validate one entry. `Err` carries the operator-facing rejection reason.
 fn validate_entry(entry: &RegistryEntry) -> Result<(), String> {
-    check_identifier("id", &entry.id)?;
-    check_identifier("name", &entry.name)?;
+    check_id(&entry.id)?;
+    check_name(&entry.name)?;
     if entry.name.starts_with(RESERVED_NAME_PREFIX) {
         return Err(format!(
             "`{}` uses the reserved `{RESERVED_NAME_PREFIX}` prefix",
@@ -250,18 +252,48 @@ fn validate_entry(entry: &RegistryEntry) -> Result<(), String> {
     validate_env(&entry.env)?;
 
     match &entry.transport {
-        RegistryTransport::Stdio { command, args } => validate_stdio(command, args),
-        RegistryTransport::Http { url, auth } => validate_http(url, auth.as_ref()),
+        RegistryTransport::Stdio { command, args } => validate_stdio(command, args)?,
+        RegistryTransport::Http { url, auth } => {
+            // An http upstream has no child process to hand environment
+            // variables to (`generate::generate_server`'s http branch emits
+            // no `env`), so a declared `env` block — including an `mcp:`
+            // reference an operator believes configures auth — is accepted
+            // here, stored, and then silently has no effect on the running
+            // server. Reject it at the same place every other unusable shape
+            // is rejected, rather than accepting it and doing nothing with it.
+            if !entry.env.is_empty() {
+                return Err(
+                    "it declares an env block, but an http server has no child process to \
+                     hand environment variables to; declare a credential in its auth block \
+                     instead"
+                        .to_string(),
+                );
+            }
+            validate_http(url, auth.as_ref())?;
+        }
     }
+
+    // The bound that actually costs is the generated launcher argv, which is
+    // what `buzz-acp` reads and bounds. Counted from the generator itself, so
+    // the two cannot drift.
+    let generated = generated_arg_count(entry);
+    if generated > MAX_GENERATED_ARGS {
+        return Err(format!(
+            "it generates a launcher command line of {generated} arguments, over the \
+             {MAX_GENERATED_ARGS} cap the agent harness accepts"
+        ));
+    }
+    Ok(())
 }
 
-fn check_identifier(field: &str, value: &str) -> Result<(), String> {
+/// The registry id: desktop-local, so it keeps the wider charset.
+fn check_id(value: &str) -> Result<(), String> {
     if value.is_empty() {
-        return Err(format!("its {field} is empty"));
+        return Err("its id is empty".to_string());
     }
-    if value.len() > MAX_NAME_LEN {
+    if value.len() > MAX_ID_LEN {
         return Err(format!(
-            "its {field} is {} bytes, over the {MAX_NAME_LEN}-byte cap",
+            "its id is {} bytes, over the {MAX_ID_LEN}-byte cap",
             value.len()
         ));
     }
@@ -269,14 +301,65 @@ fn check_identifier(field: &str, value: &str) -> Result<(), String> {
         .bytes()
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
     {
+        return Err("its id may only use lowercase letters, digits, `_` and `-`".to_string());
+    }
+    Ok(())
+}
+
+/// The server name: the one operator string that crosses into `buzz-acp`, so
+/// it takes the stricter of the two sides' bounds (Sol W4). `buzz-acp` caps a
+/// name at 32 bytes over `[A-Za-z0-9-]` and refuses the whole handover
+/// document past either, so an underscore or a 33rd byte accepted here would
+/// stop every registry-enabled agent from starting.
+fn check_name(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("its name is empty".to_string());
+    }
+    if value.len() > MAX_NAME_LEN {
         return Err(format!(
-            "its {field} may only use lowercase letters, digits, `_` and `-`"
+            "its name is {} bytes, over the {MAX_NAME_LEN}-byte cap the agent harness accepts",
+            value.len()
         ));
+    }
+    if !value
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err(
+            "its name may only use lowercase letters, digits and `-`; the agent harness refuses \
+             any other character in a server name"
+                .to_string(),
+        );
     }
     Ok(())
 }
 
 fn validate_stdio(command: &str, args: &[String]) -> Result<(), String> {
+    // Shape guard for the document-supplied command and args (PR 23 follow-up
+    // 8). A NUL cannot be passed to `execve`, so a value carrying one is a
+    // command line that silently truncates at the OS boundary or fails far
+    // from here; it is refused where the operator can see why. Count and
+    // length are bounded below and by the generated-argv cap in
+    // `validate_entry`.
+    if command.as_bytes().contains(&0) {
+        return Err("its command holds a NUL byte, which no command line can carry".to_string());
+    }
+    if command.len() > MAX_ARG_LEN {
+        return Err(format!(
+            "its command is {} bytes, over the {MAX_ARG_LEN}-byte cap; the command is generated \
+             as one launcher argument",
+            command.len()
+        ));
+    }
+    if let Some((index, _)) = args
+        .iter()
+        .enumerate()
+        .find(|(_, arg)| arg.as_bytes().contains(&0))
+    {
+        return Err(format!(
+            "argument {index} holds a NUL byte, which no command line can carry"
+        ));
+    }
     if !Path::new(command).is_absolute() {
         return Err(format!(
             "`{command}` is not an absolute path; the launcher clears PATH, so a bare name would resolve through an environment nobody controls"
@@ -294,6 +377,21 @@ fn validate_stdio(command: &str, args: &[String]) -> Result<(), String> {
             over.len()
         ));
     }
+    // The command is appended to the generated launcher argv exactly like an
+    // argument is (`generate_server`), so a credential-shaped command path is
+    // just as readable by `ps` and by a crash dump as a credential-shaped
+    // argument — and the argv scan below covers only `args`, never `command`.
+    // Scanned by path component, since the command is a path: a vendor prefix
+    // must still match the start of a component, not appear anywhere inside
+    // an absolute path.
+    if let Some(hit) = scan_command_path(command) {
+        return Err(format!(
+            "its command {} — the command is appended to the generated launcher argv, which \
+             is readable by `ps` and by any crash dump, so declare an `mcp:` reference in \
+             `env` instead",
+            hit.reason
+        ));
+    }
     if let Some((index, hit)) = scan_argv(args) {
         return Err(format!(
             "argument {index} {} — argv is readable by `ps` and by any crash dump, so declare an `mcp:` reference in `env` instead",
@@ -301,6 +399,16 @@ fn validate_stdio(command: &str, args: &[String]) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Scan a command path's own components for a credential shape.
+///
+/// `scan_value` matches a vendor prefix only at the start of a token; a
+/// command is one path, not a shell-split token, so it is split on its own
+/// separators first (`/tmp/sk-live-.../server` must scan the `sk-live-...`
+/// component, not fail to match against the path as a single string).
+fn scan_command_path(command: &str) -> Option<buzz_secret_store_pkg::sentinel::SentinelHit> {
+    command.split(['/', '\\']).find_map(scan_value)
 }
 
 fn validate_http(url: &str, auth: Option<&super::schema::HttpAuth>) -> Result<(), String> {
@@ -329,6 +437,21 @@ fn validate_env(env: &BTreeMap<String, String>) -> Result<(), String> {
         ));
     }
     for (name, value) in env {
+        if name.is_empty() || name.len() > MAX_ENV_NAME_LEN {
+            return Err(format!(
+                "the name of one env entry is {} bytes; a name must be 1 to \
+                 {MAX_ENV_NAME_LEN} bytes",
+                name.len()
+            ));
+        }
+        if name.as_bytes().contains(&0)
+            || name.as_bytes().contains(&b'=')
+            || value.as_bytes().contains(&0)
+        {
+            return Err(format!(
+                "`{name}` holds a NUL or `=`, which no `NAME=VALUE` argument can carry"
+            ));
+        }
         if value.len() > MAX_ENV_VALUE_LEN {
             return Err(format!(
                 "the value of `{name}` is {} bytes, over the {MAX_ENV_VALUE_LEN}-byte cap",
