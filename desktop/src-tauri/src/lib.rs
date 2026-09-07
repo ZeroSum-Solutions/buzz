@@ -323,6 +323,13 @@ pub fn run() {
                 eprintln!("buzz-desktop: persona-snapshot backfill failed: {e}");
             }
 
+            // Rust sync trigger once after launch restore in lib.rs setup
+            if let Ok(records) = managed_agents::load_managed_agents(&app_handle) {
+                for record in records {
+                    agent_health::sync_for_agent(&app_handle, &record.pubkey);
+                }
+            }
+
             // Warm the loaded-harness registry BEFORE restore so cold-launch
             // agent spawns can resolve custom/preset runtime ids without
             // waiting for the frontend's discover_acp_providers call.  This is

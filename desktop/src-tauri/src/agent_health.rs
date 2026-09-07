@@ -587,6 +587,26 @@ pub(crate) async fn sync_agent_health(
     .await
 }
 
+/// Trigger an asynchronous sync of an agent's ledger into the health store.
+///
+/// Spawns onto Tauri's async runtime so callers in synchronous command or setup
+/// contexts do not block. If `pubkey` is empty, syncs all local agents.
+pub(crate) fn sync_for_agent(app: &AppHandle, pubkey: &str) {
+    let app_handle = app.clone();
+    let pubkey_str = pubkey.to_string();
+    tauri::async_runtime::spawn(async move {
+        let store = app_handle.state::<AgentHealthStore>();
+        let agent_arg = if pubkey_str.is_empty() {
+            None
+        } else {
+            Some(pubkey_str.clone())
+        };
+        if let Err(e) = sync_agent_health(agent_arg, app_handle.clone(), store).await {
+            eprintln!("buzz-desktop: agent_health sync failed for {pubkey_str}: {e}");
+        }
+    });
+}
+
 /// Insert one health frame mirrored live from the harness observer (Step 7's
 /// `parseHealthFrame`). Duplicate-safe like ledger sync: the same
 /// `(agent, event_key)` primary key ignores a frame that a later

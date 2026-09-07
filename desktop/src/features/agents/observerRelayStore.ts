@@ -4,13 +4,17 @@ import { subscribeToAgentObserverFrames } from "@/shared/api/observerRelay";
 import type { RelayEvent, ManagedAgent } from "@/shared/api/types";
 import type { ControlResultFrame } from "@/shared/api/types";
 import { putAgentSessionConfig } from "@/shared/api/tauri";
-import { putManagedAgentRuntimeLifecycle } from "@/shared/api/tauriManagedAgents";
+import {
+  putManagedAgentRuntimeLifecycle,
+  ingestAgentHealthFrame,
+} from "@/shared/api/tauriManagedAgents";
 import { getIdentity } from "@/shared/api/tauriIdentity";
 import { decryptObserverEvent } from "@/shared/api/tauriObserver";
 import {
   parseAgentManagementRequest,
   type AgentManagementRequest,
 } from "./agentManagement";
+import { parseHealthFrame } from "./agentHealthFrames";
 import {
   parseProjectChannelRequest,
   type ProjectChannelRequest,
@@ -532,6 +536,13 @@ function processLiveObserverEvents(
           console.debug("Late/untracked lifecycle frame dropped:", error);
         },
       );
+    } else if (parseHealthFrame(parsed)) {
+      const healthFrame = parseHealthFrame(parsed);
+      if (healthFrame) {
+        void ingestAgentHealthFrame(agentPubkey, healthFrame).catch((error) => {
+          console.debug("Agent health frame ingest failed:", error);
+        });
+      }
     }
   }
 

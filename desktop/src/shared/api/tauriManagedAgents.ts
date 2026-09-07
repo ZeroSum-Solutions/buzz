@@ -109,6 +109,25 @@ export async function putManagedAgentRuntimeLifecycle(
   });
 }
 
+export async function ingestAgentHealthFrame(
+  agent: string,
+  frame: unknown,
+): Promise<{ alerts: unknown[] }> {
+  const result = await invokeTauri<unknown>("ingest_agent_health_frame", {
+    agent,
+    frame,
+  });
+  if (
+    result &&
+    typeof result === "object" &&
+    "alerts" in result &&
+    Array.isArray((result as { alerts: unknown[] }).alerts)
+  ) {
+    return result as { alerts: unknown[] };
+  }
+  return { alerts: [] };
+}
+
 export async function reconcileManagedAgentRuntimes(
   communities: readonly { relayUrl: string }[],
 ): Promise<ManagedAgentRuntimeStatus[]> {
