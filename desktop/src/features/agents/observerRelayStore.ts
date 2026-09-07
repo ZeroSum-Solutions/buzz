@@ -539,9 +539,7 @@ function processLiveObserverEvents(
     } else if (parseHealthFrame(parsed)) {
       const healthFrame = parseHealthFrame(parsed);
       if (healthFrame) {
-        void ingestAgentHealthFrame(agentPubkey, healthFrame).catch((error) => {
-          console.debug("Agent health frame ingest failed:", error);
-        });
+        queueAgentHealthFrame(agentPubkey, healthFrame);
       }
     }
   }
@@ -992,4 +990,70 @@ export function _testGetArchivedChannelEvents(
   return (
     archiveEventsByChannel.get(archiveChannelKey(agentPubkey, channelId)) ?? []
   );
+}
+
+type HealthQueueItem = {
+  frame: unknown;
+  retries: number;
+};
+
+type HealthQueueState = {
+  inFlight: boolean;
+  items: HealthQueueItem[];
+};
+
+export const MAX_HEALTH_QUEUE_PER_AGENT = 50;
+
+const healthQueuesByAgent = new Map<string, HealthQueueState>();
+
+export function getHealthQueueState(
+  agentPubkey: string,
+): HealthQueueState | undefined {
+  return healthQueuesByAgent.get(agentPubkey);
+}
+
+export function resetHealthQueuesForTest(): void {
+  healthQueuesByAgent.clear();
+}
+
+export async function processHealthQueue(agentPubkey: string): Promise<void> {
+  const queueState = healthQueuesByAgent.get(agentPubkey);
+  if (!queueState || queueState.inFlight || queueState.items.length === 0) {
+    return;
+  }
+  queueState.inFlight = true;
+  const currentItem = queueState.items.shift()!;
+  try {
+    await ingestAgentHealthFrame(agentPubkey, currentItem.frame);
+  } catch (error) {
+    if (currentItem.retries < 1) {
+      currentItem.retries += 1;
+      queueState.items.unshift(currentItem);
+    } else {
+      console.debug("Agent health frame ingest failed after retry:", error);
+    }
+  } finally {
+    queueState.inFlight = false;
+    if (queueState.items.length > 0) {
+      void processHealthQueue(agentPubkey);
+    } else {
+      healthQueuesByAgent.delete(agentPubkey);
+    }
+  }
+}
+
+export function queueAgentHealthFrame(
+  agentPubkey: string,
+  frame: unknown,
+): void {
+  let queueState = healthQueuesByAgent.get(agentPubkey);
+  if (!queueState) {
+    queueState = { inFlight: false, items: [] };
+    healthQueuesByAgent.set(agentPubkey, queueState);
+  }
+  if (queueState.items.length >= MAX_HEALTH_QUEUE_PER_AGENT) {
+    queueState.items.shift();
+  }
+  queueState.items.push({ frame, retries: 0 });
+  void processHealthQueue(agentPubkey);
 }

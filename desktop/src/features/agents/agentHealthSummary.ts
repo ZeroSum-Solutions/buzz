@@ -49,6 +49,7 @@ export type AgentHealthSummaryData = {
   summary7d?: readonly AgentHealthCounters[] | null;
   counters24h?: readonly AgentHealthCounters[] | null;
   counters7d?: readonly AgentHealthCounters[] | null;
+  syncError?: boolean;
 };
 
 export type AgentHealthSummaryCounters =

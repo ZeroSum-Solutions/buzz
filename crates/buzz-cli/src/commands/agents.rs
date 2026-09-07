@@ -495,9 +495,19 @@ pub fn cmd_health_to_writer<W: std::io::Write>(
 
     for dir in state_dirs {
         let ledger_path = dir.join(buzz_acp::reliability::ledger::LEDGER_FILE);
-        let records =
-            buzz_acp::reliability::ledger::read_ledger_file(&ledger_path).unwrap_or_default();
-        let mut row = buzz_acp::reliability::health::summarize(&records, duration, now);
+        let mut row = match buzz_acp::reliability::ledger::read_ledger_file(&ledger_path) {
+            Ok(records) => buzz_acp::reliability::health::summarize(&records, duration, now),
+            Err(e) => {
+                // A real I/O error (permissions, corruption at the OS level) is
+                // distinct from "no ledger yet" — `read_ledger_file` already
+                // maps a missing file to `Ok(vec![])`, so anything reaching
+                // here must not collapse into a normal-looking, healthy row.
+                let mut degraded = buzz_acp::reliability::health::summarize(&[], duration, now);
+                degraded.state = "error".to_string();
+                degraded.last_error_class = Some(format!("ledger read error: {e}"));
+                degraded
+            }
+        };
         if row.agent.is_empty() {
             if let Some(name) = dir.file_name().and_then(|s| s.to_str()) {
                 row.agent = name.to_string();
@@ -521,15 +531,8 @@ pub fn cmd_health_to_writer<W: std::io::Write>(
 
         writeln!(
             writer,
-            "{:<18} {:<10} {:>6} {:>6} {:>6} {:>12} {:>10} {}",
-            "AGENT",
-            "STATE",
-            "TURNS",
-            "FAILED",
-            "PARKED",
-            "NEEDS_REVIEW",
-            "RECONNECTS",
-            "LAST_ERROR"
+            "{:<18} {:<10} {:>6} {:>6} {:>6} {:>12} {:>10} LAST_ERROR",
+            "AGENT", "STATE", "TURNS", "FAILED", "PARKED", "NEEDS_REVIEW", "RECONNECTS",
         )
         .map_err(|e| CliError::Other(e.to_string()))?;
 
@@ -1507,5 +1510,48 @@ mod tests {
         let beta = parsed.iter().find(|r| r["agent"] == "agent_beta").unwrap();
         assert_eq!(beta["turns"], 0);
         assert_eq!(beta["state"], "offline");
+    }
+
+    /// An I/O error reading `ledger.jsonl` (permissions, corruption at the OS
+    /// level) must surface as a distinguishable degraded row, never collapse
+    /// into the same "offline, turns: 0" shape a healthy-but-idle agent gets.
+    /// Binds `cmd_health_to_writer`'s `read_ledger_file` error handling —
+    /// reverting it to `.unwrap_or_default()` makes this fail (state would
+    /// read "offline" instead of "error").
+    #[cfg(unix)]
+    #[test]
+    fn health_unreadable_ledger_reports_error_state_not_offline() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let agent_dir = tmp.path().join("agent_unreadable");
+        std::fs::create_dir(&agent_dir).expect("create agent dir");
+        let ledger_path = agent_dir.join("ledger.jsonl");
+        std::fs::write(&ledger_path, "{}\n").expect("write ledger");
+        std::fs::set_permissions(&ledger_path, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod ledger unreadable");
+
+        let mut out = Vec::new();
+        let result = cmd_health_to_writer(&mut out, "24h", true, Some(tmp.path()));
+
+        // Restore permissions so the tempdir can be cleaned up.
+        let _ = std::fs::set_permissions(&ledger_path, std::fs::Permissions::from_mode(0o644));
+
+        result.expect("cmd_health must not fail the whole command for one bad ledger");
+        let json_str = String::from_utf8(out).expect("valid utf-8 output");
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(&json_str).expect("valid json output");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["agent"], "agent_unreadable");
+        assert_eq!(
+            parsed[0]["state"], "error",
+            "unreadable ledger must report state \"error\", not \"offline\": {parsed:?}"
+        );
+        assert!(
+            parsed[0]["last_error_class"]
+                .as_str()
+                .is_some_and(|s| s.contains("ledger read error")),
+            "last_error_class must carry the read failure: {parsed:?}"
+        );
     }
 }

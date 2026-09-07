@@ -4,6 +4,7 @@ import {
   type RawManagedAgent,
 } from "@/shared/api/tauri";
 import type {
+  AgentHealthAlert,
   AgentHealthIngestResult,
   ManagedAgent,
   ManagedAgentRuntimeStatus,
@@ -128,11 +129,20 @@ export async function ingestAgentHealthFrame(
     "alerts" in result &&
     Array.isArray(result.alerts)
   ) {
+    const delivered: AgentHealthAlert[] = [];
     for (const alert of result.alerts) {
-      void sendDesktopNotification({
+      const deliveredSuccessfully = await sendDesktopNotification({
         title: alert.title,
         body: alert.body,
-      });
+      }).catch(() => false);
+      if (deliveredSuccessfully) {
+        delivered.push(alert);
+      }
+    }
+    if (delivered.length > 0) {
+      await invokeTauri("record_delivered_alerts", { alerts: delivered }).catch(
+        () => {},
+      );
     }
     return result;
   }

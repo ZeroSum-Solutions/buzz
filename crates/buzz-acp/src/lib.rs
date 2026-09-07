@@ -5355,9 +5355,7 @@ fn handle_prompt_result(
     // A successful live turn is the only thing that resumes a paused agent,
     // closes a breaker, or releases parked messages for replay. A restart
     // proves nothing about the provider and never replays anything.
-    if let (Some(reliability), PromptSource::Channel(scope)) =
-        (reliability.as_deref_mut(), &result.source)
-    {
+    if let (Some(reliability), PromptSource::Channel(scope)) = (reliability, &result.source) {
         if matches!(result.outcome, PromptOutcome::Ok(_)) {
             replay_after_success(reliability, queue, scope, now);
         } else {

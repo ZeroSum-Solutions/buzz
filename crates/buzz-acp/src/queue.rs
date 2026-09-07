@@ -746,7 +746,7 @@ impl EventQueue {
         // Replayed events are older than anything already staged, so they go
         // first — the conversation stays in order.
         let mut merged = events;
-        merged.extend(entry.drain(..));
+        merged.append(entry);
         merged.truncate(MAX_BATCH_EVENTS);
         *entry = merged;
         self.cancel_reasons

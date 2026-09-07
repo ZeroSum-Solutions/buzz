@@ -325,11 +325,7 @@ pub fn run() {
             }
 
             // Rust sync trigger once after launch restore in lib.rs setup
-            if let Ok(records) = managed_agents::load_managed_agents(&app_handle) {
-                for record in records {
-                    agent_health::sync_for_agent(&app_handle, &record.pubkey);
-                }
-            }
+            agent_health::sync_for_agent(&app_handle, "");
 
             // Warm the loaded-harness registry BEFORE restore so cold-launch
             // agent spawns can resolve custom/preset runtime ids without
@@ -766,6 +762,7 @@ pub fn run() {
             agent_health::sync_agent_health,
             agent_health::ingest_agent_health_frame,
             agent_health::get_parked_batches,
+            agent_health::record_delivered_alerts,
             channel_head_cache::channel_head_cache_load,
             channel_head_cache::channel_head_cache_store,
             channel_head_cache::channel_head_cache_clear,

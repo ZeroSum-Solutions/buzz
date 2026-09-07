@@ -9,6 +9,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 const sentNotifications = [];
+const recordedAlerts = [];
+let syncHealthShouldReject = false;
 
 globalThis.window = {
   Notification: class MockNotification {
@@ -19,8 +21,18 @@ globalThis.window = {
     close() {}
   },
   __TAURI_INTERNALS__: {
-    invoke: (cmd) => {
+    invoke: (cmd, args) => {
+      if (cmd === "record_delivered_alerts") {
+        recordedAlerts.push(...(args?.alerts ?? []));
+        return Promise.resolve();
+      }
+      if (cmd === "get_agent_health_summary") {
+        return Promise.resolve([]);
+      }
       if (cmd === "sync_agent_health") {
+        if (syncHealthShouldReject) {
+          return Promise.reject(new Error("simulated sync failure"));
+        }
         return Promise.resolve({
           inserted: 1,
           alerts: [
@@ -52,13 +64,16 @@ globalThis.window = {
   },
 };
 
-const { syncAgentHealth } = await import("@/features/agents/agentHealthHooks");
+const { syncAgentHealth, fetchAgentHealthSummary } = await import(
+  "@/features/agents/agentHealthHooks"
+);
 const { ingestAgentHealthFrame } = await import(
   "@/shared/api/tauriManagedAgents"
 );
 
 test("deliversDesktopNotificationForAlertsOnSyncAndIngest", async () => {
   sentNotifications.length = 0;
+  recordedAlerts.length = 0;
 
   const syncResult = await syncAgentHealth("pm-pubkey");
   assert.equal(syncResult.alerts.length, 1);
@@ -77,4 +92,42 @@ test("deliversDesktopNotificationForAlertsOnSyncAndIngest", async () => {
     sentNotifications[1].options.body,
     "A Critic request needs your decision",
   );
+
+  // Both delivered alerts were recorded via delivery ack
+  assert.equal(recordedAlerts.length, 2);
+  assert.equal(recordedAlerts[0].rule, "parked_older_than_15_minutes");
+  assert.equal(recordedAlerts[1].rule, "needs_review");
+});
+
+test("failedDesktopNotificationDoesNotAckDeliveredAlert", async () => {
+  sentNotifications.length = 0;
+  recordedAlerts.length = 0;
+
+  globalThis.window.Notification.permission = "denied";
+  try {
+    const syncResult = await syncAgentHealth("pm-pubkey");
+    assert.equal(syncResult.alerts.length, 1);
+    // Notification was not sent
+    assert.equal(sentNotifications.length, 0);
+    // Delivery ack was not recorded
+    assert.equal(recordedAlerts.length, 0);
+  } finally {
+    globalThis.window.Notification.permission = "granted";
+  }
+});
+
+test("fetchAgentHealthSummaryDegradesOnSyncRejection", async () => {
+  syncHealthShouldReject = true;
+  try {
+    const result = await fetchAgentHealthSummary();
+    assert.equal(
+      result.syncError,
+      true,
+      "syncError must be true when syncAgentHealth fails",
+    );
+    assert.deepEqual(result.summary24h, []);
+    assert.deepEqual(result.summary7d, []);
+  } finally {
+    syncHealthShouldReject = false;
+  }
 });

@@ -1,22 +1,25 @@
 //! Desktop health store: schema, insert-or-ignore, and retention.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use buzz_acp_pkg::reliability::ledger::{
     read_ledger_file, LedgerBody, LedgerRecord, TurnOutcome, LEDGER_FILE,
 };
-use rusqlite::{params, Connection, Row};
+use rusqlite::{params, params_from_iter, Connection, Row};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 
 use crate::managed_agents::storage::{load_managed_agents, managed_agent_state_dir};
+use crate::managed_agents::ManagedAgentRecord;
 
 #[allow(dead_code)]
 pub(crate) const SCHEMA_VERSION: i64 = 1;
 #[allow(dead_code)]
 pub(crate) const RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
+pub(crate) const DEFAULT_MAX_HEALTH_EVENTS_ROWS: i64 = 1_000;
+pub(crate) const DEFAULT_MAX_HEALTH_DB_BYTES: i64 = 10 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -38,8 +41,18 @@ impl HealthEvent {
     }
 }
 
+pub(crate) fn canonicalize_timestamp(at_rfc3339: &str) -> String {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(at_rfc3339) {
+        dt.with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    } else {
+        at_rfc3339.to_string()
+    }
+}
+
 pub(crate) fn compute_event_key(at_rfc3339: &str, kind: &str, target: Option<&str>) -> String {
-    format!("{at_rfc3339}|{kind}|{}", target.unwrap_or(""))
+    let canon_at = canonicalize_timestamp(at_rfc3339);
+    format!("{canon_at}|{kind}|{}", target.unwrap_or(""))
 }
 
 #[allow(dead_code)]
@@ -124,12 +137,74 @@ pub(crate) fn insert_event(conn: &Connection, event: &HealthEvent) -> Result<boo
 #[allow(dead_code)]
 pub(crate) fn prune(conn: &Connection, now: i64) -> Result<usize, String> {
     let cutoff = now - RETENTION_SECS;
-    let _ = conn.execute(
+    // Both retention deletes run in one transaction: a mid-way failure must
+    // not leave `health_events` pruned while `alert_state` keeps its stale
+    // rows (or vice versa) — the two tables' retention windows are meant to
+    // stay in lockstep.
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("begin prune transaction: {e}"))?;
+    tx.execute(
         "DELETE FROM alert_state WHERE last_fired_at < ?1",
         params![cutoff],
-    );
-    conn.execute("DELETE FROM health_events WHERE at < ?1", params![cutoff])
-        .map_err(|e| format!("prune agent-health events: {e}"))
+    )
+    .map_err(|e| format!("prune alert_state: {e}"))?;
+    let mut total_pruned = tx
+        .execute("DELETE FROM health_events WHERE at < ?1", params![cutoff])
+        .map_err(|e| format!("prune agent-health events: {e}"))?;
+    tx.commit()
+        .map_err(|e| format!("commit prune transaction: {e}"))?;
+
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM health_events", [], |r| r.get(0))
+        .map_err(|e| format!("count health events: {e}"))?;
+    if count > DEFAULT_MAX_HEALTH_EVENTS_ROWS {
+        let excess = count - DEFAULT_MAX_HEALTH_EVENTS_ROWS;
+        let deleted = conn
+            .execute(
+                "DELETE FROM health_events WHERE (agent, event_key) IN (
+                    SELECT agent, event_key FROM health_events ORDER BY at ASC LIMIT ?1
+                )",
+                params![excess],
+            )
+            .map_err(|e| format!("prune excess rows: {e}"))?;
+        total_pruned += deleted;
+    }
+
+    let page_count: i64 = conn
+        .query_row("PRAGMA page_count", [], |r| r.get(0))
+        .unwrap_or(0);
+    let page_size: i64 = conn
+        .query_row("PRAGMA page_size", [], |r| r.get(0))
+        .unwrap_or(4096);
+    let mut db_bytes = page_count * page_size;
+    if db_bytes > DEFAULT_MAX_HEALTH_DB_BYTES {
+        while db_bytes > DEFAULT_MAX_HEALTH_DB_BYTES {
+            let deleted = conn
+                .execute(
+                    "DELETE FROM health_events WHERE (agent, event_key) IN (
+                        SELECT agent, event_key FROM health_events ORDER BY at ASC LIMIT 100
+                    )",
+                    [],
+                )
+                .map_err(|e| format!("prune excess bytes: {e}"))?;
+            if deleted == 0 {
+                break;
+            }
+            total_pruned += deleted;
+            let _ = conn.execute("VACUUM", []);
+            let new_page_count: i64 = conn
+                .query_row("PRAGMA page_count", [], |r| r.get(0))
+                .unwrap_or(0);
+            let new_bytes = new_page_count * page_size;
+            if new_bytes >= db_bytes {
+                break;
+            }
+            db_bytes = new_bytes;
+        }
+    }
+
+    Ok(total_pruned)
 }
 
 /// Map one ledger record to a health event, or `None` when the record
@@ -139,7 +214,7 @@ pub(crate) fn prune(conn: &Connection, now: i64) -> Result<usize, String> {
 /// `raw` dropped; every other outcome (and `turn_started`) keeps its ledger
 /// kind so `sync_ledger` can feed the turns-24h/7d counters.
 fn ledger_record_to_health_event(agent: &str, record: &LedgerRecord) -> Option<HealthEvent> {
-    let at_rfc3339 = record.at.to_rfc3339();
+    let at_rfc3339 = record.at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let batch_id = record.batch_id().map(|id| id.to_string());
     let channel_id = record.channel_id().map(|id| id.to_string());
 
@@ -252,9 +327,23 @@ pub(crate) fn sync_ledger(
     Ok(inserted)
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct AgentHealthStore {
-    write_lock: Arc<Mutex<()>>,
+    pub(crate) write_lock: Arc<Mutex<()>>,
+    pub(crate) in_flight_syncs: Arc<Mutex<HashSet<String>>>,
+}
+
+pub(crate) struct InFlightGuard {
+    pub(crate) in_flight: Arc<Mutex<HashSet<String>>>,
+    pub(crate) key: String,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.in_flight.lock() {
+            set.remove(&self.key);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -298,12 +387,12 @@ struct SummaryAccumulator {
     turns: i64,
     failed: i64,
     parked: i64,
-    needs_review: i64,
     reconnects: i64,
     last_failure_class: Option<String>,
     last_failure_at: Option<i64>,
     latest_paused_until: Option<String>,
-    breaker_open: bool,
+    open_scopes: std::collections::HashSet<String>,
+    active_needs_review: std::collections::HashSet<String>,
 }
 
 fn row_to_health_event(row: &Row<'_>) -> rusqlite::Result<HealthEvent> {
@@ -319,9 +408,24 @@ fn row_to_health_event(row: &Row<'_>) -> rusqlite::Result<HealthEvent> {
     })
 }
 
-/// One `health_events` row projected down to the columns the summary
-/// grouping pass needs: agent, at, kind, class, payload.
-type SummaryRow = (String, i64, String, Option<String>, Option<String>);
+fn validate_since_hours(since_hours: Option<i64>, now: i64) -> Result<Option<i64>, String> {
+    const MAX_HOURS: i64 = 30 * 24;
+    match since_hours {
+        Some(hours) => {
+            if !(0..=MAX_HOURS).contains(&hours) {
+                return Err(format!(
+                    "since_hours must be between 0 and {MAX_HOURS}, got {hours}"
+                ));
+            }
+            let cutoff = hours
+                .checked_mul(3600)
+                .and_then(|secs| now.checked_sub(secs))
+                .ok_or_else(|| format!("cutoff timestamp overflow for since_hours: {hours}"))?;
+            Ok(Some(cutoff))
+        }
+        None => Ok(None),
+    }
+}
 
 /// Group `health_events` by agent (optionally windowed to the last
 /// `since_hours`) into the counters the Health tab and `buzz agents health`
@@ -335,76 +439,176 @@ pub(crate) fn query_agent_health_summary(
     since_hours: Option<i64>,
     now: i64,
 ) -> Result<Vec<AgentHealthCounters>, String> {
-    let rows: Vec<SummaryRow> = if let Some(hours) = since_hours {
-        let cutoff = now - hours * 3600;
-        let mut stmt = conn
-            .prepare(
-                "SELECT agent, at, kind, class, payload FROM health_events
-                     WHERE at >= ?1 ORDER BY agent ASC, at ASC",
-            )
-            .map_err(|e| format!("prepare agent-health summary query: {e}"))?;
-        let mapped = stmt
-            .query_map(params![cutoff], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })
-            .map_err(|e| format!("query agent-health summary: {e}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("read agent-health summary: {e}"))?;
-        mapped
+    let cutoff = validate_since_hours(since_hours, now)?;
+    let mut by_agent: BTreeMap<String, SummaryAccumulator> = BTreeMap::new();
+
+    // 1. Aggregated counters within window
+    let counters_sql = if cutoff.is_some() {
+        "SELECT agent,
+                SUM(CASE WHEN kind IN ('turn_finished', 'turn_failed') THEN 1 ELSE 0 END) AS turns,
+                SUM(CASE WHEN kind = 'turn_failed' THEN 1 ELSE 0 END) AS failed,
+                SUM(CASE WHEN kind = 'batch_parked' THEN 1 ELSE 0 END) AS parked,
+                SUM(CASE WHEN kind = 'relay_reconnected' THEN 1 ELSE 0 END) AS reconnects
+         FROM health_events
+         WHERE at >= ?1
+         GROUP BY agent
+         ORDER BY agent ASC"
     } else {
-        let mut stmt = conn
-            .prepare(
-                "SELECT agent, at, kind, class, payload FROM health_events
-                     ORDER BY agent ASC, at ASC",
-            )
-            .map_err(|e| format!("prepare agent-health summary query: {e}"))?;
-        let mapped = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })
-            .map_err(|e| format!("query agent-health summary: {e}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("read agent-health summary: {e}"))?;
-        mapped
+        "SELECT agent,
+                SUM(CASE WHEN kind IN ('turn_finished', 'turn_failed') THEN 1 ELSE 0 END) AS turns,
+                SUM(CASE WHEN kind = 'turn_failed' THEN 1 ELSE 0 END) AS failed,
+                SUM(CASE WHEN kind = 'batch_parked' THEN 1 ELSE 0 END) AS parked,
+                SUM(CASE WHEN kind = 'relay_reconnected' THEN 1 ELSE 0 END) AS reconnects
+         FROM health_events
+         GROUP BY agent
+         ORDER BY agent ASC"
     };
 
-    let mut by_agent: BTreeMap<String, SummaryAccumulator> = BTreeMap::new();
-    for (agent, at, kind, class, payload) in rows {
+    let mut stmt = conn
+        .prepare(counters_sql)
+        .map_err(|e| format!("prepare agent-health counters query: {e}"))?;
+
+    let map_row = |row: &Row<'_>| -> rusqlite::Result<(String, i64, i64, i64, i64)> {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+        ))
+    };
+
+    let counter_rows = if let Some(cutoff_val) = cutoff {
+        stmt.query_map(params![cutoff_val], map_row)
+    } else {
+        stmt.query_map([], map_row)
+    }
+    .map_err(|e| format!("query agent-health counters: {e}"))?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|e| format!("read agent-health counters: {e}"))?;
+
+    for (agent, turns, failed, parked, reconnects) in counter_rows {
+        let entry = by_agent.entry(agent).or_default();
+        entry.turns = turns;
+        entry.failed = failed;
+        entry.parked = parked;
+        entry.reconnects = reconnects;
+    }
+
+    // 2. Last failure within window
+    let failure_sql = if cutoff.is_some() {
+        "SELECT agent, at, class FROM health_events
+         WHERE kind = 'turn_failed' AND at >= ?1
+         ORDER BY agent ASC, at DESC"
+    } else {
+        "SELECT agent, at, class FROM health_events
+         WHERE kind = 'turn_failed'
+         ORDER BY agent ASC, at DESC"
+    };
+    let mut fail_stmt = conn
+        .prepare(failure_sql)
+        .map_err(|e| format!("prepare agent-health last failure query: {e}"))?;
+
+    let map_fail = |row: &Row<'_>| -> rusqlite::Result<(String, i64, Option<String>)> {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    };
+
+    let fail_rows = if let Some(cutoff_val) = cutoff {
+        fail_stmt.query_map(params![cutoff_val], map_fail)
+    } else {
+        fail_stmt.query_map([], map_fail)
+    }
+    .map_err(|e| format!("query agent-health last failure: {e}"))?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|e| format!("read agent-health last failure: {e}"))?;
+
+    for (agent, at, class) in fail_rows {
+        let entry = by_agent.entry(agent).or_default();
+        if entry.last_failure_at.is_none() {
+            entry.last_failure_at = Some(at);
+            entry.last_failure_class = class;
+        }
+    }
+
+    // 3. Unwindowed current-state scan across full 30-day retention
+    let state_cutoff = now - RETENTION_SECS;
+    let mut state_stmt = conn
+        .prepare(
+            "SELECT agent, at, kind, batch_id, payload FROM health_events
+             WHERE kind IN ('agent_paused', 'agent_resumed', 'breaker_opened', 'breaker_closed', 'batch_needs_review', 'batch_replayed', 'batch_discarded')
+               AND at >= ?1
+             ORDER BY agent ASC, at ASC",
+        )
+        .map_err(|e| format!("prepare agent-health state query: {e}"))?;
+
+    let state_rows = state_stmt
+        .query_map(params![state_cutoff], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })
+        .map_err(|e| format!("query agent-health state: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read agent-health state: {e}"))?;
+
+    for (agent, at, kind, batch_id, payload) in state_rows {
         let entry = by_agent.entry(agent).or_default();
         match kind.as_str() {
-            "turn_finished" => entry.turns += 1,
-            "turn_failed" => {
-                entry.turns += 1;
-                entry.failed += 1;
-                entry.last_failure_class = class;
-                entry.last_failure_at = Some(at);
-            }
-            "batch_parked" => entry.parked += 1,
-            "batch_needs_review" => entry.needs_review += 1,
-            "relay_reconnected" => entry.reconnects += 1,
-            "agent_paused" => {
-                let until = payload
-                    .as_deref()
-                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-                    .and_then(|v| v.get("until").and_then(|u| u.as_str()).map(str::to_string));
-                if until.is_some() {
-                    entry.latest_paused_until = until;
+            "batch_needs_review" => {
+                let in_window = cutoff.map(|c| at >= c).unwrap_or(true);
+                if in_window {
+                    let bid = batch_id.unwrap_or_else(|| format!("anon_{at}"));
+                    entry.active_needs_review.insert(bid);
                 }
             }
-            "breaker_opened" => entry.breaker_open = true,
-            "breaker_closed" => entry.breaker_open = false,
+            "batch_replayed" | "batch_discarded" => {
+                if let Some(bid) = batch_id {
+                    entry.active_needs_review.remove(&bid);
+                }
+            }
+            "agent_paused" => match payload.as_deref() {
+                None => {}
+                Some(raw) => match serde_json::from_str::<serde_json::Value>(raw) {
+                    Ok(v) => {
+                        if let Some(until) =
+                            v.get("until").and_then(|u| u.as_str()).map(str::to_string)
+                        {
+                            entry.latest_paused_until = Some(until);
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("buzz-desktop: corrupted payload in agent_paused event: {err}");
+                        entry.latest_paused_until = Some("degraded: malformed payload".to_string());
+                    }
+                },
+            },
+            "agent_resumed" => {
+                entry.latest_paused_until = None;
+            }
+            "breaker_opened" => {
+                let scope = payload
+                    .as_deref()
+                    .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+                    .and_then(|v| v.get("scope").and_then(|s| s.as_str()).map(str::to_string))
+                    .unwrap_or_default();
+                entry.open_scopes.insert(scope);
+            }
+            "breaker_closed" => {
+                let scope = payload
+                    .as_deref()
+                    .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+                    .and_then(|v| v.get("scope").and_then(|s| s.as_str()).map(str::to_string))
+                    .unwrap_or_default();
+                entry.open_scopes.remove(&scope);
+            }
             _ => {}
         }
     }
@@ -416,12 +620,12 @@ pub(crate) fn query_agent_health_summary(
             turns: a.turns,
             failed: a.failed,
             parked: a.parked,
-            needs_review: a.needs_review,
+            needs_review: a.active_needs_review.len() as i64,
             reconnects: a.reconnects,
             last_failure_class: a.last_failure_class,
             last_failure_at: a.last_failure_at,
             latest_paused_until: a.latest_paused_until,
-            breaker_open: a.breaker_open,
+            breaker_open: !a.open_scopes.is_empty(),
         })
         .collect())
 }
@@ -440,65 +644,148 @@ pub(crate) fn query_agent_health_events(
 ) -> Result<Vec<HealthEvent>, String> {
     const HARD_CAP: usize = 200;
     let effective_limit = limit.unwrap_or(HARD_CAP).min(HARD_CAP);
+    let cutoff = validate_since_hours(since_hours, now)?;
 
-    let events: Vec<HealthEvent> = if let Some(hours) = since_hours {
-        let cutoff = now - hours * 3600;
-        let mut stmt = conn
-            .prepare(
-                "SELECT agent, at, kind, event_key, batch_id, channel_id, class, payload
-                 FROM health_events WHERE agent = ?1 AND at >= ?2 ORDER BY at DESC",
-            )
-            .map_err(|e| format!("prepare agent-health events query: {e}"))?;
-        let mapped = stmt
-            .query_map(params![agent, cutoff], row_to_health_event)
-            .map_err(|e| format!("query agent-health events: {e}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("read agent-health events: {e}"))?;
-        mapped
-    } else {
-        let mut stmt = conn
-            .prepare(
-                "SELECT agent, at, kind, event_key, batch_id, channel_id, class, payload
-                 FROM health_events WHERE agent = ?1 ORDER BY at DESC",
-            )
-            .map_err(|e| format!("prepare agent-health events query: {e}"))?;
-        let mapped = stmt
-            .query_map(params![agent], row_to_health_event)
-            .map_err(|e| format!("query agent-health events: {e}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("read agent-health events: {e}"))?;
-        mapped
-    };
+    if let Some(ks) = kinds {
+        if ks.is_empty() {
+            return Ok(Vec::new());
+        }
+    }
 
-    Ok(events
-        .into_iter()
-        .filter(|event| {
-            kinds
-                .map(|ks| ks.iter().any(|k| k == &event.kind))
-                .unwrap_or(true)
-        })
-        .take(effective_limit)
-        .collect())
+    let mut sql = String::from(
+        "SELECT agent, at, kind, event_key, batch_id, channel_id, class, payload
+         FROM health_events WHERE agent = ?1",
+    );
+    let mut params_vec: Vec<rusqlite::types::Value> = vec![agent.to_string().into()];
+
+    if let Some(ks) = kinds {
+        let placeholders = (0..ks.len())
+            .map(|i| format!("?{}", params_vec.len() + 1 + i))
+            .collect::<Vec<_>>()
+            .join(", ");
+        sql.push_str(&format!(" AND kind IN ({placeholders})"));
+        for k in ks {
+            params_vec.push(k.to_string().into());
+        }
+    }
+
+    if let Some(cutoff_val) = cutoff {
+        let param_idx = params_vec.len() + 1;
+        sql.push_str(&format!(" AND at >= ?{param_idx}"));
+        params_vec.push(cutoff_val.into());
+    }
+
+    let limit_param_idx = params_vec.len() + 1;
+    sql.push_str(&format!(" ORDER BY at DESC LIMIT ?{limit_param_idx}"));
+    params_vec.push((effective_limit as i64).into());
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("prepare agent-health events query: {e}"))?;
+
+    let mapped = stmt
+        .query_map(params_from_iter(params_vec), row_to_health_event)
+        .map_err(|e| format!("query agent-health events: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read agent-health events: {e}"))?;
+
+    Ok(mapped)
+}
+
+pub(crate) const KNOWN_HEALTH_FRAME_KINDS: &[&str] = &[
+    "turn_failed",
+    "batch_parked",
+    "batch_replayed",
+    "batch_needs_review",
+    "agent_paused",
+    "agent_resumed",
+    "breaker_opened",
+    "breaker_closed",
+    "relay_reconnected",
+];
+
+pub(crate) const MAX_CLASS_CHARS: usize = 256;
+pub(crate) const MAX_BATCH_ID_CHARS: usize = 128;
+pub(crate) const MAX_CHANNEL_ID_CHARS: usize = 128;
+
+pub(crate) fn validate_hex64(agent: &str) -> Result<(), String> {
+    if agent.len() != 64 || !agent.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "agent must be a 64-character hex string, got {agent:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `agent` may have local state created for it: a correctly shaped
+/// hex64 id that is also a member of this machine's managed-agent roster.
+/// `managed_agent_state_dir` unconditionally `create_dir_all`s its target —
+/// every call site that takes an `agent` string from a Tauri command
+/// argument (a real trust boundary) must gate on this first, never on hex64
+/// format alone, so an unrecognized or remote-only id never mints a fresh
+/// empty state directory on disk.
+pub(crate) fn agent_may_have_local_state(known: &[ManagedAgentRecord], agent: &str) -> bool {
+    validate_hex64(agent).is_ok() && known.iter().any(|record| record.pubkey == agent)
 }
 
 /// Shape of a frame delivered by `ingest_agent_health_frame`: what
 /// `parseHealthFrame` (desktop TS, Step 7) hands over after mirroring one of
 /// the nine observer health frames. `at` is RFC3339, matching the ledger.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
-struct HealthFrame {
-    at: String,
-    kind: String,
-    batch_id: Option<String>,
-    channel_id: Option<String>,
-    class: Option<String>,
-    payload: Option<serde_json::Value>,
+pub(crate) struct HealthFrame {
+    pub at: String,
+    pub kind: String,
+    pub batch_id: Option<String>,
+    pub channel_id: Option<String>,
+    pub class: Option<String>,
+    pub payload: Option<serde_json::Value>,
 }
 
-fn frame_to_health_event(agent: &str, frame: &HealthFrame) -> Result<HealthEvent, String> {
-    let at = chrono::DateTime::parse_from_rfc3339(&frame.at)
-        .map_err(|e| format!("invalid agent-health frame timestamp {:?}: {e}", frame.at))?
-        .timestamp();
+pub(crate) fn frame_to_health_event(
+    agent: &str,
+    frame: &HealthFrame,
+) -> Result<HealthEvent, String> {
+    if !KNOWN_HEALTH_FRAME_KINDS.contains(&frame.kind.as_str()) {
+        return Err(format!("unknown health frame kind: {:?}", frame.kind));
+    }
+    if let Some(c) = &frame.class {
+        if c.chars().count() > MAX_CLASS_CHARS {
+            return Err(format!("class string exceeds {MAX_CLASS_CHARS} characters"));
+        }
+    }
+    if let Some(b) = &frame.batch_id {
+        if b.chars().count() > MAX_BATCH_ID_CHARS {
+            return Err(format!(
+                "batch_id string exceeds {MAX_BATCH_ID_CHARS} characters"
+            ));
+        }
+    }
+    if let Some(ch) = &frame.channel_id {
+        if ch.chars().count() > MAX_CHANNEL_ID_CHARS {
+            return Err(format!(
+                "channel_id string exceeds {MAX_CHANNEL_ID_CHARS} characters"
+            ));
+        }
+    }
+
+    let parsed_dt = chrono::DateTime::parse_from_rfc3339(&frame.at)
+        .map_err(|e| format!("invalid agent-health frame timestamp {:?}: {e}", frame.at))?;
+    let parsed_utc = parsed_dt.with_timezone(&chrono::Utc);
+
+    let now = chrono::Utc::now();
+    let max_future = now + chrono::Duration::minutes(5);
+    if parsed_utc > max_future {
+        return Err(format!(
+            "frame timestamp {:?} is more than 5 minutes in the future",
+            frame.at
+        ));
+    }
+
+    let at = parsed_utc.timestamp();
+    let at_rfc3339 = parsed_utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
     let target = frame.batch_id.clone().or_else(|| {
         frame
             .payload
@@ -511,7 +798,7 @@ fn frame_to_health_event(agent: &str, frame: &HealthFrame) -> Result<HealthEvent
         agent: agent.to_string(),
         at,
         kind: frame.kind.clone(),
-        event_key: compute_event_key(&frame.at, &frame.kind, target.as_deref()),
+        event_key: compute_event_key(&at_rfc3339, &frame.kind, target.as_deref()),
         batch_id: frame.batch_id.clone(),
         channel_id: frame.channel_id.clone(),
         class: frame.class.clone(),
@@ -599,17 +886,24 @@ pub(crate) fn record_alerts(
     if alerts.is_empty() {
         return Ok(());
     }
-    let mut stmt = conn
-        .prepare(
-            "INSERT INTO alert_state (agent, rule, last_fired_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(agent, rule) DO UPDATE SET last_fired_at = excluded.last_fired_at",
-        )
-        .map_err(|e| format!("prepare insert alert_state: {e}"))?;
-    for alert in alerts {
-        stmt.execute(params![alert.agent, alert.rule, now])
-            .map_err(|e| format!("record alert_state: {e}"))?;
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("begin transaction for record_alerts: {e}"))?;
+    {
+        let mut stmt = tx
+            .prepare(
+                "INSERT INTO alert_state (agent, rule, last_fired_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(agent, rule) DO UPDATE SET last_fired_at = excluded.last_fired_at",
+            )
+            .map_err(|e| format!("prepare insert alert_state: {e}"))?;
+        for alert in alerts {
+            stmt.execute(params![alert.agent, alert.rule, now])
+                .map_err(|e| format!("record alert_state: {e}"))?;
+        }
     }
+    tx.commit()
+        .map_err(|e| format!("commit alert_state: {e}"))?;
     Ok(())
 }
 
@@ -618,10 +912,51 @@ pub(crate) fn record_alerts(
 pub struct HealthIngestResult {
     pub inserted: usize,
     pub alerts: Vec<crate::agent_health_alerts::Alert>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<(String, String)>,
 }
 
 #[allow(dead_code)]
 pub type IngestResult = HealthIngestResult;
+
+pub(crate) fn sanitize_last_error(raw: &str) -> String {
+    let redacted = crate::managed_agents::redact_secrets_with(raw, &[]);
+    buzz_acp_pkg::reliability::error_class::truncate_chars(
+        &redacted,
+        buzz_acp_pkg::reliability::ledger::MAX_RAW_CHARS,
+    )
+}
+
+/// Local agent records to sync, plus `(agent, error)` pairs for agents whose
+/// own state could not be read.
+pub(crate) type ManagedAgentsForSync = (Vec<ManagedAgentRecord>, Vec<(String, String)>);
+
+/// What to do with a `load_managed_agents` result inside `sync_agent_health`:
+/// a full-sync call (`targeted_agent: None`) has no other source of truth for
+/// which agents exist, so a broken store is a hard error; a single-agent sync
+/// already has its target and can proceed with an empty roster, recording the
+/// failure instead of pretending the store came back clean. Factored out of
+/// `sync_agent_health` (which needs a real `AppHandle` and cannot be unit
+/// tested directly) so this decision has its own binding test.
+pub(crate) fn resolve_managed_agents_for_sync(
+    load_result: Result<Vec<ManagedAgentRecord>, String>,
+    targeted_agent: Option<&str>,
+) -> Result<ManagedAgentsForSync, String> {
+    match load_result {
+        Ok(agents) => Ok((agents, Vec::new())),
+        Err(e) => {
+            if targeted_agent.is_none() {
+                Err(format!("load managed agents: {e}"))
+            } else {
+                let agent_id = targeted_agent.unwrap_or("all");
+                Ok((
+                    Vec::new(),
+                    vec![(agent_id.to_string(), format!("load managed agents: {e}"))],
+                ))
+            }
+        }
+    }
+}
 
 /// Sync one agent's ledger (or, when `agent` is `None`, every local agent
 /// from `load_managed_agents`) into the health store. A remote-owned agent
@@ -639,7 +974,8 @@ pub(crate) async fn sync_agent_health(
         let _guard = write_lock.lock().map_err(|e| e.to_string())?;
         let conn = open_db(&db_path(&app)?)?;
 
-        let managed_agents = load_managed_agents(&app).unwrap_or_default();
+        let (managed_agents, mut errors) =
+            resolve_managed_agents_for_sync(load_managed_agents(&app), agent.as_deref())?;
         let pubkeys: Vec<String> = match agent {
             Some(pubkey) => vec![pubkey],
             None => managed_agents
@@ -655,18 +991,35 @@ pub(crate) async fn sync_agent_health(
         let now_ts = now_dt.timestamp();
 
         for pubkey in &pubkeys {
+            // `managed_agent_state_dir` unconditionally `create_dir_all`s its
+            // target, so it must never run for an id this machine doesn't
+            // actually manage locally — a single-agent sync request can name
+            // any string, and a remote-owned agent legitimately has no local
+            // state to read. Skip it exactly like "no local ledger yet",
+            // without minting a state directory for it.
+            if !agent_may_have_local_state(&managed_agents, pubkey) {
+                continue;
+            }
             let state_dir = managed_agent_state_dir(&app, pubkey);
             if let Ok(dir) = &state_dir {
-                if let Ok(mut batches) = read_parked_batches(dir) {
-                    for b in &mut batches {
-                        b.agent = Some(pubkey.clone());
+                match read_parked_batches(dir) {
+                    Ok(mut batches) => {
+                        for b in &mut batches {
+                            b.agent = Some(pubkey.clone());
+                        }
+                        all_parked.extend(batches);
                     }
-                    all_parked.extend(batches);
+                    Err(e) => {
+                        errors.push((pubkey.clone(), e));
+                    }
                 }
 
                 let ledger_path = dir.join(LEDGER_FILE);
                 if ledger_path.exists() {
-                    inserted += sync_ledger(&conn, pubkey, &ledger_path)?;
+                    match sync_ledger(&conn, pubkey, &ledger_path) {
+                        Ok(c) => inserted += c,
+                        Err(e) => errors.push((pubkey.clone(), e)),
+                    }
                 }
             }
 
@@ -682,6 +1035,13 @@ pub(crate) async fn sync_agent_health(
                     .or_else(|| record.last_exit_code.map(|c| c as i64));
                 if let Some(c) = code {
                     if c != 0 || record.last_error.is_some() {
+                        let sanitized_error = record.last_error.as_deref().map(sanitize_last_error);
+                        let class_name = sanitized_error.as_deref().map(|e| {
+                            buzz_acp_pkg::reliability::error_class::truncate_chars(
+                                e,
+                                buzz_acp_pkg::reliability::ledger::MAX_LABEL_CHARS,
+                            )
+                        });
                         all_events.push(HealthEvent {
                             agent: pubkey.clone(),
                             at: now_ts,
@@ -693,11 +1053,11 @@ pub(crate) async fn sync_agent_health(
                             ),
                             batch_id: None,
                             channel_id: None,
-                            class: record.last_error.clone(),
+                            class: class_name,
                             payload: Some(
                                 serde_json::json!({
                                     "code": c,
-                                    "lastError": record.last_error,
+                                    "lastError": sanitized_error,
                                 })
                                 .to_string(),
                             ),
@@ -710,9 +1070,12 @@ pub(crate) async fn sync_agent_health(
         let last_fired = load_alert_state(&conn)?;
         let alerts =
             crate::agent_health_alerts::evaluate(&all_events, &all_parked, now_dt, &last_fired);
-        record_alerts(&conn, &alerts, now_ts)?;
 
-        Ok(HealthIngestResult { inserted, alerts })
+        Ok(HealthIngestResult {
+            inserted,
+            alerts,
+            errors,
+        })
     })
     .await
 }
@@ -722,17 +1085,33 @@ pub(crate) async fn sync_agent_health(
 /// Spawns onto Tauri's async runtime so callers in synchronous command or setup
 /// contexts do not block. If `pubkey` is empty, syncs all local agents.
 pub(crate) fn sync_for_agent(app: &AppHandle, pubkey: &str) {
+    let store = app.state::<AgentHealthStore>();
+    let in_flight = Arc::clone(&store.in_flight_syncs);
+    let key = pubkey.to_string();
+    {
+        let mut set = match in_flight.lock() {
+            Ok(s) => s,
+            Err(p) => p.into_inner(),
+        };
+        if !set.insert(key.clone()) {
+            return;
+        }
+    }
+    let guard = InFlightGuard {
+        in_flight,
+        key: key.clone(),
+    };
     let app_handle = app.clone();
-    let pubkey_str = pubkey.to_string();
     tauri::async_runtime::spawn(async move {
+        let _guard = guard;
         let store = app_handle.state::<AgentHealthStore>();
-        let agent_arg = if pubkey_str.is_empty() {
+        let agent_arg = if key.is_empty() {
             None
         } else {
-            Some(pubkey_str.clone())
+            Some(key.clone())
         };
         if let Err(e) = sync_agent_health(agent_arg, app_handle.clone(), store).await {
-            eprintln!("buzz-desktop: agent_health sync failed for {pubkey_str}: {e}");
+            eprintln!("buzz-desktop: agent_health sync failed for {key}: {e}");
         }
     });
 }
@@ -748,6 +1127,7 @@ pub(crate) async fn ingest_agent_health_frame(
     app: AppHandle,
     store: State<'_, AgentHealthStore>,
 ) -> Result<HealthIngestResult, String> {
+    validate_hex64(&agent)?;
     let health_frame: HealthFrame =
         serde_json::from_value(frame).map_err(|e| format!("parse agent-health frame: {e}"))?;
     let event = frame_to_health_event(&agent, &health_frame)?;
@@ -761,10 +1141,20 @@ pub(crate) async fn ingest_agent_health_frame(
         let now_dt = chrono::Utc::now();
         let last_fired = load_alert_state(&conn)?;
 
-        let mut parked = managed_agent_state_dir(&app, &agent)
-            .ok()
-            .and_then(|d| read_parked_batches(&d).ok())
-            .unwrap_or_default();
+        // Only a locally managed agent gets a state-dir lookup:
+        // `managed_agent_state_dir` unconditionally `create_dir_all`s its
+        // target, so an unrecognized (or unloadable-roster) agent id must
+        // fall back to "no local ledger" rather than minting a fresh empty
+        // state directory for whatever id this live frame carried.
+        let mut parked = match load_managed_agents(&app) {
+            Ok(known) if agent_may_have_local_state(&known, &agent) => {
+                match managed_agent_state_dir(&app, &agent) {
+                    Ok(d) => read_parked_batches(&d)?,
+                    Err(_) => Vec::new(),
+                }
+            }
+            _ => Vec::new(),
+        };
         for b in &mut parked {
             b.agent = Some(agent.clone());
         }
@@ -775,12 +1165,31 @@ pub(crate) async fn ingest_agent_health_frame(
             now_dt,
             &last_fired,
         );
-        record_alerts(&conn, &alerts, now_dt.timestamp())?;
 
         Ok(HealthIngestResult {
             inserted: if inserted { 1 } else { 0 },
             alerts,
+            errors: Vec::new(),
         })
+    })
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn record_delivered_alerts(
+    alerts: Vec<crate::agent_health_alerts::Alert>,
+    app: AppHandle,
+    store: State<'_, AgentHealthStore>,
+) -> Result<(), String> {
+    if alerts.is_empty() {
+        return Ok(());
+    }
+    let write_lock = Arc::clone(&store.write_lock);
+    blocking::run(move |_proof| {
+        let _guard = write_lock.lock().map_err(|e| e.to_string())?;
+        let conn = open_db(&db_path(&app)?)?;
+        let now = chrono::Utc::now().timestamp();
+        record_alerts(&conn, &alerts, now)
     })
     .await
 }
@@ -801,12 +1210,26 @@ pub struct ParkedBatchView {
 }
 
 pub(crate) fn read_parked_batches(dir: &Path) -> Result<Vec<ParkedBatchView>, String> {
-    let park_file = buzz_acp_pkg::reliability::park::ParkFile::open(dir)
-        .map_err(|e| format!("open agent park file: {e}"))?;
-    Ok(park_file
-        .batches()
-        .iter()
-        .map(|batch| ParkedBatchView {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let park_path = dir.join(buzz_acp_pkg::reliability::park::PARK_FILE);
+    if !park_path.exists() {
+        return Ok(Vec::new());
+    }
+    let file = std::fs::File::open(&park_path).map_err(|e| format!("open agent park file: {e}"))?;
+    use std::io::BufRead;
+    let reader = std::io::BufReader::new(file);
+    let mut views = Vec::new();
+    for (line_idx, line_res) in reader.lines().enumerate() {
+        let line = line_res.map_err(|e| format!("read park file line {line_idx}: {e}"))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let batch: buzz_acp_pkg::reliability::park::ParkedBatch = serde_json::from_str(trimmed)
+            .map_err(|e| format!("parse park file line {line_idx}: {e}"))?;
+        views.push(ParkedBatchView {
             agent: None,
             batch_id: batch.batch_id.to_string(),
             channel_id: batch.channel_id.to_string(),
@@ -820,8 +1243,9 @@ pub(crate) fn read_parked_batches(dir: &Path) -> Result<Vec<ParkedBatchView>, St
                 .first()
                 .map(|e| e.excerpt())
                 .unwrap_or_default(),
-        })
-        .collect())
+        });
+    }
+    Ok(views)
 }
 
 #[tauri::command]
@@ -830,6 +1254,10 @@ pub(crate) async fn get_parked_batches(
     app: AppHandle,
 ) -> Result<Vec<ParkedBatchView>, String> {
     blocking::run(move |_proof| {
+        let known = load_managed_agents(&app)?;
+        if !agent_may_have_local_state(&known, &agent) {
+            return Err(format!("agent {agent} is not a locally managed agent"));
+        }
         let dir = managed_agent_state_dir(&app, &agent)?;
         let mut batches = read_parked_batches(&dir)?;
         for b in &mut batches {
@@ -841,672 +1269,5 @@ pub(crate) async fn get_parked_batches(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use buzz_acp_pkg::reliability::ledger::{AgentPaused, BatchParked, Ledger, TurnStarted};
-    use chrono::Utc;
-    use uuid::Uuid;
-
-    fn db() -> (tempfile::TempDir, Connection) {
-        let dir = tempfile::tempdir().unwrap();
-        let conn = open_db(&dir.path().join("agent-health.db")).unwrap();
-        (dir, conn)
-    }
-
-    #[test]
-    fn insert_ignores_duplicate_event_key() {
-        let (_d, conn) = db();
-        let event = HealthEvent {
-            agent: "agent_alpha".to_string(),
-            at: 1700000000,
-            kind: "turn_finished".to_string(),
-            event_key: compute_event_key("2026-09-06T15:00:00Z", "turn_finished", Some("batch-1")),
-            batch_id: Some("batch-1".to_string()),
-            channel_id: Some("channel-1".to_string()),
-            class: Some("provider_error".to_string()),
-            payload: Some("{\"result\":\"error\"}".to_string()),
-        };
-
-        let first = insert_event(&conn, &event).unwrap();
-        assert!(first, "first insert must succeed");
-
-        let second = insert_event(&conn, &event).unwrap();
-        assert!(!second, "duplicate (agent, event_key) must be ignored");
-
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM health_events WHERE agent = ?1",
-                [&event.agent],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 1, "only one row should exist after duplicate insert");
-    }
-
-    #[test]
-    fn retention_prunes_older_than_30_days() {
-        let (_d, conn) = db();
-        let now = 1_725_600_000i64;
-        let cutoff = now - RETENTION_SECS;
-
-        let old_event = HealthEvent {
-            agent: "agent_alpha".to_string(),
-            at: cutoff - 1,
-            kind: "turn_finished".to_string(),
-            event_key: "old_event_key".to_string(),
-            batch_id: Some("b-old".to_string()),
-            channel_id: None,
-            class: None,
-            payload: None,
-        };
-
-        let boundary_event = HealthEvent {
-            agent: "agent_alpha".to_string(),
-            at: cutoff,
-            kind: "turn_finished".to_string(),
-            event_key: "boundary_event_key".to_string(),
-            batch_id: Some("b-boundary".to_string()),
-            channel_id: None,
-            class: None,
-            payload: None,
-        };
-
-        let recent_event = HealthEvent {
-            agent: "agent_alpha".to_string(),
-            at: now - 3600,
-            kind: "turn_finished".to_string(),
-            event_key: "recent_event_key".to_string(),
-            batch_id: Some("b-recent".to_string()),
-            channel_id: None,
-            class: None,
-            payload: None,
-        };
-
-        assert!(insert_event(&conn, &old_event).unwrap());
-        assert!(insert_event(&conn, &boundary_event).unwrap());
-        assert!(insert_event(&conn, &recent_event).unwrap());
-
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM health_events", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 3);
-
-        let pruned = prune(&conn, now).unwrap();
-        assert_eq!(pruned, 1, "exactly 1 old event should be pruned");
-
-        let count_after: i64 = conn
-            .query_row("SELECT COUNT(*) FROM health_events", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count_after, 2, "2 events should remain");
-    }
-
-    #[test]
-    fn sync_is_idempotent_and_inserts_only_missing_records() {
-        let (_d, conn) = db();
-        let ledger_dir = tempfile::tempdir().unwrap();
-        let now = Utc::now();
-        let mut ledger = Ledger::open(ledger_dir.path(), "agent_alpha", now).unwrap();
-
-        let batch_id = Uuid::new_v4();
-        let channel_id = Uuid::new_v4();
-        ledger
-            .append(
-                now,
-                LedgerBody::TurnStarted(TurnStarted::new(
-                    batch_id,
-                    channel_id,
-                    "scope-1",
-                    vec!["event-1".to_string()],
-                    1,
-                )),
-            )
-            .unwrap();
-        ledger
-            .append(
-                now,
-                LedgerBody::BatchParked(BatchParked {
-                    batch_id,
-                    channel_id,
-                    reason: "retries_exhausted".to_string(),
-                    started: true,
-                    events: 3,
-                }),
-            )
-            .unwrap();
-        ledger
-            .append(
-                now,
-                LedgerBody::AgentPaused(AgentPaused {
-                    class: "capacity_exhausted".to_string(),
-                    until: now,
-                    waiting: 2,
-                }),
-            )
-            .unwrap();
-
-        let ledger_path = ledger.path().to_path_buf();
-
-        let first = sync_ledger(&conn, "agent_alpha", &ledger_path).unwrap();
-        assert_eq!(first, 3, "all three ledger records must be inserted once");
-
-        let second = sync_ledger(&conn, "agent_alpha", &ledger_path).unwrap();
-        assert_eq!(second, 0, "a repeat sync must insert nothing new");
-
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM health_events", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 3, "row count must not double after a second sync");
-    }
-
-    #[test]
-    fn summary_counts_per_agent_within_window() {
-        let (_d, conn) = db();
-        let now = 1_725_600_000i64;
-        let window_hours = 24;
-        let cutoff = now - window_hours * 3600;
-
-        // agent_1 events within window
-        insert_event(
-            &conn,
-            &HealthEvent {
-                agent: "agent_1".to_string(),
-                at: now - 1000,
-                kind: "turn_finished".to_string(),
-                event_key: "k1".to_string(),
-                batch_id: Some("b1".to_string()),
-                channel_id: Some("c1".to_string()),
-                class: None,
-                payload: Some(r#"{"result":"ok"}"#.to_string()),
-            },
-        )
-        .unwrap();
-
-        insert_event(
-            &conn,
-            &HealthEvent {
-                agent: "agent_1".to_string(),
-                at: now - 2000,
-                kind: "turn_finished".to_string(),
-                event_key: "k2".to_string(),
-                batch_id: Some("b2".to_string()),
-                channel_id: Some("c1".to_string()),
-                class: None,
-                payload: Some(r#"{"result":"ok"}"#.to_string()),
-            },
-        )
-        .unwrap();
-
-        insert_event(
-            &conn,
-            &HealthEvent {
-                agent: "agent_1".to_string(),
-                at: now - 3000,
-                kind: "turn_failed".to_string(),
-                event_key: "k3".to_string(),
-                batch_id: Some("b3".to_string()),
-                channel_id: Some("c1".to_string()),
-                class: Some("capacity_exhausted".to_string()),
-                payload: Some(r#"{"result":"error","class":"capacity_exhausted"}"#.to_string()),
-            },
-        )
-        .unwrap();
-
-        insert_event(
-            &conn,
-            &HealthEvent {
-                agent: "agent_1".to_string(),
-                at: now - 4000,
-                kind: "batch_parked".to_string(),
-                event_key: "k4".to_string(),
-                batch_id: Some("b4".to_string()),
-                channel_id: Some("c1".to_string()),
-                class: None,
-                payload: Some(r#"{"reason":"retries_exhausted"}"#.to_string()),
-            },
-        )
-        .unwrap();
-
-        insert_event(
-            &conn,
-            &HealthEvent {
-                agent: "agent_1".to_string(),
-                at: now - 5000,
-                kind: "batch_needs_review".to_string(),
-                event_key: "k5".to_string(),
-                batch_id: Some("b5".to_string()),
-                channel_id: Some("c1".to_string()),
-                class: None,
-                payload: Some(r#"{"reason":"manual_intervention"}"#.to_string()),
-            },
-        )
-        .unwrap();
-
-        insert_event(
-            &conn,
-            &HealthEvent {
-                agent: "agent_1".to_string(),
-                at: now - 6000,
-                kind: "relay_reconnected".to_string(),
-                event_key: "k6".to_string(),
-                batch_id: None,
-                channel_id: None,
-                class: None,
-                payload: Some(r#"{"afterSecs":5}"#.to_string()),
-            },
-        )
-        .unwrap();
-
-        insert_event(
-            &conn,
-            &HealthEvent {
-                agent: "agent_1".to_string(),
-                at: now - 7000,
-                kind: "agent_paused".to_string(),
-                event_key: "k7".to_string(),
-                batch_id: None,
-                channel_id: None,
-                class: Some("capacity_exhausted".to_string()),
-                payload: Some(
-                    r#"{"class":"capacity_exhausted","until":"2026-09-07T00:00:00Z","waiting":2}"#
-                        .to_string(),
-                ),
-            },
-        )
-        .unwrap();
-
-        insert_event(
-            &conn,
-            &HealthEvent {
-                agent: "agent_1".to_string(),
-                at: now - 8000,
-                kind: "breaker_opened".to_string(),
-                event_key: "k8".to_string(),
-                batch_id: None,
-                channel_id: None,
-                class: None,
-                payload: Some(r#"{"scope":"scope1","consecutive":3}"#.to_string()),
-            },
-        )
-        .unwrap();
-
-        // agent_1 events OUTSIDE the window (older than 24 hours)
-        insert_event(
-            &conn,
-            &HealthEvent {
-                agent: "agent_1".to_string(),
-                at: cutoff - 100,
-                kind: "turn_finished".to_string(),
-                event_key: "old_k1".to_string(),
-                batch_id: Some("old_b1".to_string()),
-                channel_id: Some("c1".to_string()),
-                class: None,
-                payload: Some(r#"{"result":"ok"}"#.to_string()),
-            },
-        )
-        .unwrap();
-
-        insert_event(
-            &conn,
-            &HealthEvent {
-                agent: "agent_1".to_string(),
-                at: cutoff - 200,
-                kind: "turn_failed".to_string(),
-                event_key: "old_k2".to_string(),
-                batch_id: Some("old_b2".to_string()),
-                channel_id: Some("c1".to_string()),
-                class: Some("old_class".to_string()),
-                payload: Some(r#"{"result":"error"}"#.to_string()),
-            },
-        )
-        .unwrap();
-
-        insert_event(
-            &conn,
-            &HealthEvent {
-                agent: "agent_1".to_string(),
-                at: cutoff - 300,
-                kind: "batch_parked".to_string(),
-                event_key: "old_k3".to_string(),
-                batch_id: Some("old_b3".to_string()),
-                channel_id: None,
-                class: None,
-                payload: None,
-            },
-        )
-        .unwrap();
-
-        insert_event(
-            &conn,
-            &HealthEvent {
-                agent: "agent_1".to_string(),
-                at: cutoff - 400,
-                kind: "batch_needs_review".to_string(),
-                event_key: "old_k4".to_string(),
-                batch_id: Some("old_b4".to_string()),
-                channel_id: None,
-                class: None,
-                payload: None,
-            },
-        )
-        .unwrap();
-
-        insert_event(
-            &conn,
-            &HealthEvent {
-                agent: "agent_1".to_string(),
-                at: cutoff - 500,
-                kind: "relay_reconnected".to_string(),
-                event_key: "old_k5".to_string(),
-                batch_id: None,
-                channel_id: None,
-                class: None,
-                payload: None,
-            },
-        )
-        .unwrap();
-
-        // agent_2 within window: breaker opened and closed (breaker not open)
-        insert_event(
-            &conn,
-            &HealthEvent {
-                agent: "agent_2".to_string(),
-                at: now - 3000,
-                kind: "turn_finished".to_string(),
-                event_key: "a2_k1".to_string(),
-                batch_id: Some("a2_b1".to_string()),
-                channel_id: None,
-                class: None,
-                payload: None,
-            },
-        )
-        .unwrap();
-
-        insert_event(
-            &conn,
-            &HealthEvent {
-                agent: "agent_2".to_string(),
-                at: now - 2000,
-                kind: "breaker_opened".to_string(),
-                event_key: "a2_k2".to_string(),
-                batch_id: None,
-                channel_id: None,
-                class: None,
-                payload: Some(r#"{"scope":"scope2"}"#.to_string()),
-            },
-        )
-        .unwrap();
-
-        insert_event(
-            &conn,
-            &HealthEvent {
-                agent: "agent_2".to_string(),
-                at: now - 1000,
-                kind: "breaker_closed".to_string(),
-                event_key: "a2_k3".to_string(),
-                batch_id: None,
-                channel_id: None,
-                class: None,
-                payload: Some(r#"{"scope":"scope2"}"#.to_string()),
-            },
-        )
-        .unwrap();
-
-        let summaries = query_agent_health_summary(&conn, Some(window_hours), now).unwrap();
-        assert_eq!(summaries.len(), 2);
-
-        let a1 = summaries.iter().find(|s| s.agent == "agent_1").unwrap();
-        assert_eq!(a1.turns, 3, "turns within window must be 3 (b1, b2, b3)");
-        assert_eq!(a1.failed, 1, "failed turns within window must be 1 (b3)");
-        assert_eq!(a1.parked, 1, "parked within window must be 1 (b4)");
-        assert_eq!(
-            a1.needs_review, 1,
-            "needs_review within window must be 1 (b5)"
-        );
-        assert_eq!(a1.reconnects, 1, "reconnects within window must be 1");
-        assert_eq!(a1.last_failure_class.as_deref(), Some("capacity_exhausted"));
-        assert_eq!(a1.last_failure_at, Some(now - 3000));
-        assert_eq!(
-            a1.latest_paused_until.as_deref(),
-            Some("2026-09-07T00:00:00Z")
-        );
-        assert!(a1.breaker_open, "breaker must be open for agent_1");
-
-        let a2 = summaries.iter().find(|s| s.agent == "agent_2").unwrap();
-        assert_eq!(a2.turns, 1);
-        assert_eq!(a2.failed, 0);
-        assert_eq!(a2.parked, 0);
-        assert_eq!(a2.needs_review, 0);
-        assert_eq!(a2.reconnects, 0);
-        assert_eq!(a2.last_failure_class, None);
-        assert_eq!(a2.last_failure_at, None);
-        assert_eq!(a2.latest_paused_until, None);
-        assert!(!a2.breaker_open, "breaker must be closed for agent_2");
-    }
-
-    #[test]
-    fn events_are_filtered_by_kind_and_capped() {
-        let (_d, conn) = db();
-        let now = 1_725_600_000i64;
-
-        // Insert 10 turn_finished, 10 turn_failed, 10 batch_parked
-        for i in 0..10 {
-            insert_event(
-                &conn,
-                &HealthEvent {
-                    agent: "agent_alpha".to_string(),
-                    at: now - 3000 + i,
-                    kind: "turn_finished".to_string(),
-                    event_key: format!("tf_{i}"),
-                    batch_id: Some(format!("b_tf_{i}")),
-                    channel_id: None,
-                    class: None,
-                    payload: None,
-                },
-            )
-            .unwrap();
-        }
-
-        for i in 0..10 {
-            insert_event(
-                &conn,
-                &HealthEvent {
-                    agent: "agent_alpha".to_string(),
-                    at: now - 2000 + i,
-                    kind: "turn_failed".to_string(),
-                    event_key: format!("err_{i}"),
-                    batch_id: Some(format!("b_err_{i}")),
-                    channel_id: None,
-                    class: Some("err".to_string()),
-                    payload: None,
-                },
-            )
-            .unwrap();
-        }
-
-        for i in 0..10 {
-            insert_event(
-                &conn,
-                &HealthEvent {
-                    agent: "agent_alpha".to_string(),
-                    at: now - 1000 + i,
-                    kind: "batch_parked".to_string(),
-                    event_key: format!("park_{i}"),
-                    batch_id: Some(format!("b_park_{i}")),
-                    channel_id: None,
-                    class: None,
-                    payload: None,
-                },
-            )
-            .unwrap();
-        }
-
-        // Insert 250 relay_reconnected events (to test 200 cap)
-        for i in 0..250 {
-            insert_event(
-                &conn,
-                &HealthEvent {
-                    agent: "agent_alpha".to_string(),
-                    at: now - 500 + i,
-                    kind: "relay_reconnected".to_string(),
-                    event_key: format!("recon_{i}"),
-                    batch_id: None,
-                    channel_id: None,
-                    class: None,
-                    payload: None,
-                },
-            )
-            .unwrap();
-        }
-
-        // 1. Filter by kinds: only turn_failed and batch_parked
-        let kinds = vec!["turn_failed".to_string(), "batch_parked".to_string()];
-        let filtered =
-            query_agent_health_events(&conn, "agent_alpha", Some(&kinds), None, Some(50), now)
-                .unwrap();
-        assert_eq!(filtered.len(), 20);
-        assert!(filtered
-            .iter()
-            .all(|e| e.kind == "turn_failed" || e.kind == "batch_parked"));
-        // Check order is descending by `at`
-        for window in filtered.windows(2) {
-            assert!(window[0].at >= window[1].at);
-        }
-
-        // 2. Capped by requested limit
-        let limited =
-            query_agent_health_events(&conn, "agent_alpha", None, None, Some(5), now).unwrap();
-        assert_eq!(limited.len(), 5);
-
-        // 3. Hard cap at 200 even when limit requested > 200
-        let capped = query_agent_health_events(
-            &conn,
-            "agent_alpha",
-            Some(&["relay_reconnected".to_string()]),
-            None,
-            Some(300),
-            now,
-        )
-        .unwrap();
-        assert_eq!(capped.len(), 200, "query must cap results to at most 200");
-    }
-
-    #[test]
-    fn parked_batches_excerpt_is_cut_to_120_chars_and_carries_no_full_text() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut park_file = buzz_acp_pkg::reliability::park::ParkFile::open(dir.path()).unwrap();
-
-        let author = nostr::Keys::generate();
-        let full_text = "This is a very long message that definitely exceeds one hundred and twenty characters in total length. \
-            We want to verify that the excerpt in the parked batch view is strictly capped at 120 characters and does not leak the full message content anywhere in the returned structure.";
-        assert!(full_text.chars().count() > 120);
-
-        let event = nostr::EventBuilder::text_note(full_text)
-            .sign_with_keys(&author)
-            .unwrap();
-
-        let batch_id = Uuid::new_v4();
-        let channel_id = Uuid::new_v4();
-        let now = Utc::now();
-        let parked_batch = buzz_acp_pkg::reliability::park::ParkedBatch {
-            batch_id,
-            channel_id,
-            scope: buzz_acp_pkg::reliability::park::ScopeRef {
-                channel_id,
-                root_event_id: None,
-            },
-            reason: buzz_acp_pkg::reliability::park::ParkReason::RetriesExhausted,
-            started: true,
-            needs_review: true,
-            needs_review_reason: Some("retries exhausted".to_string()),
-            replayed_at: None,
-            forced: false,
-            parked_at: now,
-            events: vec![buzz_acp_pkg::reliability::park::ParkedEvent {
-                event: event.clone(),
-                prompt_tag: "prompt".to_string(),
-                received_at: now,
-            }],
-        };
-
-        park_file.park(parked_batch).unwrap();
-
-        let views = read_parked_batches(dir.path()).unwrap();
-        assert_eq!(views.len(), 1);
-        let view = &views[0];
-
-        assert_eq!(view.batch_id, batch_id.to_string());
-        assert_eq!(view.channel_id, channel_id.to_string());
-        assert_eq!(view.reason, "retries_exhausted");
-        assert!(view.started);
-        assert!(view.needs_review);
-        assert_eq!(view.events, 1);
-        assert_eq!(view.excerpt.chars().count(), 120);
-        assert_eq!(view.excerpt, event.content[..120]);
-        assert_ne!(view.excerpt, full_text);
-
-        // Verify that the serialized view carries no full text
-        let serialized = serde_json::to_string(view).unwrap();
-        assert!(!serialized.contains(full_text));
-        assert!(!serialized.contains("content"));
-
-        // Check field names in serialized JSON
-        let val: serde_json::Value = serde_json::from_str(&serialized).unwrap();
-        assert!(val.get("batchId").is_some());
-        assert!(val.get("channelId").is_some());
-        assert!(val.get("reason").is_some());
-        assert!(val.get("started").is_some());
-        assert!(val.get("needsReview").is_some());
-        assert!(val.get("parkedAt").is_some());
-        assert!(val.get("events").is_some());
-        assert!(val.get("excerpt").is_some());
-    }
-
-    #[test]
-    fn alert_state_records_and_loads_and_prunes() {
-        let (_d, conn) = db();
-        let now = 1_725_600_000i64;
-
-        let alerts = vec![
-            crate::agent_health_alerts::Alert {
-                agent: "agent_alpha".to_string(),
-                rule: "needs_review".to_string(),
-                title: "agent_alpha".to_string(),
-                body: "A request needs review".to_string(),
-            },
-            crate::agent_health_alerts::Alert {
-                agent: "agent_alpha".to_string(),
-                rule: "breaker_opened".to_string(),
-                title: "agent_alpha".to_string(),
-                body: "Breaker opened".to_string(),
-            },
-        ];
-
-        record_alerts(&conn, &alerts, now).unwrap();
-
-        let loaded = load_alert_state(&conn).unwrap();
-        assert_eq!(loaded.len(), 2);
-        assert_eq!(
-            loaded.get(&("agent_alpha".to_string(), "needs_review".to_string())),
-            chrono::DateTime::from_timestamp(now, 0).as_ref()
-        );
-        assert_eq!(
-            loaded.get(&("agent_alpha".to_string(), "breaker_opened".to_string())),
-            chrono::DateTime::from_timestamp(now, 0).as_ref()
-        );
-
-        // Updating timestamp on conflict
-        let later = now + 100;
-        record_alerts(&conn, &[alerts[0].clone()], later).unwrap();
-        let updated = load_alert_state(&conn).unwrap();
-        assert_eq!(updated.len(), 2);
-        assert_eq!(
-            updated.get(&("agent_alpha".to_string(), "needs_review".to_string())),
-            chrono::DateTime::from_timestamp(later, 0).as_ref()
-        );
-
-        // Test pruning: entries older than RETENTION_SECS are pruned
-        prune(&conn, later + RETENTION_SECS + 1).unwrap();
-        let after_prune = load_alert_state(&conn).unwrap();
-        assert_eq!(after_prune.len(), 0);
-    }
-}
+#[path = "agent_health/tests.rs"]
+mod tests;

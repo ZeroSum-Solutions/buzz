@@ -513,6 +513,46 @@ mod tests {
         let event = rx.try_recv().expect("should receive breaker_opened frame");
         assert_eq!(event.kind, "breaker_opened");
         assert_eq!(event.payload["consecutive"], 3);
+
+        // batch_needs_review
+        let needs_review_id = Uuid::new_v4();
+        let needs_review = LedgerBody::BatchNeedsReview(ledger::BatchNeedsReview {
+            batch_id: needs_review_id,
+            channel_id,
+            reason: "interrupted after it had started".to_string(),
+        });
+        assert!(runtime.record(now, needs_review));
+        let event = rx
+            .try_recv()
+            .expect("should receive batch_needs_review frame");
+        assert_eq!(event.kind, "batch_needs_review");
+        assert_eq!(event.payload["batchId"], needs_review_id.to_string());
+        assert_eq!(event.payload["reason"], "interrupted after it had started");
+
+        // agent_resumed
+        let resumed = LedgerBody::AgentResumed(ledger::AgentResumed {});
+        assert!(runtime.record(now, resumed));
+        let event = rx.try_recv().expect("should receive agent_resumed frame");
+        assert_eq!(event.kind, "agent_resumed");
+
+        // breaker_closed
+        let breaker_closed = LedgerBody::BreakerClosed(ledger::BreakerClosed {
+            scope: "scope1".to_string(),
+        });
+        assert!(runtime.record(now, breaker_closed));
+        let event = rx.try_recv().expect("should receive breaker_closed frame");
+        assert_eq!(event.kind, "breaker_closed");
+        assert_eq!(event.payload["scope"], "scope1");
+
+        // relay_reconnected
+        let relay_reconnected =
+            LedgerBody::RelayReconnected(ledger::RelayReconnected { after_secs: 42 });
+        assert!(runtime.record(now, relay_reconnected));
+        let event = rx
+            .try_recv()
+            .expect("should receive relay_reconnected frame");
+        assert_eq!(event.kind, "relay_reconnected");
+        assert_eq!(event.payload["afterSecs"], 42);
     }
 
     #[test]

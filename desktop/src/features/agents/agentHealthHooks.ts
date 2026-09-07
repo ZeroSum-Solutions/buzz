@@ -55,11 +55,20 @@ export async function syncAgentHealth(
     },
   );
   if (result?.alerts && Array.isArray(result.alerts)) {
+    const delivered: AgentHealthAlert[] = [];
     for (const alert of result.alerts) {
-      void sendDesktopNotification({
+      const deliveredSuccessfully = await sendDesktopNotification({
         title: alert.title,
         body: alert.body,
-      });
+      }).catch(() => false);
+      if (deliveredSuccessfully) {
+        delivered.push(alert);
+      }
+    }
+    if (delivered.length > 0) {
+      await invokeTauri("record_delivered_alerts", { alerts: delivered }).catch(
+        () => {},
+      );
     }
   }
   return result;
@@ -96,10 +105,12 @@ export async function getParkedBatches(
 }
 
 export async function fetchAgentHealthSummary(): Promise<AgentHealthSummaryData> {
+  let syncError = false;
   try {
     await syncAgentHealth();
   } catch (error) {
     console.debug("sync_agent_health error (skipped):", error);
+    syncError = true;
   }
 
   const [summary24h, summary7d] = await Promise.all([
@@ -107,7 +118,7 @@ export async function fetchAgentHealthSummary(): Promise<AgentHealthSummaryData>
     getAgentHealthSummary(168),
   ]);
 
-  return { summary24h, summary7d };
+  return { summary24h, summary7d, syncError };
 }
 
 export function useAgentHealthSummaryQuery(options?: { enabled?: boolean }) {

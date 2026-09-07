@@ -111,6 +111,15 @@ export function AgentHealthTab() {
         </Button>
       </div>
 
+      {summaryQuery.data?.syncError ? (
+        <div
+          className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-500"
+          data-testid="agent-health-stale-banner"
+        >
+          Health sync failed; metrics may be stale.
+        </div>
+      ) : null}
+
       {summaryQuery.isError ? (
         <div className="flex flex-col items-center justify-center gap-2 rounded-lg border border-border/70 p-12 text-center text-muted-foreground">
           <p className="text-sm text-destructive">

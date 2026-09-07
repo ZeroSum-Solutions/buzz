@@ -69,7 +69,8 @@ pub fn summarize(records: &[LedgerRecord], since: Duration, now: DateTime<Utc>) 
     let mut last_error_at: Option<DateTime<Utc>> = None;
 
     let mut latest_pause_or_resume: Option<(DateTime<Utc>, Option<DateTime<Utc>>)> = None;
-    let mut latest_breaker: Option<(DateTime<Utc>, bool)> = None;
+    let mut open_breakers: std::collections::HashMap<String, (DateTime<Utc>, bool)> =
+        std::collections::HashMap::new();
 
     for record in records {
         match &record.body {
@@ -87,19 +88,19 @@ pub fn summarize(records: &[LedgerRecord], since: Duration, now: DateTime<Utc>) 
             {
                 latest_pause_or_resume = Some((record.at, None));
             }
-            LedgerBody::BreakerOpened(_)
-                if latest_breaker
-                    .as_ref()
+            LedgerBody::BreakerOpened(r)
+                if open_breakers
+                    .get(&r.scope)
                     .is_none_or(|(at, _)| record.at >= *at) =>
             {
-                latest_breaker = Some((record.at, true));
+                open_breakers.insert(r.scope.clone(), (record.at, true));
             }
-            LedgerBody::BreakerClosed(_)
-                if latest_breaker
-                    .as_ref()
+            LedgerBody::BreakerClosed(r)
+                if open_breakers
+                    .get(&r.scope)
                     .is_none_or(|(at, _)| record.at >= *at) =>
             {
-                latest_breaker = Some((record.at, false));
+                open_breakers.insert(r.scope.clone(), (record.at, false));
             }
             _ => {}
         }
@@ -131,7 +132,7 @@ pub fn summarize(records: &[LedgerRecord], since: Duration, now: DateTime<Utc>) 
     }
 
     let raw_paused_until = latest_pause_or_resume.and_then(|(_, until)| until);
-    let breaker_open = latest_breaker.is_some_and(|(_, open)| open);
+    let breaker_open = open_breakers.values().any(|(_, open)| *open);
     let is_paused = raw_paused_until.is_some_and(|until| until > now);
 
     let state = if breaker_open {
@@ -258,5 +259,42 @@ mod tests {
         assert_eq!(row.needs_review, 1); // 1 needs review inside window
         assert_eq!(row.last_error_class.as_deref(), Some("rate_limit"));
         assert_eq!(row.state, "active");
+    }
+
+    #[test]
+    fn breaker_tracks_per_scope() {
+        let now = Utc::now();
+        let agent = "test_agent".to_string();
+        let records = vec![
+            LedgerRecord {
+                at: now - Duration::hours(3),
+                agent: agent.clone(),
+                body: LedgerBody::BreakerOpened(crate::reliability::ledger::BreakerOpened {
+                    scope: "scope_a".to_string(),
+                    consecutive: 3,
+                }),
+            },
+            LedgerRecord {
+                at: now - Duration::hours(2),
+                agent: agent.clone(),
+                body: LedgerBody::BreakerOpened(crate::reliability::ledger::BreakerOpened {
+                    scope: "scope_b".to_string(),
+                    consecutive: 3,
+                }),
+            },
+            LedgerRecord {
+                at: now - Duration::hours(1),
+                agent: agent.clone(),
+                body: LedgerBody::BreakerClosed(crate::reliability::ledger::BreakerClosed {
+                    scope: "scope_a".to_string(),
+                }),
+            },
+        ];
+
+        let row = summarize(&records, Duration::hours(24), now);
+        assert!(
+            row.breaker_open,
+            "scope_b is still open, breaker_open must be true"
+        );
     }
 }
