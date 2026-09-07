@@ -82,6 +82,7 @@ export function AppSidebar({
   currentPubkey,
   fallbackDisplayName,
   homeBadgeCount,
+  agentsHealthAlert = false,
   onBackgroundClick,
   isAddCommunityOpen,
   isLoading,
@@ -558,6 +559,7 @@ export function AppSidebar({
               data-testid="sidebar-scroll-content"
             >
               <AppSidebarPrimaryMenu
+                agentsHealthAlert={agentsHealthAlert}
                 homeBadgeCount={homeBadgeCount}
                 onSelectAgents={onSelectAgents}
                 onSelectHome={onSelectHome}
