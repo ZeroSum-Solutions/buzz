@@ -36,6 +36,36 @@ pub struct GeneratedServer {
     pub args: Vec<String>,
 }
 
+/// How many arguments [`generate_server`] will produce for `entry`.
+///
+/// The loader's bound (`MAX_GENERATED_ARGS`) is on the generated command line
+/// rather than on the entry's own `args`, because the generated line is what
+/// `buzz-acp` reads and bounds. Counting it here, beside the generator,
+/// is what keeps the count and the generation in step: a new flag added below
+/// without a matching term here fails
+/// `mcp_registry_generated_arg_count_matches_the_generator`.
+pub fn generated_arg_count(entry: &RegistryEntry) -> usize {
+    // `--service <name>`.
+    let mut count = 2;
+    match &entry.transport {
+        RegistryTransport::Stdio { args, .. } => {
+            // `launch`, `--server <name>`, `--`, the command, then its args.
+            count += 1 + 2 + 1 + 1 + args.len();
+            // One flag and one `NAME=VALUE` per declared variable.
+            count += 2 * entry.env.len();
+        }
+        RegistryTransport::Http { auth, .. } => {
+            // `proxy`, `--url <url>`.
+            count += 1 + 2;
+            if auth.is_some() {
+                // `--auth-scheme <scheme>`, `--secret <ref>`.
+                count += 4;
+            }
+        }
+    }
+    count
+}
+
 /// Build the launcher invocation for one registry entry.
 ///
 /// `keychain_service` is the service name the **desktop** stores its secret

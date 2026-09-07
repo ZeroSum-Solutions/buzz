@@ -43,6 +43,7 @@ fn snap(record: &ManagedAgentRecord) -> serde_json::Value {
 
 fn record() -> ManagedAgentRecord {
     ManagedAgentRecord {
+        mcp_servers: None,
         description: None,
         pubkey: "p".repeat(64),
         name: "agent".into(),

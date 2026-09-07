@@ -268,7 +268,15 @@ pub async fn delete_persona<R: tauri::Runtime>(
 
             if !cascade.is_empty() {
                 commit_cascade_agents(&mut agents, &cascade, |recs| {
-                    save_managed_agents(&app, recs)
+                    save_managed_agents(&app, recs)?;
+                    if let Err(e) = crate::managed_agents::mcp_registry::apply::converge_now_with_records(
+                        &app,
+                        recs,
+                        &std::collections::BTreeMap::new(),
+                    ) {
+                        eprintln!("buzz-desktop: delete_persona: mcp convergence failed: {e}");
+                    }
+                    Ok(())
                 })?;
             }
 

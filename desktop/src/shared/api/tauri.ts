@@ -200,6 +200,7 @@ export type RawAcpRuntimeCatalogEntry = {
   max_parallelism?: number;
   effort_canonical_values?: string[] | null;
   mcp_config_placement?: McpConfigPlacement;
+  mcp_registry_available?: boolean;
   mcp_transports?: McpTransport[];
   mcp_native_transports?: McpTransport[];
 };
@@ -706,6 +707,7 @@ export function fromRawAcpRuntimeCatalogEntry(
     definitionEnv: entry.definition_env ?? {},
     effortCanonicalValues: entry.effort_canonical_values ?? null,
     mcpConfigPlacement: entry.mcp_config_placement ?? { kind: "unsupported" },
+    mcpRegistryAvailable: entry.mcp_registry_available ?? false,
     mcpTransports: entry.mcp_transports ?? [],
     mcpNativeTransports: entry.mcp_native_transports ?? [],
     ...(entry.max_parallelism !== undefined && {
