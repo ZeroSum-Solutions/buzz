@@ -3,12 +3,19 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { listen } from "@tauri-apps/api/event";
 
 import { invokeTauri } from "@/shared/api/tauri";
-import type { ParkedBatchView } from "@/shared/api/types";
+import type {
+  AgentHealthAlert,
+  AgentHealthIngestResult,
+  ParkedBatchView,
+} from "@/shared/api/types";
+import { sendDesktopNotification } from "@/features/notifications/lib/desktop";
 import { useAppFocused } from "@/shared/lib/useDocumentVisible";
 import type {
   AgentHealthCounters,
   AgentHealthSummaryData,
 } from "./agentHealthSummary.ts";
+
+export type { AgentHealthAlert, AgentHealthIngestResult };
 
 export type AgentHealthEvent = {
   agent: string;
@@ -38,8 +45,24 @@ export const agentHealthEventsQueryKey = (
 export const parkedBatchesQueryKey = (agent: string) =>
   ["agent-health", "parked-batches", agent] as const;
 
-export async function syncAgentHealth(agent?: string | null): Promise<number> {
-  return invokeTauri<number>("sync_agent_health", { agent: agent ?? null });
+export async function syncAgentHealth(
+  agent?: string | null,
+): Promise<AgentHealthIngestResult> {
+  const result = await invokeTauri<AgentHealthIngestResult>(
+    "sync_agent_health",
+    {
+      agent: agent ?? null,
+    },
+  );
+  if (result?.alerts && Array.isArray(result.alerts)) {
+    for (const alert of result.alerts) {
+      void sendDesktopNotification({
+        title: alert.title,
+        body: alert.body,
+      });
+    }
+  }
+  return result;
 }
 
 export async function getAgentHealthSummary(

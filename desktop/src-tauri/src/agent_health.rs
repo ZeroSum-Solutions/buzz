@@ -1,6 +1,6 @@
 //! Desktop health store: schema, insert-or-ignore, and retention.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -74,7 +74,13 @@ pub(crate) fn open_db(path: &Path) -> Result<Connection, String> {
             PRIMARY KEY(agent, event_key)
         );
         CREATE INDEX IF NOT EXISTS health_events_agent_at ON health_events(agent, at);
-        CREATE INDEX IF NOT EXISTS health_events_kind_at ON health_events(kind, at);",
+        CREATE INDEX IF NOT EXISTS health_events_kind_at ON health_events(kind, at);
+        CREATE TABLE IF NOT EXISTS alert_state(
+            agent TEXT NOT NULL,
+            rule TEXT NOT NULL,
+            last_fired_at INTEGER NOT NULL,
+            PRIMARY KEY(agent, rule)
+        );",
     )
     .map_err(|e| format!("initialize agent-health db: {e}"))?;
     let version: i64 = conn
@@ -118,6 +124,10 @@ pub(crate) fn insert_event(conn: &Connection, event: &HealthEvent) -> Result<boo
 #[allow(dead_code)]
 pub(crate) fn prune(conn: &Connection, now: i64) -> Result<usize, String> {
     let cutoff = now - RETENTION_SECS;
+    let _ = conn.execute(
+        "DELETE FROM alert_state WHERE last_fired_at < ?1",
+        params![cutoff],
+    );
     conn.execute("DELETE FROM health_events WHERE at < ?1", params![cutoff])
         .map_err(|e| format!("prune agent-health events: {e}"))
 }
@@ -555,34 +565,154 @@ pub(crate) async fn get_agent_health_events(
 /// with no ledger on this machine is skipped, not an error: `Health tab
 /// only, no local ledger` is the desktop's row-level messaging for that case,
 /// not a sync failure.
+pub(crate) fn load_alert_state(
+    conn: &Connection,
+) -> Result<HashMap<(String, String), chrono::DateTime<chrono::Utc>>, String> {
+    let mut stmt = conn
+        .prepare("SELECT agent, rule, last_fired_at FROM alert_state")
+        .map_err(|e| format!("prepare alert_state query: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let agent: String = row.get(0)?;
+            let rule: String = row.get(1)?;
+            let last_fired_at: i64 = row.get(2)?;
+            Ok(((agent, rule), last_fired_at))
+        })
+        .map_err(|e| format!("query alert_state: {e}"))?;
+
+    let mut result = HashMap::new();
+    for item in rows {
+        let ((agent, rule), last_fired_at) =
+            item.map_err(|e| format!("read alert_state row: {e}"))?;
+        if let Some(dt) = chrono::DateTime::from_timestamp(last_fired_at, 0) {
+            result.insert((agent, rule), dt);
+        }
+    }
+    Ok(result)
+}
+
+pub(crate) fn record_alerts(
+    conn: &Connection,
+    alerts: &[crate::agent_health_alerts::Alert],
+    now: i64,
+) -> Result<(), String> {
+    if alerts.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = conn
+        .prepare(
+            "INSERT INTO alert_state (agent, rule, last_fired_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(agent, rule) DO UPDATE SET last_fired_at = excluded.last_fired_at",
+        )
+        .map_err(|e| format!("prepare insert alert_state: {e}"))?;
+    for alert in alerts {
+        stmt.execute(params![alert.agent, alert.rule, now])
+            .map_err(|e| format!("record alert_state: {e}"))?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthIngestResult {
+    pub inserted: usize,
+    pub alerts: Vec<crate::agent_health_alerts::Alert>,
+}
+
+#[allow(dead_code)]
+pub type IngestResult = HealthIngestResult;
+
+/// Sync one agent's ledger (or, when `agent` is `None`, every local agent
+/// from `load_managed_agents`) into the health store. A remote-owned agent
+/// with no ledger on this machine is skipped, not an error: `Health tab
+/// only, no local ledger` is the desktop's row-level messaging for that case,
+/// not a sync failure.
 #[tauri::command]
 pub(crate) async fn sync_agent_health(
     agent: Option<String>,
     app: AppHandle,
     store: State<'_, AgentHealthStore>,
-) -> Result<usize, String> {
+) -> Result<HealthIngestResult, String> {
     let write_lock = Arc::clone(&store.write_lock);
     blocking::run(move |_proof| {
         let _guard = write_lock.lock().map_err(|e| e.to_string())?;
         let conn = open_db(&db_path(&app)?)?;
 
+        let managed_agents = load_managed_agents(&app).unwrap_or_default();
         let pubkeys: Vec<String> = match agent {
             Some(pubkey) => vec![pubkey],
-            None => load_managed_agents(&app)?
-                .into_iter()
-                .map(|record| record.pubkey)
+            None => managed_agents
+                .iter()
+                .map(|record| record.pubkey.clone())
                 .collect(),
         };
 
         let mut inserted = 0usize;
-        for pubkey in pubkeys {
-            let ledger_path = managed_agent_state_dir(&app, &pubkey)?.join(LEDGER_FILE);
-            if !ledger_path.exists() {
-                continue;
+        let mut all_events = Vec::new();
+        let mut all_parked = Vec::new();
+        let now_dt = chrono::Utc::now();
+        let now_ts = now_dt.timestamp();
+
+        for pubkey in &pubkeys {
+            let state_dir = managed_agent_state_dir(&app, pubkey);
+            if let Ok(dir) = &state_dir {
+                if let Ok(mut batches) = read_parked_batches(dir) {
+                    for b in &mut batches {
+                        b.agent = Some(pubkey.clone());
+                    }
+                    all_parked.extend(batches);
+                }
+
+                let ledger_path = dir.join(LEDGER_FILE);
+                if ledger_path.exists() {
+                    inserted += sync_ledger(&conn, pubkey, &ledger_path)?;
+                }
             }
-            inserted += sync_ledger(&conn, &pubkey, &ledger_path)?;
+
+            if let Ok(recent) =
+                query_agent_health_events(&conn, pubkey, None, Some(1), Some(50), now_ts)
+            {
+                all_events.extend(recent);
+            }
+
+            if let Some(record) = managed_agents.iter().find(|r| &r.pubkey == pubkey) {
+                let code = record
+                    .last_error_code
+                    .or_else(|| record.last_exit_code.map(|c| c as i64));
+                if let Some(c) = code {
+                    if c != 0 || record.last_error.is_some() {
+                        all_events.push(HealthEvent {
+                            agent: pubkey.clone(),
+                            at: now_ts,
+                            kind: "process_exit".to_string(),
+                            event_key: compute_event_key(
+                                &now_dt.to_rfc3339(),
+                                "process_exit",
+                                None,
+                            ),
+                            batch_id: None,
+                            channel_id: None,
+                            class: record.last_error.clone(),
+                            payload: Some(
+                                serde_json::json!({
+                                    "code": c,
+                                    "lastError": record.last_error,
+                                })
+                                .to_string(),
+                            ),
+                        });
+                    }
+                }
+            }
         }
-        Ok(inserted)
+
+        let last_fired = load_alert_state(&conn)?;
+        let alerts =
+            crate::agent_health_alerts::evaluate(&all_events, &all_parked, now_dt, &last_fired);
+        record_alerts(&conn, &alerts, now_ts)?;
+
+        Ok(HealthIngestResult { inserted, alerts })
     })
     .await
 }
@@ -617,7 +747,7 @@ pub(crate) async fn ingest_agent_health_frame(
     frame: serde_json::Value,
     app: AppHandle,
     store: State<'_, AgentHealthStore>,
-) -> Result<bool, String> {
+) -> Result<HealthIngestResult, String> {
     let health_frame: HealthFrame =
         serde_json::from_value(frame).map_err(|e| format!("parse agent-health frame: {e}"))?;
     let event = frame_to_health_event(&agent, &health_frame)?;
@@ -626,7 +756,31 @@ pub(crate) async fn ingest_agent_health_frame(
     blocking::run(move |_proof| {
         let _guard = write_lock.lock().map_err(|e| e.to_string())?;
         let conn = open_db(&db_path(&app)?)?;
-        insert_event(&conn, &event)
+        let inserted = insert_event(&conn, &event)?;
+
+        let now_dt = chrono::Utc::now();
+        let last_fired = load_alert_state(&conn)?;
+
+        let mut parked = managed_agent_state_dir(&app, &agent)
+            .ok()
+            .and_then(|d| read_parked_batches(&d).ok())
+            .unwrap_or_default();
+        for b in &mut parked {
+            b.agent = Some(agent.clone());
+        }
+
+        let alerts = crate::agent_health_alerts::evaluate(
+            std::slice::from_ref(&event),
+            &parked,
+            now_dt,
+            &last_fired,
+        );
+        record_alerts(&conn, &alerts, now_dt.timestamp())?;
+
+        Ok(HealthIngestResult {
+            inserted: if inserted { 1 } else { 0 },
+            alerts,
+        })
     })
     .await
 }
@@ -634,6 +788,8 @@ pub(crate) async fn ingest_agent_health_frame(
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ParkedBatchView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     pub batch_id: String,
     pub channel_id: String,
     pub reason: String,
@@ -651,6 +807,7 @@ pub(crate) fn read_parked_batches(dir: &Path) -> Result<Vec<ParkedBatchView>, St
         .batches()
         .iter()
         .map(|batch| ParkedBatchView {
+            agent: None,
             batch_id: batch.batch_id.to_string(),
             channel_id: batch.channel_id.to_string(),
             reason: batch.reason.as_str().to_string(),
@@ -674,7 +831,11 @@ pub(crate) async fn get_parked_batches(
 ) -> Result<Vec<ParkedBatchView>, String> {
     blocking::run(move |_proof| {
         let dir = managed_agent_state_dir(&app, &agent)?;
-        read_parked_batches(&dir)
+        let mut batches = read_parked_batches(&dir)?;
+        for b in &mut batches {
+            b.agent = Some(agent.clone());
+        }
+        Ok(batches)
     })
     .await
 }
@@ -1298,5 +1459,54 @@ mod tests {
         assert!(val.get("parkedAt").is_some());
         assert!(val.get("events").is_some());
         assert!(val.get("excerpt").is_some());
+    }
+
+    #[test]
+    fn alert_state_records_and_loads_and_prunes() {
+        let (_d, conn) = db();
+        let now = 1_725_600_000i64;
+
+        let alerts = vec![
+            crate::agent_health_alerts::Alert {
+                agent: "agent_alpha".to_string(),
+                rule: "needs_review".to_string(),
+                title: "agent_alpha".to_string(),
+                body: "A request needs review".to_string(),
+            },
+            crate::agent_health_alerts::Alert {
+                agent: "agent_alpha".to_string(),
+                rule: "breaker_opened".to_string(),
+                title: "agent_alpha".to_string(),
+                body: "Breaker opened".to_string(),
+            },
+        ];
+
+        record_alerts(&conn, &alerts, now).unwrap();
+
+        let loaded = load_alert_state(&conn).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(
+            loaded.get(&("agent_alpha".to_string(), "needs_review".to_string())),
+            chrono::DateTime::from_timestamp(now, 0).as_ref()
+        );
+        assert_eq!(
+            loaded.get(&("agent_alpha".to_string(), "breaker_opened".to_string())),
+            chrono::DateTime::from_timestamp(now, 0).as_ref()
+        );
+
+        // Updating timestamp on conflict
+        let later = now + 100;
+        record_alerts(&conn, &[alerts[0].clone()], later).unwrap();
+        let updated = load_alert_state(&conn).unwrap();
+        assert_eq!(updated.len(), 2);
+        assert_eq!(
+            updated.get(&("agent_alpha".to_string(), "needs_review".to_string())),
+            chrono::DateTime::from_timestamp(later, 0).as_ref()
+        );
+
+        // Test pruning: entries older than RETENTION_SECS are pruned
+        prune(&conn, later + RETENTION_SECS + 1).unwrap();
+        let after_prune = load_alert_state(&conn).unwrap();
+        assert_eq!(after_prune.len(), 0);
     }
 }

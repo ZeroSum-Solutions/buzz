@@ -481,6 +481,7 @@ export type ControlResultFrame = {
 };
 
 export type ParkedBatchView = {
+  agent?: string;
   batchId: string;
   channelId: string;
   reason: string;
@@ -489,6 +490,18 @@ export type ParkedBatchView = {
   parkedAt: string;
   events: number;
   excerpt: string;
+};
+
+export type AgentHealthAlert = {
+  agent: string;
+  rule: string;
+  title: string;
+  body: string;
+};
+
+export type AgentHealthIngestResult = {
+  inserted: number;
+  alerts: AgentHealthAlert[];
 };
 
 export type GitBashPrerequisite = {

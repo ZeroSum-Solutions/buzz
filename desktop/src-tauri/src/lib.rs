@@ -15,6 +15,7 @@ mod events;
 // sidebar yet — that is slice two — so the items below have no in-tree caller
 // and would read as dead code until they do.
 mod agent_health;
+mod agent_health_alerts;
 #[allow(dead_code)]
 mod google_calendar;
 mod huddle;

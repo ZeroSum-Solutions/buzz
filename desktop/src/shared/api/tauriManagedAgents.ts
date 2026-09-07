@@ -4,9 +4,11 @@ import {
   type RawManagedAgent,
 } from "@/shared/api/tauri";
 import type {
+  AgentHealthIngestResult,
   ManagedAgent,
   ManagedAgentRuntimeStatus,
 } from "@/shared/api/types";
+import { sendDesktopNotification } from "@/features/notifications/lib/desktop";
 
 export async function startManagedAgent(
   pubkey: string,
@@ -112,20 +114,29 @@ export async function putManagedAgentRuntimeLifecycle(
 export async function ingestAgentHealthFrame(
   agent: string,
   frame: unknown,
-): Promise<{ alerts: unknown[] }> {
-  const result = await invokeTauri<unknown>("ingest_agent_health_frame", {
-    agent,
-    frame,
-  });
+): Promise<AgentHealthIngestResult> {
+  const result = await invokeTauri<AgentHealthIngestResult>(
+    "ingest_agent_health_frame",
+    {
+      agent,
+      frame,
+    },
+  );
   if (
     result &&
     typeof result === "object" &&
     "alerts" in result &&
-    Array.isArray((result as { alerts: unknown[] }).alerts)
+    Array.isArray(result.alerts)
   ) {
-    return result as { alerts: unknown[] };
+    for (const alert of result.alerts) {
+      void sendDesktopNotification({
+        title: alert.title,
+        body: alert.body,
+      });
+    }
+    return result;
   }
-  return { alerts: [] };
+  return { inserted: 0, alerts: [] };
 }
 
 export async function reconcileManagedAgentRuntimes(
