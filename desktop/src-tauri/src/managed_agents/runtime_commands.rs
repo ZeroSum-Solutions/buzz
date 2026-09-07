@@ -11,6 +11,7 @@ use super::{
     ManagedAgentRuntimeKey, ManagedAgentRuntimeLifecycle, ManagedAgentRuntimeReceipt,
     ManagedAgentRuntimeStatus,
 };
+use crate::agent_health;
 use crate::app_state::AppState;
 
 const STATUS_EVENT: &str = "managed-agent-runtime-status";
@@ -268,7 +269,7 @@ fn start_pair(
     if expected_updated_at.is_some_and(|expected| record.updated_at != expected) {
         return Err("managed agent changed while runtime reconciliation was in flight".into());
     }
-    let key = ManagedAgentRuntimeKey::new(pubkey, &relay_url)?;
+    let key = ManagedAgentRuntimeKey::new(pubkey.clone(), &relay_url)?;
     let mut runtimes = state
         .managed_agent_processes
         .lock()
@@ -312,6 +313,7 @@ fn start_pair(
     drop(runtimes);
     save_managed_agents(&app, &records)?;
     emit_status(&app, &status);
+    agent_health::sync_for_agent(&app, &pubkey);
     Ok(status)
 }
 
@@ -332,7 +334,7 @@ pub fn stop_managed_agent_runtime(
         .map_err(|e| e.to_string())?;
     let mut records = load_managed_agents(&app)?;
     let record = find_managed_agent_mut(&mut records, &pubkey)?;
-    let key = ManagedAgentRuntimeKey::new(pubkey, &relay_url)?;
+    let key = ManagedAgentRuntimeKey::new(pubkey.clone(), &relay_url)?;
     let mut runtimes = state
         .managed_agent_processes
         .lock()
@@ -379,6 +381,7 @@ pub fn stop_managed_agent_runtime(
     drop(runtimes);
     save_managed_agents(&app, &records)?;
     emit_status(&app, &status);
+    agent_health::sync_for_agent(&app, &pubkey);
     Ok(status)
 }
 

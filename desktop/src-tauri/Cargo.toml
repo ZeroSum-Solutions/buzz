@@ -110,6 +110,11 @@ buzz_persona_pkg = { package = "buzz-persona", path = "../../crates/buzz-persona
 buzz_sdk_pkg = { package = "buzz-sdk", path = "../../crates/buzz-sdk" }
 buzz_agent_pkg = { package = "buzz-agent", path = "../../crates/buzz-agent" }
 buzz_secret_store_pkg = { package = "buzz-secret-store", path = "../../crates/buzz-secret-store" }
+# The ACP harness's reliability ledger reader, so agent_health.rs can sync
+# `ledger.jsonl` into the desktop's own health store (T17 step 4). The
+# `delivery-seam-test-api` feature only re-exports a test-only path used by
+# the prompt-source reload test; it adds no production code.
+buzz_acp_pkg = { package = "buzz-acp", path = "../../crates/buzz-acp", features = ["delivery-seam-test-api"] }
 # Registry validation asks the launcher for the upstream and proxy-variable
 # rules rather than keeping a second copy that can drift. `default-features =
 # false` keeps the keyring backend out of a desktop build that turned its own
@@ -170,8 +175,3 @@ tokio = { version = "1", features = ["test-util"] }
 # The relay's media validation, so desktop-produced snapshots and voice notes
 # can prove their full client-sanitize → relay-accept contract end to end.
 buzz_media_pkg = { package = "buzz-media", path = "../../crates/buzz-media" }
-# The ACP harness itself, so the prompt-source reload is provable end to end:
-# file bytes -> reload -> the value a restart writes to BUZZ_ACP_SYSTEM_PROMPT
-# -> the harness's own env parse, prompt composition and `session/new` request.
-# The feature only re-exports that path; it adds no test-only code.
-buzz_acp_pkg = { package = "buzz-acp", path = "../../crates/buzz-acp", features = ["delivery-seam-test-api"] }

@@ -4,13 +4,17 @@ import { subscribeToAgentObserverFrames } from "@/shared/api/observerRelay";
 import type { RelayEvent, ManagedAgent } from "@/shared/api/types";
 import type { ControlResultFrame } from "@/shared/api/types";
 import { putAgentSessionConfig } from "@/shared/api/tauri";
-import { putManagedAgentRuntimeLifecycle } from "@/shared/api/tauriManagedAgents";
+import {
+  putManagedAgentRuntimeLifecycle,
+  ingestAgentHealthFrame,
+} from "@/shared/api/tauriManagedAgents";
 import { getIdentity } from "@/shared/api/tauriIdentity";
 import { decryptObserverEvent } from "@/shared/api/tauriObserver";
 import {
   parseAgentManagementRequest,
   type AgentManagementRequest,
 } from "./agentManagement";
+import { parseHealthFrame } from "./agentHealthFrames";
 import {
   parseProjectChannelRequest,
   type ProjectChannelRequest,
@@ -532,6 +536,11 @@ function processLiveObserverEvents(
           console.debug("Late/untracked lifecycle frame dropped:", error);
         },
       );
+    } else if (parseHealthFrame(parsed)) {
+      const healthFrame = parseHealthFrame(parsed);
+      if (healthFrame) {
+        queueAgentHealthFrame(agentPubkey, healthFrame);
+      }
     }
   }
 
@@ -981,4 +990,70 @@ export function _testGetArchivedChannelEvents(
   return (
     archiveEventsByChannel.get(archiveChannelKey(agentPubkey, channelId)) ?? []
   );
+}
+
+type HealthQueueItem = {
+  frame: unknown;
+  retries: number;
+};
+
+type HealthQueueState = {
+  inFlight: boolean;
+  items: HealthQueueItem[];
+};
+
+export const MAX_HEALTH_QUEUE_PER_AGENT = 50;
+
+const healthQueuesByAgent = new Map<string, HealthQueueState>();
+
+export function getHealthQueueState(
+  agentPubkey: string,
+): HealthQueueState | undefined {
+  return healthQueuesByAgent.get(agentPubkey);
+}
+
+export function resetHealthQueuesForTest(): void {
+  healthQueuesByAgent.clear();
+}
+
+export async function processHealthQueue(agentPubkey: string): Promise<void> {
+  const queueState = healthQueuesByAgent.get(agentPubkey);
+  if (!queueState || queueState.inFlight || queueState.items.length === 0) {
+    return;
+  }
+  queueState.inFlight = true;
+  const currentItem = queueState.items.shift()!;
+  try {
+    await ingestAgentHealthFrame(agentPubkey, currentItem.frame);
+  } catch (error) {
+    if (currentItem.retries < 1) {
+      currentItem.retries += 1;
+      queueState.items.unshift(currentItem);
+    } else {
+      console.debug("Agent health frame ingest failed after retry:", error);
+    }
+  } finally {
+    queueState.inFlight = false;
+    if (queueState.items.length > 0) {
+      void processHealthQueue(agentPubkey);
+    } else {
+      healthQueuesByAgent.delete(agentPubkey);
+    }
+  }
+}
+
+export function queueAgentHealthFrame(
+  agentPubkey: string,
+  frame: unknown,
+): void {
+  let queueState = healthQueuesByAgent.get(agentPubkey);
+  if (!queueState) {
+    queueState = { inFlight: false, items: [] };
+    healthQueuesByAgent.set(agentPubkey, queueState);
+  }
+  if (queueState.items.length >= MAX_HEALTH_QUEUE_PER_AGENT) {
+    queueState.items.shift();
+  }
+  queueState.items.push({ frame, retries: 0 });
+  void processHealthQueue(agentPubkey);
 }

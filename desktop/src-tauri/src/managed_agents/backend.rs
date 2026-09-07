@@ -368,6 +368,15 @@ pub(crate) fn redact_secrets_with(s: &str, extras: &[&str]) -> String {
     // token reaches output from outside our environment too — embedded in a
     // git remote URL an installer echoes, say — where no name-based rule can
     // see it.
+    while let Some(pos) = result.find("Bearer ") {
+        let after = pos + "Bearer ".len();
+        let end = result[after..]
+            .find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+            .map(|i| after + i)
+            .unwrap_or(result.len());
+        result.replace_range(pos..end, "[REDACTED]");
+    }
+
     for prefix in &[
         "nsec1",
         "sprt_tok_",
@@ -377,6 +386,11 @@ pub(crate) fn redact_secrets_with(s: &str, extras: &[&str]) -> String {
         "ghs_",
         "ghr_",
         "github_pat_",
+        "sk-",
+        "api_key=",
+        "api_key:",
+        "apikey=",
+        "apiKey=",
     ] {
         while let Some(pos) = result.find(prefix) {
             let end = result[pos..]

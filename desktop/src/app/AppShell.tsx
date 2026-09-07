@@ -53,6 +53,11 @@ import { usePersonaSync } from "@/features/agents/lib/usePersonaSync";
 import { useAgentObserverIngestion } from "@/features/agents/useAgentObserverIngestion";
 import { AgentManagementDialogs } from "@/features/agents/ui/AgentManagementDialogs";
 import { RequestedAgentCreateDialogs } from "@/features/agents/ui/RequestedAgentCreateDialogs";
+import { useAgentHealthSummaryQuery } from "@/features/agents/agentHealthHooks";
+import {
+  buildHealthRows,
+  hasHealthAlertBadge,
+} from "@/features/agents/agentHealthSummary";
 import {
   usePresenceSession,
   usePresenceSubscription,
@@ -471,6 +476,11 @@ export function AppShell() {
     identityQuery.data?.pubkey,
     notificationSettings.settings.homeBadgeEnabled,
   );
+  const agentHealthSummaryQuery = useAgentHealthSummaryQuery();
+  const agentsHealthAlert = React.useMemo(
+    () => hasHealthAlertBadge(buildHealthRows(agentHealthSummaryQuery.data)),
+    [agentHealthSummaryQuery.data],
+  );
   const isNotifiedForThread = React.useCallback(
     (rootId: string) =>
       !mutedRootIds.has(rootId) &&
@@ -833,6 +843,7 @@ export function AppShell() {
                           errorMessage={channelsErrorMessage}
                           fallbackDisplayName={identityQuery.data?.displayName}
                           homeBadgeCount={homeBadgeCount + dueReminderBadge}
+                          agentsHealthAlert={agentsHealthAlert}
                           addCommunityPrefill={addCommunityDialog.prefill}
                           isAddCommunityOpen={addCommunityDialog.open}
                           relayConnectionCard={relayConnectionCard}

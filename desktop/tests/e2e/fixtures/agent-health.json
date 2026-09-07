@@ -1,0 +1,56 @@
+{
+  "summary": [
+    {
+      "agent": "953d3363262e86b770419834c53d2446409db6d918a57f8f339d495d54ab001f",
+      "turns": 10,
+      "failed": 0,
+      "parked": 0,
+      "needsReview": 0,
+      "pausedUntil": "2030-01-01T00:00:00.000Z",
+      "reconnects": 0
+    },
+    {
+      "agent": "bb22a5299220cad76ffd46190ccbeede8ab5dc260faa28b6e5a2cb31b9aff260",
+      "turns": 12,
+      "failed": 1,
+      "parked": 1,
+      "needsReview": 1,
+      "reconnects": 0
+    }
+  ],
+  "events": [
+    {
+      "agent": "953d3363262e86b770419834c53d2446409db6d918a57f8f339d495d54ab001f",
+      "at": 1893456000,
+      "kind": "agent_paused",
+      "eventKey": "2030-01-01T00:00:00Z|agent_paused|",
+      "batchId": null,
+      "channelId": null,
+      "class": "operator",
+      "payload": "{\"class\":\"operator\",\"until\":\"2030-01-01T00:00:00.000Z\",\"waiting\":0}"
+    },
+    {
+      "agent": "bb22a5299220cad76ffd46190ccbeede8ab5dc260faa28b6e5a2cb31b9aff260",
+      "at": 1788717600,
+      "kind": "batch_needs_review",
+      "eventKey": "2026-09-06T18:00:00Z|batch_needs_review|b1000000-0000-0000-0000-000000000001",
+      "batchId": "b1000000-0000-0000-0000-000000000001",
+      "channelId": "94a444a4-c0a3-5966-ab05-530c6ddc2301",
+      "class": null,
+      "payload": "{\"batch_id\":\"b1000000-0000-0000-0000-000000000001\",\"channel_id\":\"94a444a4-c0a3-5966-ab05-530c6ddc2301\",\"reason\":\"retries_exhausted\"}"
+    }
+  ],
+  "parked": [
+    {
+      "agent": "bb22a5299220cad76ffd46190ccbeede8ab5dc260faa28b6e5a2cb31b9aff260",
+      "batchId": "b1000000-0000-0000-0000-000000000001",
+      "channelId": "94a444a4-c0a3-5966-ab05-530c6ddc2301",
+      "reason": "retries_exhausted",
+      "started": true,
+      "needsReview": true,
+      "parkedAt": "2026-09-06T18:00:00.000Z",
+      "events": 1,
+      "excerpt": "Model capacity exceeded"
+    }
+  ]
+}

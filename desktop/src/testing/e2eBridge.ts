@@ -36,8 +36,11 @@ import type { ConnectionState } from "@/shared/api/relayClientShared";
 import type {
   ChannelTemplate,
   FeedItemCategory,
+  ParkedBatchView,
   RelayEvent,
 } from "@/shared/api/types";
+import type { AgentHealthCounters } from "@/features/agents/agentHealthSummary";
+import type { AgentHealthEvent } from "@/features/agents/agentHealthHooks";
 import { getMarkdownParseCount } from "@/shared/ui/markdown/nodeCache";
 import { syncAgentTurnsFromEvents } from "@/features/agents/activeAgentTurnsStore";
 import { recordTimeoutFromRejection } from "@/features/moderation/lib/timeoutStore";
@@ -133,6 +136,12 @@ type MockManagedAgentRuntimeSeed = {
   pubkey: string;
   relayUrl: string;
   lifecycle?: MockManagedAgentRuntimeRow["lifecycle"];
+};
+
+export type MockAgentHealthSeed = {
+  summary?: AgentHealthCounters[];
+  events?: AgentHealthEvent[];
+  parked?: ParkedBatchView[];
 };
 
 type MockRelayAgentSeed = {
@@ -328,6 +337,7 @@ type E2eConfig = {
     /** Per agent+relay runtime rows for the pair-scoped lifecycle commands
      *  (`list/start/stop/restart_managed_agent_runtime`). */
     managedAgentRuntimes?: MockManagedAgentRuntimeSeed[];
+    agentHealth?: MockAgentHealthSeed;
     personas?: MockPersonaSeed[];
     /** Community catalog replaceable-event heads returned by relay queries. */
     personaCatalogEvents?: RelayEvent[];
@@ -3439,6 +3449,21 @@ let mockManagedAgentRuntimes: MockManagedAgentRuntimeRow[] = [];
 let mockBestieAssignment: {
   agent_pubkey: string;
 } | null = null;
+let mockAgentHealthSummary: AgentHealthCounters[] = [];
+let mockAgentHealthEvents: AgentHealthEvent[] = [];
+let mockAgentHealthParked: ParkedBatchView[] = [];
+
+function resetMockAgentHealth(config?: E2eConfig) {
+  mockAgentHealthSummary = (config?.mock?.agentHealth?.summary ?? []).map(
+    (row) => ({ ...row }),
+  );
+  mockAgentHealthEvents = (config?.mock?.agentHealth?.events ?? []).map(
+    (row) => ({ ...row }),
+  );
+  mockAgentHealthParked = (config?.mock?.agentHealth?.parked ?? []).map(
+    (row) => ({ ...row }),
+  );
+}
 
 // Mutable `save_subscriptions` table mirror — TEST-ONLY.
 //
@@ -5083,17 +5108,19 @@ let mockObserverControlSeq = 0;
 function emitMockObserverControlResult(
   agentPubkey: string,
   request: {
-    type: "cancel_turn" | "switch_model";
+    type: string;
     channelId?: string | null;
     requestId?: string;
     modelId?: string;
+    [key: string]: unknown;
   },
   result: {
-    type: "cancel_turn" | "switch_model";
+    type: string;
     status: string;
     channelId?: string | null;
     requestId?: string;
     modelId?: string;
+    [key: string]: unknown;
   },
 ) {
   const channelId = result.channelId ?? request.channelId ?? null;
@@ -11344,10 +11371,13 @@ function sendToMockSocket(args: {
       const frame = event.tags.find((tag) => tag[0] === "frame")?.[1];
       if (frame === "control") {
         let payload: {
-          type: "cancel_turn" | "switch_model";
+          type: string;
           channelId?: string | null;
           requestId?: string;
           modelId?: string;
+          batchId?: string;
+          until?: string;
+          [key: string]: unknown;
         };
         try {
           payload = JSON.parse(event.content);
@@ -11373,7 +11403,12 @@ function sendToMockSocket(args: {
             ? configured.splice(resultIndex, 1)[0]
             : {
                 type: payload.type,
-                status: payload.type === "cancel_turn" ? "sent" : "switched",
+                status:
+                  payload.type === "cancel_turn"
+                    ? "sent"
+                    : payload.type === "switch_model"
+                      ? "switched"
+                      : "ok",
               };
         emitMockObserverControlResult(
           event.tags.find((tag) => tag[0] === "agent")?.[1] ?? "",
@@ -11650,6 +11685,7 @@ export function maybeInstallE2eTauriMocks() {
   resetMockRelayMembers(config);
   resetMockRelayAgents(config);
   resetMockManagedAgents(config);
+  resetMockAgentHealth(config);
   resetMockPersonas(config);
   resetMockTeams(config);
   seedMockSearchProfiles(config);
@@ -14253,6 +14289,54 @@ export function maybeInstallE2eTauriMocks() {
         );
       case "list_managed_agent_runtimes":
         return mockManagedAgentRuntimes.map((row) => ({ ...row }));
+      case "get_agent_health_summary": {
+        return mockAgentHealthSummary.map((row) => ({ ...row }));
+      }
+      case "get_agent_health_events": {
+        const input =
+          (payload as {
+            agent?: string;
+            kinds?: string[] | null;
+            sinceHours?: number | null;
+            since_hours?: number | null;
+            limit?: number | null;
+          }) ?? {};
+        let events = mockAgentHealthEvents;
+        if (input.agent) {
+          events = events.filter((e) => e.agent === input.agent);
+        }
+        if (input.kinds && input.kinds.length > 0) {
+          const kindSet = new Set(input.kinds);
+          events = events.filter((e) => kindSet.has(e.kind));
+        }
+        if (typeof input.limit === "number" && input.limit > 0) {
+          events = events.slice(0, input.limit);
+        }
+        return events.map((e) => ({ ...e }));
+      }
+      case "sync_agent_health": {
+        return {
+          inserted: 0,
+          alerts: [],
+        };
+      }
+      case "ingest_agent_health_frame": {
+        return {
+          inserted: 1,
+          alerts: [],
+        };
+      }
+      case "get_parked_batches": {
+        const input = (payload as { agent?: string }) ?? {};
+        let parked = mockAgentHealthParked;
+        if (input.agent) {
+          parked = parked.filter((b) => !b.agent || b.agent === input.agent);
+        }
+        return parked.map((b) => ({
+          ...b,
+          agent: input.agent ?? b.agent,
+        }));
+      }
       case "get_bestie_assignment":
         return mockBestieAssignment ? { ...mockBestieAssignment } : null;
       case "assign_bestie": {

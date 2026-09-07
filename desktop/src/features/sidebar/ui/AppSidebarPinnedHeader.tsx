@@ -40,6 +40,7 @@ type AppSidebarPinnedHeaderProps = {
 };
 
 type AppSidebarPrimaryMenuProps = {
+  agentsHealthAlert?: boolean;
   homeBadgeCount: number;
   onSelectAgents: () => void;
   onSelectHome: () => void;
@@ -90,6 +91,7 @@ export function AppSidebarPinnedHeader({
 }
 
 export function AppSidebarPrimaryMenu({
+  agentsHealthAlert = false,
   homeBadgeCount,
   onSelectAgents,
   onSelectHome,
@@ -167,6 +169,14 @@ export function AppSidebarPrimaryMenu({
               <Bot className="h-4 w-4" />
               <SidebarMenuLabel>Agents</SidebarMenuLabel>
             </SidebarMenuButton>
+            {agentsHealthAlert ? (
+              <SidebarMenuBadge
+                className="right-2 rounded-full bg-destructive/15 px-1.5 text-2xs text-destructive peer-data-[active=true]/menu-button:bg-sidebar-active-foreground/20 peer-data-[active=true]/menu-button:text-sidebar-active-foreground"
+                data-testid="sidebar-agents-health-badge"
+              >
+                !
+              </SidebarMenuBadge>
+            ) : null}
           </SidebarMenuItem>
           <ProtectedBestieSidebarEntry />
           <FeatureGate feature="workflows">
