@@ -112,7 +112,7 @@ file-size-check:
 
 # Format all Rust code
 fmt:
-    cargo fmt --all
+    CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh root)" cargo fmt --all
 
 # Check formatting without modifying files
 fmt-check:
@@ -152,11 +152,11 @@ desktop-build:
 
 # Format desktop Tauri Rust code
 desktop-tauri-fmt:
-    cargo fmt --manifest-path {{desktop_tauri_manifest}} --all
+    CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh desktop)" cargo fmt --manifest-path {{desktop_tauri_manifest}} --all
 
 # Check desktop Tauri Rust formatting
 desktop-tauri-fmt-check:
-    cargo fmt --manifest-path {{desktop_tauri_manifest}} --all -- --check
+    CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh desktop)" cargo fmt --manifest-path {{desktop_tauri_manifest}} --all -- --check
 
 # Format all code (Rust + Tauri Rust + Dart)
 fmt-all: fmt desktop-tauri-fmt mobile-fmt
@@ -207,19 +207,22 @@ _ensure-services:
 
 # Apply database migrations and seed the local dev community if the dev database is running
 _ensure-migrations: _ensure-services
-    cargo run -p buzz-admin -- migrate
+    CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh root)" cargo run -p buzz-admin -- migrate
     ./scripts/seed-local-community.sh
 
 # Run clippy on the desktop Tauri Rust crate
 desktop-tauri-clippy: _ensure-sidecar-stubs
-    cargo clippy --manifest-path {{desktop_tauri_manifest}} --workspace --all-targets -- -D warnings
+    CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh desktop)" cargo clippy --manifest-path {{desktop_tauri_manifest}} --workspace --all-targets -- -D warnings
 
 # Check the desktop Tauri Rust crate compiles
 desktop-tauri-check: _ensure-sidecar-stubs
-    cargo check --manifest-path {{desktop_tauri_manifest}}
+    CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh desktop)" cargo check --manifest-path {{desktop_tauri_manifest}}
 
 # Run desktop Tauri Rust unit tests
 desktop-tauri-test: _ensure-sidecar-stubs
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh desktop)"
     cd desktop/src-tauri && cargo test --workspace
 
 # Run the native terminal latency gate explicitly on a known-idle host.
@@ -301,6 +304,7 @@ desktop-demo-build demo_name target="aarch64-apple-darwin":
     set -euo pipefail
     TARGET={{target}}
     [[ "$(uname -s)" == "Darwin" && "$TARGET" == *-apple-darwin ]] || { echo "Demo DMGs require a macOS Apple target" >&2; exit 2; }
+    export CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh root)"
     CONFIG_PATH="$(mktemp "${TMPDIR:-/tmp}/buzz-demo-config.XXXXXX")"
     trap 'rm -f "$CONFIG_PATH"' EXIT
     DEMO_BUILD_ID="$(node -e 'console.log(require("node:crypto").randomBytes(8).toString("hex"))')"
@@ -315,17 +319,18 @@ desktop-demo-build demo_name target="aarch64-apple-darwin":
       -p buzz-mcp-launch -p git-credential-nostr -p buzz-cli
     ./scripts/bundle-sidecars.sh "$TARGET"
     pnpm install
+    export CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh desktop)"
     cd {{desktop_dir}}
     BUZZ_BUILD_DEMO_SLUG="$DEMO_SLUG" pnpm tauri build --features mesh-llm --target "$TARGET" --bundles app --config "$CONFIG_PATH"
     cd ..
     VERSION="$(node -p "require('./desktop/package.json').version")"
     DMG_ARCH="${TARGET%%-*}"; [[ "$DMG_ARCH" == "x86_64" ]] && DMG_ARCH=x64
-    APP_PATH="desktop/src-tauri/target/$TARGET/release/bundle/macos/$PRODUCT_NAME.app"
+    APP_PATH="$(scripts/zs/cargo-target-dir.sh desktop)/$TARGET/release/bundle/macos/$PRODUCT_NAME.app"
     PLIST="$APP_PATH/Contents/Info.plist"
     /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $PRODUCT_NAME" "$PLIST"
     /usr/libexec/PlistBuddy -c "Set :CFBundleName $PRODUCT_NAME" "$PLIST"
     codesign --force --deep --sign - "$APP_PATH"
-    VOL_NAME="$DMG_VOLUME_NAME" ./desktop/scripts/package-macos-dmg.sh "$APP_PATH" "desktop/src-tauri/target/$TARGET/release/bundle/dmg/${DMG_FILE_STEM}_${VERSION}_${DMG_ARCH}.dmg"
+    VOL_NAME="$DMG_VOLUME_NAME" ./desktop/scripts/package-macos-dmg.sh "$APP_PATH" "$(scripts/zs/cargo-target-dir.sh desktop)/$TARGET/release/bundle/dmg/${DMG_FILE_STEM}_${VERSION}_${DMG_ARCH}.dmg"
 
 # Run desktop checks suitable for CI / pre-push
 desktop-ci: desktop-check desktop-test desktop-tauri-fmt-check desktop-build desktop-tauri-check desktop-tauri-test
@@ -364,6 +369,7 @@ test:
 test-unit:
     #!/usr/bin/env bash
     set -euo pipefail
+    export CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh root)"
     ./scripts/test-ensure-local-relay-key.sh
     if command -v cargo-nextest &>/dev/null; then
         cargo nextest run -p buzz-core -p buzz-auth --lib
@@ -600,6 +606,7 @@ relay-release: bootstrap _ensure-migrations
 dev *ARGS: bootstrap _ensure-sidecar-stubs _ensure-migrations
     #!/usr/bin/env bash
     set -euo pipefail
+    export CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh root)"
     export PATH="{{justfile_directory()}}/bin:$PATH"
     set -o allexport
     source .env
@@ -625,7 +632,8 @@ dev *ARGS: bootstrap _ensure-sidecar-stubs _ensure-migrations
     # the bounded profile already used by the relay test launcher.
     export BUZZ_GIT_PROBE_WRITERS="${BUZZ_GIT_PROBE_WRITERS:-8}"
     export BUZZ_GIT_PROBE_ROUNDS="${BUZZ_GIT_PROBE_ROUNDS:-2}"
-    ./target/debug/buzz-relay &
+    BUZZ_RELAY_BIN="$(cargo metadata --format-version 1 --no-deps | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).target_directory")/debug/buzz-relay"
+    "$BUZZ_RELAY_BIN" &
     RELAY_PID=$!
     cleanup() {
         [[ -n "${INSTANCE_ID:-}" ]] && ../scripts/cleanup-instance-agents.sh "$INSTANCE_ID" || true
@@ -663,6 +671,7 @@ desktop-standalone *ARGS: _ensure-sidecar-stubs
     #!/usr/bin/env bash
     set -euo pipefail
     export PATH="{{justfile_directory()}}/bin:$PATH"
+    export CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh root)"
     cargo build -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes -p buzz-dev-mcp -p buzz-mcp-launch -p buzz-cli -p git-credential-nostr
     TARGET=$(rustc -vV | sed -n 's|host: ||p')
     TARGET_DIR=$(cargo metadata --format-version 1 --no-deps | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).target_directory")
@@ -687,6 +696,7 @@ desktop-standalone *ARGS: _ensure-sidecar-stubs
     fi
     trap '../scripts/cleanup-instance-agents.sh "$INSTANCE_ID" || true' EXIT
     echo "Starting standalone desktop on Vite port ${BUZZ_VITE_PORT}; no relay services were started"
+    export CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh desktop)"
     pnpm exec tauri dev --config "$BUZZ_TAURI_CONFIG" {{ARGS}}
 
 # Run the desktop app against the internal staging relay (installs deps + builds agent tools automatically)
@@ -694,6 +704,7 @@ staging *ARGS: bootstrap _ensure-sidecar-stubs
     #!/usr/bin/env bash
     set -euo pipefail
     export PATH="{{justfile_directory()}}/bin:$PATH"
+    export CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh root)"
     pnpm install  # unconditional: staging must always start with a clean dep tree
     cargo build --release -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes -p buzz-dev-mcp -p buzz-cli -p git-credential-nostr
     FEATURES=()
@@ -722,6 +733,7 @@ staging *ARGS: bootstrap _ensure-sidecar-stubs
     INSTANCE_ID=$(node -e "console.log(JSON.parse(process.env.BUZZ_TAURI_CONFIG).identifier)")
     trap '../scripts/cleanup-instance-agents.sh "$INSTANCE_ID" || true' EXIT
     echo "Starting staging on Vite port ${BUZZ_VITE_PORT}, relay ${BUZZ_RELAY_URL}"
+    export CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh desktop)"
     pnpm exec tauri dev ${FEATURES[@]+"${FEATURES[@]}"} --config "$BUZZ_TAURI_CONFIG" {{ARGS}}
 
 # Run the desktop app against the production relay (installs deps + builds agent tools automatically)
@@ -729,6 +741,7 @@ production *ARGS: bootstrap _ensure-sidecar-stubs
     #!/usr/bin/env bash
     set -euo pipefail
     export PATH="{{justfile_directory()}}/bin:$PATH"
+    export CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh root)"
     pnpm install  # unconditional: production must always start with a clean dep tree
     cargo build --release -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes -p buzz-dev-mcp -p buzz-cli -p git-credential-nostr
     FEATURES=()
@@ -757,6 +770,7 @@ production *ARGS: bootstrap _ensure-sidecar-stubs
     INSTANCE_ID=$(node -e "console.log(JSON.parse(process.env.BUZZ_TAURI_CONFIG).identifier)")
     trap '../scripts/cleanup-instance-agents.sh "$INSTANCE_ID" || true' EXIT
     echo "Starting production on Vite port ${BUZZ_VITE_PORT}, relay ${BUZZ_RELAY_URL}"
+    export CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh desktop)"
     pnpm exec tauri dev ${FEATURES[@]+"${FEATURES[@]}"} --config "$BUZZ_TAURI_CONFIG" {{ARGS}}
 
 # Run the desktop frontend dev server (port derived from worktree)
@@ -863,12 +877,16 @@ migrate: _ensure-migrations
 
 # Remove build artifacts
 clean:
-    cargo clean
-    cargo clean --manifest-path desktop/src-tauri/Cargo.toml
+    CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh root)" cargo clean
+    CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh desktop)" cargo clean --manifest-path desktop/src-tauri/Cargo.toml
+
+# Garbage-collect idle or orphaned cargo target directories
+cargo-target-gc *ARGS:
+    scripts/zs/with-gate-lock.sh scripts/zs/cargo-target-gc.sh {{ARGS}}
 
 # Check the Rust workspace compiles without producing binaries
 check-compile:
-    cargo check --workspace --all-targets
+    CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh root)" cargo check --workspace --all-targets
 
 # ─── Release ─────────────────────────────────────────────────────────────────
 
