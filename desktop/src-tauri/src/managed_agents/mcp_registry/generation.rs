@@ -115,6 +115,23 @@ pub const MAX_PLAN_FILES: usize = 1024;
 /// Largest total staged bytes in one generation.
 pub const MAX_PLAN_BYTES: usize = 64 * 1024 * 1024;
 
+/// Largest number of bytes the durable journal may hold.
+///
+/// A real journal is a handful of deletions and a generation number; this
+/// exists so a replaced `journal.json` (a multi-gigabyte or sparse file) is
+/// refused without being allocated, the same reasoning as
+/// [`super::load::MAX_DOCUMENT_BYTES`] for the registry document.
+pub(super) const MAX_JOURNAL_BYTES: usize = 1024 * 1024;
+
+/// Largest number of entries one journal's `deletions` or `rollback` array may
+/// carry.
+///
+/// A generous multiple over anything a real convergence stages
+/// ([`MAX_PLAN_FILES`]-scale): a legitimate journal never approaches it, so it
+/// exists only to bound the retry loop a corrupted or replaced `journal.json`
+/// could otherwise drive over an unbounded array.
+pub(super) const MAX_JOURNAL_DELETIONS: usize = 65536;
+
 /// The durable record of an in-flight change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Journal {
@@ -366,7 +383,7 @@ impl GenerationStore {
         self.root.join("journal.json.next")
     }
 
-    fn lock_path(&self) -> PathBuf {
+    pub(super) fn lock_path(&self) -> PathBuf {
         self.root.join("mutation.lock")
     }
 
@@ -433,18 +450,41 @@ impl GenerationStore {
 
     /// Read the journal, if one is outstanding.
     ///
+    /// Opened without following a symlink, required to be a regular file, and
+    /// read to at most [`MAX_JOURNAL_BYTES`] plus one byte before any parsing
+    /// — the same guards [`super::load::read_bounded_no_follow`] gives the
+    /// registry document, which this file had none of: a FIFO placed at
+    /// `journal.json` would otherwise block this read forever, a symlink
+    /// would redirect it, and a multi-gigabyte file would be read whole
+    /// before any cap applied. The parsed `deletions`/`rollback` arrays are
+    /// then bounded too, so a corrupted or replaced journal cannot drive
+    /// [`GenerationStore::reconcile_locked`]'s retry loop unboundedly.
+    ///
     /// # Errors
-    /// [`GenerationError::Journal`] when it exists but does not parse — which
-    /// is surfaced rather than treated as "no change in flight", because that
-    /// reading would strand every deletion it owed.
+    /// [`GenerationError::Journal`] when it exists but cannot be read safely,
+    /// does not parse, or names more deletions than [`MAX_JOURNAL_DELETIONS`]
+    /// allows — which is surfaced rather than treated as "no change in
+    /// flight", because that reading would strand every deletion it owed.
     pub fn journal(&self) -> Result<Option<Journal>, GenerationError> {
-        match std::fs::read(self.journal_path()) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map(Some)
-                .map_err(|e| GenerationError::Journal(e.to_string())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(GenerationError::Journal(e.to_string())),
+        let path = self.journal_path();
+        let bytes = match read_bounded_no_follow_regular(&path, MAX_JOURNAL_BYTES) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(None),
+            Err(reason) => return Err(GenerationError::Journal(reason)),
+        };
+        let journal: Journal =
+            serde_json::from_slice(&bytes).map_err(|e| GenerationError::Journal(e.to_string()))?;
+        if journal.deletions.len() > MAX_JOURNAL_DELETIONS
+            || journal.rollback.len() > MAX_JOURNAL_DELETIONS
+        {
+            return Err(GenerationError::Journal(format!(
+                "names {} deletions and {} rollback entries, over the \
+                 {MAX_JOURNAL_DELETIONS}-entry cap",
+                journal.deletions.len(),
+                journal.rollback.len()
+            )));
         }
+        Ok(Some(journal))
     }
 
     /// Stage and adopt one configuration change.
@@ -829,6 +869,66 @@ fn remove_tree(path: &Path) -> Result<(), GenerationError> {
     }
 }
 
+/// Open `path` without following a symlink, require it be a regular file, and
+/// read at most `cap` bytes plus one.
+///
+/// Mirrors [`super::load::read_bounded_no_follow`], which the registry
+/// document already gets: the durable journal is exactly as untrusted a file
+/// on disk (this process's own crash can leave it, but so can anything else
+/// with write access to the app data directory) and had none of these guards.
+/// A FIFO at this path would otherwise block the read forever; a symlink
+/// would redirect it to whatever it names; a multi-gigabyte file would be
+/// read in full before any size check ran.
+///
+/// `Ok(None)` when the file does not exist.
+fn read_bounded_no_follow_regular(path: &Path, cap: usize) -> Result<Option<Vec<u8>>, String> {
+    let mut options = std::fs::File::options();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // `O_NONBLOCK` alongside `O_NOFOLLOW`: opening a FIFO for reading
+        // with neither blocks until a writer connects, with no timeout
+        // anywhere on this path — the exact hang this function exists to
+        // refuse. It has no effect on a regular file, which is what the
+        // `metadata.is_file()` check just below still requires before any
+        // read is attempted.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("{}: cannot stat: {e}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+
+    let mut buffer = Vec::new();
+    let mut limited = file.take((cap as u64) + 1);
+    limited
+        .read_to_end(&mut buffer)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if buffer.len() > cap {
+        return Err(format!(
+            "{} is larger than the {cap}-byte cap",
+            path.display()
+        ));
+    }
+    Ok(Some(buffer))
+}
+
 /// Create `path` for writing without following a symlink at its final
 /// component.
 ///
@@ -912,13 +1012,45 @@ pub(super) fn sync_dir(path: &Path) -> Result<(), GenerationError> {
 }
 
 /// The one configuration-mutation lock.
-struct MutationLock {
+#[derive(Debug)]
+pub(super) struct MutationLock {
     #[allow(dead_code)]
     file: File,
 }
 
+/// How long a mutation lock acquisition waits for a concurrent holder before
+/// giving up and surfacing a busy error.
+///
+/// A blocking `lock_exclusive` has no deadline: a second process stalled
+/// while holding this lock — in keychain or filesystem work — would hang this
+/// process's startup reconciliation, and every registry command after it,
+/// forever, with nothing to show for it. Generous enough that ordinary
+/// contention (two Settings actions, or `reconcile` racing a `commit`) always
+/// finishes well inside it.
+const MUTATION_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long to wait between lock poll attempts.
+const MUTATION_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
 impl MutationLock {
     fn acquire(path: &Path) -> Result<Self, GenerationError> {
+        Self::acquire_within(path, MUTATION_LOCK_TIMEOUT)
+    }
+
+    /// [`Self::acquire`] with an injectable deadline, so a test can prove the
+    /// busy path without waiting out the production timeout.
+    ///
+    /// `try_lock_exclusive` is non-blocking, so contention is polled rather
+    /// than parking in a blocking `lock_exclusive()` — the same idiom
+    /// `buzz_agent::auth::acquire_auth_lock` uses for its own cross-process
+    /// file lock. Contention is reported as [`fs2::lock_contended_error`]
+    /// (`EWOULDBLOCK`/`EACCES` on Unix, `ERROR_LOCK_VIOLATION` on Windows);
+    /// any other error is a real fault, surfaced immediately rather than
+    /// retried.
+    pub(super) fn acquire_within(
+        path: &Path,
+        timeout: std::time::Duration,
+    ) -> Result<Self, GenerationError> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -929,11 +1061,25 @@ impl MutationLock {
             .truncate(false)
             .open(path)
             .map_err(|e| GenerationError::Lock(e.to_string()))?;
-        // Blocks until the lock is available: the loser waits and then
-        // restages, rather than having its action silently discarded. `fs2`
-        // rather than std's `File::lock`, which is 1.89+ and the repo declares
-        // a 1.88 MSRV (same reason buzz-agent uses it).
-        fs2::FileExt::lock_exclusive(&file).map_err(|e| GenerationError::Lock(e.to_string()))?;
-        Ok(Self { file })
+        // `fs2` rather than std's `File::lock`, which is 1.89+ and the repo
+        // declares a 1.88 MSRV (same reason buzz-agent uses it).
+        let contended = fs2::lock_contended_error().raw_os_error();
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match fs2::FileExt::try_lock_exclusive(&file) {
+                Ok(()) => return Ok(Self { file }),
+                Err(e) if e.raw_os_error() == contended => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(GenerationError::Lock(format!(
+                            "another configuration change has held the mutation lock for over \
+                             {}ms; refusing to wait longer",
+                            timeout.as_millis()
+                        )));
+                    }
+                    std::thread::sleep(MUTATION_LOCK_POLL);
+                }
+                Err(e) => return Err(GenerationError::Lock(e.to_string())),
+            }
+        }
     }
 }

@@ -290,8 +290,26 @@ pub fn converge_now_with_records<R: tauri::Runtime>(
     let launcher = checked_launcher(&launcher_path)?;
 
     let registry = load_registry(&paths.document()).map_err(|e| e.to_string())?;
-    let personas = crate::managed_agents::load_personas(app).unwrap_or_default();
-    let global = crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
+    // A read failure here is not "no personas"/"no global config" — those are
+    // legitimate empty states `load_personas`/`load_global_agent_config`
+    // already return `Ok` for. It is corruption or an unreadable store, and
+    // `unwrap_or_default` used to treat the two identically: a corrupt store
+    // would silently compute every agent's effective runtime, and therefore
+    // its convergence, from defaults instead of its own configuration.
+    // Propagated instead, with context, so the current generation stays
+    // adopted rather than being replaced by one built on a wrong runtime.
+    let personas = crate::managed_agents::load_personas(app).map_err(|e| {
+        format!(
+            "cannot read agent personas, which convergence needs to resolve each agent's \
+             effective runtime: {e}"
+        )
+    })?;
+    let global = crate::managed_agents::load_global_agent_config(app).map_err(|e| {
+        format!(
+            "cannot read the global agent config, which convergence needs to resolve each \
+             agent's effective runtime: {e}"
+        )
+    })?;
     let secrets = DesktopSecrets::new(crate::app_state::keyring_service());
 
     let selections = selections_for_records(records, &personas, &global, &secrets);

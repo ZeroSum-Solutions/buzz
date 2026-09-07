@@ -8,7 +8,7 @@ use super::*;
 use crate::app_state::{build_app_state, AppState};
 use crate::managed_agents::mcp_registry::load::LoadedEntry;
 use crate::managed_agents::mcp_registry::schema::{
-    RegistryDocument, RegistryEntry, RegistryTransport, MAX_DOCUMENT_BYTES,
+    RegistryDocument, RegistryEntry, RegistryTransport, MAX_DOCUMENT_BYTES, MAX_SERVERS_PER_AGENT,
 };
 use crate::managed_agents::{
     save_managed_agents, AgentMcpServers, BackendKind, ManagedAgentRecord, RespondTo,
@@ -280,7 +280,7 @@ fn mcp_registry_save_does_not_follow_a_symlinked_document() {
 }
 
 #[test]
-fn mcp_registry_delete_server_reports_partial_state_on_agent_save_failure() {
+fn mcp_registry_delete_server_leaves_consistent_state_on_agent_save_failure() {
     let (_guard, _home) = EnvGuard::new();
     let app = mock_app();
     let doc_path = document_path(app.handle()).expect("document path");
@@ -318,20 +318,83 @@ fn mcp_registry_delete_server_reports_partial_state_on_agent_save_failure() {
     });
     save_managed_agents(app.handle(), &[record]).unwrap();
 
+    // Agent selections are written FIRST now, so an injected failure there
+    // must leave the registry document untouched — the reverse of the old
+    // (torn) behaviour this test used to assert (Sol T7c round 2, item 4).
     let err = delete_mcp_registry_server_internal(app.handle(), "srv1", |_| {
         Err("injected agent write failure".to_string())
     })
     .unwrap_err();
 
-    assert_eq!(
-        err,
-        "mcp registry document updated to remove srv1, but updating agent records failed: injected agent write failure; state is inconsistent"
+    assert!(
+        err.contains("injected agent write failure"),
+        "error should carry the injected cause, got: {err}"
+    );
+    assert!(
+        err.contains("not changed") && err.contains("retried"),
+        "error should say the document is unchanged and the delete is retriable, got: {err}"
     );
 
-    // Verify document was written first and srv1 was removed
-    let updated_doc = read_document(&doc_path).unwrap();
-    assert_eq!(updated_doc.servers.len(), 1);
-    assert_eq!(updated_doc.servers[0].id, "srv2");
+    // The registry document must be untouched: srv1 is still declared.
+    let doc_after = read_document(&doc_path).unwrap();
+    assert_eq!(doc_after.servers.len(), 2);
+    assert!(doc_after.servers.iter().any(|e| e.id == "srv1"));
+    assert!(doc_after.servers.iter().any(|e| e.id == "srv2"));
+
+    // The agent's selection is unchanged too: the failed save never landed.
+    let records_after = crate::managed_agents::load_managed_agents(app.handle()).unwrap();
+    let record_after = records_after
+        .iter()
+        .find(|r| r.pubkey == "agent-save-fail")
+        .expect("agent record still present");
+    assert_eq!(
+        record_after.mcp_servers.as_ref().unwrap().enabled,
+        vec!["srv1".to_string()]
+    );
+}
+
+#[test]
+fn mcp_registry_delete_server_writes_agent_selections_before_the_document() {
+    // A direct proof of the new write order (Sol T7c round 2, item 4): when
+    // agent-record persistence succeeds, srv1 must already be gone from
+    // every agent's selection by the time the registry document write is
+    // reached, never the reverse.
+    let (_guard, _home) = EnvGuard::new();
+    let app = mock_app();
+    let doc_path = document_path(app.handle()).expect("document path");
+    fs::create_dir_all(doc_path.parent().unwrap()).unwrap();
+
+    let doc = RegistryDocument {
+        version: 1,
+        servers: vec![RegistryEntry {
+            id: "srv1".to_string(),
+            name: "Server 1".to_string(),
+            transport: RegistryTransport::Stdio {
+                command: "/usr/local/bin/server1".to_string(),
+                args: vec![],
+            },
+            env: BTreeMap::new(),
+        }],
+    };
+    write_document(&doc_path, &doc).unwrap();
+
+    let mut record = bare_agent_record("agent-order-check");
+    record.mcp_servers = Some(AgentMcpServers {
+        version: AGENT_MCP_SERVERS_VERSION,
+        enabled: vec!["srv1".to_string()],
+    });
+    save_managed_agents(app.handle(), &[record]).unwrap();
+
+    delete_mcp_registry_server_internal(app.handle(), "srv1", |records| {
+        // At the moment `save_records` runs, the document must still
+        // declare srv1 — proof this closure is invoked before the document
+        // write, not after.
+        let doc_mid = read_document(&doc_path).unwrap();
+        assert_eq!(doc_mid.servers.len(), 1, "document written too early");
+        assert_eq!(doc_mid.servers[0].id, "srv1");
+        save_managed_agents(app.handle(), records)
+    })
+    .expect("delete succeeds");
 }
 
 #[test]
@@ -402,4 +465,356 @@ fn mcp_registry_save_surfaces_a_refused_agent_not_just_an_error() {
         reason.contains("http") || reason.contains("buzz-agent"),
         "reason should explain transport incompatibility, got: {reason}"
     );
+}
+
+// ── Item 1: the selection DTO is bounded before it is written ──────────────
+
+#[test]
+fn mcp_registry_set_agent_servers_rejects_a_selection_over_the_16_server_cap() {
+    let (_guard, _home) = EnvGuard::new();
+    let app = mock_app();
+    let doc_path = document_path(app.handle()).expect("document path");
+    fs::create_dir_all(doc_path.parent().unwrap()).unwrap();
+
+    // A registry entry for every id 0..=MAX_SERVERS_PER_AGENT, so existence
+    // checks pass and only the count cap is exercised.
+    let servers: Vec<RegistryEntry> = (0..=MAX_SERVERS_PER_AGENT)
+        .map(|i| RegistryEntry {
+            id: format!("srv{i}"),
+            name: format!("Server {i}"),
+            transport: RegistryTransport::Stdio {
+                command: "/usr/local/bin/server".to_string(),
+                args: vec![],
+            },
+            env: BTreeMap::new(),
+        })
+        .collect();
+    write_document(
+        &doc_path,
+        &RegistryDocument {
+            version: 1,
+            servers,
+        },
+    )
+    .unwrap();
+
+    let record = bare_agent_record("agent-17");
+    save_managed_agents(app.handle(), &[record]).unwrap();
+
+    let enabled: Vec<String> = (0..=MAX_SERVERS_PER_AGENT)
+        .map(|i| format!("srv{i}"))
+        .collect();
+    assert_eq!(enabled.len(), MAX_SERVERS_PER_AGENT + 1);
+
+    let err =
+        set_agent_mcp_servers(app.handle().clone(), "agent-17".to_string(), enabled).unwrap_err();
+    assert!(
+        err.contains(&MAX_SERVERS_PER_AGENT.to_string()) || err.contains("cap"),
+        "expected an error naming the server cap, got: {err}"
+    );
+
+    // Nothing was written: the agent's selection stays absent.
+    let records_after = crate::managed_agents::load_managed_agents(app.handle()).unwrap();
+    let record_after = records_after
+        .iter()
+        .find(|r| r.pubkey == "agent-17")
+        .unwrap();
+    assert!(
+        record_after.mcp_servers.is_none(),
+        "an oversized selection must not be persisted"
+    );
+}
+
+#[test]
+fn mcp_registry_set_agent_servers_rejects_duplicate_ids_before_writing() {
+    let (_guard, _home) = EnvGuard::new();
+    let app = mock_app();
+    let doc_path = document_path(app.handle()).expect("document path");
+    fs::create_dir_all(doc_path.parent().unwrap()).unwrap();
+
+    write_document(
+        &doc_path,
+        &RegistryDocument {
+            version: 1,
+            servers: vec![RegistryEntry {
+                id: "srv1".to_string(),
+                name: "Server 1".to_string(),
+                transport: RegistryTransport::Stdio {
+                    command: "/usr/local/bin/server".to_string(),
+                    args: vec![],
+                },
+                env: BTreeMap::new(),
+            }],
+        },
+    )
+    .unwrap();
+
+    let record = bare_agent_record("agent-dup");
+    save_managed_agents(app.handle(), &[record]).unwrap();
+
+    let err = set_agent_mcp_servers(
+        app.handle().clone(),
+        "agent-dup".to_string(),
+        vec!["srv1".to_string(), "srv1".to_string()],
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("twice") || err.contains("duplicate"),
+        "expected an error naming the duplicate, got: {err}"
+    );
+
+    let records_after = crate::managed_agents::load_managed_agents(app.handle()).unwrap();
+    let record_after = records_after
+        .iter()
+        .find(|r| r.pubkey == "agent-dup")
+        .unwrap();
+    assert!(
+        record_after.mcp_servers.is_none(),
+        "a duplicate-bearing selection must not be persisted"
+    );
+}
+
+#[test]
+fn mcp_registry_set_agent_servers_rejects_an_id_the_registry_does_not_declare() {
+    let (_guard, _home) = EnvGuard::new();
+    let app = mock_app();
+    let doc_path = document_path(app.handle()).expect("document path");
+    fs::create_dir_all(doc_path.parent().unwrap()).unwrap();
+    write_document(
+        &doc_path,
+        &RegistryDocument {
+            version: 1,
+            servers: vec![],
+        },
+    )
+    .unwrap();
+
+    let record = bare_agent_record("agent-unknown");
+    save_managed_agents(app.handle(), &[record]).unwrap();
+
+    let err = set_agent_mcp_servers(
+        app.handle().clone(),
+        "agent-unknown".to_string(),
+        vec!["ghost-server".to_string()],
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("ghost-server"),
+        "expected an error naming the unknown id, got: {err}"
+    );
+
+    let records_after = crate::managed_agents::load_managed_agents(app.handle()).unwrap();
+    let record_after = records_after
+        .iter()
+        .find(|r| r.pubkey == "agent-unknown")
+        .unwrap();
+    assert!(
+        record_after.mcp_servers.is_none(),
+        "a selection naming an unknown id must not be persisted"
+    );
+}
+
+// ── Item 2: the document write refuses a symlink swapped in before it ──────
+
+#[test]
+fn mcp_registry_write_document_refuses_a_symlink_swapped_in_before_write() {
+    let (_guard, _home) = EnvGuard::new();
+    let app = mock_app();
+    let doc_path = document_path(app.handle()).expect("document path");
+    fs::create_dir_all(doc_path.parent().unwrap()).unwrap();
+
+    // Simulate a prior successful read: the real document already exists.
+    write_document(
+        &doc_path,
+        &RegistryDocument {
+            version: 1,
+            servers: vec![],
+        },
+    )
+    .unwrap();
+
+    // The race: something replaces the document path with a symlink to an
+    // unrelated file between that read and this write.
+    let outside_target = doc_path.parent().unwrap().join("outside.json");
+    fs::write(&outside_target, b"{\"totally\":\"unrelated\"}").unwrap();
+    fs::remove_file(&doc_path).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside_target, &doc_path).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(&outside_target, &doc_path).unwrap();
+
+    let new_doc = RegistryDocument {
+        version: 1,
+        servers: vec![RegistryEntry {
+            id: "server1".to_string(),
+            name: "Server One".to_string(),
+            transport: RegistryTransport::Stdio {
+                command: "/usr/local/bin/server".to_string(),
+                args: vec![],
+            },
+            env: BTreeMap::new(),
+        }],
+    };
+    let err = write_document(&doc_path, &new_doc).unwrap_err();
+    assert!(
+        err.contains("symbolic link") || err.contains("symlink"),
+        "expected error mentioning symlink, got: {err}"
+    );
+
+    // The file the symlink points at must be untouched.
+    let outside_contents = fs::read_to_string(&outside_target).unwrap();
+    assert_eq!(outside_contents, "{\"totally\":\"unrelated\"}");
+}
+
+// ── Item 5: the DTO is bounded before it reaches the document ──────────────
+
+#[test]
+fn mcp_registry_save_rejects_an_oversized_entry_before_writing() {
+    let (_guard, _home) = EnvGuard::new();
+    let app = mock_app();
+    let doc_path = document_path(app.handle()).expect("document path");
+    fs::create_dir_all(doc_path.parent().unwrap()).unwrap();
+    write_document(
+        &doc_path,
+        &RegistryDocument {
+            version: 1,
+            servers: vec![],
+        },
+    )
+    .unwrap();
+
+    let entry = RegistryEntry {
+        id: "server1".to_string(),
+        name: "Server One".to_string(),
+        transport: RegistryTransport::Stdio {
+            command: "/usr/local/bin/server".to_string(),
+            args: vec!["x".to_string(); 200],
+        },
+        env: BTreeMap::new(),
+    };
+    let err = save_mcp_registry_server(app.handle().clone(), entry, BTreeMap::new()).unwrap_err();
+    assert!(
+        err.contains("argument") && err.contains("cap"),
+        "expected an error naming the argument cap, got: {err}"
+    );
+
+    let after = read_document(&doc_path).unwrap();
+    assert!(
+        after.servers.is_empty(),
+        "an oversized entry must not have been written"
+    );
+}
+
+#[test]
+fn mcp_registry_save_rejects_an_oversized_secrets_map_before_writing() {
+    let (_guard, _home) = EnvGuard::new();
+    let app = mock_app();
+    let doc_path = document_path(app.handle()).expect("document path");
+    fs::create_dir_all(doc_path.parent().unwrap()).unwrap();
+    write_document(
+        &doc_path,
+        &RegistryDocument {
+            version: 1,
+            servers: vec![],
+        },
+    )
+    .unwrap();
+
+    let entry = RegistryEntry {
+        id: "server1".to_string(),
+        name: "Server One".to_string(),
+        transport: RegistryTransport::Stdio {
+            command: "/usr/local/bin/server".to_string(),
+            args: vec![],
+        },
+        env: BTreeMap::new(),
+    };
+    let mut secrets = BTreeMap::new();
+    secrets.insert("ref1".to_string(), "x".repeat(10_000));
+
+    let err = save_mcp_registry_server(app.handle().clone(), entry, secrets).unwrap_err();
+    assert!(
+        err.contains("cap") || err.contains("byte"),
+        "expected an error naming the value-size cap, got: {err}"
+    );
+
+    let after = read_document(&doc_path).unwrap();
+    assert!(
+        after.servers.is_empty(),
+        "the entry must not have been written when its secrets breach the cap"
+    );
+}
+
+// ── Item 6: rejected credential-bearing urls/commands are redacted ─────────
+
+#[test]
+fn mcp_registry_a_rejected_http_entrys_query_credential_url_is_redacted() {
+    let loaded = LoadedEntry {
+        entry: RegistryEntry {
+            id: "http1".to_string(),
+            name: "Http One".to_string(),
+            transport: RegistryTransport::Http {
+                url: "https://api.example.com/mcp?access_token=abc123".to_string(),
+                auth: None,
+            },
+            env: BTreeMap::new(),
+        },
+        rejection: Some("its url carries a query credential".to_string()),
+    };
+    let view = view_of(&loaded);
+    assert_eq!(view.url.as_deref(), Some("<redacted>"));
+}
+
+#[test]
+fn mcp_registry_a_rejected_http_entrys_userinfo_url_is_redacted() {
+    let loaded = LoadedEntry {
+        entry: RegistryEntry {
+            id: "http2".to_string(),
+            name: "Http Two".to_string(),
+            transport: RegistryTransport::Http {
+                url: "https://user:pass@api.example.com/mcp".to_string(),
+                auth: None,
+            },
+            env: BTreeMap::new(),
+        },
+        rejection: Some("its url carries userinfo".to_string()),
+    };
+    let view = view_of(&loaded);
+    assert_eq!(view.url.as_deref(), Some("<redacted>"));
+}
+
+#[test]
+fn mcp_registry_a_rejected_stdio_entrys_credential_shaped_command_is_redacted() {
+    let loaded = LoadedEntry {
+        entry: RegistryEntry {
+            id: "stdio1".to_string(),
+            name: "Stdio One".to_string(),
+            transport: RegistryTransport::Stdio {
+                command: "/tmp/sk-live-secret123/server".to_string(),
+                args: vec![],
+            },
+            env: BTreeMap::new(),
+        },
+        rejection: Some("its command carries a credential".to_string()),
+    };
+    let view = view_of(&loaded);
+    assert_eq!(view.command.as_deref(), Some("<redacted>"));
+}
+
+#[test]
+fn mcp_registry_an_unrejected_http_entrys_url_is_not_redacted() {
+    let loaded = LoadedEntry {
+        entry: RegistryEntry {
+            id: "http3".to_string(),
+            name: "Http Three".to_string(),
+            transport: RegistryTransport::Http {
+                url: "https://api.example.com/mcp".to_string(),
+                auth: None,
+            },
+            env: BTreeMap::new(),
+        },
+        rejection: None,
+    };
+    let view = view_of(&loaded);
+    assert_eq!(view.url.as_deref(), Some("https://api.example.com/mcp"));
 }

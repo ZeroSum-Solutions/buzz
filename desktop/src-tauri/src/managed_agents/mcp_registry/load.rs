@@ -253,7 +253,24 @@ fn validate_entry(entry: &RegistryEntry) -> Result<(), String> {
 
     match &entry.transport {
         RegistryTransport::Stdio { command, args } => validate_stdio(command, args)?,
-        RegistryTransport::Http { url, auth } => validate_http(url, auth.as_ref())?,
+        RegistryTransport::Http { url, auth } => {
+            // An http upstream has no child process to hand environment
+            // variables to (`generate::generate_server`'s http branch emits
+            // no `env`), so a declared `env` block — including an `mcp:`
+            // reference an operator believes configures auth — is accepted
+            // here, stored, and then silently has no effect on the running
+            // server. Reject it at the same place every other unusable shape
+            // is rejected, rather than accepting it and doing nothing with it.
+            if !entry.env.is_empty() {
+                return Err(
+                    "it declares an env block, but an http server has no child process to \
+                     hand environment variables to; declare a credential in its auth block \
+                     instead"
+                        .to_string(),
+                );
+            }
+            validate_http(url, auth.as_ref())?;
+        }
     }
 
     // The bound that actually costs is the generated launcher argv, which is
@@ -360,6 +377,21 @@ fn validate_stdio(command: &str, args: &[String]) -> Result<(), String> {
             over.len()
         ));
     }
+    // The command is appended to the generated launcher argv exactly like an
+    // argument is (`generate_server`), so a credential-shaped command path is
+    // just as readable by `ps` and by a crash dump as a credential-shaped
+    // argument — and the argv scan below covers only `args`, never `command`.
+    // Scanned by path component, since the command is a path: a vendor prefix
+    // must still match the start of a component, not appear anywhere inside
+    // an absolute path.
+    if let Some(hit) = scan_command_path(command) {
+        return Err(format!(
+            "its command {} — the command is appended to the generated launcher argv, which \
+             is readable by `ps` and by any crash dump, so declare an `mcp:` reference in \
+             `env` instead",
+            hit.reason
+        ));
+    }
     if let Some((index, hit)) = scan_argv(args) {
         return Err(format!(
             "argument {index} {} — argv is readable by `ps` and by any crash dump, so declare an `mcp:` reference in `env` instead",
@@ -367,6 +399,16 @@ fn validate_stdio(command: &str, args: &[String]) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Scan a command path's own components for a credential shape.
+///
+/// `scan_value` matches a vendor prefix only at the start of a token; a
+/// command is one path, not a shell-split token, so it is split on its own
+/// separators first (`/tmp/sk-live-.../server` must scan the `sk-live-...`
+/// component, not fail to match against the path as a single string).
+fn scan_command_path(command: &str) -> Option<buzz_secret_store_pkg::sentinel::SentinelHit> {
+    command.split(['/', '\\']).find_map(scan_value)
 }
 
 fn validate_http(url: &str, auth: Option<&super::schema::HttpAuth>) -> Result<(), String> {

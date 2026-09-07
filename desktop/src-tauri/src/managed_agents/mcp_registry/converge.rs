@@ -299,13 +299,27 @@ pub fn converge<S: SecretStoreIo>(
                 .collect();
 
             for (ref_id, value) in *pending {
-                let accounted_for = carried
-                    .keys()
-                    .any(|key| key.ends_with(&format!(":{ref_id}")));
-                if !accounted_for && declared_refs.contains(ref_id) {
+                if !is_carried(&carried, ref_id) && declared_refs.contains(ref_id) {
                     carried.insert(holding_key(ref_id), value.clone());
                 }
             }
+
+            // A holding key stores a pending secret only until some selected
+            // agent's own (agent, generation) key carries it forward — from
+            // this round's pending value, from the holding key itself, or
+            // from the agent's own prior generation. Once that has happened
+            // the holding key is stale: left in place, it would let a later
+            // convergence with no new pending value read it ahead of the
+            // agent's own carried-forward value, silently rolling a
+            // subsequent rotation back. Consume it the moment any agent
+            // carries the reference, even though the reference is still
+            // declared in the registry.
+            let consumed_holding_refs: std::collections::BTreeSet<String> = existing
+                .keys()
+                .filter_map(|key| key.strip_prefix(HOLDING_KEY_PREFIX))
+                .filter(|ref_id| is_carried(&carried, ref_id))
+                .map(str::to_string)
+                .collect();
 
             // Handed to the store rather than written here: `commit` names
             // every one of these keys in the `PREPARED` journal before it
@@ -314,7 +328,12 @@ pub fn converge<S: SecretStoreIo>(
             // the mutation ahead of its own record.
             Ok(GenerationPlan {
                 files,
-                deletions: stale_secret_deletions(&existing, next, &declared_refs),
+                deletions: stale_secret_deletions(
+                    &existing,
+                    next,
+                    &declared_refs,
+                    &consumed_holding_refs,
+                ),
                 secrets: carried,
             })
         },
@@ -410,13 +429,24 @@ fn carry_secrets(
 
 /// Every `mcp:` reference one entry names, in its `env` block and its HTTP
 /// auth. A literal value is not a reference and is skipped.
+///
+/// An http entry's `env` is never a reference channel: `generate_server`'s
+/// http branch has no child process to hand it to, so an env-declared
+/// reference on an http entry is refused at load (`load::validate_entry`) and
+/// must never be treated as declared here either — otherwise a pending value
+/// for it would still be held (as an unassigned holding-key secret, see
+/// `holding_key`) even though nothing will ever consume it.
 fn entry_references(entry: &RegistryEntry) -> Vec<McpSecretRef> {
-    let mut references: Vec<McpSecretRef> = entry
-        .env
-        .values()
-        .filter(|value| looks_like_reference(value))
-        .filter_map(|value| McpSecretRef::parse(value).ok())
-        .collect();
+    let mut references: Vec<McpSecretRef> = Vec::new();
+    if matches!(entry.transport, RegistryTransport::Stdio { .. }) {
+        references.extend(
+            entry
+                .env
+                .values()
+                .filter(|value| looks_like_reference(value))
+                .filter_map(|value| McpSecretRef::parse(value).ok()),
+        );
+    }
     if let RegistryTransport::Http {
         auth: Some(auth), ..
     } = &entry.transport
@@ -426,6 +456,15 @@ fn entry_references(entry: &RegistryEntry) -> Vec<McpSecretRef> {
         }
     }
     references
+}
+
+/// Whether some carried record's key ends in `:<ref_id>` — i.e. some selected
+/// agent's own (agent, generation) storage key already names this reference,
+/// so a holding key for it is no longer the only place its value lives.
+fn is_carried(carried: &BTreeMap<String, String>, ref_id: &str) -> bool {
+    carried
+        .keys()
+        .any(|key| key.ends_with(&format!(":{ref_id}")))
 }
 
 /// Every `mcp:` record that does not belong to the adopted generation.
@@ -438,6 +477,7 @@ fn stale_secret_deletions(
     existing: &BTreeMap<String, String>,
     adopted: u64,
     declared_refs: &std::collections::BTreeSet<String>,
+    consumed_holding_refs: &std::collections::BTreeSet<String>,
 ) -> Vec<Deletion> {
     let keep = format!(":{adopted}:");
     existing
@@ -448,7 +488,7 @@ fn stale_secret_deletions(
             }
             if is_holding_key(key) {
                 let ref_id = key.strip_prefix(HOLDING_KEY_PREFIX).unwrap_or("");
-                return !declared_refs.contains(ref_id);
+                return !declared_refs.contains(ref_id) || consumed_holding_refs.contains(ref_id);
             }
             !key.contains(&keep)
         })

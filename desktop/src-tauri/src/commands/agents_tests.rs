@@ -791,3 +791,94 @@ fn owner_only_access_deploy_payload_clamps_stale_access() {
         "owner-only-access deploy payload retained a stale allowlist"
     );
 }
+
+// ── Item 7: agent deletion propagates a swallowed mcp convergence failure ──
+
+/// Isolated env with no `buzz-mcp-launch` reachable anywhere on `PATH`, so
+/// `converge_now_with_records` fails deterministically at launcher
+/// resolution — the same real failure a build without the bundled launcher
+/// sidecar hits, not a synthetic mock.
+struct McpConvergenceEnvGuard {
+    _path_guard: std::sync::MutexGuard<'static, ()>,
+    _temp: tempfile::TempDir,
+    old_home: Option<std::ffi::OsString>,
+    old_xdg: Option<std::ffi::OsString>,
+    old_path: Option<std::ffi::OsString>,
+}
+
+impl McpConvergenceEnvGuard {
+    fn new() -> Self {
+        let path_guard = crate::managed_agents::lock_path_mutex();
+        crate::managed_agents::clear_resolve_cache();
+        let temp = tempfile::tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+        let home = temp.path().join("home");
+        let empty_bin = temp.path().join("empty-bin");
+        std::fs::create_dir_all(&home).unwrap_or_else(|error| panic!("create home: {error}"));
+        std::fs::create_dir_all(&empty_bin)
+            .unwrap_or_else(|error| panic!("create empty bin: {error}"));
+
+        let old_home = std::env::var_os("HOME");
+        let old_xdg = std::env::var_os("XDG_DATA_HOME");
+        let old_path = std::env::var_os("PATH");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_DATA_HOME", &home);
+        std::env::set_var("PATH", &empty_bin);
+
+        Self {
+            _path_guard: path_guard,
+            _temp: temp,
+            old_home,
+            old_xdg,
+            old_path,
+        }
+    }
+}
+
+impl Drop for McpConvergenceEnvGuard {
+    fn drop(&mut self) {
+        crate::managed_agents::clear_resolve_cache();
+        if let Some(ref old) = self.old_home {
+            std::env::set_var("HOME", old);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(ref old) = self.old_xdg {
+            std::env::set_var("XDG_DATA_HOME", old);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+        if let Some(ref old) = self.old_path {
+            std::env::set_var("PATH", old);
+        } else {
+            std::env::remove_var("PATH");
+        }
+    }
+}
+
+#[test]
+fn agents_delete_propagates_mcp_convergence_failure_instead_of_swallowing_it() {
+    let _guard = McpConvergenceEnvGuard::new();
+    let state = crate::app_state::build_app_state();
+    *state.keys.lock().unwrap() = nostr::Keys::generate();
+    let app = tauri::test::mock_builder()
+        .manage(state)
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("mock app builds headless");
+
+    let records: Vec<ManagedAgentRecord> = vec![];
+    let err = propagate_mcp_convergence_after_deletion(app.handle(), "agent-x", &records)
+        .expect_err("convergence must fail without a resolvable launcher");
+
+    assert!(
+        err.contains("agent-x"),
+        "error should name the agent, got: {err}"
+    );
+    assert!(
+        err.contains("removed"),
+        "error should say the agent was already removed, got: {err}"
+    );
+    assert!(
+        err.contains("stale"),
+        "error should warn its mcp state may be stale, got: {err}"
+    );
+}

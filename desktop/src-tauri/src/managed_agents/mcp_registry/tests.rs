@@ -12,7 +12,7 @@ use super::generate::{
 };
 use super::generation::{
     Deletion, FlipHooks, FlipStep, GenerationError, GenerationPlan, GenerationStore, JournalPhase,
-    NoHooks, NoSecrets, Reconciled, SecretRemover, MAX_POINTER_BYTES,
+    MutationLock, NoHooks, NoSecrets, Reconciled, SecretRemover, MAX_POINTER_BYTES,
 };
 use super::load::{parse_registry, RegistryError};
 use super::resolve::{resolve_for_agent, SpawnRefusal};
@@ -183,6 +183,26 @@ fn mcp_registry_rejects_entries_one_at_a_time_and_keeps_loading() {
             "`{id}` must carry a reason the panel can render"
         );
     }
+}
+
+/// A command path is appended to the generated launcher argv exactly like an
+/// argument (`generate::generate_server`), so a credential-shaped path
+/// component (not just a credential-shaped argument) must be refused at load,
+/// the same as the existing "Credential in argv" case above.
+#[test]
+fn mcp_registry_a_credential_shaped_command_path_is_rejected() {
+    let entry = "{\"id\":\"cred\",\"name\":\"cred\",\"transport\":\"stdio\",\
+                  \"command\":\"/tmp/sk-live-secret123/server\",\"args\":[]}";
+    let registry = parse_registry(document(entry).as_bytes()).expect("loads");
+    let loaded = registry.by_id("cred").expect("present");
+    assert!(
+        !loaded.is_usable(),
+        "a credential-shaped command path must be disabled, not silently accepted"
+    );
+    assert!(
+        !loaded.rejection.as_deref().unwrap_or_default().is_empty(),
+        "the entry must carry a reason the panel can render"
+    );
 }
 
 #[test]
@@ -614,6 +634,101 @@ fn mcp_registry_secret_writes_are_journalled_before_they_happen() {
             .contains(&"mcp:a:1:tok".to_string()));
         assert_eq!(store.journal().expect("journal readable"), None);
     }
+}
+
+/// The durable journal is a file on disk in a directory the whole user
+/// account can write, exactly like the registry document — but unlike
+/// `load::read_bounded_no_follow`, `GenerationStore::journal` used to read it
+/// with a plain, unbounded, symlink-following `std::fs::read`. A FIFO placed
+/// there would block the read forever; a symlink would redirect it; a
+/// sparse multi-gigabyte file would be read whole before any cap applied.
+#[test]
+fn mcp_registry_the_journal_read_is_bounded_no_follow_and_regular_file_only() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    let store = GenerationStore::open(root).expect("opens");
+    assert_eq!(store.journal().expect("no journal yet"), None);
+
+    // A sparse file far over the cap is refused without being allocated.
+    let journal_path = root.join("journal.json");
+    let file = std::fs::File::create(&journal_path).expect("create");
+    file.set_len(4 * 1024 * 1024 * 1024).expect("sparse");
+    drop(file);
+    store
+        .journal()
+        .expect_err("a journal over the byte cap must be refused");
+    std::fs::remove_file(&journal_path).expect("remove");
+
+    // A symlink at the fixed journal name must not be followed.
+    #[cfg(unix)]
+    {
+        let victim = dir.path().join("victim.json");
+        std::fs::write(
+            &victim,
+            br#"{"generation":1,"phase":"flipped","deletions":[]}"#,
+        )
+        .expect("write victim");
+        std::os::unix::fs::symlink(&victim, &journal_path).expect("symlink");
+        store
+            .journal()
+            .expect_err("a symlinked journal.json must not be followed");
+        std::fs::remove_file(&journal_path).expect("remove symlink");
+    }
+
+    // A FIFO at the fixed journal name must not be opened (it would block a
+    // read forever waiting for a writer).
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let c_path = std::ffi::CString::new(journal_path.as_os_str().as_bytes()).expect("cstring");
+        assert_eq!(
+            unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) },
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let error = store
+            .journal()
+            .expect_err("a FIFO at journal.json must be refused, not opened");
+        assert!(
+            format!("{error}").contains("regular file"),
+            "the refusal must say why, got {error}"
+        );
+    }
+}
+
+/// A corrupted or replaced `journal.json` naming an excessive number of
+/// deletions must not be allowed to drive `reconcile`'s retry loop over an
+/// unbounded array — `run_deletions` iterates every entry the journal names.
+#[test]
+fn mcp_registry_the_journal_rejects_an_excessive_deletion_array() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    let store = GenerationStore::open(root).expect("opens");
+
+    let over_cap = super::generation::MAX_JOURNAL_DELETIONS + 1;
+    let deletions: Vec<serde_json::Value> = (0..over_cap)
+        .map(|i| serde_json::json!({"kind": "secret", "key": format!("mcp:x:{i}")}))
+        .collect();
+    let body = serde_json::json!({
+        "generation": 1,
+        "phase": "flipped",
+        "deletions": deletions,
+        "rollback": [],
+    });
+    std::fs::write(
+        root.join("journal.json"),
+        serde_json::to_vec(&body).expect("serialize"),
+    )
+    .expect("write");
+
+    let error = store
+        .journal()
+        .expect_err("a journal over the deletion-count cap must be refused");
+    assert!(
+        format!("{error}").contains("cap"),
+        "the refusal must name the cap, got {error}"
+    );
 }
 
 /// A rollback the keychain refuses is owed, not forgotten.
@@ -1119,6 +1234,61 @@ fn mcp_registry_two_writers_serialize() {
         final_log.contains("+one") && final_log.contains("+two"),
         "neither action may be silently discarded: {final_log}"
     );
+}
+
+/// `lock_exclusive` blocks with no deadline: a second process stalled while
+/// holding the mutation lock — in keychain or filesystem work — would hang
+/// this process's startup reconciliation and every registry command forever.
+/// A real second holder (a spawned thread taking the same OS-level flock,
+/// exactly as another process would) proves the bounded retry surfaces a
+/// busy error instead of hanging, and that the lock is usable again once
+/// released.
+#[test]
+fn mcp_registry_a_held_mutation_lock_times_out_with_a_busy_error_rather_than_hanging() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = GenerationStore::open(dir.path()).expect("opens");
+    let lock_path = store.lock_path();
+
+    let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder_path = lock_path.clone();
+    let holder = std::thread::spawn(move || {
+        let file = std::fs::File::options()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&holder_path)
+            .expect("open lock file");
+        fs2::FileExt::lock_exclusive(&file).expect("acquire in holder thread");
+        acquired_tx.send(()).expect("signal acquired");
+        // Hold the lock until the main thread has proved the busy path.
+        let _ = release_rx.recv();
+        drop(file);
+    });
+
+    acquired_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the holder thread must acquire the lock");
+
+    let started = std::time::Instant::now();
+    let error = MutationLock::acquire_within(&lock_path, std::time::Duration::from_millis(100))
+        .expect_err("a held lock must be refused as busy, not waited on forever");
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(error, GenerationError::Lock(_)),
+        "expected a busy Lock error, got {error:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "the bounded retry must give up close to its own deadline, took {elapsed:?}"
+    );
+
+    release_tx.send(()).expect("release the holder");
+    holder.join().expect("holder thread");
+
+    // Once released, an ordinary acquire succeeds again.
+    MutationLock::acquire_within(&lock_path, std::time::Duration::from_secs(5))
+        .expect("the lock is free again once the holder released it");
 }
 
 #[test]

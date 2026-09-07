@@ -1086,6 +1086,187 @@ fn mcp_registry_a_pending_secret_for_an_unselected_server_is_not_silently_droppe
     );
 }
 
+/// A holding key stores a pending secret only until some selected agent
+/// carries it forward under its own (agent, generation) key. Once that has
+/// happened, the holding key must be consumed: a later convergence with no
+/// new pending value must read the agent's own carried-forward value, not
+/// fall back to a stale holding key that a subsequent rotation left behind.
+#[test]
+fn mcp_registry_a_consumed_holding_secret_does_not_roll_a_later_rotation_back() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let root = temporary.path();
+    let store = FakeStore::default();
+    let body = document(
+        "{\"id\":\"auth\",\"name\":\"auth\",\"transport\":\"stdio\",\
+          \"command\":\"/usr/local/bin/auth\",\"args\":[],\"env\":{\"API_KEY\":\"mcp:api-key\"}}",
+    );
+
+    // 1. Save OLD while "auth" is unselected by any agent: OLD lands only in
+    //    the holding key.
+    let old_pending = BTreeMap::from([("api-key".to_string(), "sk-old".to_string())]);
+    converge_with(
+        root,
+        &body,
+        &[selection(&[], &[McpTransport::Stdio])],
+        &store,
+        &old_pending,
+    )
+    .expect("first convergence without agent selection");
+
+    // 2. Enable "auth" with no new pending secret: the agent's generation-2
+    //    key is seeded from the holding key.
+    converge_with(
+        root,
+        &body,
+        &[selection(&["auth"], &[McpTransport::Stdio])],
+        &store,
+        &BTreeMap::new(),
+    )
+    .expect("second convergence with agent selection");
+
+    // 3. Rotate to NEW while still selected: the operator's pending value
+    //    supersedes whatever the holding key still carries.
+    let new_pending = BTreeMap::from([("api-key".to_string(), "sk-new".to_string())]);
+    converge_with(
+        root,
+        &body,
+        &[selection(&["auth"], &[McpTransport::Stdio])],
+        &store,
+        &new_pending,
+    )
+    .expect("third convergence with rotated pending secret");
+
+    // 4. Converge again with no pending secret at all.
+    converge_with(
+        root,
+        &body,
+        &[selection(&["auth"], &[McpTransport::Stdio])],
+        &store,
+        &BTreeMap::new(),
+    )
+    .expect("fourth convergence with no pending secret");
+
+    let records = store.records.lock().unwrap().clone();
+    let key = format!("mcp:{AGENT}:4:api-key");
+    assert_eq!(
+        records.get(&key).map(String::as_str),
+        Some("sk-new"),
+        "the fourth convergence must carry forward the rotated NEW value, \
+         not roll back to the stale holding value; got {:?}",
+        records.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        records.get(&super::converge::holding_key("api-key")),
+        None,
+        "the holding key must be consumed once an agent carries the \
+         reference, not linger and later win over a fresher rotation; got {:?}",
+        records.keys().collect::<Vec<_>>()
+    );
+}
+
+/// A credential-shaped command path is rejected at load (`load.rs`), so an
+/// agent that has it enabled refuses through the same production seam a
+/// rejected argument uses — and the raw path never reaches a staged
+/// artefact, because `resolve_for_agent` returns the refusal before
+/// `generate_server` ever runs on the entry.
+#[test]
+fn mcp_registry_a_credential_shaped_command_is_refused_and_never_reaches_generated_argv() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let root = temporary.path();
+    let store = FakeStore::default();
+    let body = document(
+        "{\"id\":\"cred\",\"name\":\"cred\",\"transport\":\"stdio\",\
+          \"command\":\"/tmp/sk-live-secret123/server\",\"args\":[]}",
+    );
+
+    let converged = converge_with(
+        root,
+        &body,
+        &[selection(&["cred"], &[McpTransport::Stdio])],
+        &store,
+        &BTreeMap::new(),
+    )
+    .expect("convergence still adopts a generation; the refusal is per-agent, not fatal");
+
+    assert_eq!(
+        converged.refused.len(),
+        1,
+        "the agent must be refused for enabling a rejected entry; got {:?}",
+        converged.refused
+    );
+    assert_eq!(converged.refused[0].0, AGENT);
+
+    let generations = GenerationStore::open(&paths(root).generations_root()).expect("open");
+    let staged = generations.generation_dir(1);
+    let mut checked = 0;
+    for entry in walk(&staged) {
+        let content = std::fs::read_to_string(&entry).expect("read");
+        assert!(
+            !content.contains("sk-live-secret123"),
+            "{} carries the credential-shaped command path",
+            entry.display()
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "no staged file was checked");
+}
+
+/// An http entry's `env` block is accepted as valid syntax (an `mcp:`
+/// reference) but has no effect: the http generator hands nothing to a child
+/// process. Saving such an entry with a pending secret for that reference
+/// must be rejected, and the operator's credential must never be retained
+/// anywhere in the secret store — not under an agent's carried key and not as
+/// an unassigned holding secret either.
+#[test]
+fn mcp_registry_an_http_entrys_env_is_rejected_and_its_secret_is_never_retained() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let root = temporary.path();
+    let store = FakeStore::default();
+    let body = document(
+        "{\"id\":\"authed\",\"name\":\"authed\",\"transport\":\"http\",\
+          \"url\":\"https://mcp.example/v1\",\"env\":{\"API_TOKEN\":\"mcp:token\"}}",
+    );
+
+    let loaded = parse_registry(body.as_bytes()).expect("document loads");
+    let entry = loaded.by_id("authed").expect("present");
+    assert!(
+        !entry.is_usable(),
+        "an http entry with a non-empty env must be rejected at validation"
+    );
+
+    let pending = BTreeMap::from([("token".to_string(), "sk-do-not-retain".to_string())]);
+    let converged = converge_with(
+        root,
+        &body,
+        &[selection(&["authed"], &[McpTransport::Http])],
+        &store,
+        &pending,
+    )
+    .expect("convergence still adopts a generation; the rejection is per-agent, not fatal");
+
+    assert_eq!(
+        converged.refused.len(),
+        1,
+        "the agent must be refused for enabling a rejected entry; got {:?}",
+        converged.refused
+    );
+
+    let records = store.records.lock().unwrap().clone();
+    assert!(
+        records.values().all(|value| value != "sk-do-not-retain"),
+        "the credential must never be retained anywhere in the store; got {:?}",
+        records.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        !records
+            .keys()
+            .any(|key| super::converge::is_holding_key(key)),
+        "an http env reference must not be held as an unassigned pending \
+         secret either, since nothing will ever consume it; got {:?}",
+        records.keys().collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn mcp_registry_deleted_agent_retires_mcp_state_and_allows_subsequent_convergence() {
     let temporary = tempfile::tempdir().expect("tempdir");
@@ -1150,5 +1331,138 @@ fn mcp_registry_deleted_agent_retires_mcp_state_and_allows_subsequent_convergenc
         a_keys.is_empty(),
         "agent A keys should be gone, found: {:?}",
         a_keys
+    );
+}
+
+// ── `converge_now` — the real production caller ────────────────────────────
+
+/// A sandboxed `HOME`/`PATH` for the one test below that has to exercise the
+/// real `converge_now_with_records` (`apply.rs`), which resolves the app data
+/// directory and the agent nest from the real environment.
+///
+/// Every other test in this file drives `converge()` directly against a
+/// caller-chosen root, which is deliberately independent of `HOME`; this is
+/// the only one that needs the production entry point itself, so it is the
+/// only one paying for this fixture. Same technique
+/// `commands::mcp_registry_tests::EnvGuard` uses for the same reason, and the
+/// same shared `lock_path_mutex`, so the two cannot race each other over the
+/// process-global environment.
+struct SandboxedHome {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    temp: tempfile::TempDir,
+    old_home: Option<std::ffi::OsString>,
+    old_xdg: Option<std::ffi::OsString>,
+    old_path: Option<std::ffi::OsString>,
+}
+
+impl SandboxedHome {
+    fn new() -> Self {
+        let guard = crate::managed_agents::lock_path_mutex();
+        crate::managed_agents::clear_resolve_cache();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::create_dir_all(&bin).expect("mkdir bin");
+
+        // `converge_now_with_records` must get past `checked_launcher` before
+        // it ever reaches the personas/global-config read this test targets.
+        let launcher = bin.join(super::apply::LAUNCHER_COMMAND);
+        std::fs::write(&launcher, b"#!/bin/sh\nexit 0\n").expect("write launcher");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+
+        let old_home = std::env::var_os("HOME");
+        let old_xdg = std::env::var_os("XDG_DATA_HOME");
+        let old_path = std::env::var_os("PATH");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_DATA_HOME", &home);
+        let new_path = old_path
+            .as_ref()
+            .map(|p| format!("{}:{}", bin.display(), p.to_string_lossy()))
+            .unwrap_or_else(|| bin.display().to_string());
+        std::env::set_var("PATH", &new_path);
+
+        Self {
+            _guard: guard,
+            temp,
+            old_home,
+            old_xdg,
+            old_path,
+        }
+    }
+
+    fn home(&self) -> PathBuf {
+        self.temp.path().join("home")
+    }
+}
+
+impl Drop for SandboxedHome {
+    fn drop(&mut self) {
+        crate::managed_agents::clear_resolve_cache();
+        match &self.old_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match &self.old_xdg {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        match &self.old_path {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+    }
+}
+
+fn mock_app() -> tauri::App<tauri::test::MockRuntime> {
+    tauri::test::mock_builder()
+        .manage(crate::app_state::build_app_state())
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("mock app builds headless")
+}
+
+/// [PRIOR F7] `converge_now_with_records` used to read personas and the
+/// global agent config with `.unwrap_or_default()`, treating "corrupt" the
+/// same as "absent" — silently computing every agent's effective runtime,
+/// and therefore its convergence, from defaults instead of surfacing that the
+/// store could not be read. A corrupt `managed-agents.json` must now be
+/// propagated as an error, and the current generation must be left exactly as
+/// it was: nothing is adopted from defaults.
+#[test]
+fn mcp_registry_a_corrupt_personas_store_is_propagated_and_leaves_the_generation_unchanged() {
+    let sandbox = SandboxedHome::new();
+    let app = mock_app();
+
+    let base =
+        crate::managed_agents::managed_agents_base_dir(app.handle()).expect("base dir resolves");
+    std::fs::write(base.join("managed-agents.json"), b"{ not json")
+        .expect("write a corrupt agent store");
+
+    let generations_root = RegistryPaths::new(base, sandbox.home()).generations_root();
+    let before = GenerationStore::open(&generations_root)
+        .expect("open")
+        .current()
+        .expect("readable");
+    assert_eq!(before, None, "nothing has converged yet");
+
+    let error = super::apply::converge_now_with_records(app.handle(), &[], &BTreeMap::new())
+        .expect_err("a corrupt personas store must be propagated, not defaulted away");
+    assert!(
+        error.contains("personas"),
+        "the error must name what failed to read, got {error}"
+    );
+
+    let after = GenerationStore::open(&generations_root)
+        .expect("open")
+        .current()
+        .expect("readable");
+    assert_eq!(
+        before, after,
+        "a propagated read failure must leave the current generation unchanged"
     );
 }

@@ -22,7 +22,9 @@ use crate::managed_agents::mcp_registry::apply;
 use crate::managed_agents::mcp_registry::apply::converge_now;
 use crate::managed_agents::mcp_registry::load::{load_registry, LoadedEntry};
 use crate::managed_agents::mcp_registry::schema::{
-    RegistryDocument, RegistryEntry, RegistryTransport, MAX_DOCUMENT_SERVERS,
+    RegistryDocument, RegistryEntry, RegistryTransport, MAX_ARGS, MAX_ARG_LEN, MAX_DOCUMENT_BYTES,
+    MAX_DOCUMENT_SERVERS, MAX_ENTRY_BYTES, MAX_ENV_ENTRIES, MAX_ENV_NAME_LEN, MAX_ENV_VALUE_LEN,
+    MAX_ID_LEN, MAX_NAME_LEN, MAX_SERVERS_PER_AGENT,
 };
 use crate::managed_agents::types::{AgentMcpServers, AGENT_MCP_SERVERS_VERSION};
 use crate::managed_agents::ManagedAgentRecord;
@@ -114,20 +116,37 @@ fn view_of(loaded: &LoadedEntry) -> McpRegistryEntryView {
     let entry = &loaded.entry;
     let (transport, command, args, url, auth_scheme) = match &entry.transport {
         RegistryTransport::Stdio { command, args } => {
-            let effective_args = if loaded.rejection.is_some() {
-                redact_args(args)
+            // A rejected entry's `command` is redacted the same way its `env`
+            // literals already are: the loader's rejection reason is not
+            // necessarily "this is a credential", but the executable path
+            // itself can be credential-shaped (e.g. `/tmp/sk-live-.../server`)
+            // and the panel must not render what caused the refusal (Sol T7c
+            // round 2, item 6).
+            let (effective_command, effective_args) = if loaded.rejection.is_some() {
+                ("<redacted>".to_string(), redact_args(args))
             } else {
-                args.clone()
+                (command.clone(), args.clone())
             };
-            ("stdio", Some(command.clone()), effective_args, None, None)
+            ("stdio", Some(effective_command), effective_args, None, None)
         }
-        RegistryTransport::Http { url, auth } => (
-            "http",
-            None,
-            Vec::new(),
-            Some(url.clone()),
-            auth.as_ref().map(|auth| auth.scheme.clone()),
-        ),
+        RegistryTransport::Http { url, auth } => {
+            // Same reasoning as the stdio command above: a rejected URL can
+            // carry a query-string or userinfo credential, which is exactly
+            // why it was rejected — the panel must show the rejection
+            // message, not the URL that triggered it.
+            let effective_url = if loaded.rejection.is_some() {
+                "<redacted>".to_string()
+            } else {
+                url.clone()
+            };
+            (
+                "http",
+                None,
+                Vec::new(),
+                Some(effective_url),
+                auth.as_ref().map(|auth| auth.scheme.clone()),
+            )
+        }
     };
     McpRegistryEntryView {
         id: entry.id.clone(),
@@ -158,6 +177,173 @@ fn view_of(loaded: &LoadedEntry) -> McpRegistryEntryView {
             .collect(),
         rejection: loaded.rejection.clone(),
     }
+}
+
+/// Largest accepted number of secret values one save may carry: one per
+/// possible `env` reference plus one for an HTTP entry's own auth reference.
+const MAX_SECRETS_PER_SAVE: usize = MAX_ENV_ENTRIES + 1;
+
+/// Bound the DTO before it is merged into the document.
+///
+/// `save_mcp_registry_server` used to validate only secret-key syntax and the
+/// *old* document, then write the merged document unconditionally — an
+/// oversized `args`/`env`/id/name landed on disk before `validate_entry`
+/// (which only runs at load/list time) ever rejected it. This runs the same
+/// bounds `validate_entry` enforces, but before the write instead of after
+/// (Sol T7c round 2, item 5).
+///
+/// # Errors
+/// A message naming the breached cap.
+fn validate_prospective_entry(entry: &RegistryEntry) -> Result<(), String> {
+    if entry.id.is_empty() || entry.id.len() > MAX_ID_LEN {
+        return Err(format!(
+            "the server id must be 1 to {MAX_ID_LEN} bytes, got {}",
+            entry.id.len()
+        ));
+    }
+    if entry.name.is_empty() || entry.name.len() > MAX_NAME_LEN {
+        return Err(format!(
+            "the server name must be 1 to {MAX_NAME_LEN} bytes, got {}",
+            entry.name.len()
+        ));
+    }
+    if let RegistryTransport::Stdio { args, .. } = &entry.transport {
+        if args.len() > MAX_ARGS {
+            return Err(format!(
+                "this entry declares {} arguments, over the {MAX_ARGS} cap",
+                args.len()
+            ));
+        }
+        for arg in args {
+            if arg.len() > MAX_ARG_LEN {
+                return Err(format!(
+                    "one argument is {} bytes, over the {MAX_ARG_LEN}-byte cap",
+                    arg.len()
+                ));
+            }
+        }
+    }
+    if entry.env.len() > MAX_ENV_ENTRIES {
+        return Err(format!(
+            "this entry declares {} env vars, over the {MAX_ENV_ENTRIES} cap",
+            entry.env.len()
+        ));
+    }
+    for (name, value) in &entry.env {
+        if name.len() > MAX_ENV_NAME_LEN {
+            return Err(format!(
+                "env var name `{name}` is {} bytes, over the {MAX_ENV_NAME_LEN}-byte cap",
+                name.len()
+            ));
+        }
+        if value.len() > MAX_ENV_VALUE_LEN {
+            return Err(format!(
+                "env var `{name}`'s value is {} bytes, over the {MAX_ENV_VALUE_LEN}-byte cap",
+                value.len()
+            ));
+        }
+    }
+    let serialized =
+        serde_json::to_vec(entry).map_err(|e| format!("cannot serialize this entry: {e}"))?;
+    if serialized.len() > MAX_ENTRY_BYTES {
+        return Err(format!(
+            "this entry serializes to {} bytes, over the {MAX_ENTRY_BYTES}-byte cap",
+            serialized.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Bound the secrets map before it reaches convergence: an unbounded count or
+/// an oversized value would otherwise be written into the secret store with
+/// no cap of its own (Sol T7c round 2, item 5).
+///
+/// # Errors
+/// A message naming the breached cap.
+fn validate_secrets(secrets: &BTreeMap<String, String>) -> Result<(), String> {
+    if secrets.len() > MAX_SECRETS_PER_SAVE {
+        return Err(format!(
+            "this save carries {} secret values, over the {MAX_SECRETS_PER_SAVE} cap",
+            secrets.len()
+        ));
+    }
+    for (id, value) in secrets {
+        if value.len() > MAX_ENV_VALUE_LEN {
+            return Err(format!(
+                "the value for `{id}` is {} bytes, over the {MAX_ENV_VALUE_LEN}-byte cap",
+                value.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The registry id shape, mirrored from the loader's own `check_id` (which is
+/// private to `load.rs`): lowercase letters, digits, `_` and `-`, 1 to
+/// [`MAX_ID_LEN`] bytes.
+fn validate_registry_id_shape(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("a selected server id is empty".to_string());
+    }
+    if value.len() > MAX_ID_LEN {
+        return Err(format!(
+            "`{value}` is {} bytes, over the {MAX_ID_LEN}-byte id cap",
+            value.len()
+        ));
+    }
+    if !value
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+    {
+        return Err(format!(
+            "`{value}` is not a usable mcp server id: only lowercase letters, digits, `_` and \
+             `-`"
+        ));
+    }
+    Ok(())
+}
+
+/// Bound and validate an agent's requested server selection before it is ever
+/// written to the agent store.
+///
+/// `resolve_for_agent` enforces the [`MAX_SERVERS_PER_AGENT`] cap and rejects
+/// an unknown id, but only downstream at convergence — by which point
+/// `set_agent_mcp_servers` had already durably written the oversized or
+/// duplicate-bearing selection and merely recorded a refusal beside it. A
+/// selection at or under the cap but with duplicate ids also produces
+/// duplicate generated server names that `buzz-acp` only refuses at spawn.
+/// This gates count, id shape, existence, and uniqueness first, so a breach
+/// changes nothing (Sol T7c round 2, item 1).
+///
+/// # Errors
+/// A message naming the breached cap, the malformed id, or the duplicate.
+fn validate_enabled_selection<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    enabled: &[String],
+) -> Result<(), String> {
+    if enabled.len() > MAX_SERVERS_PER_AGENT {
+        return Err(format!(
+            "this selection enables {} mcp servers, over the {MAX_SERVERS_PER_AGENT} cap",
+            enabled.len()
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for id in enabled {
+        validate_registry_id_shape(id)?;
+        if !seen.insert(id.as_str()) {
+            return Err(format!("`{id}` is enabled twice in the same selection"));
+        }
+    }
+    let path = document_path(app)?;
+    let document = read_document(&path)?;
+    for id in enabled {
+        if !document.servers.iter().any(|entry| &entry.id == id) {
+            return Err(format!(
+                "no mcp server with id `{id}` is declared in the registry"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn document_path<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<std::path::PathBuf, String> {
@@ -218,6 +404,9 @@ pub fn save_mcp_registry_server<R: tauri::Runtime>(
         .lock()
         .map_err(|e| format!("cannot acquire mcp registry lock: {e}"))?;
 
+    validate_prospective_entry(&entry)?;
+    validate_secrets(&secrets)?;
+
     for id in secrets.keys() {
         // The reference id is operator-typed, so it is validated against the
         // same closed namespace a generated config uses. `identity` and
@@ -239,6 +428,19 @@ pub fn save_mcp_registry_server<R: tauri::Runtime>(
             document.servers.push(entry);
         }
     }
+    // The whole prospective document is checked too: every individual entry
+    // can be under its own cap and still push the merged document over
+    // MAX_DOCUMENT_BYTES. Checked before the write, so a breach here changes
+    // nothing on disk (Sol T7c round 2, item 5).
+    let prospective_bytes = serde_json::to_vec(&document)
+        .map_err(|e| format!("cannot serialize the mcp registry: {e}"))?;
+    if prospective_bytes.len() > MAX_DOCUMENT_BYTES {
+        return Err(format!(
+            "writing this entry would make the registry {} bytes, over the \
+             {MAX_DOCUMENT_BYTES}-byte cap",
+            prospective_bytes.len()
+        ));
+    }
     write_document(&path, &document)?;
     let converged = converge_now(&app, &secrets)?;
     let mut view = list_mcp_registry_servers(app.clone())?;
@@ -256,11 +458,30 @@ pub fn delete_mcp_registry_server_internal<R: tauri::Runtime, F>(
 where
     F: FnOnce(&[ManagedAgentRecord]) -> Result<(), String>,
 {
-    let path = document_path(app)?;
-    let mut document = read_document(&path)?;
-    document.servers.retain(|entry| entry.id != id);
-    write_document(&path, &document)?;
+    use tauri::Manager;
 
+    // Agent selections are written FIRST, the registry document LAST — the
+    // reverse of write order costs less to leave torn. If the document write
+    // below fails after this succeeds, every agent has already dropped `id`
+    // and the registry document merely still declares a server nothing
+    // references: a consistent, retriable state (a retried delete just
+    // removes it from the document too). The old order left agents
+    // referencing an id the registry no longer declared — not retriable
+    // without a manual repair (Sol T7c round 2, item 4).
+    //
+    // This read-modify-write is also serialized with the canonical
+    // `managed_agents_store_lock` every other agent-store mutator takes, not
+    // only the registry-specific `mcp_registry_store_lock` the caller holds
+    // across this whole command — lock order: `mcp_registry_store_lock`
+    // (outer, held by the caller), then `managed_agents_store_lock` (inner,
+    // here). Two different mutexes guarding the same file let a normal agent
+    // edit and this delete race each other's read-modify-write (Sol T7c
+    // round 2, item 3).
+    let state = app.state::<AppState>();
+    let agents_lock = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|e| format!("cannot acquire managed agents lock: {e}"))?;
     let mut records = crate::managed_agents::load_managed_agents(app)?;
     let mut touched = false;
     for record in &mut records {
@@ -273,10 +494,18 @@ where
     if touched {
         save_records(&records).map_err(|e| {
             format!(
-                "mcp registry document updated to remove {id}, but updating agent records failed: {e}; state is inconsistent"
+                "updating agent records to drop {id} failed: {e}; the mcp registry document \
+                 was not changed, so {id} is still declared and this delete can be retried"
             )
         })?;
     }
+    drop(agents_lock);
+
+    let path = document_path(app)?;
+    let mut document = read_document(&path)?;
+    document.servers.retain(|entry| entry.id != id);
+    write_document(&path, &document)?;
+
     let converged = converge_now(app, &BTreeMap::new())?;
     let mut view = list_mcp_registry_servers(app.clone())?;
     view.refused = converged.refused;
@@ -286,9 +515,9 @@ where
 /// Delete one registry entry, drop its id from every agent, and adopt a new
 /// generation.
 ///
-/// The document is written first so that the server declaration is removed
-/// from the authoritative registry. If updating the agent records subsequently
-/// fails, an error noting the partial/inconsistent state is returned.
+/// Agent records are written first, the registry document last: every prefix
+/// of that order is consistent and retriable (see
+/// [`delete_mcp_registry_server_internal`]).
 ///
 /// # Errors
 /// A message when the document or the agent store cannot be written, or when
@@ -333,6 +562,12 @@ pub fn set_agent_mcp_servers<R: tauri::Runtime>(
         .lock()
         .map_err(|e| format!("cannot acquire mcp registry lock: {e}"))?;
 
+    validate_enabled_selection(&app, &enabled)?;
+
+    let agents_lock = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|e| format!("cannot acquire managed agents lock: {e}"))?;
     let mut records = crate::managed_agents::load_managed_agents(&app)?;
     let record = records
         .iter_mut()
@@ -343,6 +578,7 @@ pub fn set_agent_mcp_servers<R: tauri::Runtime>(
         enabled,
     });
     crate::managed_agents::save_managed_agents(&app, &records)?;
+    drop(agents_lock);
     let converged = converge_now(&app, &BTreeMap::new())?;
     let mut view = list_mcp_registry_servers(app.clone())?;
     view.refused = converged.refused;
@@ -390,9 +626,38 @@ fn write_document(path: &std::path::Path, document: &RegistryDocument) -> Result
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
-    // The same atomic-write helper the agent store uses: a reader never sees a
-    // prefix, and a failed write leaves the previous document intact.
-    crate::managed_agents::atomic_write_json(path, &body)
+    // Deliberately NOT `atomic_write_json`: that helper canonicalizes `path`
+    // first, which is symlink-*preserving* by design for the agent store
+    // (`storage.rs`'s own doc comment). For the registry document that same
+    // canonicalize-then-write is a redirection hazard — something replacing
+    // `path` with a symlink between this command's earlier read and this
+    // write would have its write silently follow the link and land on
+    // whatever it points at. This writer refuses instead: the temp file is
+    // written and renamed at `path` itself with no canonicalization, and the
+    // rename is preceded by a no-follow check as close to it as this API
+    // allows (Sol T7c round 2, item 2).
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "refusing to write {}: a symbolic link now occupies the mcp registry \
+                 document's path",
+                path.display()
+            ));
+        }
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &body).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!(
+                "refusing to write {}: a symbolic link now occupies the mcp registry \
+                 document's path",
+                path.display()
+            ));
+        }
+    }
+    std::fs::rename(&tmp, path).map_err(|e| format!("cannot rename {}: {e}", path.display()))
 }
 
 #[cfg(test)]

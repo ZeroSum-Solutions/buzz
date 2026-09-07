@@ -105,8 +105,15 @@ export function AgentMcpServersField({
     onEnabledChange(next);
     if (pubkey === null) return;
     try {
-      await setAgentMcpServers(pubkey, next);
-      setRefusal(null);
+      const view = await setAgentMcpServers(pubkey, next);
+      // A successful write can still convergence-refuse THIS agent (its
+      // selection could not be resolved into the adopted generation). Inspect
+      // the response for that before clearing the alert — an `Ok` response is
+      // not the same as a refusal-free convergence, and the post-invalidate
+      // refetch below always reports an empty `refused` (list_mcp_registry_servers
+      // never recomputes it), so it cannot be relied on to surface this.
+      const ownRefusal = view.refused.find(([agentId]) => agentId === pubkey);
+      setRefusal(ownRefusal ? ownRefusal[1] : null);
       void queryClient.invalidateQueries({ queryKey: MCP_REGISTRY_QUERY_KEY });
     } catch (error) {
       // Surfaced, not swallowed: the write failed, so the agent will spawn
