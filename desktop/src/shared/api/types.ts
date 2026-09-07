@@ -502,6 +502,14 @@ export type AgentHealthAlert = {
 export type AgentHealthIngestResult = {
   inserted: number;
   alerts: AgentHealthAlert[];
+  /**
+   * `(agent, error)` pairs for per-agent read/query failures the backend
+   * swallowed rather than aborting the whole sync for. A successful
+   * (`Ok`) response can still carry these — callers must check this field,
+   * not just whether the promise rejected, before treating a sync as fully
+   * clean.
+   */
+  errors?: Array<[string, string]>;
 };
 
 export type GitBashPrerequisite = {

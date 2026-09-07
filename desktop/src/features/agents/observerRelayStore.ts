@@ -15,6 +15,7 @@ import {
   type AgentManagementRequest,
 } from "./agentManagement";
 import { parseHealthFrame } from "./agentHealthFrames";
+import { syncAgentHealth } from "./agentHealthHooks";
 import {
   parseProjectChannelRequest,
   type ProjectChannelRequest,
@@ -954,6 +955,13 @@ export function resetAgentObserverStore() {
   onSessionConfigCaptured = null;
   connectionState = "idle";
   errorMessage = null;
+  // A health frame queued (or mid-delivery) for the old community must not
+  // keep draining into the backend after a community switch — see
+  // AGENTS.md "Community Switching". `processHealthQueue`'s loop checks
+  // `generation` (bumped above) on every iteration and stops delivering
+  // once it no longer matches, so clearing the map here cannot race a
+  // still-running delivery back into existence.
+  healthQueuesByAgent.clear();
   notifyListeners();
   void unsubscribe?.();
 }
@@ -1000,6 +1008,10 @@ type HealthQueueItem = {
 type HealthQueueState = {
   inFlight: boolean;
   items: HealthQueueItem[];
+  /** Frames dropped on overflow (oldest-first) — never resolved either way. */
+  overflowDropped: number;
+  /** Frames that exhausted retries and fell back to a full resync instead. */
+  terminalFailures: number;
 };
 
 export const MAX_HEALTH_QUEUE_PER_AGENT = 50;
@@ -1017,6 +1029,12 @@ export function resetHealthQueuesForTest(): void {
 }
 
 export async function processHealthQueue(agentPubkey: string): Promise<void> {
+  // Captured once: if a community switch bumps `generation` while this
+  // call is awaiting delivery, every check below sees a mismatch and this
+  // run stops rather than recursing into (or re-queuing onto) a queue
+  // object that belongs to a community this store no longer represents —
+  // see `resetAgentObserverStore`.
+  const startedGeneration = generation;
   const queueState = healthQueuesByAgent.get(agentPubkey);
   if (!queueState || queueState.inFlight || queueState.items.length === 0) {
     return;
@@ -1026,18 +1044,30 @@ export async function processHealthQueue(agentPubkey: string): Promise<void> {
   try {
     await ingestAgentHealthFrame(agentPubkey, currentItem.frame);
   } catch (error) {
+    if (startedGeneration !== generation) {
+      return;
+    }
     if (currentItem.retries < 1) {
       currentItem.retries += 1;
       queueState.items.unshift(currentItem);
     } else {
+      // Retries exhausted: this single frame is not durably retried from
+      // here, but it is not lost either — it already exists in the
+      // harness's own ledger, so a full resync reconciles it. Without this,
+      // a persistently failing ingest would silently and permanently drop
+      // whatever this frame reported.
       console.debug("Agent health frame ingest failed after retry:", error);
+      queueState.terminalFailures += 1;
+      void syncAgentHealth(agentPubkey).catch(() => {});
     }
   } finally {
-    queueState.inFlight = false;
-    if (queueState.items.length > 0) {
-      void processHealthQueue(agentPubkey);
-    } else {
-      healthQueuesByAgent.delete(agentPubkey);
+    if (startedGeneration === generation) {
+      queueState.inFlight = false;
+      if (queueState.items.length > 0) {
+        void processHealthQueue(agentPubkey);
+      } else {
+        healthQueuesByAgent.delete(agentPubkey);
+      }
     }
   }
 }
@@ -1048,11 +1078,17 @@ export function queueAgentHealthFrame(
 ): void {
   let queueState = healthQueuesByAgent.get(agentPubkey);
   if (!queueState) {
-    queueState = { inFlight: false, items: [] };
+    queueState = {
+      inFlight: false,
+      items: [],
+      overflowDropped: 0,
+      terminalFailures: 0,
+    };
     healthQueuesByAgent.set(agentPubkey, queueState);
   }
   if (queueState.items.length >= MAX_HEALTH_QUEUE_PER_AGENT) {
     queueState.items.shift();
+    queueState.overflowDropped += 1;
   }
   queueState.items.push({ frame, retries: 0 });
   void processHealthQueue(agentPubkey);

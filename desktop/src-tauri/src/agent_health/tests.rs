@@ -262,16 +262,64 @@ fn sync_is_idempotent_and_inserts_only_missing_records() {
 
     let ledger_path = ledger.path().to_path_buf();
 
-    let first = sync_ledger(&conn, "agent_alpha", &ledger_path).unwrap();
+    let first = sync_ledger(&conn, "agent_alpha", &ledger_path, now).unwrap();
     assert_eq!(first, 3, "all three ledger records must be inserted once");
 
-    let second = sync_ledger(&conn, "agent_alpha", &ledger_path).unwrap();
+    let second = sync_ledger(&conn, "agent_alpha", &ledger_path, now).unwrap();
     assert_eq!(second, 0, "a repeat sync must insert nothing new");
 
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM health_events", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 3, "row count must not double after a second sync");
+}
+
+/// A ledger record whose embedded `agent` differs from the state directory's
+/// owner, or whose `at` is far in the future, must never be ingested — binds
+/// `sync_ledger` to `read_ledger_file_for_agent` rather than the raw reader.
+#[test]
+fn sync_ledger_ignores_mismatched_agent_and_future_records() {
+    let (_d, conn) = db();
+    let ledger_dir = tempfile::tempdir().unwrap();
+    let ledger_path = ledger_dir.path().join("ledger.jsonl");
+    let now = Utc::now();
+
+    let make =
+        |agent: &str, at: chrono::DateTime<Utc>| buzz_acp_pkg::reliability::ledger::LedgerRecord {
+            at,
+            agent: agent.to_string(),
+            body: LedgerBody::TurnFinished(buzz_acp_pkg::reliability::ledger::TurnFinished {
+                batch_id: Uuid::new_v4(),
+                channel_id: Uuid::new_v4(),
+                outcome: buzz_acp_pkg::reliability::ledger::TurnOutcome::Ok,
+            }),
+        };
+
+    let legit = make("agent_alpha", now);
+    let intruder = make("intruder_agent", now);
+    let future = make("agent_alpha", now + chrono::Duration::days(1));
+
+    let contents = [&legit, &intruder, &future]
+        .iter()
+        .map(|r| serde_json::to_string(r).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&ledger_path, format!("{contents}\n")).unwrap();
+
+    let inserted = sync_ledger(&conn, "agent_alpha", &ledger_path, now).unwrap();
+    assert_eq!(
+        inserted, 1,
+        "only the matching, non-future record must be ingested"
+    );
+
+    let agents: Vec<String> = conn
+        .prepare("SELECT DISTINCT agent FROM health_events")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(agents, vec!["agent_alpha".to_string()]);
 }
 
 #[test]
@@ -548,10 +596,17 @@ fn summary_counts_per_agent_within_window() {
     let a1 = summaries.iter().find(|s| s.agent == "agent_1").unwrap();
     assert_eq!(a1.turns, 3, "turns within window must be 3 (b1, b2, b3)");
     assert_eq!(a1.failed, 1, "failed turns within window must be 1 (b3)");
-    assert_eq!(a1.parked, 1, "parked within window must be 1 (b4)");
+    // `parked`/`needs_review` are current outstanding counts across the full
+    // 30-day retention, not gated to the requested 24h window: b4/old_b3 and
+    // b5/old_b4 are all still-unresolved batches (no replay/discard event),
+    // so both the in-window and the older-but-unresolved batch must count.
     assert_eq!(
-        a1.needs_review, 1,
-        "needs_review within window must be 1 (b5)"
+        a1.parked, 2,
+        "parked must count b4 (in window) and old_b3 (older, still unresolved)"
+    );
+    assert_eq!(
+        a1.needs_review, 2,
+        "needs_review must count b5 (in window) and old_b4 (older, still unresolved)"
     );
     assert_eq!(a1.reconnects, 1, "reconnects within window must be 1");
     assert_eq!(a1.last_failure_class.as_deref(), Some("capacity_exhausted"));
@@ -727,6 +782,41 @@ fn invalid_since_hours_is_rejected() {
 }
 
 #[test]
+fn oversized_or_over_count_kinds_filter_is_rejected() {
+    let (_d, conn) = db();
+    let now = 1_725_600_000i64;
+
+    let too_many: Vec<String> = (0..(MAX_KIND_FILTER_COUNT + 1))
+        .map(|i| format!("kind_{i}"))
+        .collect();
+    assert!(
+        query_agent_health_events(&conn, "agent_alpha", Some(&too_many), None, None, now).is_err(),
+        "a kinds vector over the count cap must be rejected"
+    );
+
+    let oversized_entry = vec!["k".repeat(MAX_KIND_FILTER_CHARS + 1)];
+    assert!(
+        query_agent_health_events(
+            &conn,
+            "agent_alpha",
+            Some(&oversized_entry),
+            None,
+            None,
+            now
+        )
+        .is_err(),
+        "a single kind entry over the length cap must be rejected"
+    );
+
+    let within_caps = vec!["turn_failed".to_string()];
+    assert!(
+        query_agent_health_events(&conn, "agent_alpha", Some(&within_caps), None, None, now)
+            .is_ok(),
+        "a small, valid kinds filter must still succeed"
+    );
+}
+
+#[test]
 fn parked_batches_excerpt_is_cut_to_120_chars_and_carries_no_full_text() {
     let dir = tempfile::tempdir().unwrap();
     let mut park_file = buzz_acp_pkg::reliability::park::ParkFile::open(dir.path()).unwrap();
@@ -897,6 +987,73 @@ fn needs_review_cleared_by_replayed_or_discarded() {
     );
 }
 
+/// `parked` must be the count of batches CURRENTLY sitting parked (keyed by
+/// batch id, resolved by `batch_replayed`/`batch_discarded`), not a raw
+/// count of `batch_parked` events inside the caller's requested window. A
+/// batch parked 8 days ago with no resolution is still outstanding even when
+/// the caller asks for the last 24 hours; a batch resolved inside the window
+/// must stop counting immediately.
+#[test]
+fn parked_counts_current_outstanding_batches_not_windowed_events() {
+    let (_d, conn) = db();
+    let now = 1_725_600_000i64;
+    let eight_days_ago = now - 8 * 24 * 3600;
+    let old_unresolved = "old-unresolved-batch";
+    let old_resolved = "old-resolved-batch";
+
+    insert_event(
+        &conn,
+        &HealthEvent {
+            agent: "agent_alpha".to_string(),
+            at: eight_days_ago,
+            kind: "batch_parked".to_string(),
+            event_key: "k_old_unresolved".to_string(),
+            batch_id: Some(old_unresolved.to_string()),
+            channel_id: None,
+            class: None,
+            payload: None,
+        },
+    )
+    .unwrap();
+    insert_event(
+        &conn,
+        &HealthEvent {
+            agent: "agent_alpha".to_string(),
+            at: eight_days_ago,
+            kind: "batch_parked".to_string(),
+            event_key: "k_old_resolved".to_string(),
+            batch_id: Some(old_resolved.to_string()),
+            channel_id: None,
+            class: None,
+            payload: None,
+        },
+    )
+    .unwrap();
+    insert_event(
+        &conn,
+        &HealthEvent {
+            agent: "agent_alpha".to_string(),
+            at: eight_days_ago + 100,
+            kind: "batch_discarded".to_string(),
+            event_key: "k_old_discard".to_string(),
+            batch_id: Some(old_resolved.to_string()),
+            channel_id: None,
+            class: None,
+            payload: None,
+        },
+    )
+    .unwrap();
+
+    // Requested window is 24h; both park events happened 8 days ago.
+    let summaries = query_agent_health_summary(&conn, Some(24), now).unwrap();
+    let s = summaries.iter().find(|s| s.agent == "agent_alpha").unwrap();
+    assert_eq!(
+        s.parked, 1,
+        "the still-unresolved 8-day-old batch must count even outside the requested window; \
+         the discarded one must not"
+    );
+}
+
 #[test]
 fn agent_paused_cleared_by_agent_resumed() {
     let (_d, conn) = db();
@@ -1022,6 +1179,78 @@ fn corrupted_payload_marks_degraded() {
     );
 }
 
+/// A corrupt `breaker_opened` payload must not silently default to scope ""
+/// — it must still read as an open breaker (fail safe, not fail healthy).
+/// A corrupt `breaker_closed` payload must not guess scope "" and close
+/// whatever legitimate breaker happens to be tracked under it.
+#[test]
+fn corrupted_breaker_payload_fails_safe_not_silently_healthy() {
+    let (_d, conn) = db();
+    let now = 1_725_600_000i64;
+
+    // A real breaker is open under a real scope.
+    insert_event(
+        &conn,
+        &HealthEvent {
+            agent: "agent_alpha".to_string(),
+            at: now - 500,
+            kind: "breaker_opened".to_string(),
+            event_key: "k_real_open".to_string(),
+            batch_id: None,
+            channel_id: None,
+            class: None,
+            payload: Some(r#"{"scope":"real-scope","consecutive":3}"#.to_string()),
+        },
+    )
+    .unwrap();
+
+    // A corrupted breaker_closed arrives (unparseable JSON) — must not be
+    // able to guess-close the real breaker above.
+    insert_event(
+        &conn,
+        &HealthEvent {
+            agent: "agent_alpha".to_string(),
+            at: now - 400,
+            kind: "breaker_closed".to_string(),
+            event_key: "k_corrupt_close".to_string(),
+            batch_id: None,
+            channel_id: None,
+            class: None,
+            payload: Some("not json".to_string()),
+        },
+    )
+    .unwrap();
+
+    let s = query_agent_health_summary(&conn, Some(24), now).unwrap();
+    assert!(
+        s[0].breaker_open,
+        "the real, unrelated breaker must still read open after a corrupt close"
+    );
+
+    // Separately: a corrupted breaker_opened (missing scope) for a fresh
+    // agent must still surface as an open breaker, not a silently healthy one.
+    insert_event(
+        &conn,
+        &HealthEvent {
+            agent: "agent_beta".to_string(),
+            at: now - 500,
+            kind: "breaker_opened".to_string(),
+            event_key: "k_corrupt_open".to_string(),
+            batch_id: None,
+            channel_id: None,
+            class: None,
+            payload: Some(r#"{"consecutive":3}"#.to_string()),
+        },
+    )
+    .unwrap();
+    let s2 = query_agent_health_summary(&conn, Some(24), now).unwrap();
+    let beta = s2.iter().find(|c| c.agent == "agent_beta").unwrap();
+    assert!(
+        beta.breaker_open,
+        "a corrupt breaker_opened payload (missing scope) must fail open, not silently healthy"
+    );
+}
+
 #[test]
 fn duplicate_events_with_different_rfc3339_timezone_notations_deduplicate() {
     let (_d, conn) = db();
@@ -1065,6 +1294,54 @@ fn duplicate_events_with_different_rfc3339_timezone_notations_deduplicate() {
 }
 
 #[test]
+fn distinct_subsecond_events_do_not_collapse() {
+    let (_d, conn) = db();
+    let agent = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    // Same agent, kind, and target, same UTC second, different milliseconds:
+    // two real, distinct breaker_opened events for the same scope (a flap)
+    // must both persist, not collapse onto one `event_key` via
+    // whole-second truncation.
+    let at_a = "2026-09-06T15:00:00.100Z";
+    let at_b = "2026-09-06T15:00:00.900Z";
+
+    let event_a = HealthEvent {
+        agent: agent.to_string(),
+        at: 1788706800,
+        kind: "breaker_opened".to_string(),
+        event_key: compute_event_key(at_a, "breaker_opened", Some("scope-1")),
+        batch_id: None,
+        channel_id: None,
+        class: None,
+        payload: None,
+    };
+    let event_b = HealthEvent {
+        agent: agent.to_string(),
+        at: 1788706800,
+        kind: "breaker_opened".to_string(),
+        event_key: compute_event_key(at_b, "breaker_opened", Some("scope-1")),
+        batch_id: None,
+        channel_id: None,
+        class: None,
+        payload: None,
+    };
+
+    assert_ne!(
+        event_a.event_key, event_b.event_key,
+        "distinct sub-second instants must produce distinct event keys"
+    );
+    assert!(insert_event(&conn, &event_a).unwrap());
+    assert!(
+        insert_event(&conn, &event_b).unwrap(),
+        "second distinct sub-second event must not be ignored as a duplicate"
+    );
+
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM health_events", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 2, "both distinct sub-second events must persist");
+}
+
+#[test]
 fn ingest_rejects_unknown_kind_oversized_class_and_invalid_agent() {
     let unknown_kind = serde_json::json!({
         "at": "2026-09-06T15:00:00Z",
@@ -1095,6 +1372,36 @@ fn ingest_rejects_unknown_kind_oversized_class_and_invalid_agent() {
     assert!(
         validate_hex64("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").is_ok()
     );
+}
+
+/// A frame's `payload` has no other length or depth bound — a syntactically
+/// valid, known-kind frame with an arbitrarily large payload must still be
+/// rejected before it reaches SQLite.
+#[test]
+fn oversized_payload_frame_is_rejected() {
+    let huge_payload = serde_json::json!({
+        "at": "2026-09-06T15:00:00Z",
+        "kind": "turn_failed",
+        "payload": { "note": "x".repeat(MAX_PAYLOAD_CHARS) },
+    });
+    let f: HealthFrame = serde_json::from_value(huge_payload).unwrap();
+    assert!(frame_to_health_event(
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        &f
+    )
+    .is_err());
+
+    let small_payload = serde_json::json!({
+        "at": "2026-09-06T15:00:00Z",
+        "kind": "turn_failed",
+        "payload": { "note": "fine" },
+    });
+    let f2: HealthFrame = serde_json::from_value(small_payload).unwrap();
+    assert!(frame_to_health_event(
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        &f2
+    )
+    .is_ok());
 }
 
 #[test]
@@ -1196,6 +1503,81 @@ fn read_parked_batches_distinguishes_missing_from_corrupt() {
     assert!(err.is_err(), "corrupt parked.jsonl must return Err");
 }
 
+fn minimal_parked_batch_line(batch_id: uuid::Uuid) -> String {
+    let channel_id = uuid::Uuid::new_v4();
+    let batch = buzz_acp_pkg::reliability::park::ParkedBatch {
+        batch_id,
+        channel_id,
+        scope: buzz_acp_pkg::reliability::park::ScopeRef {
+            channel_id,
+            root_event_id: None,
+        },
+        reason: buzz_acp_pkg::reliability::park::ParkReason::RetriesExhausted,
+        started: true,
+        needs_review: false,
+        needs_review_reason: None,
+        replayed_at: None,
+        forced: false,
+        parked_at: chrono::Utc::now(),
+        events: Vec::new(),
+    };
+    serde_json::to_string(&batch).unwrap()
+}
+
+/// A single park-file line over the bounded reader's line-size cap must be
+/// rejected, not buffered whole — binds `read_parked_batches` to the same
+/// `MAX_LINE_BYTES` cap the harness's own park reader enforces.
+#[test]
+fn read_parked_batches_rejects_line_over_max_line_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let park_file = dir.path().join(buzz_acp_pkg::reliability::park::PARK_FILE);
+    let oversized_line = "x".repeat(buzz_acp_pkg::reliability::park::MAX_LINE_BYTES + 1);
+    std::fs::write(&park_file, format!("{oversized_line}\n")).unwrap();
+
+    let err = read_parked_batches(dir.path());
+    assert!(err.is_err(), "a line over MAX_LINE_BYTES must be rejected");
+}
+
+/// More records than the bounded reader's total-count cap must be rejected
+/// rather than read in full — binds `read_parked_batches` to the same
+/// `MAX_PARKED_TOTAL` cap the harness's own park reader enforces.
+#[test]
+fn read_parked_batches_rejects_more_than_max_parked_total() {
+    let dir = tempfile::tempdir().unwrap();
+    let park_file = dir.path().join(buzz_acp_pkg::reliability::park::PARK_FILE);
+    let total = buzz_acp_pkg::reliability::park::MAX_PARKED_TOTAL + 1;
+    let mut contents = String::new();
+    for _ in 0..total {
+        contents.push_str(&minimal_parked_batch_line(uuid::Uuid::new_v4()));
+        contents.push('\n');
+    }
+    std::fs::write(&park_file, contents).unwrap();
+
+    let err = read_parked_batches(dir.path());
+    assert!(
+        err.is_err(),
+        "more than MAX_PARKED_TOTAL records must be rejected, not silently read in full"
+    );
+}
+
+/// Exactly the cap, and one under it, must both still read successfully —
+/// the boundary itself must not be off-by-one in the strict direction.
+#[test]
+fn read_parked_batches_accepts_exactly_max_parked_total() {
+    let dir = tempfile::tempdir().unwrap();
+    let park_file = dir.path().join(buzz_acp_pkg::reliability::park::PARK_FILE);
+    let total = buzz_acp_pkg::reliability::park::MAX_PARKED_TOTAL;
+    let mut contents = String::new();
+    for _ in 0..total {
+        contents.push_str(&minimal_parked_batch_line(uuid::Uuid::new_v4()));
+        contents.push('\n');
+    }
+    std::fs::write(&park_file, contents).unwrap();
+
+    let views = read_parked_batches(dir.path()).expect("exactly the cap must still succeed");
+    assert_eq!(views.len(), total);
+}
+
 #[test]
 fn health_ingest_result_serde_errors() {
     let empty_result = HealthIngestResult {
@@ -1227,24 +1609,81 @@ fn health_ingest_result_serde_errors() {
 #[test]
 fn in_flight_sync_guard_coalesces_concurrent_calls() {
     let in_flight = Arc::new(Mutex::new(HashSet::new()));
+    let dirty = Arc::new(Mutex::new(HashSet::new()));
     let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string();
 
-    // First attempt acquires the flight lock
-    assert!(in_flight.lock().unwrap().insert(key.clone()));
+    // First attempt claims the slot and starts a run.
+    assert!(matches!(
+        claim_sync_slot(&in_flight, &dirty, &key),
+        SyncClaim::Start
+    ));
     let guard = InFlightGuard {
         in_flight: Arc::clone(&in_flight),
+        dirty: Arc::clone(&dirty),
         key: key.clone(),
     };
 
-    // Concurrent attempt fails to insert (coalesced)
-    assert!(!in_flight.lock().unwrap().insert(key.clone()));
+    // Concurrent attempt while the run is active is coalesced, not started.
+    assert!(matches!(
+        claim_sync_slot(&in_flight, &dirty, &key),
+        SyncClaim::AlreadyRunning
+    ));
 
-    // Dropping the guard frees the key
-    drop(guard);
+    // With no further request, finishing the run releases the slot.
+    dirty.lock().unwrap().remove(&key); // simulate no dirty mark this time
+    assert!(!finish_sync_or_rerun(&in_flight, &dirty, &key));
     assert!(!in_flight.lock().unwrap().contains(&key));
+    drop(guard);
 
-    // New attempt can acquire the flight lock again
-    assert!(in_flight.lock().unwrap().insert(key));
+    // A fresh attempt can claim the slot again.
+    assert!(matches!(
+        claim_sync_slot(&in_flight, &dirty, &key),
+        SyncClaim::Start
+    ));
+}
+
+/// This is the exact concurrency defect T17 delta round 2 flagged: a
+/// `sync_for_agent` request arriving while a sync is already in flight for
+/// the same key must not be silently dropped — it must cause one more run
+/// after the active one finishes. Binds `claim_sync_slot` +
+/// `finish_sync_or_rerun`, the production functions `sync_for_agent` itself
+/// calls with no other coordination logic of its own — bypassing them (e.g.
+/// manipulating the `HashSet`s directly, as the pre-delta version of this
+/// test did) would not exercise this guarantee at all.
+#[test]
+fn late_request_during_active_sync_causes_a_rerun_not_a_drop() {
+    let in_flight = Arc::new(Mutex::new(HashSet::new()));
+    let dirty = Arc::new(Mutex::new(HashSet::new()));
+    let key = "agent-under-test".to_string();
+
+    // The first request starts a run.
+    assert!(matches!(
+        claim_sync_slot(&in_flight, &dirty, &key),
+        SyncClaim::Start
+    ));
+
+    // While that run is still active, a second request for the same key
+    // arrives (e.g. a new ledger event landed mid-sync).
+    assert!(matches!(
+        claim_sync_slot(&in_flight, &dirty, &key),
+        SyncClaim::AlreadyRunning
+    ));
+
+    // The active run finishes: it must be told to run again, not exit —
+    // the late event must still be picked up.
+    assert!(
+        finish_sync_or_rerun(&in_flight, &dirty, &key),
+        "a request received during the active run must cause a rerun"
+    );
+    assert!(
+        in_flight.lock().unwrap().contains(&key),
+        "the slot must remain held across the rerun"
+    );
+
+    // The rerun completes with no further requests: now it releases.
+    assert!(!finish_sync_or_rerun(&in_flight, &dirty, &key));
+    assert!(!in_flight.lock().unwrap().contains(&key));
+    assert!(!dirty.lock().unwrap().contains(&key));
 }
 
 #[test]
@@ -1292,9 +1731,65 @@ fn record_alerts_transactional_failure_rolls_back_all() {
 }
 
 #[test]
+fn filter_valid_alert_acks_drops_forged_agent_and_forged_rule() {
+    let real_agent = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let known = vec![managed_record(real_agent)];
+
+    let legit = crate::agent_health_alerts::Alert {
+        agent: real_agent.to_string(),
+        rule: crate::agent_health_alerts::RULE_BREAKER_OPENED.to_string(),
+        title: "Breaker opened".to_string(),
+        body: "body".to_string(),
+    };
+    let forged_agent = crate::agent_health_alerts::Alert {
+        agent: "intruder_not_hex64".to_string(),
+        rule: crate::agent_health_alerts::RULE_BREAKER_OPENED.to_string(),
+        title: "Forged".to_string(),
+        body: "body".to_string(),
+    };
+    let unmanaged_agent = crate::agent_health_alerts::Alert {
+        agent: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba987654321f".to_string(),
+        rule: crate::agent_health_alerts::RULE_BREAKER_OPENED.to_string(),
+        title: "Not mine".to_string(),
+        body: "body".to_string(),
+    };
+    let forged_rule = crate::agent_health_alerts::Alert {
+        agent: real_agent.to_string(),
+        rule: "made_up_rule".to_string(),
+        title: "Forged rule".to_string(),
+        body: "body".to_string(),
+    };
+
+    let valid = filter_valid_alert_acks(
+        &known,
+        vec![legit.clone(), forged_agent, unmanaged_agent, forged_rule],
+    );
+
+    assert_eq!(
+        valid,
+        vec![legit],
+        "only the real agent + known rule combination must survive"
+    );
+}
+
+#[test]
+fn record_delivered_alerts_rejects_over_count_acks() {
+    let alerts: Vec<crate::agent_health_alerts::Alert> = (0..(MAX_ALERTS_PER_ACK + 1))
+        .map(|i| crate::agent_health_alerts::Alert {
+            agent: format!("agent_{i}"),
+            rule: crate::agent_health_alerts::RULE_BREAKER_OPENED.to_string(),
+            title: "t".to_string(),
+            body: "b".to_string(),
+        })
+        .collect();
+    assert!(validate_alert_ack_count(alerts.len()).is_err());
+    assert!(validate_alert_ack_count(MAX_ALERTS_PER_ACK).is_ok());
+}
+
+#[test]
 fn sanitize_last_error_redacts_bearer_and_api_key() {
     let raw = "failed to connect: Bearer sk-ant-api03-abcdef123456789 and api_key=secret_123456789";
-    let sanitized = sanitize_last_error(raw);
+    let sanitized = sanitize_last_error(raw, &[]);
     assert!(
         !sanitized.contains("sk-ant-api03-abcdef123456789"),
         "sk token must be redacted: {sanitized}"
@@ -1307,6 +1802,30 @@ fn sanitize_last_error_redacts_bearer_and_api_key() {
         sanitized.contains("[REDACTED]"),
         "redaction marker must be present"
     );
+}
+
+/// A secret that does not match any built-in shape (not "Bearer ...", not a
+/// known API-key or GitHub-token prefix) — e.g. a custom provider key this
+/// agent's own `env_vars` holds, or its nsec — still leaks through the
+/// pattern-only redaction. Callers must pass every literal secret value the
+/// agent's own configuration holds as `known_secrets`.
+#[test]
+fn sanitize_last_error_redacts_known_secrets_with_no_recognizable_shape() {
+    let custom_secret = "correct-horse-battery-staple-9f8e7d6c";
+    let raw = format!("provider rejected credential {custom_secret} for host example.com");
+
+    let unsanitized = sanitize_last_error(&raw, &[]);
+    assert!(
+        unsanitized.contains(custom_secret),
+        "sanity check: a shapeless secret is NOT caught by built-in patterns alone"
+    );
+
+    let sanitized = sanitize_last_error(&raw, &[custom_secret]);
+    assert!(
+        !sanitized.contains(custom_secret),
+        "a known configured secret must be redacted even with no recognizable shape: {sanitized}"
+    );
+    assert!(sanitized.contains("[REDACTED]"));
 }
 
 /// A full-sync call (`targeted_agent: None`) has no other source of truth

@@ -57,13 +57,33 @@ fn normalized_relay_scope(relay_url: &str) -> &str {
 /// The normalized scope is hashed so relay URLs never become path components.
 /// Trimming a trailing slash keeps equivalent workspace URLs on one scope.
 pub fn scoped_retention_db_path(base_dir: &Path, relay_url: &str, owner_pubkey: &str) -> PathBuf {
+    scoped_db_path(base_dir, "retention", relay_url, owner_pubkey)
+}
+
+/// Resolve a community-scoped database path under `base_dir/<subdir>/`, for
+/// any store (not just persona-event retention) that must keep community A's
+/// data from being read into, or written from, community B after a
+/// workspace switch — see [`RetentionScope`]'s doc comment for why "separate
+/// database per (relay_url, owner_pubkey)" is this codebase's house pattern
+/// for that problem, rather than a `community_id` column threaded through
+/// every query.
+///
+/// The normalized scope is hashed so relay URLs never become path
+/// components. Trimming a trailing slash keeps equivalent workspace URLs on
+/// one scope.
+pub fn scoped_db_path(
+    base_dir: &Path,
+    subdir: &str,
+    relay_url: &str,
+    owner_pubkey: &str,
+) -> PathBuf {
     let normalized_relay = normalized_relay_scope(relay_url);
     let mut hasher = Sha256::new();
     hasher.update(owner_pubkey.trim().to_ascii_lowercase().as_bytes());
     hasher.update(b"\0");
     hasher.update(normalized_relay.as_bytes());
     let scope_id = hex::encode(hasher.finalize());
-    base_dir.join("retention").join(format!("{scope_id}.db"))
+    base_dir.join(subdir).join(format!("{scope_id}.db"))
 }
 
 /// Snapshot the active relay + owner and resolve their durable event store.

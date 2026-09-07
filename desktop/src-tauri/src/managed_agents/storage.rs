@@ -105,6 +105,7 @@ pub fn managed_agent_state_dir(app: &AppHandle, pubkey: &str) -> Result<PathBuf,
         ));
     }
     let dir = managed_agents_base_dir(app)?.join("state").join(pubkey);
+    reject_symlink(&dir)?;
     fs::create_dir_all(&dir)
         .map_err(|error| format!("failed to create agent state dir: {error}"))?;
     #[cfg(unix)]
@@ -114,6 +115,25 @@ pub fn managed_agent_state_dir(app: &AppHandle, pubkey: &str) -> Result<PathBuf,
             .map_err(|error| format!("failed to lock down agent state dir: {error}"))?;
     }
     Ok(dir)
+}
+
+/// Reject `path` if it already exists as a symlink (to a directory, a file,
+/// or a dangling target).
+///
+/// `create_dir_all` and `set_permissions` both follow symlinks — a symlink
+/// planted at this exact path before an agent's state directory is first
+/// resolved would make every read, write, and permission change against
+/// "the agent's state directory" actually land wherever that symlink
+/// points. `symlink_metadata` (unlike `metadata`) does not follow the link,
+/// so this check itself cannot be fooled by the same symlink it is
+/// inspecting.
+fn reject_symlink(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(format!(
+            "refusing to use {path:?}: it is a symlink, not a real directory"
+        )),
+        Ok(_) | Err(_) => Ok(()),
+    }
 }
 
 /// Pair-scoped log path for a managed runtime. The relay URL never appears in

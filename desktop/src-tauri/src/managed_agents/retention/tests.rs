@@ -20,6 +20,40 @@ fn retention_scope_is_stable_and_separates_relay_and_owner() {
     );
 }
 
+/// `scoped_db_path` is the general form `scoped_retention_db_path` now
+/// delegates to — used by the agent-health store (T17 delta) to keep one
+/// community's health data from being read into, or overwritten by, another
+/// community after a workspace switch. Same stability/separation contract,
+/// under a caller-chosen subdirectory instead of the hardcoded "retention".
+#[test]
+fn scoped_db_path_separates_by_subdir_relay_and_owner() {
+    let base = Path::new("/tmp/buzz-scoped-db-test");
+    let owner_a = "a".repeat(64);
+    let owner_b = "b".repeat(64);
+
+    let health_a = scoped_db_path(base, "agent-health", "wss://a.example/", &owner_a);
+    assert_eq!(
+        health_a,
+        scoped_db_path(base, "agent-health", "wss://a.example", &owner_a),
+        "equivalent relay URLs (trailing slash) must resolve to the same path"
+    );
+    assert_ne!(
+        health_a,
+        scoped_db_path(base, "agent-health", "wss://b.example", &owner_a),
+        "a different relay (community) must resolve to a different path"
+    );
+    assert_ne!(
+        health_a,
+        scoped_db_path(base, "agent-health", "wss://a.example", &owner_b),
+        "a different owner must resolve to a different path"
+    );
+    assert_ne!(
+        health_a,
+        scoped_db_path(base, "retention", "wss://a.example", &owner_a),
+        "a different subdir (store) must resolve to a different path"
+    );
+}
+
 #[test]
 fn test_arrival_relay_matching_agrees_with_database_identity() {
     let base = Path::new("/tmp/buzz-retention-test");

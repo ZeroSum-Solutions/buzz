@@ -11,6 +11,7 @@ import test from "node:test";
 const sentNotifications = [];
 const recordedAlerts = [];
 let syncHealthShouldReject = false;
+let syncHealthResultErrors = [];
 
 globalThis.window = {
   Notification: class MockNotification {
@@ -43,6 +44,7 @@ globalThis.window = {
               body: "PM has 3 saved messages waiting for 20 minutes",
             },
           ],
+          errors: syncHealthResultErrors,
         });
       }
       if (cmd === "ingest_agent_health_frame") {
@@ -64,7 +66,7 @@ globalThis.window = {
   },
 };
 
-const { syncAgentHealth, fetchAgentHealthSummary } = await import(
+const { syncAgentHealth, fetchAgentHealthSummary, withTimeout } = await import(
   "@/features/agents/agentHealthHooks"
 );
 const { ingestAgentHealthFrame } = await import(
@@ -130,4 +132,69 @@ test("fetchAgentHealthSummaryDegradesOnSyncRejection", async () => {
   } finally {
     syncHealthShouldReject = false;
   }
+});
+
+// The exact gap T17 delta round 2 flagged: a RESOLVED sync_agent_health
+// response can still carry per-agent errors the backend swallowed rather
+// than aborting the whole sync for. A promise resolving is not the same as
+// the sync having actually succeeded for every agent — this must still
+// degrade the summary, not present stale data as fresh.
+test("fetchAgentHealthSummaryDegradesOnResolvedResponseWithErrors", async () => {
+  sentNotifications.length = 0;
+  syncHealthResultErrors = [["agent-with-bad-ledger", "corrupt ledger"]];
+  try {
+    const result = await fetchAgentHealthSummary();
+    assert.equal(
+      result.syncError,
+      true,
+      "syncError must be true when a resolved response carries errors",
+    );
+    assert.deepEqual(
+      result.syncErrorAgents,
+      ["agent-with-bad-ledger"],
+      "the affected agent id must be surfaced, not just a boolean",
+    );
+  } finally {
+    syncHealthResultErrors = [];
+  }
+});
+
+test("fetchAgentHealthSummaryStaysCleanOnResolvedResponseWithNoErrors", async () => {
+  syncHealthResultErrors = [];
+  const result = await fetchAgentHealthSummary();
+  assert.equal(result.syncError, false);
+  assert.deepEqual(result.syncErrorAgents, []);
+});
+
+// `withTimeout` is the exact mechanism `syncAgentHealth` now wraps
+// notification delivery and the delivery-ack invoke in (T17 delta round 2):
+// neither permission prompts, native delivery, nor the ack invoke can hang
+// a sync indefinitely, because none of them are awaited directly anymore.
+test("withTimeoutResolvesToTheRealValueWhenTheInnerPromiseSettlesInTime", async () => {
+  const value = await withTimeout(
+    Promise.resolve("real value"),
+    1000,
+    "fallback",
+  );
+  assert.equal(value, "real value");
+});
+
+test("withTimeoutFallsBackWhenTheInnerPromiseNeverSettles", async () => {
+  const neverSettles = new Promise(() => {});
+  const value = await withTimeout(neverSettles, 20, "fallback");
+  assert.equal(
+    value,
+    "fallback",
+    "a never-resolving promise must not hang the caller past the timeout",
+  );
+});
+
+test("withTimeoutFallsBackWhenTheInnerPromiseRejects", async () => {
+  const rejecting = Promise.reject(new Error("boom"));
+  const value = await withTimeout(rejecting, 1000, "fallback");
+  assert.equal(
+    value,
+    "fallback",
+    "a rejection must resolve to the fallback, not propagate as a thrown error",
+  );
 });

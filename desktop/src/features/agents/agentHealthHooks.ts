@@ -45,6 +45,52 @@ export const agentHealthEventsQueryKey = (
 export const parkedBatchesQueryKey = (agent: string) =>
   ["agent-health", "parked-batches", agent] as const;
 
+/** How long one notification delivery or acknowledgement may take before
+ * `syncAgentHealth` gives up waiting on it. Notification permission
+ * prompts, native delivery, and the ack invoke are all awaited in this
+ * function's serial loop — a single never-resolving promise among them
+ * would otherwise hang every later frame this store processes (the
+ * observer relay queue awaits `syncAgentHealth`'s callers serially too). */
+export const HEALTH_NOTIFICATION_TIMEOUT_MS = 5_000;
+
+/**
+ * Resolve to `onTimeout` if `promise` neither resolves nor rejects within
+ * `ms`, and to `onTimeout` (not a thrown error) if it rejects — the caller
+ * treats "failed" and "never settled" identically, so both collapse to the
+ * same fallback value instead of one of them propagating an exception.
+ */
+export function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  onTimeout: T,
+): Promise<T> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        resolve(onTimeout);
+      }
+    }, ms);
+    promise.then(
+      (value) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve(value);
+        }
+      },
+      () => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve(onTimeout);
+        }
+      },
+    );
+  });
+}
+
 export async function syncAgentHealth(
   agent?: string | null,
 ): Promise<AgentHealthIngestResult> {
@@ -57,17 +103,23 @@ export async function syncAgentHealth(
   if (result?.alerts && Array.isArray(result.alerts)) {
     const delivered: AgentHealthAlert[] = [];
     for (const alert of result.alerts) {
-      const deliveredSuccessfully = await sendDesktopNotification({
-        title: alert.title,
-        body: alert.body,
-      }).catch(() => false);
+      const deliveredSuccessfully = await withTimeout(
+        sendDesktopNotification({
+          title: alert.title,
+          body: alert.body,
+        }),
+        HEALTH_NOTIFICATION_TIMEOUT_MS,
+        false,
+      );
       if (deliveredSuccessfully) {
         delivered.push(alert);
       }
     }
     if (delivered.length > 0) {
-      await invokeTauri("record_delivered_alerts", { alerts: delivered }).catch(
-        () => {},
+      await withTimeout(
+        invokeTauri("record_delivered_alerts", { alerts: delivered }),
+        HEALTH_NOTIFICATION_TIMEOUT_MS,
+        undefined,
       );
     }
   }
@@ -106,8 +158,18 @@ export async function getParkedBatches(
 
 export async function fetchAgentHealthSummary(): Promise<AgentHealthSummaryData> {
   let syncError = false;
+  let syncErrorAgents: string[] = [];
   try {
-    await syncAgentHealth();
+    const result = await syncAgentHealth();
+    // A resolved `Ok` response can still carry per-agent failures the
+    // backend swallowed rather than aborting the whole sync for (a corrupt
+    // ledger, a park-file read failure, …) — those must degrade this
+    // summary the same way an outright rejection does, not be silently
+    // dropped just because the promise itself resolved.
+    if (result?.errors && result.errors.length > 0) {
+      syncError = true;
+      syncErrorAgents = result.errors.map(([agent]) => agent);
+    }
   } catch (error) {
     console.debug("sync_agent_health error (skipped):", error);
     syncError = true;
@@ -118,7 +180,7 @@ export async function fetchAgentHealthSummary(): Promise<AgentHealthSummaryData>
     getAgentHealthSummary(168),
   ]);
 
-  return { summary24h, summary7d, syncError };
+  return { summary24h, summary7d, syncError, syncErrorAgents };
 }
 
 export function useAgentHealthSummaryQuery(options?: { enabled?: boolean }) {

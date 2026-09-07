@@ -49,7 +49,14 @@ export type AgentHealthSummaryData = {
   summary7d?: readonly AgentHealthCounters[] | null;
   counters24h?: readonly AgentHealthCounters[] | null;
   counters7d?: readonly AgentHealthCounters[] | null;
+  /**
+   * Set when the sync step failed outright OR completed but reported
+   * per-agent errors (a resolved `sync_agent_health` response can still
+   * carry `errors` — see `AgentHealthIngestResult`). The rows below may be
+   * stale for the agents named in `syncErrorAgents`.
+   */
   syncError?: boolean;
+  syncErrorAgents?: readonly string[];
 };
 
 export type AgentHealthSummaryCounters =

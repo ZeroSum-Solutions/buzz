@@ -60,6 +60,21 @@ pub struct Alert {
     pub body: String,
 }
 
+/// Whether `rule` is exactly one of the canonical rule identifiers `evaluate`
+/// emits (not an alias `normalize_rule` would still map somewhere) — used to
+/// validate a renderer-supplied acknowledgement before it is allowed to
+/// suppress a future real alert.
+pub fn is_known_rule(rule: &str) -> bool {
+    matches!(
+        rule,
+        RULE_PARKED_OLDER_THAN_15_MINUTES
+            | RULE_NEEDS_REVIEW
+            | RULE_BREAKER_OPENED
+            | RULE_PAUSE_LONGER_THAN_1_HOUR
+            | RULE_NON_ZERO_EXIT
+    )
+}
+
 pub fn normalize_rule(rule: &str) -> &'static str {
     match rule {
         "parked_older_than_15_minutes" | "parked_15m" | "parked_batch_older_than_15_minutes" => {

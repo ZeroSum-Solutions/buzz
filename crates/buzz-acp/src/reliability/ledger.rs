@@ -571,6 +571,31 @@ pub fn read_ledger_file(path: &Path) -> io::Result<Vec<LedgerRecord>> {
     Ok(records)
 }
 
+/// Read `path` like [`read_ledger_file`], then drop any record whose `agent`
+/// does not equal `expected_agent` or whose `at` is more than five minutes
+/// ahead of `now`.
+///
+/// A ledger lives inside the state directory of one managed agent, but
+/// nothing at the file-format level stops a record embedding a *different*
+/// `agent` value, and nothing bounds how far in the future `at` claims to be.
+/// Both the desktop health sync (`sync_ledger`) and the CLI's `agents health`
+/// aggregation read health-relevant ledgers through this function, so a
+/// mixed-identity or clock-skewed ledger can never be blended into either
+/// consumer's per-agent counters or evade the 30-day retention window that
+/// keys off `at`.
+pub fn read_ledger_file_for_agent(
+    path: &Path,
+    expected_agent: &str,
+    now: DateTime<Utc>,
+) -> io::Result<Vec<LedgerRecord>> {
+    let max_future = now + Duration::minutes(5);
+    let records = read_ledger_file(path)?;
+    Ok(records
+        .into_iter()
+        .filter(|record| record.agent == expected_agent && record.at <= max_future)
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,5 +648,50 @@ mod tests {
             bytes_after, original_bytes,
             "file bytes must remain unchanged"
         );
+    }
+
+    #[test]
+    fn read_ledger_file_for_agent_drops_mismatched_agent_and_future_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let now = Utc::now();
+
+        let make = |agent: &str, at: DateTime<Utc>| LedgerRecord {
+            at,
+            agent: agent.to_string(),
+            body: LedgerBody::TurnFinished(TurnFinished {
+                batch_id: Uuid::new_v4(),
+                channel_id: Uuid::new_v4(),
+                outcome: TurnOutcome::Ok,
+            }),
+        };
+
+        let owned = make("owner_agent", now);
+        let intruder = make("intruder_agent", now);
+        let future = make("owner_agent", now + Duration::days(1));
+
+        let contents = [&owned, &intruder, &future]
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, format!("{contents}\n")).unwrap();
+
+        let records = read_ledger_file_for_agent(&path, "owner_agent", now)
+            .expect("read_ledger_file_for_agent should succeed");
+
+        assert_eq!(
+            records,
+            vec![owned],
+            "only the matching, non-future record must survive"
+        );
+    }
+
+    #[test]
+    fn read_ledger_file_for_agent_missing_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does_not_exist.jsonl");
+        let records = read_ledger_file_for_agent(&path, "owner_agent", Utc::now()).unwrap();
+        assert!(records.is_empty());
     }
 }

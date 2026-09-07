@@ -467,6 +467,21 @@ async fn cmd_archived(client: &BuzzClient) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Longest byte prefix of `s` that is at most `max_bytes` bytes and ends on a
+/// UTF-8 character boundary. `&s[..max_bytes]` panics whenever a multibyte
+/// character straddles that offset (any UTF-8 string long enough to lead
+/// with one), which a ledger-supplied agent id is not guaranteed to avoid.
+fn char_boundary_prefix(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// View agent health counters and state from local ledgers.
 pub fn cmd_health(since: &str, json: bool, state_root: Option<&Path>) -> Result<(), CliError> {
     cmd_health_to_writer(&mut std::io::stdout(), since, json, state_root)
@@ -495,7 +510,21 @@ pub fn cmd_health_to_writer<W: std::io::Write>(
 
     for dir in state_dirs {
         let ledger_path = dir.join(buzz_acp::reliability::ledger::LEDGER_FILE);
-        let mut row = match buzz_acp::reliability::ledger::read_ledger_file(&ledger_path) {
+        let expected_agent = dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        // Read through the agent- and clock-skew-validated reader, not the
+        // raw `read_ledger_file`: a ledger holding a record whose embedded
+        // `agent` differs from this state directory's owner (or a
+        // future-dated record) must never be blended into this directory's
+        // counters — see `read_ledger_file_for_agent`.
+        let mut row = match buzz_acp::reliability::ledger::read_ledger_file_for_agent(
+            &ledger_path,
+            &expected_agent,
+            now,
+        ) {
             Ok(records) => buzz_acp::reliability::health::summarize(&records, duration, now),
             Err(e) => {
                 // A real I/O error (permissions, corruption at the OS level) is
@@ -509,9 +538,7 @@ pub fn cmd_health_to_writer<W: std::io::Write>(
             }
         };
         if row.agent.is_empty() {
-            if let Some(name) = dir.file_name().and_then(|s| s.to_str()) {
-                row.agent = name.to_string();
-            }
+            row.agent = expected_agent;
         }
         rows.push(row);
     }
@@ -537,11 +564,7 @@ pub fn cmd_health_to_writer<W: std::io::Write>(
         .map_err(|e| CliError::Other(e.to_string()))?;
 
         for row in &rows {
-            let agent_prefix = if row.agent.len() > 16 {
-                &row.agent[..16]
-            } else {
-                &row.agent
-            };
+            let agent_prefix = char_boundary_prefix(&row.agent, 16);
             let last_error = row.last_error_class.as_deref().unwrap_or("-");
             writeln!(
                 writer,
@@ -1552,6 +1575,83 @@ mod tests {
                 .as_str()
                 .is_some_and(|s| s.contains("ledger read error")),
             "last_error_class must carry the read failure: {parsed:?}"
+        );
+    }
+
+    /// A ledger agent id longer than 16 bytes with a multibyte character
+    /// straddling byte offset 16 must not panic the text-table renderer.
+    /// `&row.agent[..16]` indexes mid-character; `char_boundary_prefix` must
+    /// back off to the nearest valid boundary instead.
+    #[test]
+    fn health_text_table_truncates_unicode_agent_without_panicking() {
+        // 15 ASCII bytes then a 3-byte character starting at byte 15, so a
+        // naive 16-byte slice lands inside the character (byte 16 splits it).
+        let agent = format!("{}\u{4e2d}suffix", "a".repeat(15));
+        assert!(!agent.is_char_boundary(16), "fixture must straddle byte 16");
+
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let agent_dir = tmp.path().join(&agent);
+        std::fs::create_dir(&agent_dir).expect("create agent dir");
+        let ledger_path = agent_dir.join("ledger.jsonl");
+        let record = buzz_acp::reliability::ledger::LedgerRecord {
+            at: chrono::Utc::now(),
+            agent: agent.clone(),
+            body: buzz_acp::reliability::ledger::LedgerBody::TurnFinished(
+                buzz_acp::reliability::ledger::TurnFinished {
+                    batch_id: uuid::Uuid::new_v4(),
+                    channel_id: uuid::Uuid::new_v4(),
+                    outcome: buzz_acp::reliability::ledger::TurnOutcome::Ok,
+                },
+            ),
+        };
+        let line = serde_json::to_string(&record).expect("serialize record");
+        std::fs::write(&ledger_path, format!("{line}\n")).expect("write ledger");
+
+        let mut out = Vec::new();
+        // json=false exercises the text-table path that indexes `row.agent`.
+        cmd_health_to_writer(&mut out, "24h", false, Some(tmp.path()))
+            .expect("must not panic or error on a unicode agent id");
+        let rendered = String::from_utf8(out).expect("valid utf-8 output");
+        assert!(rendered.contains("aaaaaaaaaaaaaaa"));
+    }
+
+    /// A ledger record whose embedded `agent` field does not match the state
+    /// directory it lives in must not be blended into that directory's row —
+    /// closes the "mixed identities" gap in `read_ledger_file_for_agent`.
+    #[test]
+    fn health_ignores_records_with_mismatched_embedded_agent() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let agent_dir = tmp.path().join("agent_owner");
+        std::fs::create_dir(&agent_dir).expect("create agent dir");
+        let ledger_path = agent_dir.join("ledger.jsonl");
+
+        let make_record = |agent: &str| buzz_acp::reliability::ledger::LedgerRecord {
+            at: chrono::Utc::now(),
+            agent: agent.to_string(),
+            body: buzz_acp::reliability::ledger::LedgerBody::TurnFinished(
+                buzz_acp::reliability::ledger::TurnFinished {
+                    batch_id: uuid::Uuid::new_v4(),
+                    channel_id: uuid::Uuid::new_v4(),
+                    outcome: buzz_acp::reliability::ledger::TurnOutcome::Ok,
+                },
+            ),
+        };
+        let mut lines = String::new();
+        lines.push_str(&serde_json::to_string(&make_record("agent_owner")).unwrap());
+        lines.push('\n');
+        lines.push_str(&serde_json::to_string(&make_record("agent_intruder")).unwrap());
+        lines.push('\n');
+        std::fs::write(&ledger_path, lines).expect("write ledger");
+
+        let mut out = Vec::new();
+        cmd_health_to_writer(&mut out, "24h", true, Some(tmp.path())).expect("cmd_health succeeds");
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(&String::from_utf8(out).unwrap()).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["agent"], "agent_owner");
+        assert_eq!(
+            parsed[0]["turns"], 1,
+            "the mismatched-agent record must not be counted: {parsed:?}"
         );
     }
 }
