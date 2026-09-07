@@ -95,6 +95,7 @@ import { useNavigationGuard } from "./useNavigationGuard";
 import * as searchForwarding from "./searchTargetForwarding";
 import { ChannelFilesTab } from "@/features/channel-files/ChannelFilesTab";
 import { isFilesIndexEnabled } from "@/features/channel-files/filesTabActivation";
+import { useChannelFilesCanvas } from "@/features/channel-files/useChannelFilesCanvas";
 import { useChannelFilesIndex } from "@/features/channel-files/useChannelFilesIndex";
 import { useFileFolders } from "@/features/channel-files/useFileFolders";
 import {
@@ -244,10 +245,16 @@ export function ChannelScreen({
       setFilesTabOpenedChannelId(activeChannelId);
     }
   }, [activeTab, activeChannelId]);
-  const channelFiles = useChannelFilesIndex(
-    activeChannel,
-    isFilesIndexEnabled(filesTabOpenedChannelId, activeChannelId),
+  const isFilesTabOpened = isFilesIndexEnabled(
+    filesTabOpenedChannelId,
+    activeChannelId,
   );
+  const channelFiles = useChannelFilesIndex(activeChannel, isFilesTabOpened);
+  const filesCanvas = useChannelFilesCanvas({
+    channel: activeChannel,
+    currentPubkey,
+    enabled: isFilesTabOpened,
+  });
   const fileFoldersHook = useFileFolders(activeChannelId, currentPubkey);
   // Reset to chat tab when switching channels
   // biome-ignore lint/correctness/useExhaustiveDependencies: activeChannelId is the intentional reset trigger
@@ -1126,6 +1133,7 @@ export function ChannelScreen({
                     >
                   <ChannelFilesTab
                     canLoadOlder={channelFiles.canLoadOlder}
+                    canvas={filesCanvas ?? undefined}
                     canMutateFolders={fileFoldersHook.canMutate}
                     fileFolderMap={fileFoldersHook.fileFolderMap}
                     files={channelFiles.files}

@@ -6,6 +6,26 @@ use crate::{
     relay::{query_relay, submit_event},
 };
 
+/// Reject canvas content larger than [`events::MAX_CONTENT_BYTES`] before it
+/// is folded into the DTO returned to the frontend.
+///
+/// `get_canvas` returns `event.content` verbatim from the relay query, and
+/// the relay read path applies no response-size ceiling of its own — only
+/// the write path (`events::build_set_canvas`) bounds what a well-behaved
+/// client publishes. Without this check, a hostile or nonconforming relay
+/// peer can push an arbitrarily large kind:40100 body through this command
+/// and into the Files tab's eager `useCanvasQuery` cache.
+fn enforce_canvas_content_cap(content: &str) -> Result<(), String> {
+    if content.len() > events::MAX_CONTENT_BYTES {
+        return Err(format!(
+            "canvas content exceeds maximum size of {} bytes (got {})",
+            events::MAX_CONTENT_BYTES,
+            content.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Read the most recent canvas event (kind:40100) for a channel.
 #[tauri::command]
 pub async fn get_canvas(
@@ -34,6 +54,8 @@ pub async fn get_canvas(
         }));
     };
 
+    enforce_canvas_content_cap(&event.content)?;
+
     Ok(serde_json::json!({
         "content": event.content,
         "event_id": event.id.to_hex(),
@@ -57,4 +79,21 @@ pub async fn set_canvas(
         "ok": true,
         "event_id": result.event_id,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_at_the_cap_is_accepted() {
+        let content = "a".repeat(events::MAX_CONTENT_BYTES);
+        assert!(enforce_canvas_content_cap(&content).is_ok());
+    }
+
+    #[test]
+    fn content_one_byte_over_the_cap_is_rejected() {
+        let content = "a".repeat(events::MAX_CONTENT_BYTES + 1);
+        assert!(enforce_canvas_content_cap(&content).is_err());
+    }
 }

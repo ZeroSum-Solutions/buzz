@@ -204,6 +204,30 @@ pub async fn get_user_profile(
         .unwrap_or_else(|| empty_profile_info(&target)))
 }
 
+/// Maximum pubkeys accepted per `get_users_batch` request.
+///
+/// The real caller (`useUsersBatchQuery` in
+/// `desktop/src/features/profile/hooks.ts`, driving `ChannelScreen`'s
+/// author-profile batch and every other member/mention surface) sends the
+/// unique authors of one loaded window — dozens at most in practice. Without
+/// a cap, `get_users_batch` sent an unbounded `authors` filter, so a large or
+/// hostile requested pubkey list drove unbounded relay filter-matching work
+/// and (via `users_batch_from_events`) unbounded response processing. 256
+/// gives real callers generous headroom while bounding the worst case.
+const MAX_USERS_BATCH_PUBKEYS: usize = 256;
+
+/// Build the `get_users_batch` relay filter. `limit` is set to the request
+/// size: the query has no reason to return more kind:0 events than there are
+/// requested authors, and an unbounded (`limit`-less) filter let a
+/// nonconforming relay return an unbounded number of events for processing.
+fn build_users_batch_filter(pubkeys: &[String]) -> serde_json::Value {
+    serde_json::json!({
+        "kinds": [0],
+        "authors": pubkeys,
+        "limit": pubkeys.len(),
+    })
+}
+
 #[tauri::command]
 pub async fn get_users_batch(
     pubkeys: Vec<String>,
@@ -215,14 +239,13 @@ pub async fn get_users_batch(
             missing: Vec::new(),
         });
     }
-    let events = query_relay(
-        &state,
-        &[serde_json::json!({
-            "kinds": [0],
-            "authors": pubkeys,
-        })],
-    )
-    .await?;
+    if pubkeys.len() > MAX_USERS_BATCH_PUBKEYS {
+        return Err(format!(
+            "get_users_batch accepts at most {MAX_USERS_BATCH_PUBKEYS} pubkeys (got {})",
+            pubkeys.len()
+        ));
+    }
+    let events = query_relay(&state, &[build_users_batch_filter(&pubkeys)]).await?;
 
     Ok(nostr_convert::users_batch_from_events(&events, &pubkeys))
 }
@@ -416,6 +439,78 @@ fn empty_profile_info(pubkey: &str) -> ProfileInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tauri::Manager;
+
+    #[test]
+    fn users_batch_filter_limits_results_to_the_request_size() {
+        let pubkeys = vec!["a".repeat(64), "b".repeat(64), "c".repeat(64)];
+
+        let filter = build_users_batch_filter(&pubkeys);
+
+        assert_eq!(filter["kinds"], serde_json::json!([0]));
+        assert_eq!(filter["authors"], serde_json::json!(pubkeys));
+        assert_eq!(filter["limit"], serde_json::json!(3));
+    }
+
+    /// Spawn a relay stub that records every connection it accepts and
+    /// answers each with an empty `[]` query result. Used to prove a
+    /// rejection happens *before* the relay round trip, not merely that the
+    /// command errors for some incidental reason (e.g. no relay configured).
+    async fn spawn_recording_relay() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub relay");
+        let addr = listener.local_addr().expect("stub relay local addr");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_task = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                hits_for_task.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let body = "[]";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("ws://{addr}"), hits)
+    }
+
+    #[tokio::test]
+    async fn users_batch_rejects_pubkey_count_over_the_cap() {
+        let (relay_url, hits) = spawn_recording_relay().await;
+        let state = crate::app_state::build_app_state();
+        *state.relay_url_override.lock().unwrap() = Some(relay_url);
+        let app = tauri::test::mock_builder()
+            .manage(state)
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app builds headless");
+        let oversized = vec!["a".repeat(64); MAX_USERS_BATCH_PUBKEYS + 1];
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            get_users_batch(oversized, app.state()),
+        )
+        .await
+        .expect("command must not hang");
+
+        assert!(result.is_err(), "over-cap pubkey list must be rejected");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an over-cap request must be rejected before it reaches the relay"
+        );
+    }
 
     #[test]
     fn deferred_profile_signer_is_captured_and_rejects_wrong_identity() {

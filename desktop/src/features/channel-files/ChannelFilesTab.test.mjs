@@ -580,3 +580,128 @@ test("the failure banner's Retry runs the retry it was given", async () => {
     cleanup();
   }
 });
+
+/** A stand-in for the channel's Canvas surface, identifiable in the tree. */
+async function canvasProp(preview) {
+  const React = await import("react");
+  return {
+    preview,
+    surface: React.createElement(
+      "div",
+      { "data-testid": "stub-canvas-surface" },
+      "canvas editor",
+    ),
+  };
+}
+
+test("no canvas row when the channel has no canvas", async () => {
+  const { cleanup, screen } = await renderTab({
+    files: [{ url: "https://media.example/one.png", filename: "one.png" }],
+  });
+  try {
+    assert.equal(
+      screen.queryByTestId("channel-files-canvas-row"),
+      null,
+      "a channel without a canvas pins nothing",
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("the pinned canvas row opens the Canvas surface, not the attachment viewer", async () => {
+  const { act, cleanup, screen } = await renderTab({
+    canvas: await canvasProp("Kickoff notes"),
+    files: [{ url: "https://media.example/one.png", filename: "one.png" }],
+  });
+  try {
+    const { fireEvent } = await import("@testing-library/react");
+    const row = screen.getByTestId("channel-files-canvas-row");
+    assert.equal(row.tagName, "BUTTON", "the row is a control, not a download");
+    assert.equal(row.getAttribute("aria-expanded"), "false");
+    assert.equal(
+      screen.queryByTestId("stub-canvas-surface"),
+      null,
+      "the surface is revealed on open, not mounted eagerly",
+    );
+
+    await act(async () => {
+      fireEvent.click(row);
+    });
+
+    assert.ok(
+      screen.getByTestId("stub-canvas-surface"),
+      "opening the row shows the channel's own Canvas surface",
+    );
+    assert.equal(
+      screen
+        .getByTestId("channel-files-canvas-row")
+        .getAttribute("aria-expanded"),
+      "true",
+    );
+    // A canvas is not an attachment: nothing about the row links to media.
+    assert.equal(
+      screen.queryByRole("link", { name: /canvas/i }),
+      null,
+      "the row never opens the attachment viewer",
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("the pinned canvas row caps the relay-sourced preview it renders", async () => {
+  const { MAX_CANVAS_PREVIEW_LENGTH } = await import("./ChannelFilesTab.tsx");
+  const { cleanup, screen } = await renderTab({
+    canvas: await canvasProp("p".repeat(MAX_CANVAS_PREVIEW_LENGTH + 500)),
+    files: [],
+  });
+  try {
+    const row = screen.getByTestId("channel-files-canvas-row");
+    assert.match(row.textContent, /^Canvasp+$/);
+    assert.equal(
+      row.textContent.length,
+      "Canvas".length + MAX_CANVAS_PREVIEW_LENGTH,
+      "the row renders the capped prefix, never the whole body",
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("the Documents facet filters the list and the sort control reorders it", async () => {
+  const { act, cleanup, screen } = await renderTab({
+    files: [
+      { url: "https://media.example/notes.bin", filename: "notes.md" },
+      { url: "https://media.example/b.png", filename: "b.png" },
+      { url: "https://media.example/a.png", filename: "a.png" },
+    ],
+  });
+  try {
+    const { fireEvent } = await import("@testing-library/react");
+    const listedNames = () =>
+      screen
+        .getAllByRole("link")
+        .map((node) => node.getAttribute("title"))
+        .filter(Boolean);
+
+    // Every seeded row is an image by MIME; only the .md is a document, and
+    // only its filename says so.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^Documents/ }));
+    });
+    assert.deepEqual(listedNames(), ["notes.md"]);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^All/ }));
+    });
+    await act(async () => {
+      fireEvent.change(screen.getByRole("combobox", { name: "Sort files" }), {
+        target: { value: "name" },
+      });
+    });
+    assert.deepEqual(listedNames(), ["a.png", "b.png", "notes.md"]);
+  } finally {
+    cleanup();
+  }
+});
