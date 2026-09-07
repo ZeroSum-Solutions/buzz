@@ -187,12 +187,11 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE").map(PathBuf::from)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
     #[test]
-    #[cfg(unix)]
     fn test_write_atomic_survives_parent_dir_fsync_error() {
         use std::os::unix::fs::PermissionsExt;
 
