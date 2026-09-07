@@ -1,8 +1,7 @@
 use std::path::PathBuf;
 
 use super::overrides::{divergent_agent_command_override, update_time_agent_command_override};
-// Glob, not a named list: this file is frozen at the file-size ratchet
-// ceiling and the named-import list this replaced had no spare line budget.
+// Glob, not a named list: this file is frozen at the file-size ratchet ceiling and the named-import list this replaced had no spare line budget.
 use super::*;
 use crate::managed_agents::AcpAvailabilityStatus;
 

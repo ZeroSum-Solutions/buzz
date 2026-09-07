@@ -10,8 +10,7 @@
 //! * [`EffectiveAgentEnv`] — the resolved environment a spawn would actually
 //!   see: baked build defaults (floor) → runtime metadata env vars → merged
 //!   user env_vars (last-wins) → reserved-key filtered.  A separate
-//!   `config_file` tier tracks fields the harness reads from its config file
-//!   rather than the process env.
+//!   `config_file` tier tracks fields the harness reads from its config file rather than the process env.
 //! * [`resolve_effective_agent_env`] — assembles an `EffectiveAgentEnv` from
 //!   a record + personas + runtime catalog; no `AppHandle` dependency so it
 //!   is fully unit-testable.
