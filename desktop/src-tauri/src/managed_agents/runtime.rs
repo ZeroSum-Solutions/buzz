@@ -129,6 +129,42 @@ pub(crate) fn apply_system_prompt_env(
     SystemPromptApplied(())
 }
 
+pub(crate) const STATE_DIR_ENV_VAR: &str = "BUZZ_ACP_STATE_DIR";
+
+/// Proof token for the state-dir env application, consumed by
+/// `spawn_with_effort_proof` the same way `EffortApplied`/`McpEnvApplied`
+/// are. `#[must_use]`; the only way to obtain one is
+/// [`apply_state_dir_env`], and the real spawn site cannot compile without
+/// passing it through — deleting the `apply_state_dir_env` call, or moving it
+/// before the `descriptor.env` loop it must override, leaves `state_dir_applied`
+/// undefined at the spawn call, a compile error CI catches before any test
+/// runs (T16 delta 1, finding 16 / prior #20 — the added tests before this
+/// exercised `apply_state_dir_env` in isolation, never binding it to the real
+/// command-builder seam).
+#[must_use]
+pub(crate) struct StateDirApplied(());
+
+/// Apply the harness reliability state-dir env to an agent spawn command.
+///
+/// Called AFTER the `descriptor.env` loop at the real spawn site, so a saved
+/// user value for the reserved key can never redirect an agent's park file.
+/// `None` explicitly removes the key rather than leaving it unset, so the
+/// child never inherits an ambient value from the desktop's own environment.
+pub(crate) fn apply_state_dir_env(
+    command: &mut std::process::Command,
+    state_dir: Option<&std::path::Path>,
+) -> StateDirApplied {
+    match state_dir {
+        Some(dir) => {
+            command.env(STATE_DIR_ENV_VAR, dir);
+        }
+        None => {
+            command.env_remove(STATE_DIR_ENV_VAR);
+        }
+    }
+    StateDirApplied(())
+}
+
 /// Classify an agent's persona against the live catalog for the Agents-menu
 /// drift indicator. Returns `(out_of_date, orphaned)`.
 ///
@@ -535,6 +571,7 @@ pub(crate) fn spawn_with_effort_proof(
     _effort: EffortApplied,
     _prompt: SystemPromptApplied,
     _mcp: McpEnvApplied,
+    _state_dir: StateDirApplied,
 ) -> std::io::Result<std::process::Child> {
     cmd.spawn()
 }
@@ -1008,6 +1045,23 @@ pub fn spawn_agent_child(
         }
     }
 
+    // Harness reliability state (T16). Applied AFTER the `descriptor.env` loop,
+    // like the replay floor and the registry env above, so a saved user value
+    // can never redirect an agent's park file. The key is reserved, so the
+    // layered env never carries one anyway; this is the belt to that braces.
+    // A directory we cannot create is not fatal — the agent still answers, and
+    // the harness logs that parked batches will not survive a restart.
+    let state_dir_applied = match super::managed_agent_state_dir(app, &record.pubkey) {
+        Ok(state_dir) => apply_state_dir_env(&mut command, Some(&state_dir)),
+        Err(error) => {
+            eprintln!(
+                "buzz-desktop: no reliability state dir for agent {}: {error}",
+                record.name,
+            );
+            apply_state_dir_env(&mut command, None)
+        }
+    };
+
     // Stamp desktop ownership and an unpredictable harness-generation identity.
     let start_nonce = uuid::Uuid::new_v4().simple().to_string();
     command
@@ -1046,14 +1100,20 @@ pub fn spawn_agent_child(
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let child = spawn_with_effort_proof(&mut command, effort, prompt_applied, mcp_applied)
-        .map_err(|error| {
-            format!(
-                "failed to spawn `{}` for agent {}: {error}",
-                resolved_acp_command.display(),
-                record.name
-            )
-        })?;
+    let child = spawn_with_effort_proof(
+        &mut command,
+        effort,
+        prompt_applied,
+        mcp_applied,
+        state_dir_applied,
+    )
+    .map_err(|error| {
+        format!(
+            "failed to spawn `{}` for agent {}: {error}",
+            resolved_acp_command.display(),
+            record.name
+        )
+    })?;
 
     // Codex: stamp adapter availability for the Phase-2 badge drift check.
     // Cold cache returns `None` → drift check skipped until discovery warms it.

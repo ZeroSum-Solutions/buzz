@@ -13,7 +13,7 @@ use tempfile::NamedTempFile;
 
 use super::{
     agent_keyring_name, hydrate_keys_with, migrate_inline_key, persist_agent_keys_with,
-    KeyMigration, KeyStore, KeyringProbe, ManagedAgentRecord,
+    validate_state_dir_pubkey, KeyMigration, KeyStore, KeyringProbe, ManagedAgentRecord,
 };
 
 /// In-memory [`KeyStore`] for testing the migrate decision without the OS
@@ -829,4 +829,44 @@ fn install_log_filename_accepts_ordinary_runtime_ids() {
             format!("install-{id}.log")
         );
     }
+}
+
+// ── validate_state_dir_pubkey ───────────────────────────────────────
+//
+// The pubkey names a directory under the agents state root, so it is
+// validated (not sanitised) — a `/` or `..` in it would place one agent's
+// parked messages outside its own state directory.
+
+#[test]
+fn validate_state_dir_pubkey_rejects_empty() {
+    assert!(validate_state_dir_pubkey("").is_err());
+}
+
+#[test]
+fn validate_state_dir_pubkey_rejects_non_hex() {
+    assert!(validate_state_dir_pubkey("zz").is_err());
+}
+
+#[test]
+fn validate_state_dir_pubkey_rejects_path_traversal() {
+    assert!(validate_state_dir_pubkey("../x").is_err());
+}
+
+#[test]
+fn validate_state_dir_pubkey_rejects_embedded_separator() {
+    assert!(validate_state_dir_pubkey("a/b").is_err());
+}
+
+#[test]
+fn validate_state_dir_pubkey_accepts_64_lowercase_hex() {
+    let pubkey = "a".repeat(64);
+    assert!(validate_state_dir_pubkey(&pubkey).is_ok());
+}
+
+#[test]
+fn validate_state_dir_pubkey_uppercase_hex_matches_current_behavior() {
+    // `char::is_ascii_hexdigit` accepts both cases; this pins whatever the
+    // current implementation does rather than asserting a preference.
+    let pubkey = "A".repeat(64);
+    assert!(validate_state_dir_pubkey(&pubkey).is_ok());
 }

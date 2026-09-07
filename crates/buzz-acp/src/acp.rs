@@ -268,6 +268,16 @@ pub struct AcpClient {
     /// a JSON-RPC *success*, not `-32601` — which the main loop would read as
     /// a delivered steer and drop the user's message from the queue.
     steering_supported: bool,
+    /// Whether this turn produced agent output or a tool call.
+    ///
+    /// The reliability path calls a batch **started** when this is true: a
+    /// started batch is never replayed automatically, because the agent may
+    /// already have acted on it. Reset at the top of every prompt.
+    turn_saw_output: bool,
+    /// Optional shared atomic flag updated whenever `turn_saw_output` is set,
+    /// allowing tasks that retain the batch (e.g. `TaskMeta`) to observe whether
+    /// output occurred even if the task panics.
+    started_signal: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Per-turn channel for receiving goose-native non-cancelling steer
     /// requests from the main loop. Installed by
     /// [`install_steer_rx`](Self::install_steer_rx) at dispatch and
@@ -627,6 +637,8 @@ impl AcpClient {
             observer_context: ObserverContext::default(),
             active_run_id: None,
             steering_supported: false,
+            turn_saw_output: false,
+            started_signal: None,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
@@ -858,6 +870,12 @@ impl AcpClient {
         // misattributed to this turn.
         self.goose_usage.begin_turn(session_id);
         self.standard_usage.begin_turn(session_id);
+        // Reset the started signal for this turn, alongside the usage
+        // trackers, so activity from a previous turn is never attributed here.
+        self.turn_saw_output = false;
+        if let Some(signal) = &self.started_signal {
+            signal.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
 
         self.last_prompt_id = Some(self.next_id);
         let id = self.next_id;
@@ -947,6 +965,29 @@ impl AcpClient {
     /// for the supervisor's post-initialize log line.
     pub fn steering_supported(&self) -> bool {
         self.steering_supported
+    }
+
+    /// Whether the agent produced output or started a tool call during the most
+    /// recent turn. See [`turn_saw_output`](Self::turn_saw_output) on the field.
+    pub fn turn_saw_output(&self) -> bool {
+        self.turn_saw_output
+    }
+
+    /// Attach or detach a shared atomic flag that mirrors `turn_saw_output`.
+    pub fn set_started_signal(
+        &mut self,
+        signal: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) {
+        self.started_signal = signal;
+    }
+
+    /// Mark that this turn produced agent output or a tool call, and notify
+    /// the shared atomic flag if attached.
+    pub(crate) fn mark_turn_saw_output(&mut self) {
+        self.turn_saw_output = true;
+        if let Some(signal) = &self.started_signal {
+            signal.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     /// Consume per-turn usage for NIP-AM publishing. Goose/buzz-agent is an
@@ -1822,12 +1863,14 @@ impl AcpClient {
 
         match update_type {
             "agent_message_chunk" => {
+                self.mark_turn_saw_output();
                 if let Some(text) = update["content"]["text"].as_str() {
                     tracing::info!(target: "acp::stream", "{text}");
                 }
                 false
             }
             "tool_call" => {
+                self.mark_turn_saw_output();
                 let title = update
                     .get("title")
                     .and_then(|v| v.as_str())
@@ -1966,6 +2009,9 @@ impl AcpClient {
         match serde_json::from_value::<GooseSessionUpdateNotification>(params.clone()) {
             Ok(notif) => {
                 if let GooseSessionUpdateVariant::UsageUpdate(payload) = &notif.update {
+                    if payload.accumulated_output_tokens.unwrap_or(0) > 0 {
+                        self.mark_turn_saw_output();
+                    }
                     tracing::debug!(
                         target: "acp::usage",
                         session_id = %notif.session_id,
@@ -3302,6 +3348,124 @@ mod tests {
             .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap()["stopReason"].as_str(), Some("end_turn"));
+    }
+
+    #[tokio::test]
+    async fn wire_session_info_and_available_commands_do_not_set_turn_saw_output() {
+        let script = r#"
+echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"session_info_update","_meta":{"goose":{"activeRunId":"r1"}}}}}'
+echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"test"}]}}}'
+echo '{"jsonrpc":"2.0","id":42,"result":{"stopReason":"end_turn"}}'
+"#;
+        let mut client = spawn_script(script).await;
+        let max_dur = std::time::Duration::from_secs(5);
+        let hard_deadline = tokio::time::Instant::now() + max_dur;
+        let res = client
+            .read_until_response_with_idle_timeout(
+                "test",
+                42,
+                std::time::Duration::from_secs(2),
+                hard_deadline,
+                max_dur,
+            )
+            .await;
+        assert!(res.is_ok());
+        assert!(
+            !client.turn_saw_output(),
+            "session_info_update and available_commands_update must not set turn_saw_output"
+        );
+    }
+
+    #[tokio::test]
+    async fn wire_agent_message_chunk_and_tool_call_set_turn_saw_output() {
+        let script = r#"
+echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"text":"hello"}}}}'
+echo '{"jsonrpc":"2.0","id":43,"result":{"stopReason":"end_turn"}}'
+"#;
+        let mut client = spawn_script(script).await;
+        let max_dur = std::time::Duration::from_secs(5);
+        let hard_deadline = tokio::time::Instant::now() + max_dur;
+        let res = client
+            .read_until_response_with_idle_timeout(
+                "test",
+                43,
+                std::time::Duration::from_secs(2),
+                hard_deadline,
+                max_dur,
+            )
+            .await;
+        assert!(res.is_ok());
+        assert!(
+            client.turn_saw_output(),
+            "agent_message_chunk must set turn_saw_output"
+        );
+
+        let script2 = r#"
+echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s2","update":{"sessionUpdate":"tool_call","title":"tool1","kind":"shell"}}}'
+echo '{"jsonrpc":"2.0","id":44,"result":{"stopReason":"end_turn"}}'
+"#;
+        let mut client2 = spawn_script(script2).await;
+        let hard_deadline2 = tokio::time::Instant::now() + max_dur;
+        let res2 = client2
+            .read_until_response_with_idle_timeout(
+                "test",
+                44,
+                std::time::Duration::from_secs(2),
+                hard_deadline2,
+                max_dur,
+            )
+            .await;
+        assert!(res2.is_ok());
+        assert!(
+            client2.turn_saw_output(),
+            "tool_call must set turn_saw_output"
+        );
+    }
+
+    #[tokio::test]
+    async fn wire_goose_usage_update_turn_saw_output() {
+        let script_zero = r#"
+echo '{"jsonrpc":"2.0","method":"_goose/unstable/session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"usage_update","accumulatedOutputTokens":0}}}'
+echo '{"jsonrpc":"2.0","id":45,"result":{"stopReason":"end_turn"}}'
+"#;
+        let mut client_zero = spawn_script(script_zero).await;
+        let max_dur = std::time::Duration::from_secs(5);
+        let hard_deadline = tokio::time::Instant::now() + max_dur;
+        let res = client_zero
+            .read_until_response_with_idle_timeout(
+                "test",
+                45,
+                std::time::Duration::from_secs(2),
+                hard_deadline,
+                max_dur,
+            )
+            .await;
+        assert!(res.is_ok());
+        assert!(
+            !client_zero.turn_saw_output(),
+            "goose usage update with 0 output tokens must not set turn_saw_output"
+        );
+
+        let script_output = r#"
+echo '{"jsonrpc":"2.0","method":"_goose/unstable/session/update","params":{"sessionId":"s2","update":{"sessionUpdate":"usage_update","accumulatedOutputTokens":10}}}'
+echo '{"jsonrpc":"2.0","id":46,"result":{"stopReason":"end_turn"}}'
+"#;
+        let mut client_output = spawn_script(script_output).await;
+        let hard_deadline2 = tokio::time::Instant::now() + max_dur;
+        let res2 = client_output
+            .read_until_response_with_idle_timeout(
+                "test",
+                46,
+                std::time::Duration::from_secs(2),
+                hard_deadline2,
+                max_dur,
+            )
+            .await;
+        assert!(res2.is_ok());
+        assert!(
+            client_output.turn_saw_output(),
+            "goose usage update with >0 output tokens must set turn_saw_output"
+        );
     }
 
     #[tokio::test]
