@@ -181,6 +181,16 @@ fn rfc3339(instant_ms: i64) -> String {
 /// same client fail on a dead pooled connection — a fixture defect that looks
 /// exactly like a transport bug.
 fn serve(stream: TcpStream, state: &Arc<Mutex<MockState>>) {
+    // The listener polls for shutdown, so it is non-blocking — and on macOS an
+    // accepted socket inherits that flag. A non-blocking read returns
+    // `WouldBlock` at once, which the loop below cannot tell from a closed
+    // connection, so the fixture would answer at most one request per socket
+    // and would close on a client that had already written its request. The
+    // client sees that as a reset mid-request, or as a dead pooled connection
+    // on its next call — a fixture defect that looks exactly like a transport
+    // bug. Blocking reads, bounded by the timeouts below, are what this server
+    // means.
+    let _ = stream.set_nonblocking(false);
     // Well past any gap between two requests in one test: a server that closed
     // an idle keep-alive connection sooner would fail the client's next request
     // on a connection the client still believed usable.
