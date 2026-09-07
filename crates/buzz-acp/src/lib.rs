@@ -2010,8 +2010,20 @@ fn handle_reliability_control(
         },
         "discard_batch" => match control_batch_id(payload) {
             Some(batch_id) => match reliability.discard(batch_id, "operator", now) {
-                Ok(true) => "discarded",
-                Ok(false) => "unknown_batch",
+                Ok(reliability::DiscardOutcome::Discarded) => "discarded",
+                Ok(reliability::DiscardOutcome::NotFound) => "unknown_batch",
+                Ok(reliability::DiscardOutcome::DiscardedUnrecorded) => {
+                    // The batch is genuinely gone — never report "unknown
+                    // batch" for a destructive action that actually
+                    // happened, which would invite an operator to retry a
+                    // discard on an id that no longer exists for a
+                    // completely different reason.
+                    tracing::error!(
+                        %batch_id,
+                        "discard_batch destroyed the batch but its ledger record failed to write"
+                    );
+                    "discarded_unrecorded"
+                }
                 Err(error) => {
                     tracing::error!(%batch_id, error = %error, "discard_batch failed");
                     "write_failed"
@@ -3316,6 +3328,12 @@ async fn tokio_main() -> Result<()> {
 
         probe_timer.rearm(reliability.as_mut());
 
+        // While durable reliability state is unavailable, `push` must not
+        // evict an already-admitted event to make room for a new one — an
+        // evicted event has nowhere durable to land right now (T16 delta 1,
+        // finding 8 / prior #4).
+        queue.set_reliability_unavailable(reliability.is_none());
+
         if pool_ready && last_maintenance.elapsed() >= maintenance_interval {
             last_maintenance = std::time::Instant::now();
             queue.compact_expired_state();
@@ -4034,7 +4052,16 @@ async fn tokio_main() -> Result<()> {
                 _ = probe_timer.tick() => {
                     let _ = result_rx;
                     if probe_timer.is_valid_wake(reliability.as_ref()) {
-                        if pool_ready && queue.has_flushable_work() {
+                        if pool_ready {
+                            // Always give dispatch a chance on a valid probe
+                            // wake, even with nothing in the LIVE queue: a
+                            // pause/breaker probe's own batch is typically
+                            // already durably parked, not queued, so gating
+                            // on `has_flushable_work()` meant the gate call
+                            // that actually resolves the due deadline never
+                            // ran at all — the deadline stayed stuck in the
+                            // past and this arm re-fired every loop
+                            // iteration (T16 delta 1, finding 2).
                             for (scope, thread_tags) in dispatch_pending(
                                 &mut pool,
                                 &mut queue,
@@ -4043,6 +4070,25 @@ async fn tokio_main() -> Result<()> {
                                 reliability.as_mut(),
                             ) {
                                 typing_channels.insert(scope, thread_tags);
+                            }
+                        }
+                        // Catch any breaker whose deadline is due but that
+                        // `dispatch_pending` never touched this cycle because
+                        // its scope had nothing live to flush — the same
+                        // stuck-deadline spin as pause, plus the breaker
+                        // never expiring at all once its scope goes silent
+                        // (finding 2 and finding 7).
+                        if let Some(reliability) = reliability.as_mut() {
+                            let now = chrono::Utc::now();
+                            for scope in reliability.state().sweep_breakers(now) {
+                                reliability.record(
+                                    now,
+                                    reliability::ledger::LedgerBody::BreakerClosed(
+                                        reliability::ledger::BreakerClosed {
+                                            scope: scope.telemetry_label(),
+                                        },
+                                    ),
+                                );
                             }
                         }
                     } else {
@@ -4093,6 +4139,8 @@ async fn tokio_main() -> Result<()> {
                     &respawn_tx,
                     &mut respawn_tasks,
                     observer.clone(),
+                    Some(&ctx.rest_client),
+                    reliability.as_mut(),
                 ) == LoopAction::Exit
                 {
                     break;
@@ -4121,6 +4169,8 @@ async fn tokio_main() -> Result<()> {
                     &respawn_tx,
                     &mut respawn_tasks,
                     observer.clone(),
+                    Some(&ctx.rest_client),
+                    reliability.as_mut(),
                 );
                 if pool.live_count() == 0 && !any_respawn_in_flight(&crash_history) {
                     tracing::error!("all agents dead — exiting");
@@ -4932,16 +4982,30 @@ fn dispatch_pending(
                 ),
             );
         }
+        if is_pause_probe {
+            // Exactly one bounded probe batch is selected for a pause probe.
+            // Record which scope actually got dispatched so its terminal
+            // outcome (success, retry, park, panic) — and only its — is what
+            // resolves this probe's lease (finding 9 / prior #5).
+            if let Some(reliability) = reliability.as_deref_mut() {
+                reliability.state().set_pause_probe_scope(scope.clone());
+            }
+        }
         dispatched_channels.push((scope, typing_scope));
         *last_activity = tokio::time::Instant::now();
         if is_pause_probe {
-            // Exactly one bounded probe batch is selected for a pause probe.
             break;
         }
     }
     if is_pause_probe && dispatched_channels.is_empty() {
         if let Some(reliability) = reliability {
-            reliability.state().release_pause_probe();
+            // Nothing was actually dispatched as the probe this cycle —
+            // reschedule rather than leaving the deadline eligible-now, or a
+            // probe-timer wake with nothing to claim spins forever
+            // recomputing the same past deadline (finding 2).
+            reliability
+                .state()
+                .reschedule_pause_probe(chrono::Utc::now());
         }
     }
     // Release held batches back to the queue (owner busy). They were flushed
@@ -5176,6 +5240,30 @@ fn apply_reliability(
     }
 }
 
+/// After a batch was durably parked, tell the operator's channel too when the
+/// `batch_parked` / `batch_needs_review` ledger record for it failed to
+/// write — `reliability.record` already logs this at ERROR, but a log line
+/// nobody is watching is not the same as the channel notice every other
+/// reliability event gets. Compares `write_failures()` before and after so
+/// this only fires on a fresh failure, never a stale prior one (T16 delta 1,
+/// finding 13 / prior #14b).
+fn notice_ledger_write_failure(
+    batch: &FlushBatch,
+    before: (u64, u64),
+    reliability: &reliability::ReliabilityRuntime,
+    rest_client: Option<&relay::RestClient>,
+) {
+    let (ledger_before, park_before) = before;
+    let (ledger_after, park_after) = reliability.write_failures();
+    if ledger_after > ledger_before || park_after > park_before {
+        spawn_failure_notice(
+            rest_client,
+            batch,
+            reliability::notices::state_write_failures(ledger_after, park_after),
+        );
+    }
+}
+
 /// Park a batch, or hand it back to the retry path when the park write failed.
 ///
 /// A failed park is logged and counted, never swallowed: the batch returns to
@@ -5188,6 +5276,7 @@ fn park_or_fallthrough(
     rest_client: Option<&relay::RestClient>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Disposition {
+    let failures_before = reliability.write_failures();
     match reliability.park_batch(&batch, reason, started, now) {
         Ok(()) => {
             let content = if started {
@@ -5196,6 +5285,7 @@ fn park_or_fallthrough(
                 reliability::notices::parked(reason.as_str())
             };
             spawn_failure_notice(rest_client, &batch, content);
+            notice_ledger_write_failure(&batch, failures_before, reliability, rest_client);
             let preserve_retries = matches!(
                 reason,
                 reliability::ParkReason::Pause | reliability::ParkReason::BreakerOpen
@@ -5230,12 +5320,19 @@ fn drain_park_handoff(
             queue::ParkHandoffReason::RetriesExhausted => reliability::ParkReason::RetriesExhausted,
         };
         let started = handoff.batch.is_started();
+        let failures_before = reliability.write_failures();
         match reliability.park_batch(&handoff.batch, reason, started, now) {
             Ok(()) => {
                 spawn_failure_notice(
                     rest_client,
                     &handoff.batch,
                     reliability::notices::parked(reason.as_str()),
+                );
+                notice_ledger_write_failure(
+                    &handoff.batch,
+                    failures_before,
+                    reliability,
+                    rest_client,
                 );
             }
             Err(error) => {
@@ -5246,11 +5343,27 @@ fn drain_park_handoff(
                     error = %error,
                     "park file write failed — holding the batch in memory for the next attempt"
                 );
-                if !queue.return_unparked(handoff) {
+                if let Err(handoff) = queue.return_unparked(handoff) {
+                    // The hand-off itself is full (MAX_PARK_HANDOFF), on top of
+                    // the park file being unwritable. `return_unparked` gives
+                    // the exact same handoff straight back rather than
+                    // dropping it — fall back to the live per-scope queue so
+                    // the events stay in the harness's custody (at-least-once,
+                    // subject to the ordinary per-scope cap) instead of being
+                    // lost the moment this function returns (T16 delta 1,
+                    // finding 1).
                     tracing::error!(
+                        channel_id = %handoff.batch.channel_id,
+                        batch_id = %handoff.batch.batch_id,
+                        events = handoff.batch.events.len(),
                         "park hand-off overflowed while the park file was unwritable — \
+                         returning the batch to the live queue instead of losing it; \
                          the operator must fix the state directory"
                     );
+                    let handoff = *handoff;
+                    let scope = handoff.batch.scope.clone();
+                    queue.requeue_preserve_timestamps(handoff.batch);
+                    queue.mark_complete_preserving_retries(scope);
                 }
             }
         }
@@ -5274,22 +5387,24 @@ pub(crate) fn replay_after_success(
     // A `turn_finished` for every batch this turn replayed: the pair
     // (`batch_replayed`, `turn_finished`) is what tells a later start-up that
     // the replay completed and must not run again.
-    match reliability.finish_replay(scope) {
-        Ok(released) => {
-            for batch_id in released {
-                reliability.record(
-                    now,
-                    LedgerBody::TurnFinished(led::TurnFinished {
-                        batch_id,
-                        channel_id: scope.channel_id(),
-                        outcome: led::TurnOutcome::Ok,
-                    }),
-                );
-            }
-        }
-        Err(error) => {
-            tracing::error!(error = %error, "could not clear replayed batches from the park file");
-        }
+    let report = reliability.finish_replay(scope);
+    for batch_id in report.released {
+        reliability.record(
+            now,
+            LedgerBody::TurnFinished(led::TurnFinished {
+                batch_id,
+                channel_id: scope.channel_id(),
+                outcome: led::TurnOutcome::Ok,
+            }),
+        );
+    }
+    if let Some(error) = report.error {
+        tracing::error!(
+            error = %error,
+            "could not clear all replayed batches from the park file — the \
+             remaining ones stay tracked as in-flight for this scope and are \
+             retried on the next successful turn"
+        );
     }
     let (pause_lifted, breaker_closed) = reliability.state().on_success(scope);
     if pause_lifted {
@@ -5597,6 +5712,15 @@ fn handle_prompt_result(
             // eligible again: delivery is at least once, never at most once.
             reliability.abandon_replay(scope);
         }
+        // Release any pause/breaker probe lease this turn was carrying, on
+        // every outcome. `on_success` above already clears both for a
+        // successful turn (these calls are then idempotent no-ops); the gap
+        // this closes is every OTHER outcome — Retry, Auth-park,
+        // hard-timeout-park, cancelled — which previously left the lease
+        // stuck forever with no path back to a probe (T16 delta 1, finding 9
+        // / prior #5).
+        reliability.state().release_pause_probe_for(scope);
+        reliability.state().release_breaker_probe(scope);
         reliability.maintain(now);
     }
 
@@ -5849,6 +5973,8 @@ fn recover_panicked_agent(
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
+    rest_client: Option<&relay::RestClient>,
+    mut reliability: Option<&mut reliability::ReliabilityRuntime>,
 ) {
     let task_id = join_error.id();
     let Some(meta) = pool.task_map_mut().remove(&task_id) else {
@@ -5856,15 +5982,59 @@ fn recover_panicked_agent(
         return;
     };
     let i = meta.agent_index;
+    let now = chrono::Utc::now();
 
     // Requeue BEFORE mark_complete (same rationale as handle_prompt_result).
     if let Some(batch) = meta.recoverable_batch {
         if let Some(ch) = meta.channel_id {
             if !removed_channels.contains(&ch) {
-                // Dead-letter on exhaustion is logged inside requeue(); a
-                // panic path has no outcome to report, so no notice here.
-                let _ = queue.requeue(batch);
-                tracing::warn!("requeued batch for panicked agent {i}");
+                if batch.is_started() {
+                    // The turn produced output or a tool call before the
+                    // agent process panicked. `queue.requeue` deconstructs a
+                    // batch into plain `QueuedEvent`s, discarding the shared
+                    // `started` `Arc<AtomicBool>` entirely — the next flush
+                    // builds a brand-new `FlushBatch` with a fresh (false)
+                    // `started` flag, so already-started work would become
+                    // silently auto-replay-eligible once retries exhaust.
+                    // Park it directly as needs_review instead, the same
+                    // outcome an in-flight interruption gets everywhere else
+                    // (T16 delta 1, finding 10 / prior #8).
+                    match reliability
+                        .as_deref_mut()
+                        .map(|r| r.park_batch(&batch, reliability::ParkReason::Panic, true, now))
+                    {
+                        Some(Ok(())) => {
+                            spawn_failure_notice(
+                                rest_client,
+                                &batch,
+                                reliability::notices::needs_review(),
+                            );
+                            tracing::warn!(
+                                "parked already-started batch for panicked agent {i} — \
+                                 held for operator review, not requeued for auto-replay"
+                            );
+                        }
+                        Some(Err(error)) => {
+                            tracing::error!(
+                                error = %error,
+                                "could not park already-started batch after panic — \
+                                 falling back to the ordinary retry queue"
+                            );
+                            let _ = queue.requeue(batch);
+                        }
+                        None => {
+                            // No durable reliability state available at all;
+                            // same fallback the rest of the harness uses when
+                            // reliability is unset.
+                            let _ = queue.requeue(batch);
+                        }
+                    }
+                } else {
+                    // Dead-letter on exhaustion is logged inside requeue(); a
+                    // panic path has no outcome to report, so no notice here.
+                    let _ = queue.requeue(batch);
+                    tracing::warn!("requeued batch for panicked agent {i}");
+                }
             } else {
                 tracing::debug!(
                     channel_id = %ch,
@@ -5886,6 +6056,14 @@ fn recover_panicked_agent(
                 // the same channel keeps its typing indicator.
                 typing_channels.remove(scope);
                 queue.mark_complete(scope.clone());
+                // A panicked turn can never resolve a pause/breaker probe it
+                // was carrying on its own; release the lease here so the
+                // next eligible attempt is not wedged forever (T16 delta 1,
+                // finding 9 / prior #5).
+                if let Some(reliability) = reliability.as_mut() {
+                    reliability.state().release_pause_probe_for(scope);
+                    reliability.state().release_breaker_probe(scope);
+                }
             }
             None => {
                 typing_channels.retain(|scope, _| scope.channel_id() != ch);
@@ -5962,6 +6140,8 @@ fn drain_ready_join_results(
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
+    rest_client: Option<&relay::RestClient>,
+    mut reliability: Option<&mut reliability::ReliabilityRuntime>,
 ) -> LoopAction {
     while let Some(Some(join_result)) = pool.join_set.join_next().now_or_never() {
         if let Err(join_error) = join_result {
@@ -5978,6 +6158,8 @@ fn drain_ready_join_results(
                 respawn_tx,
                 respawn_tasks,
                 observer.clone(),
+                rest_client,
+                reliability.as_deref_mut(),
             );
             if pool.live_count() == 0 && !any_respawn_in_flight(crash_history) {
                 return LoopAction::Exit;
@@ -11661,6 +11843,8 @@ mod error_outcome_emission_tests {
             &respawn_tx,
             &mut respawn_tasks,
             Some(observer.clone()),
+            None,
+            None,
         );
 
         let panic = observer
@@ -11752,6 +11936,8 @@ mod error_outcome_emission_tests {
             &mut crash_history,
             &respawn_tx,
             &mut respawn_tasks,
+            None,
+            None,
             None,
         );
 
@@ -13820,6 +14006,193 @@ mod reliability_dispatch_tests {
         assert!(
             !parked_batch.replay_eligible(),
             "parked batch that started must not be replay-eligible"
+        );
+    }
+
+    // T16 delta 1, finding 10 (prior #8): the production panic-recovery seam
+    // itself — not a hand-rolled `mark_started` + `queue.requeue` sequence —
+    // must carry `started` through to the park file. Before the fix,
+    // `recover_panicked_agent` called plain `queue.requeue(batch)`, which
+    // deconstructs the batch into `QueuedEvent`s and drops the shared
+    // `started` `Arc` entirely; the next flush built a fresh batch with
+    // `started` defaulting back to `false`.
+    #[tokio::test]
+    async fn panicked_agent_with_output_is_parked_directly_as_needs_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+        let pubkey = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345678";
+        let mut runtime =
+            reliability::ReliabilityRuntime::open_in(dir.path(), pubkey, now).unwrap();
+
+        let mut pool = AgentPool::from_slots(vec![]);
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let channel_id = Uuid::new_v4();
+        let scope = scope::SessionScope::Conversation { channel_id };
+
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "work")
+            .tags([])
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+        queue.push(queue::QueuedEvent {
+            channel_id,
+            scope: scope.clone(),
+            event,
+            received_at: std::time::Instant::now(),
+            prompt_tag: "p".into(),
+        });
+        let batch = queue.flush_next().expect("flush batch");
+        // The agent produced output/a tool call before it panicked.
+        batch.mark_started();
+        assert!(batch.is_started());
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let abort_handle = pool.join_set.spawn(async move {
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        pool.task_map_mut().insert(
+            abort_handle.id(),
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                scope: Some(scope.clone()),
+                turn_id: "panic-turn-id".to_string(),
+                recoverable_batch: Some(batch),
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        started_rx.await.unwrap();
+        abort_handle.abort();
+        let join_error = pool.join_set.join_next().await.unwrap().unwrap_err();
+
+        let config = crate::error_outcome_emission_tests::test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut typing_channels = HashMap::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: Some(std::time::Instant::now() + Duration::from_secs(3600)),
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+
+        recover_panicked_agent(
+            &mut pool,
+            &mut queue,
+            &config,
+            join_error,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut typing_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+            Some(&mut runtime),
+        );
+
+        assert!(
+            !queue.has_undispatched_work(),
+            "an already-started batch must never re-enter the ordinary retry \
+             queue — it was parked directly instead"
+        );
+        let parked = runtime.park().batches();
+        assert_eq!(
+            parked.len(),
+            1,
+            "the panicked batch must be parked, not requeued"
+        );
+        assert!(
+            parked[0].started,
+            "batch that produced output before panicking must park with started == true"
+        );
+        assert!(
+            parked[0].needs_review,
+            "an already-started parked batch must be held for operator review"
+        );
+        assert!(
+            !parked[0].replay_eligible(),
+            "an already-started parked batch must not be auto-replay-eligible"
+        );
+    }
+
+    // T16 delta 1, finding 13 (prior #14b): `park_batch` durably writes the
+    // park file even when its OWN follow-up `batch_parked` ledger record
+    // fails to append. The batch is not lost — but nothing beyond a log line
+    // told the operator the audit trail was incomplete. `park_or_fallthrough`
+    // now checks `write_failures()` and sends the (previously dead-code)
+    // `state_write_failures` notice on exactly this gap.
+    #[test]
+    #[cfg(unix)]
+    fn park_or_fallthrough_reports_a_ledger_write_failure_even_though_the_batch_still_parks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+        let pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut runtime =
+            reliability::ReliabilityRuntime::open_in(dir.path(), pubkey, now).unwrap();
+
+        let channel_id = Uuid::new_v4();
+        let scope = scope::SessionScope::Conversation { channel_id };
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "x")
+            .tags([])
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+        let batch = FlushBatch {
+            batch_id: Uuid::new_v4(),
+            channel_id,
+            scope,
+            events: vec![queue::BatchEvent {
+                event,
+                prompt_tag: "t".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        // Ledger unwritable, park file (and its directory) stay writable.
+        let ledger_path = dir.path().join("ledger.jsonl");
+        let original_mode = std::fs::metadata(&ledger_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        std::fs::set_permissions(&ledger_path, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+        let failures_before = runtime.write_failures();
+        let disposition = park_or_fallthrough(
+            &mut runtime,
+            batch,
+            reliability::ParkReason::RetriesExhausted,
+            false,
+            None,
+            now,
+        );
+
+        let _ =
+            std::fs::set_permissions(&ledger_path, std::fs::Permissions::from_mode(original_mode));
+
+        assert!(
+            matches!(disposition, Disposition::Handled { .. }),
+            "the batch is durably parked and must count as Handled even though \
+             its ledger record failed"
+        );
+        assert_eq!(
+            runtime.park().batches().len(),
+            1,
+            "the batch itself must still be durably parked"
+        );
+        let failures_after = runtime.write_failures();
+        assert!(
+            failures_after.0 > failures_before.0,
+            "a ledger append failure inside park_batch must be visible through \
+             write_failures(), which is what gates the state_write_failures notice"
         );
     }
 

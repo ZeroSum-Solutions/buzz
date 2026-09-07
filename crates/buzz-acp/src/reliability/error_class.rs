@@ -100,6 +100,46 @@ pub fn truncate_chars(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
+/// Well-known credential prefixes redacted regardless of any surrounding
+/// `key=`/`key:` framing — these tokens are self-identifying by shape alone
+/// (GitHub personal-access and app tokens, Anthropic/OpenAI-style secret
+/// keys, Nostr private keys).
+const CREDENTIAL_PREFIXES: &[&str] = &[
+    "sk-",
+    "nsec1",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+];
+
+/// Substrings that mark a `key`/`key=value` token as sensitive, matched
+/// against the key with every non-alphanumeric character stripped and
+/// lowercased — so `API_KEY`, `api-key`, `apiKey`, `"api_key"` (a JSON key
+/// with its opening brace/quote still attached) and `OPENAI_API_KEY` all
+/// normalize to a form containing `apikey`/`key` and match the same way.
+/// Bare substring matching is deliberately broad: over-redacting a
+/// non-sensitive `key=value` pair is a cosmetic loss, letting a real
+/// credential through because its separator or casing was slightly
+/// different is not (T16 delta 1, finding 15 / prior #19).
+const SENSITIVE_KEY_MARKERS: &[&str] = &["key", "token", "secret", "password", "credential"];
+
+/// Lowercase and drop every non-alphanumeric character, so `API_KEY`,
+/// `api-key`, `"api_key"` and `apiKey` all compare equal.
+fn normalize_key(k: &str) -> String {
+    k.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+fn is_sensitive_key(k: &str) -> bool {
+    let normalized = normalize_key(k);
+    !normalized.is_empty() && SENSITIVE_KEY_MARKERS.iter().any(|m| normalized.contains(m))
+}
+
 /// Sanitize and bound an error string for external diagnostics (observer events,
 /// warnings, channel notices).
 ///
@@ -136,47 +176,27 @@ pub fn sanitize_error_diagnostic(raw: &str) -> String {
             words.push(part.to_string());
             continue;
         }
-        // sk-ant-... or sk-... secret keys
-        if lower_trimmed.starts_with("sk-") && trimmed_part.len() > 7 {
-            words.push(format!("sk-<redacted>{trailing_punct}"));
+        // Self-identifying credential shapes: `sk-...`, `nsec1...`,
+        // `ghp_...` and the rest of `CREDENTIAL_PREFIXES` — redacted whole,
+        // wherever they appear, with no key= framing needed.
+        if let Some(prefix) = CREDENTIAL_PREFIXES
+            .iter()
+            .find(|p| lower_trimmed.starts_with(**p) && trimmed_part.len() > p.len() + 3)
+        {
+            words.push(format!("{prefix}<redacted>{trailing_punct}"));
             continue;
         }
-        // nsec1... private keys
-        if lower_trimmed.starts_with("nsec1") && trimmed_part.len() > 10 {
-            words.push(format!("nsec1<redacted>{trailing_punct}"));
-            continue;
-        }
-        // key=value or key:value
+        // key=value or key:value — including a JSON-style `"key":"value"`
+        // token, where `k` still carries its opening brace/quote and `is_sensitive_key`
+        // strips that off before comparing.
         if let Some((k, _v)) = trimmed_part.split_once('=') {
-            let k_lower = k.to_lowercase();
-            if matches!(
-                k_lower.as_str(),
-                "token"
-                    | "secret"
-                    | "password"
-                    | "key"
-                    | "api_key"
-                    | "apikey"
-                    | "auth_token"
-                    | "access_token"
-            ) {
+            if is_sensitive_key(k) {
                 words.push(format!("{k}=<redacted>{trailing_punct}"));
                 continue;
             }
         }
         if let Some((k, _v)) = trimmed_part.split_once(':') {
-            let k_lower = k.to_lowercase();
-            if matches!(
-                k_lower.as_str(),
-                "token"
-                    | "secret"
-                    | "password"
-                    | "key"
-                    | "api_key"
-                    | "apikey"
-                    | "auth_token"
-                    | "access_token"
-            ) {
+            if is_sensitive_key(k) {
                 words.push(format!("{k}:<redacted>{trailing_punct}"));
                 continue;
             }
@@ -296,4 +316,64 @@ fn next_local_occurrence(tz: Tz, time: NaiveTime, now: DateTime<Utc>) -> Option<
         }
     }
     None
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::sanitize_error_diagnostic;
+
+    // T16 delta 1, finding 15 (prior #19): the token matcher only recognized
+    // a narrow set of unquoted exact keys, so common real-world credential
+    // shapes reached tracing, the observer diagnostic and channel notices
+    // unredacted.
+    #[test]
+    fn redacts_a_json_style_quoted_key() {
+        let out = sanitize_error_diagnostic(r#"provider error: {"api_key":"sk-abcdef123456"}"#);
+        assert!(
+            !out.contains("abcdef123456"),
+            "the secret value must not survive: {out}"
+        );
+    }
+
+    #[test]
+    fn redacts_an_environment_style_key_name() {
+        let out = sanitize_error_diagnostic("OPENAI_API_KEY=sk-abcdef123456 rejected");
+        assert!(
+            !out.contains("abcdef123456"),
+            "an env-var-style key name (not the bare exact \"api_key\") must \
+             still trigger redaction: {out}"
+        );
+    }
+
+    #[test]
+    fn redacts_a_hyphenated_key_name() {
+        let out = sanitize_error_diagnostic("api-key=abcdef123456 invalid");
+        assert!(
+            !out.contains("abcdef123456"),
+            "a hyphenated key name must match the same as the underscored form: {out}"
+        );
+    }
+
+    #[test]
+    fn redacts_a_github_token_prefix_with_no_key_framing() {
+        let out = sanitize_error_diagnostic("push failed: ghp_abcdef1234567890 denied");
+        assert!(
+            !out.contains("abcdef1234567890"),
+            "a self-identifying credential prefix must redact even with no \
+             key=/key: framing at all: {out}"
+        );
+    }
+
+    #[test]
+    fn still_redacts_the_original_bare_exact_keys() {
+        let out = sanitize_error_diagnostic("token=abcdef123456 password=hunter2");
+        assert!(!out.contains("abcdef123456"));
+        assert!(!out.contains("hunter2"));
+    }
+
+    #[test]
+    fn leaves_ordinary_text_alone() {
+        let out = sanitize_error_diagnostic("connection refused: timeout after 30s");
+        assert_eq!(out, "connection refused: timeout after 30s");
+    }
 }

@@ -39,6 +39,33 @@ pub struct ReplayPlan {
     pub channel_id: Uuid,
 }
 
+/// The result of [`ReliabilityRuntime::discard`], distinguishing "there was
+/// nothing to discard" from "the batch was destroyed but its ledger record
+/// failed" — the two collapsed into the same `false` under the old `bool`
+/// return, which made the caller report a successful destructive discard as
+/// `unknown_batch` (T16 delta 1, finding 12 / prior #14a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscardOutcome {
+    /// No parked batch had this id; nothing was touched.
+    NotFound,
+    /// The batch was removed and the ledger record landed.
+    Discarded,
+    /// The batch was durably removed, but the ledger append failed — the
+    /// discard happened and is irreversible, it just has no audit record.
+    DiscardedUnrecorded,
+}
+
+/// The result of [`ReliabilityRuntime::finish_replay`].
+#[derive(Debug, Default)]
+pub struct FinishReplayReport {
+    /// Batch ids actually removed from the park file, even when a later id
+    /// in the same call failed to remove.
+    pub released: Vec<Uuid>,
+    /// The first removal failure encountered, if any. `released` still holds
+    /// whatever succeeded before it.
+    pub error: Option<ParkError>,
+}
+
 /// The harness's reliability state for one agent.
 pub struct ReliabilityRuntime {
     dir: PathBuf,
@@ -226,8 +253,24 @@ impl ReliabilityRuntime {
         new_batch_id: Uuid,
         now: DateTime<Utc>,
     ) -> Result<(), ParkError> {
+        // Mark every batch in the plan as replayed, but if any mark fails
+        // partway through, roll back the ones that already landed rather
+        // than propagating immediately: an unrolled-back partial mark would
+        // leave an earlier batch durably stamped `replayed_at` (making it
+        // permanently ineligible for replay) even though this replay attempt
+        // as a whole is being reported as failed and nothing is being sent
+        // (T16 delta 1, finding 4a).
+        let mut marked = Vec::with_capacity(plan.batch_ids.len());
         for batch_id in &plan.batch_ids {
-            self.park.mark_replayed(*batch_id, now)?;
+            match self.park.mark_replayed(*batch_id, now) {
+                Ok(()) => marked.push(*batch_id),
+                Err(error) => {
+                    for done in &marked {
+                        let _ = self.park.unmark_replayed(*done);
+                    }
+                    return Err(error);
+                }
+            }
         }
         let mut all_recorded = true;
         for batch_id in &plan.batch_ids {
@@ -260,18 +303,50 @@ impl ReliabilityRuntime {
     }
 
     /// A turn for `scope` finished successfully: any batches it was replaying
-    /// leave the park file for good. Returns the batch ids released.
-    pub fn finish_replay(&mut self, scope: &SessionScope) -> Result<Vec<Uuid>, ParkError> {
-        let Some(batch_ids) = self.in_flight_replays.remove(scope) else {
-            return Ok(Vec::new());
+    /// leave the park file for good.
+    ///
+    /// In-flight ownership for `scope` is only cleared once every batch is
+    /// actually removed. A batch that fails to remove stays recorded as
+    /// in-flight for the scope so a later call (the next successful turn, or
+    /// an explicit retry) can still find and finish it — dropping ownership
+    /// on a partial failure would leave that batch stamped `replayed_at`
+    /// forever with nothing left that knows to clean it up (T16 delta 1,
+    /// finding 4b). The report carries every id actually released even when
+    /// a later one in the same plan failed, so the caller can still write
+    /// `turn_finished` for the ones that did land.
+    pub fn finish_replay(&mut self, scope: &SessionScope) -> FinishReplayReport {
+        let Some(batch_ids) = self.in_flight_replays.get(scope).cloned() else {
+            return FinishReplayReport {
+                released: Vec::new(),
+                error: None,
+            };
         };
         let mut released = Vec::new();
+        let mut remaining = Vec::new();
+        let mut first_error = None;
         for batch_id in batch_ids {
-            if self.park.remove(batch_id)?.is_some() {
-                released.push(batch_id);
+            match self.park.remove(batch_id) {
+                Ok(Some(_)) => released.push(batch_id),
+                // Already gone (e.g. a previous partial attempt already
+                // removed it) — nothing left to track for this id.
+                Ok(None) => {}
+                Err(error) => {
+                    remaining.push(batch_id);
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
             }
         }
-        Ok(released)
+        if remaining.is_empty() {
+            self.in_flight_replays.remove(scope);
+        } else {
+            self.in_flight_replays.insert(scope.clone(), remaining);
+        }
+        FinishReplayReport {
+            released,
+            error: first_error,
+        }
     }
 
     /// A turn for `scope` failed: its replayed batches stay parked and go back
@@ -293,14 +368,21 @@ impl ReliabilityRuntime {
     }
 
     /// Operator control frame `discard_batch`.
+    ///
+    /// [`DiscardOutcome::NotFound`] and a failed ledger record after a real
+    /// destructive removal must never collapse into the same signal — an
+    /// operator who sees "unknown batch" for a discard that actually
+    /// happened has no way to tell it landed, and might discard-retry a
+    /// batch id that no longer exists for a completely different reason
+    /// (T16 delta 1, finding 12 / prior #14a).
     pub fn discard(
         &mut self,
         batch_id: Uuid,
         by: &str,
         now: DateTime<Utc>,
-    ) -> Result<bool, ParkError> {
+    ) -> Result<DiscardOutcome, ParkError> {
         let Some(removed) = self.park.remove(batch_id)? else {
-            return Ok(false);
+            return Ok(DiscardOutcome::NotFound);
         };
         let recorded = self.record(
             now,
@@ -310,7 +392,11 @@ impl ReliabilityRuntime {
                 by: super::error_class::truncate_chars(by, ledger::MAX_LABEL_CHARS),
             }),
         );
-        Ok(recorded)
+        if recorded {
+            Ok(DiscardOutcome::Discarded)
+        } else {
+            Ok(DiscardOutcome::DiscardedUnrecorded)
+        }
     }
 
     /// Operator control frame `replay_batch`: make one parked batch eligible
@@ -567,6 +653,21 @@ mod tests {
     }
 
     #[test]
+    fn test_discard_of_unknown_batch_is_not_found_not_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let now = Utc::now();
+        let mut runtime = ReliabilityRuntime::open_in(dir.path(), pubkey, now).unwrap();
+
+        let result = runtime.discard(Uuid::new_v4(), "operator", now);
+        assert!(
+            matches!(result, Ok(DiscardOutcome::NotFound)),
+            "discarding an id that was never parked must report NotFound, \
+             distinct from a destructive outcome: got {result:?}"
+        );
+    }
+
+    #[test]
     #[cfg(unix)]
     fn test_discard_fails_contract_when_ledger_append_fails() {
         use std::os::unix::fs::PermissionsExt;
@@ -601,11 +702,101 @@ mod tests {
         let _ =
             std::fs::set_permissions(&ledger_path, std::fs::Permissions::from_mode(original_mode));
 
-        // The batch was removed from park, but ledger write failed.
-        // It must NOT report unconditional success (Ok(true)).
+        // The batch was removed from park, but ledger write failed. It must
+        // be reported as destroyed-but-unrecorded — never as a clean
+        // `Discarded` (unconditional success) and never as `NotFound`
+        // (which would collapse a genuine destructive action into the same
+        // signal as "no such batch", inviting a pointless retry).
         assert!(
-            !matches!(result, Ok(true)),
-            "discard must not report unconditional success when ledger write failed: got {result:?}"
+            matches!(result, Ok(DiscardOutcome::DiscardedUnrecorded)),
+            "discard must distinguish a destroyed-but-unrecorded batch from \
+             both a clean success and an unknown batch: got {result:?}"
+        );
+    }
+
+    /// The largest content length for which `runtime.park_batch(..)` still
+    /// succeeds — i.e. the batch's own serialized line is at (or a hair
+    /// under) `MAX_LINE_BYTES`. Used to build a batch whose line has no
+    /// headroom left for the extra bytes `mark_replayed` adds.
+    fn max_parkable_content_len(
+        runtime: &mut ReliabilityRuntime,
+        channel_id: Uuid,
+        scope: SessionScope,
+        now: DateTime<Utc>,
+    ) -> usize {
+        let (mut low, mut high) = (0usize, crate::reliability::park::MAX_LINE_BYTES);
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            let content = "x".repeat(mid);
+            let (probe, _) = make_flush_batch(channel_id, scope.clone(), &content);
+            let fits = runtime
+                .park_batch(&probe, ParkReason::RetriesExhausted, false, now)
+                .is_ok();
+            if fits {
+                let _ = runtime.discard(probe.batch_id, "test-calibration", now);
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        low
+    }
+
+    #[test]
+    fn test_commit_replay_rolls_back_earlier_marks_when_a_later_one_fails() {
+        // T16 delta 1, finding 4a: `commit_replay` marks every batch in the
+        // plan as replayed one at a time. If an EARLIER mark durably lands
+        // and a LATER one in the same call fails, the earlier one must not
+        // stay stamped `replayed_at` — that would make it permanently
+        // ineligible for replay even though this whole replay attempt is
+        // being reported as failed and nothing was sent.
+        let dir = tempfile::tempdir().unwrap();
+        let pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let now = Utc::now();
+        let mut runtime = ReliabilityRuntime::open_in(dir.path(), pubkey, now).unwrap();
+
+        let channel_id = Uuid::new_v4();
+        let scope = SessionScope::Conversation { channel_id };
+
+        // batch1: tiny, parks and marks-replayed with room to spare.
+        let (batch1, _) = make_flush_batch(channel_id, scope.clone(), "small");
+        let batch1_id = batch1.batch_id;
+        runtime
+            .park_batch(&batch1, ParkReason::RetriesExhausted, false, now)
+            .unwrap();
+
+        // batch2: calibrated to the exact line-length ceiling, so it parks
+        // successfully now but `mark_replayed`'s extra `replayed_at` field
+        // pushes its line over MAX_LINE_BYTES.
+        let max_len = max_parkable_content_len(&mut runtime, channel_id, scope.clone(), now);
+        let (batch2, _) = make_flush_batch(channel_id, scope.clone(), &"x".repeat(max_len));
+        let batch2_id = batch2.batch_id;
+        runtime
+            .park_batch(&batch2, ParkReason::RetriesExhausted, false, now)
+            .expect("batch2 must park at the calibrated max length");
+
+        let plan = ReplayPlan {
+            batch_ids: vec![batch1_id, batch2_id],
+            events: vec![],
+            scope: scope.clone(),
+            channel_id,
+        };
+
+        let result = runtime.commit_replay(&plan, Uuid::new_v4(), now);
+        assert!(
+            result.is_err(),
+            "marking the oversized batch2 as replayed must fail: {result:?}"
+        );
+
+        let batches = runtime.park().batches();
+        let find = |id: Uuid| batches.iter().find(|b| b.batch_id == id).unwrap();
+        assert!(
+            find(batch1_id).replayed_at.is_none(),
+            "batch1's successful mark must be rolled back when batch2's mark fails"
+        );
+        assert!(
+            find(batch2_id).replayed_at.is_none(),
+            "batch2 must never have been marked replayed"
         );
     }
 
@@ -676,9 +867,10 @@ mod tests {
         );
 
         // The turn for this scope finishes successfully (clearing in-flight replay)
-        let released = runtime.finish_replay(&scope).unwrap();
+        let report = runtime.finish_replay(&scope);
+        assert!(report.error.is_none(), "no removal should fail here");
         assert_eq!(
-            released,
+            report.released,
             vec![batch1_id],
             "only the included batch should be finished/released"
         );

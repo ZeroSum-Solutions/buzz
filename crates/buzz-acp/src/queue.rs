@@ -271,6 +271,17 @@ pub struct EventQueue {
     parked_out: VecDeque<ParkHandoff>,
     /// Number of times `flush_next` has been called.
     flush_count: usize,
+    /// Set by the caller while the durable reliability state directory is
+    /// unavailable (state-dir open failed and has not yet reopened).
+    ///
+    /// `push` still admits events into the live per-scope/per-channel queues
+    /// while this is set — dropping the connection or refusing to admit at
+    /// all would just move the loss earlier — but it refuses to *evict* an
+    /// already-admitted event to make room for a new one, since an evicted
+    /// event has nowhere durable to land. The newest arrival is refused
+    /// instead, which is explicit and counted rather than a silent swap of
+    /// one lost message for another (T16 delta 1, finding 8/"prior #4").
+    reliability_unavailable: bool,
 }
 
 /// Most batches held in the park hand-off at once.
@@ -313,7 +324,17 @@ impl EventQueue {
             in_flight_deadline: Duration::from_secs(DEFAULT_IN_FLIGHT_DEADLINE_SECS),
             parked_out: VecDeque::new(),
             flush_count: 0,
+            reliability_unavailable: false,
         }
+    }
+
+    /// Record whether durable reliability state is currently unavailable.
+    ///
+    /// Called once per main-loop iteration from the harness so `push`'s
+    /// admission-vs-eviction choice always reflects the current state-dir
+    /// availability, not a stale snapshot from when the queue was built.
+    pub fn set_reliability_unavailable(&mut self, unavailable: bool) {
+        self.reliability_unavailable = unavailable;
     }
 
     /// Number of times `flush_next` has been called on this queue.
@@ -378,8 +399,25 @@ impl EventQueue {
         let channel_id = event.channel_id;
         let scope = event.scope.clone();
         let queue = self.queues.entry(scope.clone()).or_default();
-        // Enforce per-scope depth cap: drop oldest in this partition.
+        // Enforce per-scope depth cap. Normally this evicts the oldest event
+        // in the partition to admit the new one. But an evicted event is
+        // gone for good — nothing durable holds it — so while reliability
+        // state is unavailable (no park file to fall back on if things get
+        // worse), refuse the *new* arrival instead: whatever is already
+        // queued stays queued, and the refusal is explicit and logged at
+        // ERROR rather than a silent swap of one lost message for another.
         if queue.len() >= MAX_PENDING_PER_SCOPE {
+            if self.reliability_unavailable {
+                tracing::error!(
+                    channel_id = %channel_id,
+                    scope = %scope.telemetry_label(),
+                    limit = MAX_PENDING_PER_SCOPE,
+                    "refusing new event — per-scope queue is at cap and durable \
+                     reliability state is unavailable, so an eviction would be \
+                     unrecoverable"
+                );
+                return false;
+            }
             queue.pop_front();
             tracing::warn!(
                 channel_id = %channel_id,
@@ -725,11 +763,13 @@ impl EventQueue {
 
     /// Give a batch back to the hand-off after a park-file write failed.
     ///
-    /// Returns `false` — and logs — when the hand-off is at
-    /// [`MAX_PARK_HANDOFF`]. A `false` return is the caller's signal that the
-    /// batch could not be held here either; it must stay in the caller's own
-    /// hands or the failure has to be surfaced.
-    pub fn return_unparked(&mut self, handoff: ParkHandoff) -> bool {
+    /// Returns `Err(handoff)` — and logs — when the hand-off is at
+    /// [`MAX_PARK_HANDOFF`], handing the exact same handoff straight back to
+    /// the caller. The caller owns it again immediately: nothing is ever
+    /// dropped here even when the hand-off itself is full, unlike the old
+    /// `bool` return, which let a `false` result fall out of scope and take
+    /// the batch's messages with it (T16 delta 1, finding 1).
+    pub fn return_unparked(&mut self, handoff: ParkHandoff) -> Result<(), Box<ParkHandoff>> {
         if self.parked_out.len() >= MAX_PARK_HANDOFF {
             tracing::error!(
                 channel_id = %handoff.batch.channel_id,
@@ -738,10 +778,10 @@ impl EventQueue {
                 events = handoff.batch.events.len(),
                 "park hand-off is full — the batch could not be held for a retry of the park write"
             );
-            return false;
+            return Err(Box::new(handoff));
         }
         self.parked_out.push_front(handoff);
-        true
+        Ok(())
     }
 
     /// Stage parked events for replay ahead of anything newer for `scope`.
@@ -2674,6 +2714,42 @@ mod tests {
         // Queue should be empty now.
         assert_eq!(pending_count(&q), 0);
         assert_eq!(q.queues.len(), 0);
+    }
+
+    // T16 delta 1, finding 8 (prior #4): while durable reliability state is
+    // unavailable, hitting the per-scope cap must refuse the new arrival
+    // rather than silently evict an already-queued one that has nowhere
+    // durable to fall back to.
+    #[test]
+    fn push_refuses_new_arrival_at_cap_when_reliability_unavailable() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+
+        for i in 0..MAX_PENDING_PER_SCOPE {
+            assert!(q.push(make_queued(ch, &format!("msg-{i}"))));
+        }
+        assert_eq!(pending_count(&q), MAX_PENDING_PER_SCOPE);
+
+        q.set_reliability_unavailable(true);
+        let accepted = q.push(make_queued(ch, "the 501st message"));
+        assert!(
+            !accepted,
+            "a new arrival at cap must be refused, not silently admitted by evicting an old one"
+        );
+        assert_eq!(
+            pending_count(&q),
+            MAX_PENDING_PER_SCOPE,
+            "the already-queued messages must be untouched — none evicted"
+        );
+
+        // Once reliability is back, normal eviction behavior resumes.
+        q.set_reliability_unavailable(false);
+        let accepted = q.push(make_queued(ch, "message after recovery"));
+        assert!(
+            accepted,
+            "once reliability is available again, admission (with eviction) resumes"
+        );
+        assert_eq!(pending_count(&q), MAX_PENDING_PER_SCOPE);
     }
 
     #[test]

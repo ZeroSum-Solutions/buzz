@@ -149,10 +149,31 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
         file.sync_all()?;
     }
     fs::rename(&temp, path)?;
-    // Durability of the rename itself: without this a crash can leave the
-    // directory entry pointing at neither file.
-    let dir = fs::File::open(parent)?;
-    dir.sync_all()?;
+    // The rename above is what commits the write: `path` now holds
+    // `contents` regardless of anything below. Syncing the parent directory
+    // entry only hardens against an OS crash landing in the narrow window
+    // before that entry itself reaches disk — a best-effort durability
+    // improvement, not the thing that decides whether the write happened.
+    //
+    // So a failure here must never turn into `Err`: an earlier version
+    // propagated it, which meant a caller (e.g. `ParkFile::commit`) that
+    // sees `Err` assumes NOTHING was written and keeps its own copy for a
+    // future retry — while the target file, on disk, right now, already
+    // holds the new content. That caller then falls through to a legacy
+    // path that requeues/re-parks the same batch, producing two live copies
+    // of one message (T16 delta 1, finding 5). Log and move on instead.
+    match fs::File::open(parent).and_then(|dir| dir.sync_all()) {
+        Ok(()) => {}
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "could not fsync the state directory entry after an atomic rename — \
+                 the write itself already landed; durability is degraded only against \
+                 an OS crash in the next instant, not lost"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -172,7 +193,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn test_write_atomic_propagates_parent_dir_fsync_error() {
+    fn test_write_atomic_survives_parent_dir_fsync_error() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -180,18 +201,32 @@ mod tests {
         fs::create_dir(&sub).unwrap();
 
         // 0o300: write + execute, but NO read permission.
-        // Creating and renaming temp files succeeds, but fs::File::open(parent) fails with PermissionDenied.
+        // Creating and renaming temp files succeeds (needs only write+exec on
+        // the directory), but fs::File::open(parent) — used only for the
+        // trailing directory-entry fsync — fails with PermissionDenied.
         fs::set_permissions(&sub, fs::Permissions::from_mode(0o300)).unwrap();
 
         let target = sub.join("target.txt");
         let result = write_atomic(&target, b"test payload");
 
-        // Restore permissions for clean tempdir teardown
+        // Restore permissions for clean tempdir teardown and to read the file back.
         let _ = fs::set_permissions(&sub, fs::Permissions::from_mode(0o700));
 
+        // T16 delta 1, finding 5: the rename already committed the write
+        // before the directory-fsync step ever runs, so a failure there
+        // must never be reported as "nothing was written" — a caller that
+        // saw `Err` here would keep its own copy and retry, producing two
+        // live copies of the same durably-written batch.
         assert!(
-            result.is_err(),
-            "write_atomic must return Err when parent directory open/fsync fails"
+            result.is_ok(),
+            "write_atomic must not fail the whole write just because the \
+             trailing directory-entry fsync could not run: {result:?}"
+        );
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            b"test payload",
+            "the content must be exactly what was requested — the rename \
+             already committed it before the fsync step"
         );
     }
 }

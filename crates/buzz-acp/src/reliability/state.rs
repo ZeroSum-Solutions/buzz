@@ -46,6 +46,13 @@ pub const PAUSE_RENOTIFY_MINUTES: i64 = 15;
 /// pruning.
 pub const MAX_CONSECUTIVE_SCOPES: usize = 1_000;
 
+/// Maximum number of scopes with an open breaker tracked at once, mirroring
+/// [`MAX_CONSECUTIVE_SCOPES`]. Without this an unbounded number of
+/// distinct scopes (one-off channels/threads, each opening a breaker and then
+/// going silent) grow the map forever — nothing else prunes it once a scope
+/// stops sending failures (T16 delta 1, finding 7).
+pub const MAX_OPEN_BREAKERS: usize = 1_000;
+
 /// Whether the agent may run a turn right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PauseGate {
@@ -86,6 +93,12 @@ struct Pause {
     /// Set once the pause expires and a probe has been handed out, so only one
     /// batch probes per expiry.
     probe_issued: bool,
+    /// The scope of the batch actually dispatched as the outstanding pause
+    /// probe, if any got that far. Only that scope's turn completion may
+    /// release this probe's lease — an unrelated scope finishing a turn
+    /// (e.g. an already in-flight breaker probe) must not free it early and
+    /// let a second probe batch dispatch while the first is still running.
+    probe_scope: Option<SessionScope>,
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +179,20 @@ impl ReliabilityState {
         }
         let consecutive = *count;
         self.consecutive.remove(scope);
+        if self.breakers.len() >= MAX_OPEN_BREAKERS && !self.breakers.contains_key(scope) {
+            // Evict the longest-open breaker to admit this one rather than
+            // growing without bound. This is a bounded-memory safety valve,
+            // not a substitute for `sweep_breakers` actually expiring stale
+            // entries — normal operation should never reach this cap.
+            if let Some(oldest_scope) = self
+                .breakers
+                .iter()
+                .min_by_key(|(_, b)| b.opened_at)
+                .map(|(s, _)| s.clone())
+            {
+                self.breakers.remove(&oldest_scope);
+            }
+        }
         self.breakers.insert(
             scope.clone(),
             Breaker {
@@ -246,9 +273,111 @@ impl ReliabilityState {
         if let Some(pause) = self.pause.as_mut() {
             if pause.probe_issued {
                 pause.probe_issued = false;
+                pause.probe_scope = None;
                 self.generation = self.generation.wrapping_add(1);
             }
         }
+    }
+
+    /// Record which scope's batch was actually dispatched as the outstanding
+    /// pause probe. Called once dispatch has genuinely claimed a worker for
+    /// it — not merely selected it — so [`release_pause_probe_for`] can later
+    /// tell "this turn was the probe" from "this is an unrelated scope's turn
+    /// completing while the probe is still in flight".
+    pub fn set_pause_probe_scope(&mut self, scope: SessionScope) {
+        if let Some(pause) = self.pause.as_mut() {
+            pause.probe_scope = Some(scope);
+        }
+    }
+
+    /// Release the pause probe lease, but only if `scope` is the exact scope
+    /// that was dispatched as the probe.
+    ///
+    /// Safety net for every terminal outcome of a dispatched batch (success,
+    /// retry, park, panic) — not just the paths that already know they held
+    /// a probe. A stray call for an unrelated scope (e.g. a breaker probe for
+    /// a different scope completing while a pause probe is still in flight)
+    /// is a no-op, so calling this unconditionally at every completion point
+    /// is safe (T16 delta 1, finding 9 / prior #5).
+    pub fn release_pause_probe_for(&mut self, scope: &SessionScope) {
+        if let Some(pause) = self.pause.as_mut() {
+            if pause.probe_issued && pause.probe_scope.as_ref() == Some(scope) {
+                pause.probe_issued = false;
+                pause.probe_scope = None;
+                self.generation = self.generation.wrapping_add(1);
+            }
+        }
+    }
+
+    /// A pause probe was selected but dispatch never actually ran it (no
+    /// worker claimed it, or the owner was busy) — reschedule the deadline
+    /// forward rather than reverting to "eligible right now".
+    ///
+    /// Reverting to eligible-now would make the very next `pause_gate` call
+    /// hand out another probe immediately, and if nothing is ever available
+    /// to dispatch (the queue is genuinely empty because the batch that
+    /// triggered the pause is sitting in the park file, not the live queue)
+    /// that repeats forever with the deadline pinned in the past — a busy
+    /// spin that burns CPU indefinitely. Advancing the deadline the same way
+    /// an open breaker already does between probes closes it (T16 delta 1,
+    /// finding 2).
+    /// A no-op if the probe was already released by another path (a held
+    /// batch, a busy session owner, pool exhaustion) — those call
+    /// [`release_pause_probe`](Self::release_pause_probe) inline and must
+    /// stay immediately eligible again, not pushed 10 minutes out. This only
+    /// actually reschedules when `probe_issued` is *still* true, meaning
+    /// dispatch never found anything to even attempt.
+    pub fn reschedule_pause_probe(&mut self, now: DateTime<Utc>) {
+        if let Some(pause) = self.pause.as_mut() {
+            if pause.probe_issued {
+                pause.until = now + Duration::minutes(BREAKER_PROBE_MINUTES);
+                pause.probe_issued = false;
+                pause.probe_scope = None;
+                self.generation = self.generation.wrapping_add(1);
+            }
+        }
+    }
+
+    /// Expire breakers that have been open for the full
+    /// [`BREAKER_MAX_OPEN_HOURS`] window, and reschedule any breaker whose
+    /// probe deadline is due but was never actually issued this cycle
+    /// (because the live queue had nothing queued for that scope, so
+    /// `breaker_gate` never ran for it).
+    ///
+    /// Call this once per probe-timer wake, AFTER giving `dispatch_pending`
+    /// its chance to run — a breaker whose probe genuinely got issued this
+    /// cycle already has `probe_issued == true` by then and is left alone.
+    /// Without this sweep, a scope that opens a breaker and then sends
+    /// nothing else ever again keeps its breaker (and the per-scope
+    /// `consecutive` residue) forever, and its stale due-in-the-past deadline
+    /// re-triggers the timer on every loop iteration (T16 delta 1, finding 7,
+    /// and the breaker half of finding 2).
+    ///
+    /// Returns the scopes whose breaker expired (closed via timeout, not a
+    /// successful probe) so the caller can write the ledger record.
+    pub fn sweep_breakers(&mut self, now: DateTime<Utc>) -> Vec<SessionScope> {
+        let mut expired = Vec::new();
+        let mut changed = false;
+        self.breakers.retain(|scope, breaker| {
+            if now - breaker.opened_at >= Duration::hours(BREAKER_MAX_OPEN_HOURS) {
+                expired.push(scope.clone());
+                changed = true;
+                false
+            } else if now >= breaker.next_probe && !breaker.probe_issued {
+                breaker.next_probe = now + Duration::minutes(BREAKER_PROBE_MINUTES);
+                changed = true;
+                true
+            } else {
+                true
+            }
+        });
+        for scope in &expired {
+            self.consecutive.remove(scope);
+        }
+        if changed {
+            self.generation = self.generation.wrapping_add(1);
+        }
+        expired
     }
 
     /// Release an unconsumed breaker probe permit so a subsequent dispatch may probe.
@@ -410,6 +539,7 @@ impl ReliabilityState {
                 let moved = (until - pause.notified_until).num_minutes().abs();
                 pause.until = until;
                 pause.probe_issued = false;
+                pause.probe_scope = None;
                 if moved > PAUSE_RENOTIFY_MINUTES {
                     pause.notified_channels.clear();
                     pause.notified_until = until;
@@ -421,6 +551,7 @@ impl ReliabilityState {
                     notified_until: until,
                     notified_channels: HashSet::new(),
                     probe_issued: false,
+                    probe_scope: None,
                 });
             }
         }
@@ -447,4 +578,173 @@ pub fn clamp_pause(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Date
         return now + Duration::minutes(DEFAULT_PAUSE_MINUTES);
     }
     resets_at
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reliability::ErrorClass;
+    use uuid::Uuid;
+
+    fn scope() -> SessionScope {
+        SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        }
+    }
+
+    fn open_breaker(state: &mut ReliabilityState, scope: &SessionScope, now: DateTime<Utc>) {
+        for _ in 0..BREAKER_THRESHOLD {
+            state.on_failure(scope, ErrorClass::ProviderInternal, now);
+        }
+    }
+
+    // T16 delta 1, finding 7: a breaker whose scope never sends anything
+    // again must still eventually close — nothing but `sweep_breakers`
+    // touches it once the scope goes silent.
+    #[test]
+    fn sweep_breakers_expires_a_breaker_whose_scope_went_silent() {
+        let mut state = ReliabilityState::default();
+        let s = scope();
+        let now = Utc::now();
+        open_breaker(&mut state, &s, now);
+        assert!(
+            state.breaker_opened_at(&s).is_some(),
+            "breaker must be open"
+        );
+
+        // Well short of the 6h expiry: nothing changes.
+        let before_expiry = now + Duration::hours(BREAKER_MAX_OPEN_HOURS - 1);
+        let expired = state.sweep_breakers(before_expiry);
+        assert!(expired.is_empty());
+        assert!(state.breaker_opened_at(&s).is_some());
+
+        // Past the 6h expiry with no new traffic on this scope at all: the
+        // sweep — not a failure on the scope — must close it.
+        let after_expiry = now + Duration::hours(BREAKER_MAX_OPEN_HOURS) + Duration::minutes(1);
+        let expired = state.sweep_breakers(after_expiry);
+        assert_eq!(expired, vec![s.clone()]);
+        assert!(
+            state.breaker_opened_at(&s).is_none(),
+            "the breaker must actually be gone after the sweep expires it"
+        );
+    }
+
+    // The busy-spin half of finding 2: a breaker whose probe deadline is due
+    // but that no live dispatch ever touched this cycle (its scope had
+    // nothing queued) must not keep reporting the same past deadline.
+    #[test]
+    fn sweep_breakers_reschedules_a_due_but_unconsumed_probe() {
+        let mut state = ReliabilityState::default();
+        let s = scope();
+        let now = Utc::now();
+        open_breaker(&mut state, &s, now);
+
+        let due = now + Duration::minutes(BREAKER_PROBE_MINUTES) + Duration::seconds(1);
+        assert_eq!(
+            state.earliest_probe_deadline(),
+            Some(now + Duration::minutes(BREAKER_PROBE_MINUTES))
+        );
+
+        let expired = state.sweep_breakers(due);
+        assert!(expired.is_empty(), "6h expiry has not been reached");
+        let next = state
+            .earliest_probe_deadline()
+            .expect("a rescheduled breaker still has a future deadline");
+        assert!(
+            next > due,
+            "the deadline must move into the future, not stay stuck at `due`"
+        );
+    }
+
+    #[test]
+    fn breakers_map_is_bounded_across_many_distinct_scopes() {
+        let mut state = ReliabilityState::default();
+        let now = Utc::now();
+        for _ in 0..(MAX_OPEN_BREAKERS + 50) {
+            open_breaker(&mut state, &scope(), now);
+        }
+        // Each `scope()` call is a brand-new SessionScope, so without a
+        // bound this would grow to MAX_OPEN_BREAKERS + 50 entries. `breakers`
+        // is a private field, visible here as a descendant module of
+        // `reliability::state` — there is no public len() accessor and
+        // adding one only for this test isn't worth the API surface.
+        assert!(
+            state.breakers.len() <= MAX_OPEN_BREAKERS,
+            "breakers map must not grow past MAX_OPEN_BREAKERS: got {}",
+            state.breakers.len()
+        );
+    }
+
+    // Finding 9 / prior #5: a pause probe that was actually dispatched (its
+    // scope recorded) must only release for that exact scope — an unrelated
+    // scope's turn completing (e.g. a breaker probe running concurrently)
+    // must not free the pause lease early and let a second probe dispatch
+    // while the first is still in flight.
+    #[test]
+    fn release_pause_probe_for_only_releases_the_dispatched_scope() {
+        let mut state = ReliabilityState::default();
+        let probe_scope = scope();
+        let other_scope = scope();
+        let now = Utc::now();
+        state.set_pause(now); // already due at `now`
+        assert_eq!(state.pause_gate(now), PauseGate::Probe);
+        state.set_pause_probe_scope(probe_scope.clone());
+
+        state.release_pause_probe_for(&other_scope);
+        assert_eq!(
+            state.pause_gate(now),
+            PauseGate::Held {
+                until: state.paused_until().unwrap()
+            },
+            "an unrelated scope must not release the probe lease"
+        );
+
+        state.release_pause_probe_for(&probe_scope);
+        assert_eq!(
+            state.pause_gate(now),
+            PauseGate::Probe,
+            "the exact dispatched scope must release the lease"
+        );
+    }
+
+    // Finding 2: a pause probe selected but never actually dispatched must
+    // reschedule forward, not revert to "eligible right now" — reverting
+    // would make the very next call hand out another probe immediately,
+    // spinning forever when nothing is ever available to dispatch.
+    #[test]
+    fn reschedule_pause_probe_moves_the_deadline_forward() {
+        let mut state = ReliabilityState::default();
+        let now = Utc::now();
+        state.set_pause(now); // already due at `now`
+        assert_eq!(state.pause_gate(now), PauseGate::Probe);
+
+        state.reschedule_pause_probe(now);
+        match state.pause_gate(now) {
+            PauseGate::Held { until } => assert!(until > now),
+            other => panic!("expected Held after reschedule, got {other:?}"),
+        }
+    }
+
+    // A batch WAS found and held (busy owner / pool exhausted) — those
+    // paths already call the bare, non-rescheduling `release_pause_probe`
+    // inline. A caller that then also calls `reschedule_pause_probe` as a
+    // blanket "nothing dispatched" cleanup must not clobber that decision
+    // and push the deadline out — the probe must stay immediately eligible.
+    #[test]
+    fn reschedule_pause_probe_is_a_no_op_after_an_inline_release() {
+        let mut state = ReliabilityState::default();
+        let now = Utc::now();
+        state.set_pause(now);
+        assert_eq!(state.pause_gate(now), PauseGate::Probe);
+
+        state.release_pause_probe(); // simulates the held/pool-exhausted path
+        state.reschedule_pause_probe(now); // the blanket post-loop cleanup
+
+        assert_eq!(
+            state.pause_gate(now),
+            PauseGate::Probe,
+            "an already-released probe must remain immediately eligible, not \
+             be pushed 10 minutes out by a later reschedule call"
+        );
+    }
 }

@@ -30,7 +30,7 @@ pub mod state_dir;
 
 pub use error_class::{classify_at, sanitize_error_diagnostic};
 pub use park::{ParkError, ParkReason, ParkedBatch};
-pub use runtime::{ReliabilityRuntime, ReplayPlan};
+pub use runtime::{DiscardOutcome, ReliabilityRuntime, ReplayPlan};
 pub use state::{BreakerGate, BreakerVerdict, PauseGate, ReliabilityState};
 
 /// Longest provider error text the harness inspects, stores or forwards.

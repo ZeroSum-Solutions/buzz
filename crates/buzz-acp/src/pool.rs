@@ -5049,8 +5049,19 @@ pub(crate) async fn post_failure_notice(
             return false;
         }
     };
-    const MAX_NOTICE_ATTEMPTS: usize = 3;
-    let mut delay = Duration::from_millis(100);
+    // T16 delta 1, finding 14 (prior #15): 3 attempts spanning well under a
+    // minute gives up long before a typical relay blip (seconds to several
+    // minutes) recovers, so a channel/scope going through an outage at the
+    // same moment the relay itself is degraded is simply never told. This is
+    // a detached `tokio::spawn`ed task (see `spawn_failure_notice[_with_ack]`
+    // in lib.rs) — it costs nothing to keep retrying here; it only blocks
+    // itself, never the main loop. This still does not survive a process
+    // restart mid-retry (a genuinely durable, cross-restart outbox is a
+    // larger follow-up), but it closes the much more common case of the
+    // relay recovering while the harness keeps running.
+    const MAX_NOTICE_ATTEMPTS: usize = 12;
+    const MAX_NOTICE_DELAY: Duration = Duration::from_secs(60);
+    let mut delay = Duration::from_secs(1);
     for attempt in 1..=MAX_NOTICE_ATTEMPTS {
         match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
             Ok(Ok(_)) => return true,
@@ -5063,9 +5074,15 @@ pub(crate) async fn post_failure_notice(
         }
         if attempt < MAX_NOTICE_ATTEMPTS {
             tokio::time::sleep(delay).await;
-            delay = (delay * 2).min(Duration::from_secs(2));
+            delay = (delay * 2).min(MAX_NOTICE_DELAY);
         }
     }
+    tracing::error!(
+        channel = %channel_id,
+        attempts = MAX_NOTICE_ATTEMPTS,
+        "failure notice exhausted every retry — the channel was never told; \
+         this does not persist across a process restart"
+    );
     false
 }
 
