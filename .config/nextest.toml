@@ -54,10 +54,13 @@ run-wrapper = "postgres-isolation"
 filter = "test(=cancelled_turn_with_usage_emits_notification_before_response)"
 retries = 2
 
-# zs fork: the empty-steer rejection test reads at most 40 frames and stops at
-# the prompt's own response; under load that response can land before the
-# steer rejection and the test fails without a code change (merge-queue run
-# 34090515497 ejected PR #35 this way). Same remedy as above.
+# zs fork: the buzz-agent integration tests drive a spawned agent over a
+# fake LLM and read a bounded number of frames; under load the frames arrive
+# in a different order and a test fails without a code change. Two different
+# steer tests ejected PR #35 from the merge queue in one day (runs 34090515497
+# steer_rejected_on_empty_prompt, 34126777445 handoff_cap_binds_within_a_single_turn)
+# while the same tree passed on the next runner. Retry the whole family in
+# place; a genuine regression still fails every attempt.
 [[profile.default.overrides]]
-filter = "test(=steer_rejected_on_empty_prompt)"
+filter = "package(buzz-agent) and kind(test)"
 retries = 2
