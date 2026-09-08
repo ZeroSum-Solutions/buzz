@@ -419,16 +419,26 @@ fn users_batch_truncates_oversized_picture_at_the_seam() {
 
     let resp = users_batch_from_events(std::slice::from_ref(&event), std::slice::from_ref(&pk));
 
-    let capped = resp.profiles[&pk]
-        .avatar_url
-        .as_deref()
-        .expect("avatar_url present");
     assert!(
-        capped.len() <= PROFILE_PICTURE_MAX_BYTES,
-        "capped avatar_url is {} bytes, expected <= {PROFILE_PICTURE_MAX_BYTES}",
-        capped.len()
+        resp.profiles[&pk].avatar_url.is_none(),
+        "an oversized URL must be omitted, never changed to a different resource"
     );
-    assert!(capped.len() < oversized_picture.len());
+}
+
+#[test]
+fn users_batch_omits_unsolicited_authors_and_non_profile_events() {
+    let requested = ev(0, r#"{"name":"Requested"}"#, vec![]);
+    let other = ev(0, r#"{"name":"Unsolicited"}"#, vec![]);
+    let requested_key = requested.pubkey.to_hex();
+    let note = ev(1, r#"{"name":"Not a profile"}"#, vec![]);
+    let note_key = note.pubkey.to_hex();
+    let result = users_batch_from_events(
+        &[requested, other, note],
+        &[requested_key.clone(), note_key.clone()],
+    );
+    assert_eq!(result.profiles.len(), 1);
+    assert!(result.profiles.contains_key(&requested_key));
+    assert!(result.missing.contains(&note_key));
 }
 
 #[test]

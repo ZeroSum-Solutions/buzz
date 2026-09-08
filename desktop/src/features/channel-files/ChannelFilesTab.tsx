@@ -807,7 +807,7 @@ export function ChannelFilesTab({
           </button>
           {isCanvasOpen ? (
             <div
-              className="border-t border-border px-4 py-3"
+              className="max-h-[35vh] overflow-y-auto border-t border-border px-4 py-3"
               data-testid="channel-files-canvas-surface"
             >
               {canvas.surface}

@@ -73,6 +73,7 @@ export function extensionOf(filename: string | undefined): string | undefined {
 
 /** The facet a MIME type alone implies. */
 function classifyMimeType(mimeType: string): ConcreteFileFacet {
+  mimeType = mimeType.slice(0, 256).trim().toLowerCase();
   if (mimeType.startsWith("image/")) return "image";
   if (mimeType.startsWith("video/")) return "video";
   if (

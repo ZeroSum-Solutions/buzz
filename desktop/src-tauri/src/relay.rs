@@ -239,7 +239,7 @@ fn classify_intercepted_response(final_host: &str, content_type: &str) -> Option
 /// URL details are deliberately omitted from error strings so raw URLs are never
 /// surfaced in the UI.
 pub(crate) async fn parse_json_response<T: DeserializeOwned>(
-    response: reqwest::Response,
+    mut response: reqwest::Response,
 ) -> Result<T, String> {
     let final_host = response.url().host_str().unwrap_or("").to_string();
     let content_type = response
@@ -266,9 +266,26 @@ pub(crate) async fn parse_json_response<T: DeserializeOwned>(
     // malformed body, so route it through `classify_body_timeout` — the same
     // helper the non-2xx error-body path uses — to preserve the stable
     // "relay unreachable: request timed out" label.
-    response.json::<T>().await.map_err(|e| {
+    // Bound bytes while receiving, before serde can allocate a relay-chosen
+    // object graph. Content-Length is advisory; chunked bodies share this cap.
+    const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+    const TOO_LARGE: &str = "relay response exceeds the 8 MiB size limit";
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(TOO_LARGE.to_string());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| {
         classify_body_timeout(&e).unwrap_or_else(|| MALFORMED_RESPONSE_MESSAGE.to_string())
-    })
+    })? {
+        if chunk.len() > MAX_RESPONSE_BYTES.saturating_sub(body.len()) {
+            return Err(TOO_LARGE.to_string());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|_| MALFORMED_RESPONSE_MESSAGE.to_string())
 }
 
 /// Extract the `retry in Ns` hint from a rate-limit error string.

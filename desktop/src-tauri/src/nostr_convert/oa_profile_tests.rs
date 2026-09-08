@@ -73,8 +73,15 @@ fn assert_ownership(event: &Event, expected: Option<String>) {
     assert_eq!(search.pubkey, event.pubkey.to_hex());
     let pubkey = event.pubkey.to_hex();
     let batch = users_batch_from_events(std::slice::from_ref(event), std::slice::from_ref(&pubkey));
-    assert_eq!(batch.profiles[&pubkey].owner_pubkey, expected);
-    assert_eq!(batch.profiles[&pubkey].is_agent, expected.is_some());
+    if event.kind == Kind::Metadata {
+        assert_eq!(batch.profiles[&pubkey].owner_pubkey, expected);
+        assert_eq!(batch.profiles[&pubkey].is_agent, expected.is_some());
+    } else {
+        // Batch lookups now reject non-profile relay results entirely, rather
+        // than exposing their content as an unowned profile.
+        assert!(!batch.profiles.contains_key(&pubkey));
+        assert_eq!(batch.missing, vec![pubkey.clone()]);
+    }
     let owners = verified_agent_owners_from_profiles(std::slice::from_ref(event));
     assert_eq!(owners.get(&pubkey), expected.as_ref());
 }
