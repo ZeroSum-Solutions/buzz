@@ -14,6 +14,18 @@ esac
 # one's cache slot — `git rev-parse --show-toplevel` alone answers "what
 # worktree is the CWD in", not "what worktree is this script part of".
 worktree_root="$(git -C "$(dirname -- "$0")" rev-parse --show-toplevel)"
+# CI runners are ephemeral, and the CI jobs download prebuilt binaries into the
+# repo-local target/ dir (see "Download relay binary" in _ci-relay.yml) before
+# starting them with --no-build. Keying the target dir by worktree there sends
+# the script to an empty cache dir and ejects every merge-queue entry, so on CI
+# keep cargo's default locations.
+if [[ -n "${CI:-}" ]]; then
+    case "$subtree" in
+        root) printf '%s\n' "$worktree_root/target" ;;
+        desktop) printf '%s\n' "$worktree_root/desktop/src-tauri/target" ;;
+    esac
+    exit 0
+fi
 key="$(printf '%s' "$worktree_root" | shasum -a 256 | cut -c1-12)"
 cache_dir="$HOME/.cache/zs/buzz-cargo-targets/$key"
 mkdir -p "$cache_dir/$subtree"
