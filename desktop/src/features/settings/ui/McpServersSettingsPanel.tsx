@@ -21,6 +21,7 @@ import {
   type McpServerDraft,
 } from "./mcpRegistryLogic";
 import { SettingsOptionGroup } from "./SettingsOptionGroup";
+import { McpEnvironmentFields } from "./McpEnvironmentFields";
 
 /** Query key for the registry document, so a save invalidates every reader. */
 export const MCP_REGISTRY_QUERY_KEY = ["mcp-registry"] as const;
@@ -46,7 +47,19 @@ function TransportChoice({
         <Button
           aria-checked={draft.transport === transport}
           key={transport}
-          onClick={() => onChange({ ...draft, transport })}
+          onClick={() =>
+            onChange(
+              draft.transport === transport
+                ? draft
+                : {
+                    ...draft,
+                    transport,
+                    env: [],
+                    secrets: {},
+                    authSecretName: "",
+                  },
+            )
+          }
           role="radio"
           size="sm"
           type="button"
@@ -191,6 +204,7 @@ function ServerForm({
               value={draft.argsText}
             />
           </label>
+          <McpEnvironmentFields draft={draft} onChange={onChange} />
         </>
       ) : (
         <>
@@ -350,13 +364,6 @@ export function McpServersSettingsPanel() {
   const [draft, setDraft] = React.useState<McpServerDraft | null>(null);
   const [approving, setApproving] = React.useState(false);
   const [failure, setFailure] = React.useState<string | null>(null);
-  // The most recent save's own `refused` list. `list_mcp_registry_servers`
-  // never recomputes refusals — it always answers `refused: []` — so the
-  // post-save `invalidate()` refetch below would silently erase this the
-  // instant it resolved if the panel read `registry.data?.refused` instead.
-  const [saveRefusals, setSaveRefusals] = React.useState<[string, string][]>(
-    [],
-  );
 
   const invalidate = () => {
     void queryClient.invalidateQueries({ queryKey: MCP_REGISTRY_QUERY_KEY });
@@ -369,7 +376,7 @@ export function McpServersSettingsPanel() {
       setDraft(null);
       setApproving(false);
       setFailure(null);
-      setSaveRefusals(view.refused);
+      queryClient.setQueryData(MCP_REGISTRY_QUERY_KEY, view);
       invalidate();
     },
     // Surfaced, never swallowed: a failed convergence leaves the previous
@@ -380,15 +387,16 @@ export function McpServersSettingsPanel() {
 
   const remove = useMutation({
     mutationFn: (id: string) => deleteMcpRegistryServer(id),
-    onSuccess: () => {
+    onSuccess: (view) => {
       setFailure(null);
+      queryClient.setQueryData(MCP_REGISTRY_QUERY_KEY, view);
       invalidate();
     },
     onError: (error: unknown) => setFailure(String(error)),
   });
 
   const servers = registry.data?.servers ?? [];
-  const refused = saveRefusals;
+  const refused = registry.data?.refused ?? [];
 
   return (
     <SettingsOptionGroup

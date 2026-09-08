@@ -147,6 +147,11 @@ pub async fn update_managed_agent(
 ) -> Result<UpdateManagedAgentResponse, String> {
     // Phase 1: local save (synchronous, under lock)
     let (mut summary, sync_params, rollback, access_policy_changed, access_restart_relays) = {
+        // Match registry mutation lock order: registry, then canonical agents.
+        let _registry_guard = state
+            .mcp_registry_store_lock
+            .lock()
+            .map_err(|e| e.to_string())?;
         let _store_guard = state
             .managed_agents_store_lock
             .lock()
@@ -321,6 +326,9 @@ pub async fn update_managed_agent(
         stamp_record_updated_at(record, applied);
 
         save_managed_agents(&app, &records)?;
+        crate::managed_agents::mcp_registry::apply::reconverge_after_runtime_change(
+            &app, &records,
+        )?;
 
         let record = records
             .iter()

@@ -72,6 +72,16 @@ pub async fn set_global_agent_config(
     // lock in Phase 2 after sync_managed_agent_processes.
     let app_for_write = app.clone();
     let phase1 = tokio::task::spawn_blocking(move || {
+        use tauri::Manager;
+        let state = app_for_write.state::<AppState>();
+        let _registry_guard = state
+            .mcp_registry_store_lock
+            .lock()
+            .map_err(|e| e.to_string())?;
+        let _store_guard = state
+            .managed_agents_store_lock
+            .lock()
+            .map_err(|e| e.to_string())?;
         validate_global_config(&config)?;
 
         let old_global = load_global_agent_config(&app_for_write).unwrap_or_default();
@@ -80,6 +90,11 @@ pub async fn set_global_agent_config(
 
         // Re-read from disk so the returned value reflects the strip-on-write pass.
         let new_global = load_global_agent_config(&app_for_write)?;
+        let registry_records = load_managed_agents(&app_for_write)?;
+        crate::managed_agents::mcp_registry::apply::reconverge_after_runtime_change(
+            &app_for_write,
+            &registry_records,
+        )?;
 
         // Pre-filter: identify agents that look eligible before taking any locks.
         // This is a hint only; definitive eligibility check happens under lock

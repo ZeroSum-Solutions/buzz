@@ -123,7 +123,10 @@ test("editing a stored entry carries no secret value back into the form", () => 
       env: [{ name: "API_KEY", reference: "mcp:fake-api-key", literal: null }],
     }),
   );
-  assert.deepEqual(draft.env, [{ name: "API_KEY", reference: "fake-api-key" }]);
+  assert.deepEqual(
+    draft.env.map(({ name, reference }) => ({ name, reference })),
+    [{ name: "API_KEY", reference: "fake-api-key" }],
+  );
   assert.deepEqual(
     draft.secrets,
     {},
@@ -308,4 +311,41 @@ test("an agent on a harness with mcpRegistryAvailable false is told runtime-unav
   const support = serverSupport(entry(), goose);
   assert.equal(support.kind, "runtime-unavailable");
   assert.match(support.reason, /not one the registry can configure/);
+});
+
+test("editing HTTP metadata preserves its authentication reference", () => {
+  const draft = entryToDraft(
+    entry({
+      transport: "http",
+      command: null,
+      args: [],
+      url: "https://example.com/mcp",
+      auth_scheme: "bearer",
+      auth_secret: "mcp:existing",
+    }),
+  );
+  assert.deepEqual(draftToInput({ ...draft, name: "renamed" }).auth, {
+    scheme: "bearer",
+    secret: "mcp:existing",
+  });
+  assert.deepEqual(draft.secrets, {});
+});
+
+test("approval distinguishes a spaced argument from two separate arguments", () => {
+  const one = approvalSummary(stdioDraft({ argsText: "Quarterly report" }));
+  const two = approvalSummary(stdioDraft({ argsText: "Quarterly\nreport" }));
+  assert.notEqual(one.target, two.target);
+  assert.match(one.target, /"Quarterly report"/);
+});
+
+test("HTTP input cannot retain invisible stdio environment references", () => {
+  const draft = httpDraft({ env: [{ name: "API_KEY", reference: "local" }] });
+  assert.deepEqual(draftToInput(draft).env, {});
+});
+
+test("editing a safe literal environment variable preserves it", () => {
+  const draft = entryToDraft(
+    entry({ env: [{ name: "MODE", reference: null, literal: "production" }] }),
+  );
+  assert.deepEqual(draftToInput(draft).env, { MODE: "production" });
 });

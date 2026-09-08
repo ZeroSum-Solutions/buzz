@@ -227,27 +227,25 @@ pub async fn delete_persona<R: tauri::Runtime>(
 
             // ── Phase 2: Stop ───────────────────────────────────────────────
             //
-            // Best-effort stop each running cascade instance. Lock ordering:
+            // Stop each running cascade instance before deleting custody. Lock ordering:
             // store lock (held) → process lock acquired per-agent and released
             // between stops so the process lock is not held across the full poll
             // cycle (stop_managed_agent_process polls 100ms×10 before SIGKILL).
             //
-            // Per-agent stop errors are swallowed — these records are deleted in
-            // Phase 3 regardless. Intentional difference from delete_managed_agent
-            // (single-agent, fatal on stop failure); here the cascade is multi-agent
-            // and deletion must proceed even if one instance cannot be stopped.
-            for pk in &cascade {
+            // A failed stop preserves every durable record and MCP capability.
+            // Already stopped processes remain stopped; the same deletion can retry.
+            stop_cascade_before_deletion(&cascade, |pk| {
                 if let Some(rec) = agents.iter_mut().find(|a| a.pubkey == *pk) {
                     let mut runtimes = state
                         .managed_agent_processes
                         .lock()
                         .map_err(|error| error.to_string())?;
-                    if let Err(e) = stop_managed_agent_process(&app, rec, &mut runtimes) {
-                        eprintln!("buzz-desktop: delete_persona: failed to stop agent {pk}: {e}");
-                    }
+                    stop_managed_agent_process(&app, rec, &mut runtimes)
+                        .map_err(|error| format!("cannot delete persona: agent {pk} could not stop: {error}; agent records and MCP configuration were retained"))?;
                     // runtimes drops here (per-agent, process lock not held across stops).
                 }
-            }
+                Ok(())
+            })?;
 
             // ── Phase 3: Commit ─────────────────────────────────────────────
             //
@@ -268,24 +266,16 @@ pub async fn delete_persona<R: tauri::Runtime>(
 
             if !cascade.is_empty() {
                 commit_cascade_agents(&mut agents, &cascade, |recs| {
+                    // Keep the durable cascade records until MCP cleanup succeeds.
+                    // An interrupted/failed cleanup can then be retried from the same
+                    // identities, and convergence's journal retains partial revocations.
+                    crate::managed_agents::mcp_registry::apply::converge_now_with_records(
+                        &app, recs, &std::collections::BTreeMap::new(),
+                    )?;
                     save_managed_agents(&app, recs)?;
-                    if let Err(e) = crate::managed_agents::mcp_registry::apply::converge_now_with_records(
-                        &app,
-                        recs,
-                        &std::collections::BTreeMap::new(),
-                    ) {
-                        eprintln!("buzz-desktop: delete_persona: mcp convergence failed: {e}");
-                    }
                     Ok(())
                 })?;
             }
-
-            let original_len = personas.len();
-            personas.retain(|record| record.id != id);
-            if personas.len() == original_len {
-                return Err(format!("persona {id} not found"));
-            }
-            save_personas(&app, &personas)?;
 
             // Side effects — strictly after records leave disk.
             for pk in &cascade {
@@ -296,6 +286,13 @@ pub async fn delete_persona<R: tauri::Runtime>(
                 // archive's `persona_id` is derived from the retained 30177 head.
                 super::agents::tombstone_managed_agent_pending(&app, &state, pk);
             }
+            let original_len = personas.len();
+            personas.retain(|record| record.id != id);
+            if personas.len() == original_len {
+                return Err(format!("persona {id} not found"));
+            }
+            save_personas(&app, &personas)?;
+
             tombstone_persona_pending(&app, &state, &d_tag);
 
             // _store_guard drops here, before try_regenerate_nest.
@@ -360,6 +357,37 @@ pub async fn set_persona_active(
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
+}
+
+/// Complete process revocation before the caller begins durable deletion.
+fn stop_cascade_before_deletion<'a>(
+    agents: impl IntoIterator<Item = &'a String>,
+    mut stop: impl FnMut(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    for agent in agents {
+        stop(agent)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod cascade_stop_tests {
+    #[test]
+    fn failed_cascade_stop_prevents_the_deletion_phase() {
+        let mut attempted = Vec::new();
+        let mut deleted = false;
+        let outcome =
+            super::stop_cascade_before_deletion(&["first".into(), "second".into()], |agent| {
+                attempted.push(agent.to_string());
+                Err("process refused stop".into())
+            })
+            .map(|_| {
+                deleted = true;
+            });
+        assert!(outcome.is_err());
+        assert_eq!(attempted, vec!["first"]);
+        assert!(!deleted);
+    }
 }
 
 pub(crate) const PNG_MAGIC: [u8; 4] = [0x89, 0x50, 0x4E, 0x47];

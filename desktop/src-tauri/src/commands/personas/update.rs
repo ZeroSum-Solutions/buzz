@@ -195,6 +195,7 @@ pub(super) async fn update_persona_with_precondition<R: tauri::Runtime, T: Send 
             let model = trim_optional(input.model);
             let provider = trim_optional(input.provider);
 
+            let _registry_guard = state.mcp_registry_store_lock.lock().map_err(|e| e.to_string())?;
             let _store_guard = state
                 .managed_agents_store_lock
                 .lock()
@@ -249,6 +250,9 @@ pub(super) async fn update_persona_with_precondition<R: tauri::Runtime, T: Send 
 
             let result = persona.clone();
             save_personas(&app, &personas)?;
+            let registry_records = load_managed_agents(&app)?;
+            crate::managed_agents::mcp_registry::apply::reconverge_after_runtime_change(&app, &registry_records)?;
+
 
             let retained = retain(&app, &state, &result)?;
             try_regenerate_nest(&app);

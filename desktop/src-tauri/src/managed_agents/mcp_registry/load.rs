@@ -234,7 +234,7 @@ pub(crate) fn read_bounded_no_follow(path: &Path) -> Result<Option<Vec<u8>>, Reg
 }
 
 /// Validate one entry. `Err` carries the operator-facing rejection reason.
-fn validate_entry(entry: &RegistryEntry) -> Result<(), String> {
+pub(crate) fn validate_entry(entry: &RegistryEntry) -> Result<(), String> {
     check_id(&entry.id)?;
     check_name(&entry.name)?;
     if entry.name.starts_with(RESERVED_NAME_PREFIX) {

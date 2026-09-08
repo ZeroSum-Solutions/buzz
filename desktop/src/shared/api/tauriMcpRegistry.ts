@@ -24,6 +24,8 @@ export type McpRegistryEntry = {
   /** Upstream URL for an http entry. */
   url: string | null;
   auth_scheme: string | null;
+  /** Safe reference spelling only, never a credential value. */
+  auth_secret?: string | null;
   env: McpRegistryEnvEntry[];
   /**
    * The loader's reason this entry is disabled, or `null` when it is usable.

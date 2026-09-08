@@ -266,6 +266,42 @@ pub fn converge_now<R: tauri::Runtime>(
     converge_now_with_records(app, &records, pending)
 }
 
+/// Reproject an authored runtime/config edit while its registry/store locks
+/// remain held. With no configured registry or selection there is no MCP work.
+pub fn reconverge_after_runtime_change<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    records: &[ManagedAgentRecord],
+) -> Result<Option<Converged>, String> {
+    let secrets = DesktopSecrets::new(crate::app_state::keyring_service());
+    reconverge_after_runtime_change_with_secrets(app, records, &secrets)
+}
+
+pub fn reconverge_after_runtime_change_with_secrets<R: tauri::Runtime, S: SecretStoreIo>(
+    app: &AppHandle<R>,
+    records: &[ManagedAgentRecord],
+    secrets: &S,
+) -> Result<Option<Converged>, String> {
+    let configured = records.iter().any(|record| record.mcp_servers.is_some());
+    let document_exists = match registry_paths(app)? {
+        Some(paths) => match paths.document().symlink_metadata() {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect MCP registry after runtime change: {error}"
+                ))
+            }
+        },
+        None => false,
+    };
+    if !configured && !document_exists {
+        return Ok(None);
+    }
+    converge_now_with_records_and_secrets(app, records, &std::collections::BTreeMap::new(), secrets)
+        .map(Some)
+        .map_err(|error| format!("runtime/config changes were saved, but MCP configuration could not converge: {error}; retry the edit before starting the affected agents"))
+}
+
 /// Stage and adopt one generation from the registry document and the provided
 /// agent records.
 pub fn converge_now_with_records<R: tauri::Runtime>(
@@ -290,6 +326,16 @@ pub fn converge_now_with_records_and_secrets<R: tauri::Runtime, S: SecretStoreIo
     pending: &std::collections::BTreeMap<String, String>,
     secrets: &S,
 ) -> Result<Converged, String> {
+    for record in records {
+        if let Some(selection) = &record.mcp_servers {
+            if selection.version != crate::managed_agents::types::AGENT_MCP_SERVERS_VERSION {
+                return Err(format!(
+                    "agent {} has unsupported MCP selection version {}",
+                    record.pubkey, selection.version
+                ));
+            }
+        }
+    }
     let Some(paths) = crate::managed_agents::runtime::mcp_registry_paths(app)? else {
         return Err(
             "this build cannot resolve the agent working directory, so mcp server settings \

@@ -54,26 +54,59 @@ async function setSelection(
   page: import("@playwright/test").Page,
   enabled: string[],
 ) {
-  await page.evaluate(
-    async ({ pubkey, servers }) => {
-      const internals = (
-        window as unknown as {
-          __TAURI_INTERNALS__: {
-            invoke: (cmd: string, args: unknown) => Promise<unknown>;
-          };
-        }
-      ).__TAURI_INTERNALS__;
-      await internals.invoke("set_agent_mcp_servers", {
-        pubkey,
-        enabled: servers,
-      });
-    },
-    { pubkey: AGENT_PUBKEY, servers: enabled },
-  );
+  const dialog = page.getByTestId("edit-agent-dialog");
+  if (!(await dialog.isVisible())) {
+    await page.getByTestId("settings-back-to-app").click();
+    await page.getByTestId("open-agents-view").click();
+    await page
+      .getByRole("button", { name: "Registry Agent agent profile" })
+      .click();
+    await page.getByTestId("user-profile-edit-agent").click();
+    await expect(dialog).toBeVisible();
+    await dialog.getByRole("button", { name: "Advanced", exact: true }).click();
+  }
+  const toggle = dialog.getByRole("switch", { name: "Enable fake" });
+  await expect(toggle).toBeEnabled();
+  await toggle.setChecked(enabled.includes("fake"));
+  await expect(toggle).toBeChecked({ checked: enabled.includes("fake") });
 }
 
 test.beforeEach(async ({ page }) => {
-  await installMockBridge(page);
+  await installMockBridge(page, {
+    managedAgents: [
+      {
+        pubkey: AGENT_PUBKEY,
+        name: "Registry Agent",
+        runtime: "buzz-agent",
+        status: "stopped",
+        channelNames: ["agents"],
+      },
+    ],
+    acpRuntimesCatalog: [
+      {
+        id: "buzz-agent",
+        label: "Buzz Agent",
+        avatar_url: "",
+        binary_path: "/usr/local/bin/buzz-agent",
+        install_instructions_url: "",
+        can_auto_install: false,
+        requires_external_cli: false,
+        underlying_cli_path: null,
+        node_required: false,
+        auth_status: { status: "not_applicable" },
+        source: "builtin",
+        command: "buzz-agent",
+        default_args: [],
+        availability: "available",
+        install_hint: "",
+        mcp_command: "",
+        mcp_registry_available: true,
+        mcp_transports: ["stdio"],
+        mcp_native_transports: [],
+        mcp_config_placement: { kind: "unsupported" },
+      },
+    ],
+  });
   await page.goto("/");
 });
 
@@ -112,6 +145,9 @@ test("a registry server is added behind an approve step and reaches one agent's 
   expect(before.artefact).toBeNull();
 
   await setSelection(page, ["fake"]);
+  await expect
+    .poll(async () => (await readGeneration(page)).generation)
+    .toBeGreaterThan(before.generation);
   const enabled = await readGeneration(page);
   expect(enabled.generation).toBeGreaterThan(before.generation);
   expect(enabled.artefact).not.toBeNull();
@@ -123,6 +159,9 @@ test("a registry server is added behind an approve step and reaches one agent's 
 
   // And the next generation drops it.
   await setSelection(page, []);
+  await expect
+    .poll(async () => (await readGeneration(page)).generation)
+    .toBeGreaterThan(enabled.generation);
   const dropped = await readGeneration(page);
   expect(dropped.generation).toBeGreaterThan(enabled.generation);
   expect(dropped.artefact).toBeNull();
