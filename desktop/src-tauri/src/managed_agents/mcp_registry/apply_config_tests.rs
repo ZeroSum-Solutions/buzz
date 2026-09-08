@@ -19,14 +19,8 @@ fn mcp_registry_a_corrupt_personas_store_is_propagated_and_leaves_the_generation
     std::fs::write(base.join("managed-agents.json"), b"{ not json")
         .expect("write a corrupt agent store");
 
-    // `generations_root` is rooted at `managed_agents_base_dir`, i.e. Tauri's
-    // real `app_data_dir()` — `dirs::data_dir()` on Windows resolves via
-    // `SHGetKnownFolderPath`, a Win32 call that reads neither `HOME` nor
-    // `XDG_DATA_HOME`, so `SandboxedHome` cannot isolate this path on that
-    // platform the way it does on unix. What this test can still assert
-    // platform-independently — and what its guard actually protects — is
-    // that the pointer this convergence attempt found is exactly the pointer
-    // it leaves behind, whatever value that happens to be.
+    // The mock app owns an isolated data directory on every platform. A
+    // refused read must leave its adopted generation exactly unchanged.
     let generations_root = RegistryPaths::new(base, sandbox.home()).generations_root();
     let before = GenerationStore::open(&generations_root)
         .expect("open")
