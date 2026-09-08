@@ -831,6 +831,40 @@ fn install_log_filename_accepts_ordinary_runtime_ids() {
     }
 }
 
+/// `managed_agent_state_dir` gates on this before `create_dir_all` /
+/// `set_permissions`, both of which follow symlinks. A symlink planted at
+/// the exact state-dir path (pointing anywhere — inside or outside the
+/// state root) must be rejected, not silently used.
+#[cfg(unix)]
+#[test]
+fn reject_symlink_refuses_a_symlinked_path() {
+    let root = tempfile::tempdir().unwrap();
+    let real_target = root.path().join("elsewhere");
+    std::fs::create_dir_all(&real_target).unwrap();
+    let symlinked_state_dir = root.path().join("state_dir_is_a_symlink");
+    std::os::unix::fs::symlink(&real_target, &symlinked_state_dir).unwrap();
+
+    assert!(
+        super::reject_symlink(&symlinked_state_dir).is_err(),
+        "a symlink at the target path must be rejected"
+    );
+}
+
+/// A real, ordinary directory (the common case) and a path that does not
+/// exist yet (about to be created fresh) must both be accepted — the guard
+/// must not reject the paths it exists to serve.
+#[cfg(unix)]
+#[test]
+fn reject_symlink_accepts_real_dir_and_missing_path() {
+    let root = tempfile::tempdir().unwrap();
+    let real_dir = root.path().join("a_real_directory");
+    std::fs::create_dir_all(&real_dir).unwrap();
+    assert!(super::reject_symlink(&real_dir).is_ok());
+
+    let not_yet_created = root.path().join("does_not_exist_yet");
+    assert!(super::reject_symlink(&not_yet_created).is_ok());
+}
+
 // ── validate_state_dir_pubkey ───────────────────────────────────────
 //
 // The pubkey names a directory under the agents state root, so it is

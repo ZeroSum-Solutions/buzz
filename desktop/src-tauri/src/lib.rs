@@ -14,6 +14,8 @@ mod events;
 // the event contract. Nothing here is wired to a command, the webview or the
 // sidebar yet — that is slice two — so the items below have no in-tree caller
 // and would read as dead code until they do.
+mod agent_health;
+mod agent_health_alerts;
 #[allow(dead_code)]
 mod google_calendar;
 mod huddle;
@@ -244,6 +246,7 @@ pub fn run() {
         .manage(archive::sync::ArchiveSyncState::default())
         .manage(native_relay_client::NativeRelayClient::default())
         .manage(observed_unread::ObservedUnreadStore::default())
+        .manage(agent_health::AgentHealthStore::default())
         .manage(channel_head_cache::ChannelHeadCacheStore::default())
         .setup(move |app| {
             let app_handle = app.handle().clone();
@@ -338,6 +341,8 @@ pub fn run() {
                     eprintln!("buzz-desktop: mcp registry reconcile at start failed: {e}");
                 }
             }
+            // Rust sync trigger once after launch restore in lib.rs setup
+            agent_health::sync_for_agent(&app_handle, "");
 
             // Warm the loaded-harness registry BEFORE restore so cold-launch
             // agent spawns can resolve custom/preset runtime ids without
@@ -774,6 +779,12 @@ pub fn run() {
             unread_catch_up::unread_catch_up,
             observed_unread::observed_unread_open_scope,
             observed_unread::observed_unread_ingest,
+            agent_health::get_agent_health_summary,
+            agent_health::get_agent_health_events,
+            agent_health::sync_agent_health,
+            agent_health::ingest_agent_health_frame,
+            agent_health::get_parked_batches,
+            agent_health::record_delivered_alerts,
             channel_head_cache::channel_head_cache_load,
             channel_head_cache::channel_head_cache_store,
             channel_head_cache::channel_head_cache_clear,

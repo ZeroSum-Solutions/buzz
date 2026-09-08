@@ -465,13 +465,51 @@ export type SwitchManagedAgentModelStatus =
   | "failure";
 
 export type ControlResultFrame = {
-  type: "cancel_turn" | "switch_model";
+  type:
+    | "cancel_turn"
+    | "switch_model"
+    | "replay_batch"
+    | "discard_batch"
+    | "resume_now"
+    | "keep_paused";
   status: string;
   modelId?: string;
   /** Opaque per-pick id echoed from the request; correlates late frames. */
   requestId?: string;
   /** Buzz channel UUID from the observer envelope; disambiguates channels. */
   channelId?: string | null;
+};
+
+export type ParkedBatchView = {
+  agent?: string;
+  batchId: string;
+  channelId: string;
+  reason: string;
+  started: boolean;
+  needsReview: boolean;
+  parkedAt: string;
+  events: number;
+  excerpt: string;
+};
+
+export type AgentHealthAlert = {
+  agent: string;
+  rule: string;
+  title: string;
+  body: string;
+};
+
+export type AgentHealthIngestResult = {
+  inserted: number;
+  alerts: AgentHealthAlert[];
+  /**
+   * `(agent, error)` pairs for per-agent read/query failures the backend
+   * swallowed rather than aborting the whole sync for. A successful
+   * (`Ok`) response can still carry these — callers must check this field,
+   * not just whether the promise rejected, before treating a sync as fully
+   * clean.
+   */
+  errors?: Array<[string, string]>;
 };
 
 export type GitBashPrerequisite = {

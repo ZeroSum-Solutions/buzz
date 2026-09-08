@@ -71,6 +71,11 @@ impl LedgerRecord {
         self.body.batch_id()
     }
 
+    /// The channel this record is about, when it is about one.
+    pub fn channel_id(&self) -> Option<Uuid> {
+        self.body.channel_id()
+    }
+
     /// The record kind, as written to the `kind` field.
     pub fn kind(&self) -> &'static str {
         self.body.kind()
@@ -106,6 +111,24 @@ impl LedgerBody {
             Self::BatchReplayed(r) => Some(r.batch_id),
             Self::BatchNeedsReview(r) => Some(r.batch_id),
             Self::BatchDiscarded(r) => Some(r.batch_id),
+            Self::AgentPaused(_)
+            | Self::AgentResumed(_)
+            | Self::BreakerOpened(_)
+            | Self::BreakerClosed(_)
+            | Self::RelayReconnected(_) => None,
+        }
+    }
+
+    /// The channel this record is about, when it is about one.
+    pub fn channel_id(&self) -> Option<Uuid> {
+        match self {
+            Self::TurnStarted(r) => Some(r.channel_id),
+            Self::TurnActivity(r) => Some(r.channel_id),
+            Self::TurnFinished(r) => Some(r.channel_id),
+            Self::BatchParked(r) => Some(r.channel_id),
+            Self::BatchReplayed(r) => Some(r.channel_id),
+            Self::BatchNeedsReview(r) => Some(r.channel_id),
+            Self::BatchDiscarded(r) => Some(r.channel_id),
             Self::AgentPaused(_)
             | Self::AgentResumed(_)
             | Self::BreakerOpened(_)
@@ -385,7 +408,7 @@ impl Ledger {
     /// [`MAX_LINE_BYTES`] per line. Malformed lines are counted and skipped,
     /// never propagated as a parse failure for the whole file.
     pub fn read_all(&self) -> io::Result<Vec<LedgerRecord>> {
-        read_records(&self.path)
+        read_ledger_file(&self.path)
     }
 
     /// Batch ids with a `batch_replayed` record and no later `turn_finished`.
@@ -547,9 +570,13 @@ fn sanitize_dangling_final_line(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Read a JSONL ledger file with a hard byte cap on the input and a hard cap
-/// per line.
-fn read_records(path: &Path) -> io::Result<Vec<LedgerRecord>> {
+/// Read a JSONL ledger file in a read-only manner with a hard byte cap on the
+/// input and a hard cap per line.
+///
+/// Returns all parsed records. Lines that are malformed or exceed
+/// [`MAX_LINE_BYTES`] are skipped without modifying or rewriting the file on
+/// disk. If the file does not exist, returns an empty vector.
+pub fn read_ledger_file(path: &Path) -> io::Result<Vec<LedgerRecord>> {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -594,9 +621,129 @@ fn read_records(path: &Path) -> io::Result<Vec<LedgerRecord>> {
     Ok(records)
 }
 
+/// Read `path` like [`read_ledger_file`], then drop any record whose `agent`
+/// does not equal `expected_agent` or whose `at` is more than five minutes
+/// ahead of `now`.
+///
+/// A ledger lives inside the state directory of one managed agent, but
+/// nothing at the file-format level stops a record embedding a *different*
+/// `agent` value, and nothing bounds how far in the future `at` claims to be.
+/// Both the desktop health sync (`sync_ledger`) and the CLI's `agents health`
+/// aggregation read health-relevant ledgers through this function, so a
+/// mixed-identity or clock-skewed ledger can never be blended into either
+/// consumer's per-agent counters or evade the 30-day retention window that
+/// keys off `at`.
+pub fn read_ledger_file_for_agent(
+    path: &Path,
+    expected_agent: &str,
+    now: DateTime<Utc>,
+) -> io::Result<Vec<LedgerRecord>> {
+    let max_future = now + Duration::minutes(5);
+    let records = read_ledger_file(path)?;
+    Ok(records
+        .into_iter()
+        .filter(|record| record.agent == expected_agent && record.at <= max_future)
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_ledger_file_skips_malformed_lines_and_does_not_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+
+        let batch_1 = Uuid::new_v4();
+        let channel_1 = Uuid::new_v4();
+        let rec_1 = LedgerRecord {
+            at: Utc::now(),
+            agent: "test_agent".to_string(),
+            body: LedgerBody::TurnActivity(TurnActivity {
+                batch_id: batch_1,
+                channel_id: channel_1,
+            }),
+        };
+
+        let batch_2 = Uuid::new_v4();
+        let channel_2 = Uuid::new_v4();
+        let rec_2 = LedgerRecord {
+            at: Utc::now(),
+            agent: "test_agent".to_string(),
+            body: LedgerBody::TurnFinished(TurnFinished {
+                batch_id: batch_2,
+                channel_id: channel_2,
+                outcome: TurnOutcome::Ok,
+            }),
+        };
+
+        let line_1 = serde_json::to_string(&rec_1).unwrap();
+        let malformed = "{\"invalid\":json broken line";
+        let line_2 = serde_json::to_string(&rec_2).unwrap();
+
+        let contents = format!("{line_1}\n{malformed}\n{line_2}\n");
+        std::fs::write(&path, contents.as_bytes()).unwrap();
+
+        let original_bytes = std::fs::read(&path).unwrap();
+
+        let records = read_ledger_file(&path).expect("read_ledger_file should succeed");
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0], rec_1);
+        assert_eq!(records[1], rec_2);
+
+        let bytes_after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            bytes_after, original_bytes,
+            "file bytes must remain unchanged"
+        );
+    }
+
+    #[test]
+    fn read_ledger_file_for_agent_drops_mismatched_agent_and_future_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let now = Utc::now();
+
+        let make = |agent: &str, at: DateTime<Utc>| LedgerRecord {
+            at,
+            agent: agent.to_string(),
+            body: LedgerBody::TurnFinished(TurnFinished {
+                batch_id: Uuid::new_v4(),
+                channel_id: Uuid::new_v4(),
+                outcome: TurnOutcome::Ok,
+            }),
+        };
+
+        let owned = make("owner_agent", now);
+        let intruder = make("intruder_agent", now);
+        let future = make("owner_agent", now + Duration::days(1));
+
+        let contents = [&owned, &intruder, &future]
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, format!("{contents}\n")).unwrap();
+
+        let records = read_ledger_file_for_agent(&path, "owner_agent", now)
+            .expect("read_ledger_file_for_agent should succeed");
+
+        assert_eq!(
+            records,
+            vec![owned],
+            "only the matching, non-future record must survive"
+        );
+    }
+
+    #[test]
+    fn read_ledger_file_for_agent_missing_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does_not_exist.jsonl");
+        let records = read_ledger_file_for_agent(&path, "owner_agent", Utc::now()).unwrap();
+        assert!(records.is_empty());
+    }
 
     #[test]
     fn test_ledger_append_and_read_all() {

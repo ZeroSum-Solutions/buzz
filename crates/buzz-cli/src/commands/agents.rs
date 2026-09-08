@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use buzz_core::kind::KIND_IA_ARCHIVED_LIST;
 use buzz_sdk::builders::{build_archive_identity_request, build_unarchive_identity_request};
 use nostr::PublicKey;
@@ -11,6 +13,11 @@ use crate::{AgentsCmd, RespondToArg};
 
 pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), CliError> {
     match command {
+        AgentsCmd::Health {
+            since,
+            json,
+            state_root,
+        } => cmd_health(&since, json, state_root.as_deref()),
         AgentsCmd::DraftCreate {
             channel,
             display_name,
@@ -458,6 +465,210 @@ async fn cmd_archived(client: &BuzzClient) -> Result<(), CliError> {
     let archived = fetch_archived_snapshot(client).await?;
     println!("{}", json!({"archived": archived}));
     Ok(())
+}
+
+/// Longest byte prefix of `s` that is at most `max_bytes` bytes and ends on a
+/// UTF-8 character boundary. `&s[..max_bytes]` panics whenever a multibyte
+/// character straddles that offset (any UTF-8 string long enough to lead
+/// with one), which a ledger-supplied agent id is not guaranteed to avoid.
+fn char_boundary_prefix(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// View agent health counters and state from local ledgers.
+pub fn cmd_health(since: &str, json: bool, state_root: Option<&Path>) -> Result<(), CliError> {
+    cmd_health_to_writer(&mut std::io::stdout(), since, json, state_root)
+}
+
+/// Inner implementation of `cmd_health` allowing writer injection for testing.
+pub fn cmd_health_to_writer<W: std::io::Write>(
+    writer: &mut W,
+    since: &str,
+    json: bool,
+    state_root: Option<&Path>,
+) -> Result<(), CliError> {
+    let duration = match since.to_ascii_lowercase().as_str() {
+        "24h" => chrono::Duration::hours(24),
+        "7d" => chrono::Duration::days(7),
+        _ => {
+            return Err(CliError::Usage(format!(
+                "invalid --since '{since}': expected '24h' or '7d'"
+            )));
+        }
+    };
+
+    let state_dirs = discover_state_dirs(state_root);
+    let now = chrono::Utc::now();
+    let mut rows = Vec::new();
+
+    for dir in state_dirs {
+        let ledger_path = dir.join(buzz_acp::reliability::ledger::LEDGER_FILE);
+        let expected_agent = dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        // Read through the agent- and clock-skew-validated reader, not the
+        // raw `read_ledger_file`: a ledger holding a record whose embedded
+        // `agent` differs from this state directory's owner (or a
+        // future-dated record) must never be blended into this directory's
+        // counters — see `read_ledger_file_for_agent`.
+        let mut row = match buzz_acp::reliability::ledger::read_ledger_file_for_agent(
+            &ledger_path,
+            &expected_agent,
+            now,
+        ) {
+            Ok(records) => buzz_acp::reliability::health::summarize(&records, duration, now),
+            Err(e) => {
+                // A real I/O error (permissions, corruption at the OS level) is
+                // distinct from "no ledger yet" — `read_ledger_file` already
+                // maps a missing file to `Ok(vec![])`, so anything reaching
+                // here must not collapse into a normal-looking, healthy row.
+                let mut degraded = buzz_acp::reliability::health::summarize(&[], duration, now);
+                degraded.state = "error".to_string();
+                degraded.last_error_class = Some(format!("ledger read error: {e}"));
+                degraded
+            }
+        };
+        if row.agent.is_empty() {
+            row.agent = expected_agent;
+        }
+        rows.push(row);
+    }
+
+    rows.sort_by(|a, b| a.agent.cmp(&b.agent));
+
+    if json {
+        let json_str =
+            serde_json::to_string_pretty(&rows).map_err(|e| CliError::Other(e.to_string()))?;
+        writeln!(writer, "{json_str}").map_err(|e| CliError::Other(e.to_string()))?;
+    } else {
+        if rows.is_empty() {
+            writeln!(writer, "No agent state directories found.")
+                .map_err(|e| CliError::Other(e.to_string()))?;
+            return Ok(());
+        }
+
+        writeln!(
+            writer,
+            "{:<18} {:<10} {:>6} {:>6} {:>6} {:>12} {:>10} LAST_ERROR",
+            "AGENT", "STATE", "TURNS", "FAILED", "PARKED", "NEEDS_REVIEW", "RECONNECTS",
+        )
+        .map_err(|e| CliError::Other(e.to_string()))?;
+
+        for row in &rows {
+            let agent_prefix = char_boundary_prefix(&row.agent, 16);
+            let last_error = row.last_error_class.as_deref().unwrap_or("-");
+            writeln!(
+                writer,
+                "{:<18} {:<10} {:>6} {:>6} {:>6} {:>12} {:>10} {}",
+                agent_prefix,
+                row.state,
+                row.turns,
+                row.failed,
+                row.parked,
+                row.needs_review,
+                row.reconnects,
+                last_error
+            )
+            .map_err(|e| CliError::Other(e.to_string()))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Find agent state directories to inspect.
+fn discover_state_dirs(state_root: Option<&Path>) -> Vec<PathBuf> {
+    let mut state_dirs = Vec::new();
+
+    if let Some(root) = state_root {
+        if root.is_dir() {
+            if root
+                .join(buzz_acp::reliability::ledger::LEDGER_FILE)
+                .is_file()
+            {
+                state_dirs.push(root.to_path_buf());
+            }
+            if let Ok(entries) = std::fs::read_dir(root) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        state_dirs.push(path);
+                    }
+                }
+            }
+        }
+    } else if let Ok(env_dir) = std::env::var(buzz_acp::reliability::state_dir::STATE_DIR_ENV) {
+        let trimmed = env_dir.trim();
+        if !trimmed.is_empty() {
+            let p = PathBuf::from(trimmed);
+            if p.is_dir() {
+                if p.join(buzz_acp::reliability::ledger::LEDGER_FILE).is_file() {
+                    state_dirs.push(p.clone());
+                }
+                let mut found_sub = false;
+                if let Ok(entries) = std::fs::read_dir(&p) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            state_dirs.push(path);
+                            found_sub = true;
+                        }
+                    }
+                }
+                if !found_sub && !state_dirs.contains(&p) {
+                    state_dirs.push(p);
+                }
+            }
+        }
+    } else {
+        let mut candidate_roots = Vec::new();
+        if let Some(home) = dirs::home_dir() {
+            candidate_roots.push(home.join(".buzz").join(".state"));
+        }
+        if let Some(data_dir) = dirs::data_dir() {
+            candidate_roots.push(
+                data_dir
+                    .join("xyz.block.buzz.app")
+                    .join("agents")
+                    .join("state"),
+            );
+        }
+        if let Some(home) = dirs::home_dir() {
+            candidate_roots.push(
+                home.join("Library")
+                    .join("Application Support")
+                    .join("xyz.block.buzz.app")
+                    .join("agents")
+                    .join("state"),
+            );
+        }
+
+        for root in candidate_roots {
+            if root.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(&root) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            state_dirs.push(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    state_dirs.sort();
+    state_dirs.dedup();
+    state_dirs
 }
 
 /// Pure verification of a kind:13535 archived-identities event.
@@ -1273,5 +1484,174 @@ mod tests {
             .expect("sign");
         let result = verify_archived_event(&event, &self_hex).expect("should pass");
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn health_json_lists_one_row_per_state_dir() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let agent1_dir = tmp.path().join("agent_alpha");
+        let agent2_dir = tmp.path().join("agent_beta");
+        std::fs::create_dir(&agent1_dir).expect("create agent1 dir");
+        std::fs::create_dir(&agent2_dir).expect("create agent2 dir");
+
+        let ledger1_path = agent1_dir.join("ledger.jsonl");
+        let now = chrono::Utc::now();
+        let record = buzz_acp::reliability::ledger::LedgerRecord {
+            at: now,
+            agent: "agent_alpha".to_string(),
+            body: buzz_acp::reliability::ledger::LedgerBody::TurnFinished(
+                buzz_acp::reliability::ledger::TurnFinished {
+                    batch_id: uuid::Uuid::new_v4(),
+                    channel_id: uuid::Uuid::new_v4(),
+                    outcome: buzz_acp::reliability::ledger::TurnOutcome::Ok,
+                },
+            ),
+        };
+        let line = serde_json::to_string(&record).expect("serialize record");
+        std::fs::write(&ledger1_path, format!("{line}\n")).expect("write ledger");
+
+        let mut out = Vec::new();
+        cmd_health_to_writer(&mut out, "24h", true, Some(tmp.path())).expect("cmd_health succeeds");
+
+        let json_str = String::from_utf8(out).expect("valid utf-8 output");
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(&json_str).expect("valid json output");
+
+        assert_eq!(parsed.len(), 2, "must list one row per state dir");
+
+        let agents: Vec<&str> = parsed
+            .iter()
+            .map(|r| r["agent"].as_str().expect("agent field is string"))
+            .collect();
+        assert!(agents.contains(&"agent_alpha"));
+        assert!(agents.contains(&"agent_beta"));
+
+        let alpha = parsed.iter().find(|r| r["agent"] == "agent_alpha").unwrap();
+        assert_eq!(alpha["turns"], 1);
+        assert_eq!(alpha["state"], "active");
+
+        let beta = parsed.iter().find(|r| r["agent"] == "agent_beta").unwrap();
+        assert_eq!(beta["turns"], 0);
+        assert_eq!(beta["state"], "offline");
+    }
+
+    /// An I/O error reading `ledger.jsonl` (permissions, corruption at the OS
+    /// level) must surface as a distinguishable degraded row, never collapse
+    /// into the same "offline, turns: 0" shape a healthy-but-idle agent gets.
+    /// Binds `cmd_health_to_writer`'s `read_ledger_file` error handling —
+    /// reverting it to `.unwrap_or_default()` makes this fail (state would
+    /// read "offline" instead of "error").
+    #[cfg(unix)]
+    #[test]
+    fn health_unreadable_ledger_reports_error_state_not_offline() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let agent_dir = tmp.path().join("agent_unreadable");
+        std::fs::create_dir(&agent_dir).expect("create agent dir");
+        let ledger_path = agent_dir.join("ledger.jsonl");
+        std::fs::write(&ledger_path, "{}\n").expect("write ledger");
+        std::fs::set_permissions(&ledger_path, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod ledger unreadable");
+
+        let mut out = Vec::new();
+        let result = cmd_health_to_writer(&mut out, "24h", true, Some(tmp.path()));
+
+        // Restore permissions so the tempdir can be cleaned up.
+        let _ = std::fs::set_permissions(&ledger_path, std::fs::Permissions::from_mode(0o644));
+
+        result.expect("cmd_health must not fail the whole command for one bad ledger");
+        let json_str = String::from_utf8(out).expect("valid utf-8 output");
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(&json_str).expect("valid json output");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["agent"], "agent_unreadable");
+        assert_eq!(
+            parsed[0]["state"], "error",
+            "unreadable ledger must report state \"error\", not \"offline\": {parsed:?}"
+        );
+        assert!(
+            parsed[0]["last_error_class"]
+                .as_str()
+                .is_some_and(|s| s.contains("ledger read error")),
+            "last_error_class must carry the read failure: {parsed:?}"
+        );
+    }
+
+    /// A ledger agent id longer than 16 bytes with a multibyte character
+    /// straddling byte offset 16 must not panic the text-table renderer.
+    /// `&row.agent[..16]` indexes mid-character; `char_boundary_prefix` must
+    /// back off to the nearest valid boundary instead.
+    #[test]
+    fn health_text_table_truncates_unicode_agent_without_panicking() {
+        // 15 ASCII bytes then a 3-byte character starting at byte 15, so a
+        // naive 16-byte slice lands inside the character (byte 16 splits it).
+        let agent = format!("{}\u{4e2d}suffix", "a".repeat(15));
+        assert!(!agent.is_char_boundary(16), "fixture must straddle byte 16");
+
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let agent_dir = tmp.path().join(&agent);
+        std::fs::create_dir(&agent_dir).expect("create agent dir");
+        let ledger_path = agent_dir.join("ledger.jsonl");
+        let record = buzz_acp::reliability::ledger::LedgerRecord {
+            at: chrono::Utc::now(),
+            agent: agent.clone(),
+            body: buzz_acp::reliability::ledger::LedgerBody::TurnFinished(
+                buzz_acp::reliability::ledger::TurnFinished {
+                    batch_id: uuid::Uuid::new_v4(),
+                    channel_id: uuid::Uuid::new_v4(),
+                    outcome: buzz_acp::reliability::ledger::TurnOutcome::Ok,
+                },
+            ),
+        };
+        let line = serde_json::to_string(&record).expect("serialize record");
+        std::fs::write(&ledger_path, format!("{line}\n")).expect("write ledger");
+
+        let mut out = Vec::new();
+        // json=false exercises the text-table path that indexes `row.agent`.
+        cmd_health_to_writer(&mut out, "24h", false, Some(tmp.path()))
+            .expect("must not panic or error on a unicode agent id");
+        let rendered = String::from_utf8(out).expect("valid utf-8 output");
+        assert!(rendered.contains("aaaaaaaaaaaaaaa"));
+    }
+
+    /// A ledger record whose embedded `agent` field does not match the state
+    /// directory it lives in must not be blended into that directory's row —
+    /// closes the "mixed identities" gap in `read_ledger_file_for_agent`.
+    #[test]
+    fn health_ignores_records_with_mismatched_embedded_agent() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let agent_dir = tmp.path().join("agent_owner");
+        std::fs::create_dir(&agent_dir).expect("create agent dir");
+        let ledger_path = agent_dir.join("ledger.jsonl");
+
+        let make_record = |agent: &str| buzz_acp::reliability::ledger::LedgerRecord {
+            at: chrono::Utc::now(),
+            agent: agent.to_string(),
+            body: buzz_acp::reliability::ledger::LedgerBody::TurnFinished(
+                buzz_acp::reliability::ledger::TurnFinished {
+                    batch_id: uuid::Uuid::new_v4(),
+                    channel_id: uuid::Uuid::new_v4(),
+                    outcome: buzz_acp::reliability::ledger::TurnOutcome::Ok,
+                },
+            ),
+        };
+        let mut lines = String::new();
+        lines.push_str(&serde_json::to_string(&make_record("agent_owner")).unwrap());
+        lines.push('\n');
+        lines.push_str(&serde_json::to_string(&make_record("agent_intruder")).unwrap());
+        lines.push('\n');
+        std::fs::write(&ledger_path, lines).expect("write ledger");
+
+        let mut out = Vec::new();
+        cmd_health_to_writer(&mut out, "24h", true, Some(tmp.path())).expect("cmd_health succeeds");
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(&String::from_utf8(out).unwrap()).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["agent"], "agent_owner");
+        assert_eq!(
+            parsed[0]["turns"], 1,
+            "the mismatched-agent record must not be counted: {parsed:?}"
+        );
     }
 }

@@ -6,6 +6,8 @@ mod error;
 mod links;
 mod validate;
 
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 use client::BuzzClient;
 use error::CliError;
@@ -266,6 +268,18 @@ impl RespondToArg {
 
 #[derive(Subcommand)]
 pub enum AgentsCmd {
+    /// View agent health counters and state from local ledgers
+    Health {
+        /// Time window: "24h" or "7d"
+        #[arg(long, default_value = "24h")]
+        since: String,
+        /// Output machine-readable JSON instead of a formatted table
+        #[arg(long)]
+        json: bool,
+        /// Override the state directory root (defaults to BUZZ_ACP_STATE_DIR or ~/.buzz/.state)
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
     /// Open a prefilled create-agent form in the owner's Buzz Desktop
     DraftCreate {
         /// Current channel UUID; the new agent is added here after save
@@ -2065,6 +2079,16 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         };
     }
 
+    // Health is local-only — reads ledger files from disk, no relay connection needed.
+    if let Cmd::Agents(AgentsCmd::Health {
+        ref since,
+        json,
+        ref state_root,
+    }) = cli.command
+    {
+        return commands::agents::cmd_health(since, json, state_root.as_deref());
+    }
+
     // Auth: private key is required for all relay operations.
     // The keypair IS the identity — no tokens, no other auth.
     let private_key_str = cli.private_key.ok_or_else(|| {
@@ -2324,6 +2348,7 @@ mod tests {
                 "archived",
                 "draft-create",
                 "draft-update",
+                "health",
                 "unarchive"
             ]
         );
@@ -2463,7 +2488,7 @@ mod tests {
     #[test]
     fn subcommand_counts_are_stable() {
         let expected: Vec<(&str, usize)> = vec![
-            ("agents", 5),
+            ("agents", 6),
             ("canvas", 2),
             ("channels", 16),
             ("dms", 4),

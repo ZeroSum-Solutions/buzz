@@ -28,6 +28,7 @@ export type AppSidebarProps = {
   currentPubkey?: string;
   fallbackDisplayName?: string;
   homeBadgeCount: number;
+  agentsHealthAlert?: boolean;
   isAddCommunityOpen?: boolean;
   isLoading: boolean;
   isCreatingChannel: boolean;

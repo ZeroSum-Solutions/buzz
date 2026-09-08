@@ -180,6 +180,7 @@ export default defineConfig({
         "**/agent-numeric-tuning.spec.ts",
         "**/needs-restart-screenshots.spec.ts",
         "**/team-catalog-screenshots.spec.ts",
+        "**/agent-health.spec.ts",
       ],
       // zs fork: the fork's GitHub runners are slower than upstream's and the smoke
       // shards fail unrelated specs on Playwright's 5 s default expect budget. Match
