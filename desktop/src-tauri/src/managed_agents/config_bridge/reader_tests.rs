@@ -72,6 +72,7 @@ fn test_runtime() -> &'static KnownAcpRuntime {
 
 fn test_record() -> ManagedAgentRecord {
     ManagedAgentRecord {
+        mcp_servers: None,
         description: None,
         pubkey: "test".to_string(),
         name: "Test Agent".to_string(),

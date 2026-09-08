@@ -25,20 +25,61 @@ pub const MAX_DOCUMENT_SERVERS: usize = 256;
 /// Inherited from buzz-acp (`crates/buzz-acp/src/lib.rs:5888`).
 pub const MAX_SERVERS_PER_AGENT: usize = 16;
 
-/// Largest accepted server name or id, in bytes.
-pub const MAX_NAME_LEN: usize = 64;
+/// Largest accepted registry id, in bytes.
+///
+/// An id never leaves the desktop: it keys the agent record's enabled list and
+/// nothing downstream reads it, so it keeps the wider bound.
+pub const MAX_ID_LEN: usize = 64;
+
+/// Largest accepted server name, in bytes.
+///
+/// Unified with the consumer (Sol W4). A name is the one operator string that
+/// crosses into `buzz-acp`, which caps a generated name at
+/// `MAX_MCP_NAME_LEN` — 32 bytes, budgeted against `buzz-agent`'s 64-byte
+/// qualified `<server>__<tool>` name — and refuses the **whole** handover
+/// document past it. A desktop that accepted 64 would write a document every
+/// registry-enabled agent then failed to start on.
+/// `mcp_registry_name_bounds_match_the_consumer` pins the two together.
+pub const MAX_NAME_LEN: usize = 32;
 
 /// Largest accepted number of command arguments on one entry.
 pub const MAX_ARGS: usize = 64;
 
 /// Largest accepted length of one command argument, in bytes.
+///
+/// Unified with `buzz_acp::mcp_registry::MAX_REGISTRY_ARG_LEN`: every one of
+/// these strings is copied verbatim into the generated launcher argv, which
+/// the consumer bounds at the same number.
 pub const MAX_ARG_LEN: usize = 1024;
 
 /// Largest accepted number of `env` entries on one server.
 pub const MAX_ENV_ENTRIES: usize = 32;
 
+/// Largest accepted `env` variable name, in bytes.
+///
+/// The launcher's own bound (`buzz_mcp_launch::cli::MAX_ENV_NAME_LEN`); a
+/// longer name would be refused by the process the desktop generated the
+/// argument for.
+pub const MAX_ENV_NAME_LEN: usize = 128;
+
 /// Largest accepted `env` value, in bytes.
-pub const MAX_ENV_VALUE_LEN: usize = 4 * 1024;
+///
+/// Derived, not chosen. Each declared variable is generated as one
+/// `NAME=VALUE` launcher argument, and `buzz-acp` refuses the whole handover
+/// document when any argument passes [`MAX_ARG_LEN`]. Deriving the value cap
+/// from the name cap and the argument cap makes the worst case fit by
+/// construction rather than by a number somebody has to keep in step.
+pub const MAX_ENV_VALUE_LEN: usize = MAX_ARG_LEN - MAX_ENV_NAME_LEN - 1;
+
+/// Largest accepted number of arguments on one **generated** launcher command
+/// line.
+///
+/// The bound that actually costs is the generated argv, not the entry's own
+/// `args`: the generator prepends the service flags, the mode, the server name
+/// and two arguments per declared variable, and `buzz-acp` bounds the sum.
+/// Bounding `args` alone let an entry with 64 arguments and 32 variables
+/// generate 135 and take every registry-enabled agent down at startup.
+pub const MAX_GENERATED_ARGS: usize = 64;
 
 /// Reserved name prefix; no registry server may use it.
 pub const RESERVED_NAME_PREFIX: &str = "buzz-";

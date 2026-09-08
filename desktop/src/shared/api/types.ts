@@ -551,6 +551,8 @@ export type AcpRuntimeCatalogEntry = {
    * read this one value so they cannot drift.
    */
   mcpConfigPlacement: McpConfigPlacement;
+  /** Whether the registry can configure this runtime at all. */
+  mcpRegistryAvailable: boolean;
   /** Transports the MCP registry may offer this runtime. */
   mcpTransports: McpTransport[];
   /**

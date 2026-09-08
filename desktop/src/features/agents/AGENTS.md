@@ -52,6 +52,21 @@ projected onto `AcpRuntimeCatalogEntry` and reach TypeScript as
 `mcp_config_root_env` shape was dropped. Design memo:
 `docs/plans/2026-09-04-mcp-registry-design.md` decision 11.
 
+**Reading them in the UI.** `serverSupport` in
+`features/settings/ui/mcpRegistryLogic.ts` is the one place a registry entry
+meets a runtime, and it asks `runtime.mcpTransports` — never `runtime.id`. It
+returns one of four states and the toggle acts on that value alone:
+`supported`; `rejected` with the Rust loader's own status string, which is the
+message the agent's spawn refuses with; `unsupported` when the runtime's
+catalog entry does not declare the transport the entry needs — an HTTP entry on
+buzz-agent, which is the case decision 2 names; and `runtime-unavailable` when
+the harness is not one the registry can configure at all. An unsupported entry
+is **refused with its reason**, never quietly left off, because an agent short
+a server it was told to have is a behaviour change the operator cannot see.
+Toggling *off* always succeeds, so a refused entry can still be removed
+(Review-Proven Rule 6). Adding a transport to a runtime is a `KnownAcpRuntime`
+edit and nothing else; no component learns a new id.
+
 ## Rules
 
 1. **No hardcoded harness-ID checks in render code.** `runtime.id === "claude"`

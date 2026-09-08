@@ -193,6 +193,7 @@ fn team_export_with_instance_and_memory_level_uses_supplied_entries() {
 
     // Build a fake instance record tied to this team+persona.
     let instance = ManagedAgentRecord {
+        mcp_servers: None,
         description: None,
         pubkey: "a".repeat(64),
         name: "Alice".to_string(),
