@@ -13,6 +13,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 MODE="${1:-all}"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$("${SCRIPT_DIR}/zs/cargo-target-dir.sh" root)}"
 
 # Colors
 RED='\033[0;31m'

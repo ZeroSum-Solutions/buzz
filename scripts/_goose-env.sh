@@ -10,6 +10,8 @@ _agents="$3"
 _heartbeat="$4"
 _prompt="${5:-}"
 
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$(scripts/zs/cargo-target-dir.sh root)}"
+export BUZZ_GOOSE_BINARY="$CARGO_TARGET_DIR/release/buzz-acp"
 cargo build --release -p buzz-acp -p buzz-cli
 
 env_args=(

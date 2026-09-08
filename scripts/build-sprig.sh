@@ -40,6 +40,8 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$("$SCRIPT_DIR/zs/cargo-target-dir.sh" root)}"
 VERSION="${1:-${VERSION:-0.0.0-dev}}"
 HOST_TARGET="$(rustc -vV | sed -n 's|host: ||p')"
 TARGET="${2:-${TARGET:-$HOST_TARGET}}"
@@ -73,10 +75,10 @@ if [[ "${USE_CROSS:-0}" == "1" ]] || [[ "$TARGET" != "$HOST_TARGET" ]]; then
         exit 1
     fi
     BUILDER=(cross build --profile "$BUILD_PROFILE" --target "$TARGET")
-    BIN_DIR="target/${TARGET}/${BUILD_PROFILE}"
+    BIN_DIR="${CARGO_TARGET_DIR}/${TARGET}/${BUILD_PROFILE}"
 else
     BUILDER=(cargo build --profile "$BUILD_PROFILE")
-    BIN_DIR="target/${BUILD_PROFILE}"
+    BIN_DIR="${CARGO_TARGET_DIR}/${BUILD_PROFILE}"
 fi
 
 if [[ "${SKIP_BUILD:-0}" == "1" ]]; then

@@ -21,9 +21,21 @@ const defaultTauriEntrypoint = path.resolve(
 function runTauri(args, options = {}) {
   const entrypoint =
     process.env.BUZZ_TAURI_CLI_ENTRYPOINT ?? defaultTauriEntrypoint;
+  const env = { ...process.env, ...options.env };
+  if (!env.CARGO_TARGET_DIR && (args[0] === "build" || args[0] === "dev")) {
+    const target = spawnSync(
+      "bash",
+      [path.join(desktopRoot, "../scripts/zs/cargo-target-dir.sh"), "desktop"],
+      { cwd: desktopRoot, env, encoding: "utf8" },
+    );
+    if (target.error) throw target.error;
+    if (target.status !== 0)
+      throw new Error("Could not select the Cargo target directory");
+    env.CARGO_TARGET_DIR = target.stdout.replace(/\n$/, "");
+  }
   const result = spawnSync(process.execPath, [entrypoint, ...args], {
     cwd: desktopRoot,
-    env: { ...process.env, ...options.env },
+    env,
     stdio: "inherit",
   });
   if (result.error) throw result.error;
