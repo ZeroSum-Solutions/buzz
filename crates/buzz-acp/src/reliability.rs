@@ -23,11 +23,13 @@ use chrono::{DateTime, Utc};
 pub mod error_class;
 pub mod health;
 pub mod ledger;
+pub mod notice_outbox;
 pub mod notices;
 pub mod park;
 pub mod runtime;
 pub mod state;
 pub mod state_dir;
+mod transaction;
 
 pub use error_class::{classify_at, sanitize_error_diagnostic};
 pub use park::{ParkError, ParkReason, ParkedBatch};
@@ -78,8 +80,10 @@ pub enum Action {
     Pause { until: DateTime<Utc> },
     /// Freeze this scope; probe every ten minutes.
     OpenBreaker,
-    /// Put the batch in the park file.
+    /// Put an authentication failure in the park file.
     Park,
+    /// Park with the state-machine reason preserved.
+    ParkFor(ParkReason),
 }
 
 #[cfg(test)]

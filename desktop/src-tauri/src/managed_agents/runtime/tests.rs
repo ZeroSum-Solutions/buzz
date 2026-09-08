@@ -1320,16 +1320,8 @@ fn test_command_execution_overrides_and_ignores_ambient_state_dir() {
     );
 }
 
-// T16 delta 1, finding 16 (prior #20): the only tests that existed before
-// this called `apply_state_dir_env` directly on a fresh `Command`, never
-// through the real ordering (`descriptor.env` loop, THEN the state-dir
-// override). `spawn_with_effort_proof` now requires a `StateDirApplied`
-// token to compile at all, so deleting the production call — or moving it
-// before `descriptor.env` the way this test simulates the opposite of — is a
-// compile error, not a silently-passing test. This test additionally proves
-// the ordering itself: a per-agent env override (`descriptor.env`) setting
-// the reserved key must still lose to the state-dir authority applied after
-// it, the exact production sequence in `spawn_agent_child`.
+// Direct helper behavior; the actual spawn-boundary regression below also
+// verifies authority when descriptor construction is reordered.
 #[test]
 fn test_state_dir_env_wins_over_a_descriptor_env_override() {
     let mut command = std::process::Command::new("buzz-acp");
@@ -1351,4 +1343,33 @@ fn test_state_dir_env_wins_over_a_descriptor_env_override() {
         Some(std::ffi::OsStr::new("/real/state/dir")),
         "the state-dir authority applied after descriptor.env must win, got: {value:?}"
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn state_dir_authority_is_final_at_the_actual_spawn_boundary() {
+    for expected in [Some(std::path::Path::new("/correct-state")), None] {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.env_clear();
+        command.arg("-c").arg(if expected.is_some() {
+            "test \"$BUZZ_ACP_STATE_DIR\" = /correct-state"
+        } else {
+            "test \"${BUZZ_ACP_STATE_DIR+x}\" != x"
+        });
+        let proof = super::apply_state_dir_env(&mut command, expected);
+        // A later descriptor layer must not defeat the authority carried to spawn.
+        command.env(super::STATE_DIR_ENV_VAR, "/untrusted-descriptor");
+        let mut child = super::spawn_with_effort_proof(
+            &mut command,
+            super::EffortApplied(()),
+            super::SystemPromptApplied(()),
+            super::McpEnvApplied(()),
+            proof,
+        )
+        .unwrap();
+        assert!(
+            child.wait().unwrap().success(),
+            "spawn did not enforce its state directory"
+        );
+    }
 }

@@ -33,6 +33,8 @@ pub use config::Config;
 /// A failure while reading or validating a harness configuration.
 pub use config::ConfigError;
 pub use usage::TurnUsage;
+// Typed observer handle for embedders driving the reliability runtime.
+pub use observer::ObserverHandle;
 
 /// The `session/new` delivery seam, re-exported for cross-crate end-to-end tests.
 ///
@@ -686,6 +688,7 @@ impl QueuedNormalListenerEvent {
         pool: &mut AgentPool,
         queue: &mut EventQueue,
         steer_ack_tx: &mpsc::UnboundedSender<SteerAckEvent>,
+        reliability: &mut reliability::ReliabilityRuntime,
     ) {
         if !self.accepted || !queue.is_scope_in_flight(&self.scope) {
             return;
@@ -693,6 +696,14 @@ impl QueuedNormalListenerEvent {
         let Some(signal) = mode_gate_signal(handling, &self.effective_author, owner) else {
             return;
         };
+        if matches!(signal, ControlSignal::Steer) {
+            if let Err(error) =
+                reliability.prepare_steer(self.event_for_steer.id, chrono::Utc::now())
+            {
+                tracing::error!(%error, "native steer remains queued until custody is durable");
+                return;
+            }
+        }
         let native_attempted = matches!(signal, ControlSignal::Steer)
             && try_native_steer(
                 pool,
@@ -703,12 +714,36 @@ impl QueuedNormalListenerEvent {
                 steer_ack_tx,
             );
         if !native_attempted {
+            if matches!(signal, ControlSignal::Steer) {
+                if let Err(error) = reliability.reject_steer(&self.event_id_hex, chrono::Utc::now())
+                {
+                    tracing::error!(%error, "native steer rejection awaits durable recovery");
+                    return;
+                }
+            }
             signal_in_flight_task_for_scope(pool, &self.scope, signal);
         }
     }
 }
 
 impl NormalListenerIngress {
+    fn persist(
+        &self,
+        runtime: &mut reliability::ReliabilityRuntime,
+        scope: &scope::SessionScope,
+    ) -> Result<bool, reliability::ParkError> {
+        runtime.admit_event(
+            &QueuedEvent {
+                channel_id: self.buzz_event.channel_id,
+                scope: scope.clone(),
+                event: self.buzz_event.event.clone(),
+                prompt_tag: self.prompt_tag.clone(),
+                received_at: std::time::Instant::now(),
+            },
+            chrono::Utc::now(),
+        )
+    }
+
     fn push(
         self,
         queue: &mut EventQueue,
@@ -1990,15 +2025,42 @@ fn handle_reliability_control(
         return;
     };
     let now = chrono::Utc::now();
+    let mut replay_batch_id = None;
+    let mut blocked_by = None;
     let status = match command {
         "replay_batch" => match control_batch_id(payload) {
             Some(batch_id) => match reliability.force_replay(batch_id) {
                 Ok(true) => {
-                    // Staging happens on the next successful turn for the
-                    // scope, through the same replay path an automatic replay
-                    // uses, so the ledger record still precedes the send.
-                    tracing::info!(%batch_id, "operator marked a parked batch for replay");
-                    "queued"
+                    let parked = reliability.park().get(batch_id).cloned();
+                    if let Some(parked) = parked {
+                        let scope = parked.scope();
+                        if queue.can_stage_replay(&scope) && reliability.notices_ready() {
+                            let plan = reliability::ReplayPlan {
+                                batch_ids: vec![batch_id],
+                                events: parked.to_batch_events(),
+                                scope: scope.clone(),
+                                channel_id: parked.channel_id,
+                            };
+                            match reliability.commit_replay(&plan, Uuid::new_v4(), now) {
+                                Ok(id) => {
+                                    replay_batch_id = Some(id);
+                                    if queue.is_scope_in_flight(&scope) {
+                                        blocked_by = Some("active_turn");
+                                    }
+                                    if !queue.stage_replay_with_id(scope, plan.events, id) {
+                                        blocked_by = Some("staging_refused");
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::error!(%error, "operator replay transaction pending");
+                                    blocked_by = Some("durability");
+                                }
+                            }
+                        } else {
+                            blocked_by = Some("pending_scope_or_notice");
+                        }
+                    }
+                    "scheduled"
                 }
                 Ok(false) => "unknown_batch",
                 Err(error) => {
@@ -2082,7 +2144,10 @@ fn handle_reliability_control(
             "control_result",
             None,
             &observer::ObserverContext::default(),
-            serde_json::json!({ "type": command, "status": status }),
+            serde_json::json!({ "type": command, "status": status,
+                "requestId": payload.get("requestId").and_then(|value| value.as_str()).and_then(|value| Uuid::parse_str(value).ok()),
+                "requestedBatchId": control_batch_id(payload), "replayBatchId": replay_batch_id,
+                "blockedBy": blocked_by }),
         );
     }
 }
@@ -2851,6 +2916,8 @@ async fn tokio_main() -> Result<()> {
 
     tracing::info!("connected to relay at {}", config.relay_url);
 
+    let mut channel_access_rx = relay.channel_access_receiver();
+    let mut channel_access_open = true;
     let relay_rest_client = relay.rest_client();
     let mut author_gate_ctx =
         InboundAuthorGate::connect(&relay_rest_client, &pubkey_hex, "startup").await;
@@ -2973,13 +3040,62 @@ async fn tokio_main() -> Result<()> {
         }
     };
 
+    // Durable custody must open successfully before subscriptions accept work.
+    let mut reliability = match reliability::ReliabilityRuntime::open(
+        &config.keys.public_key().to_hex(),
+        chrono::DateTime::from_timestamp(startup_watermark as i64, 0)
+            .ok_or_else(|| anyhow::anyhow!("invalid startup replay floor"))?,
+    )
+    .map(|runtime| {
+        runtime
+            .with_observer(observer.clone())
+            .with_channel_access(channel_access_rx.clone())
+    }) {
+        Ok(mut runtime) => {
+            match runtime.reconcile_on_start(chrono::Utc::now()) {
+                Ok(report) if !report.is_empty() => tracing::warn!(
+                    crashed_mid_replay = report.crashed_mid_replay,
+                    aged_out = report.aged_out,
+                    over_scope_cap = report.over_scope_cap,
+                    "parked batches moved to the review list at start-up"
+                ),
+                Ok(_) => {}
+                Err(error) => return Err(error.into()),
+            }
+            tracing::info!(
+                state_dir = %runtime.dir().display(),
+                parked = runtime.park().batches().len(),
+                "reliability state opened"
+            );
+            reliability::notice_outbox::initialize(runtime.dir(), &relay_rest_client)
+                .map_err(std::io::Error::other)?;
+            if let Err(error) = flush_pending_failure_notices(&mut runtime, &relay_rest_client) {
+                tracing::error!(%error, "pending failure notices block admission until durable enqueue succeeds");
+            }
+            Some(runtime)
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    let saved_replay_floor = reliability
+        .as_ref()
+        .expect("startup requires durable runtime")
+        .replay_floor();
+    relay
+        .set_startup_watermark(saved_replay_floor)
+        .await
+        .map_err(|error| anyhow::anyhow!("durable replay floor was not accepted: {error}"))?;
+
     let channel_filters = config::resolve_channel_filters(&config, &channel_ids, &rules);
     if channel_filters.is_empty() {
         tracing::warn!("no channel subscriptions resolved — agent will sit idle");
     }
     let mut subscribed_channel_ids = HashSet::with_capacity(channel_filters.len());
     for (channel_id, filter) in &channel_filters {
-        if let Err(e) = relay.subscribe_channel(*channel_id, filter.clone()).await {
+        if let Err(e) = relay
+            .subscribe_channel_from(*channel_id, filter.clone(), Some(saved_replay_floor))
+            .await
+        {
             tracing::warn!("failed to subscribe to channel {channel_id}: {e}");
         } else {
             subscribed_channel_ids.insert(*channel_id);
@@ -3004,47 +3120,10 @@ async fn tokio_main() -> Result<()> {
     let dedup_mode = config.dedup_mode;
     let mut queue =
         EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);
-
-    // T16 durable reliability state: the ledger and the park file in this
-    // agent's own state directory. The harness runs without it if the
-    // directory cannot be opened — a broken state directory must not stop the
-    // agent answering — but the failure is loud, because parking is what keeps
-    // messages from being lost.
-    let mut reliability = match reliability::ReliabilityRuntime::open(
-        &config.keys.public_key().to_hex(),
-        chrono::Utc::now(),
-    )
-    .map(|runtime| runtime.with_observer(observer.clone()))
-    {
-        Ok(mut runtime) => {
-            match runtime.reconcile_on_start(chrono::Utc::now()) {
-                Ok(report) if !report.is_empty() => tracing::warn!(
-                    crashed_mid_replay = report.crashed_mid_replay,
-                    aged_out = report.aged_out,
-                    over_scope_cap = report.over_scope_cap,
-                    "parked batches moved to the review list at start-up"
-                ),
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::error!(error = %error, "park file reconciliation failed at start-up")
-                }
-            }
-            tracing::info!(
-                state_dir = %runtime.dir().display(),
-                parked = runtime.park().batches().len(),
-                "reliability state opened"
-            );
-            Some(runtime)
-        }
-        Err(error) => {
-            tracing::error!(
-                error = %error,
-                "could not open the agent state directory — parked batches will NOT survive a \
-                 restart; set BUZZ_ACP_STATE_DIR to a writable path"
-            );
-            None
-        }
-    };
+    let mut pending_ingress: Option<(NormalListenerIngress, scope::SessionScope)> = None;
+    if let Some(runtime) = &reliability {
+        runtime.refill_ingress_for(&mut queue, &subscribed_channel_ids);
+    }
 
     // Online means the harness can receive work, not merely that its socket is
     // connected. Publishing after channel subscriptions gives desktop callers
@@ -3192,6 +3271,8 @@ async fn tokio_main() -> Result<()> {
     // starved by the biased select. Slot refill spawns background tasks so
     // spawn_and_init never blocks the main loop.
     let maintenance_interval = Duration::from_secs(30);
+    let mut maintenance_tick = tokio::time::interval(maintenance_interval);
+    maintenance_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_maintenance = std::time::Instant::now();
 
     // Channel for background respawn tasks to return completed agents.
@@ -3292,6 +3373,25 @@ async fn tokio_main() -> Result<()> {
     }
 
     loop {
+        let access = channel_access_rx.borrow().clone();
+        if access.overflowed {
+            return Err(anyhow::anyhow!("relay channel revocation capacity exceeded; dispatch stopped; reconcile channel memberships before restarting"));
+        }
+        for ch in access.denied {
+            subscribed_channel_ids.remove(&ch);
+            removed_channels.insert(ch);
+            queue.drain_channel(ch);
+            if pool_ready {
+                pool.invalidate_channel_sessions(ch);
+            }
+            typing_channels.retain(|scope, _| scope.channel_id() != ch);
+            if let Some(runtime) = reliability.as_mut() {
+                if let Err(error) = runtime.retain_revoked_channel(ch, chrono::Utc::now()) {
+                    tracing::error!(%error, channel_id = %ch, "revoked channel custody remains blocked pending durable review status");
+                }
+            }
+        }
+
         // Whether buffered work is waiting on a lazy pool. Also gates the
         // retry-deadline sleep arm below: a `Failed` lifecycle keeps its
         // (possibly past) `retry_at` until the next wake, so sleeping on it
@@ -3328,6 +3428,14 @@ async fn tokio_main() -> Result<()> {
             }
         }
 
+        if let Some(runtime) = reliability.as_mut() {
+            if !runtime.notices_ready() {
+                if let Err(error) = flush_pending_failure_notices(runtime, &relay_rest_client) {
+                    tracing::error!(%error, "failure notice remains in parked custody; admission is paused");
+                }
+            }
+        }
+
         probe_timer.rearm(reliability.as_mut());
 
         // While durable reliability state is unavailable, `push` must not
@@ -3336,9 +3444,50 @@ async fn tokio_main() -> Result<()> {
         // finding 8 / prior #4).
         queue.set_reliability_unavailable(reliability.is_none());
 
-        if pool_ready && last_maintenance.elapsed() >= maintenance_interval {
+        if last_maintenance.elapsed() >= maintenance_interval {
             last_maintenance = std::time::Instant::now();
             queue.compact_expired_state();
+            if let Some(runtime) = reliability.as_mut() {
+                if let Err(error) = runtime.recover_pending(chrono::Utc::now()) {
+                    tracing::error!(%error, "durable custody recovery remains blocked");
+                } else {
+                    if let Some((ingress, scope)) = pending_ingress.take() {
+                        match ingress.persist(runtime, &scope) {
+                            Ok(true) => {
+                                let queued = ingress.push(&mut queue, scope);
+                                queued.steer_or_interrupt(
+                                    config.multiple_event_handling,
+                                    owner_cache.get(),
+                                    &mut pool,
+                                    &mut queue,
+                                    &steer_ack_tx,
+                                    runtime,
+                                );
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                tracing::error!(%error, "pending ingress still awaits durable storage");
+                                pending_ingress = Some((ingress, scope));
+                            }
+                        }
+                    }
+                    if let Err(error) = runtime.stage_due_probes(
+                        &mut queue,
+                        &subscribed_channel_ids,
+                        chrono::Utc::now(),
+                    ) {
+                        tracing::error!(%error, "parked probe remains in durable custody");
+                    }
+                    runtime.refill_ingress_for(&mut queue, &subscribed_channel_ids);
+                    if let Err(error) = runtime.stage_forced_replays(
+                        &mut queue,
+                        &subscribed_channel_ids,
+                        chrono::Utc::now(),
+                    ) {
+                        tracing::error!(%error, "scheduled operator replay remains in durable custody");
+                    }
+                }
+            }
 
             if reliability.is_none() {
                 match reliability::ReliabilityRuntime::open(&pubkey_hex, chrono::Utc::now()) {
@@ -3353,7 +3502,7 @@ async fn tokio_main() -> Result<()> {
                             let _ = publish_presence(&presence_publisher, &presence_keys, "online")
                                 .await;
                         }
-                        reliability = Some(runtime);
+                        reliability = Some(runtime.with_channel_access(channel_access_rx.clone()));
                     }
                     Err(error) => {
                         tracing::warn!(error = %error, "periodic retry to reopen state directory failed");
@@ -3365,7 +3514,7 @@ async fn tokio_main() -> Result<()> {
             // circuit breaker allows it. spawn_and_init runs off the main
             // loop so it never blocks event processing.
             for (idx, slot) in crash_history.iter_mut().enumerate() {
-                if pool.slot_alive(idx) || slot.respawn_in_flight {
+                if !pool_ready || pool.slot_alive(idx) || slot.respawn_in_flight {
                     continue;
                 }
                 if !slot.can_refill() {
@@ -3390,7 +3539,7 @@ async fn tokio_main() -> Result<()> {
             // indefinitely on quiet channels — dispatch_pending is only
             // called on relay events or pool results, neither of which
             // arrive when the channel is silent.
-            if queue.has_flushable_work() {
+            if pool_ready && queue.has_flushable_work() {
                 for (scope, thread_tags) in dispatch_pending(
                     &mut pool,
                     &mut queue,
@@ -3544,6 +3693,10 @@ async fn tokio_main() -> Result<()> {
                                     reliability.as_mut(),
                                     &mut queue,
                                 );
+                                if pool_ready {
+                                    for (scope, tags) in dispatch_pending(&mut pool, &mut queue, &ctx,
+                                        &mut last_activity, reliability.as_mut()) { typing_channels.insert(scope, tags); }
+                                }
                             } else {
                                 tracing::warn!("observer control frame received but no owner resolved — dropping");
                             }
@@ -3556,7 +3709,12 @@ async fn tokio_main() -> Result<()> {
                     None
                 }
                 // Remaining branches don't touch pool — evaluated when pool is idle.
-                buzz_event = relay.next_event() => {
+                change = channel_access_rx.changed(), if channel_access_open => {
+                    if change.is_err() { channel_access_open = false; }
+                    None
+                }
+                buzz_event = relay.next_event(), if pending_ingress.is_none()
+                    && reliability.as_ref().is_some_and(|runtime| runtime.is_ready() && runtime.notices_ready()) => {
                     let _ = result_rx; // end split borrow before relay handling
                     match buzz_event {
                         Some(buzz_event) => {
@@ -3634,6 +3792,7 @@ async fn tokio_main() -> Result<()> {
                                 } else {
                                     subscribed_channel_ids.remove(&ch);
                                     tracing::info!(channel_id = %ch, "membership notification: unsubscribing from channel");
+                                    relay.note_channel_revoked(ch);
                                     if let Err(e) = relay.unsubscribe_channel(ch).await {
                                         tracing::warn!("failed to unsubscribe from channel {ch}: {e}");
                                     }
@@ -3650,6 +3809,11 @@ async fn tokio_main() -> Result<()> {
                                     // Track removed channels so checked-out agents get
                                     // their sessions stripped when they return to the pool.
                                     removed_channels.insert(ch);
+                                    if let Some(runtime) = reliability.as_mut() {
+                                        if let Err(error) = runtime.retain_revoked_channel(ch, chrono::Utc::now()) {
+                                            tracing::error!(%error, channel_id = %ch, "removed channel custody awaits durable review status");
+                                        }
+                                    }
                                     // Drop every thread scope's typing entry for
                                     // the removed channel.
                                     typing_channels.retain(|scope, _| scope.channel_id() != ch);
@@ -3876,6 +4040,19 @@ async fn tokio_main() -> Result<()> {
                                 policy = %config.session_policy,
                                 "admitted event — resolved session scope"
                             );
+                            let persisted = match reliability.as_mut() {
+                                Some(runtime) => ingress.persist(runtime, &session_scope),
+                                None => Err(reliability::ParkError::Io(std::io::Error::other("reliability unavailable"))),
+                            };
+                            match persisted {
+                                Ok(true) => {}
+                                Ok(false) => continue,
+                                Err(error) => {
+                                    tracing::error!(%error, "ingress admission failed; retaining input and suspending relay polling");
+                                    pending_ingress = Some((ingress, session_scope));
+                                    continue;
+                                }
+                            }
                             let queued = ingress.push(&mut queue, session_scope);
                             // 👀 — immediate "seen" reaction, only if the event
                             // was actually queued (not dropped by DedupMode::Drop).
@@ -3893,6 +4070,7 @@ async fn tokio_main() -> Result<()> {
                                 &mut pool,
                                 &mut queue,
                                 &steer_ack_tx,
+                                reliability.as_mut().expect("admission requires runtime"),
                             );
                             if pool_ready {
                                 for (scope, thread_tags) in
@@ -4051,9 +4229,15 @@ async fn tokio_main() -> Result<()> {
                     }
                     None
                 }
+                _ = maintenance_tick.tick() => None,
                 _ = probe_timer.tick() => {
                     let _ = result_rx;
                     if probe_timer.is_valid_wake(reliability.as_ref()) {
+                        if let Some(runtime) = reliability.as_mut() {
+                            if let Err(error) = runtime.stage_due_probes(&mut queue, &subscribed_channel_ids, chrono::Utc::now()) {
+                                tracing::error!(%error, "due parked probe awaits custody recovery");
+                            }
+                        }
                         if pool_ready {
                             // Always give dispatch a chance on a valid probe
                             // wake, even with nothing in the LIVE queue: a
@@ -4324,6 +4508,35 @@ async fn tokio_main() -> Result<()> {
                             event_id = %event_id,
                             "successful steer lost its in-flight delivery ledger"
                         );
+                    }
+                }
+                let definitely_rejected = matches!(
+                    &ack,
+                    Ok(pool::SteerAck::Err(
+                        pool::SteerError::ExpectedRunIdMissing
+                            | pool::SteerError::OutcomeRejected { .. }
+                            | pool::SteerError::AgentError { .. }
+                            | pool::SteerError::PromptCompleted
+                    ))
+                );
+                if !drop_withheld && !definitely_rejected {
+                    // A transport failure or lost acknowledgement cannot prove
+                    // that native injection did not start side effects.
+                    queue.remove_event(&scope, &event_id);
+                    tracing::error!(%event_id, "uncertain native steer retained for review; automatic replay suppressed");
+                    continue;
+                }
+                if let Some(runtime) = reliability.as_mut() {
+                    let now = chrono::Utc::now();
+                    let result = if drop_withheld {
+                        runtime.finish_steer(&event_id, now)
+                    } else {
+                        runtime.reject_steer(&event_id, now)
+                    };
+                    if let Err(error) = result {
+                        tracing::error!(%error, "native steer disposition remains in durable custody");
+                        queue.remove_event(&scope, &event_id);
+                        continue;
                     }
                 }
                 if drop_withheld {
@@ -4800,7 +5013,11 @@ fn dispatch_pending(
     // release them at the end so `flush_next` cannot re-pick them mid-loop;
     // releasing requeues them so the next dispatch (when the owner returns)
     // reuses that exact session instead of forking a duplicate.
-    if reliability.is_none() {
+    if reliability
+        .as_ref()
+        .is_none_or(|runtime| !runtime.is_ready() || !runtime.notices_ready())
+        || queue.has_parked_handoff()
+    {
         tracing::warn!(
             "reliability state unavailable — refusing to dispatch work without durable reliability"
         );
@@ -4911,12 +5128,20 @@ fn dispatch_pending(
             DedupMode::Queue => Some(batch.clone()),
             DedupMode::Drop => None,
         };
-        // Captured before the batch moves into the spawned task; the ledger
-        // record is written after the spawn so a failed claim writes nothing.
-        let dispatched_batch_id = batch.batch_id;
-        let dispatched_attempt = queue.retry_count(&scope);
-        let dispatched_event_ids: Vec<String> =
-            batch.events.iter().map(|be| be.event.id.to_hex()).collect();
+        // Durable event-id/start custody precedes the spawn. A crash after
+        // this boundary is uncertain work, never automatic replay.
+        if let Some(runtime) = reliability.as_deref_mut() {
+            if let Err(error) =
+                runtime.prepare_dispatch(&batch, queue.retry_count(&scope), chrono::Utc::now())
+            {
+                tracing::error!(%error, "dispatch custody commit failed; worker not started");
+                pool.return_agent(agent);
+                queue.requeue_preserve_timestamps(batch);
+                queue.mark_complete_preserving_retries(&scope);
+                runtime.release_probe(Some(&scope));
+                break;
+            }
+        }
 
         let result_tx = pool.result_tx();
         let ctx_clone = Arc::clone(ctx);
@@ -4970,20 +5195,6 @@ fn dispatch_pending(
         // Record this worker as the scope's session owner so a later dispatch
         // while it is busy holds instead of forking a duplicate session.
         pool.record_scope_owner(scope.clone(), agent_index);
-        if let Some(reliability) = reliability.as_deref_mut() {
-            reliability.record(
-                chrono::Utc::now(),
-                reliability::ledger::LedgerBody::TurnStarted(
-                    reliability::ledger::TurnStarted::new(
-                        dispatched_batch_id,
-                        channel_id,
-                        &scope.telemetry_label(),
-                        dispatched_event_ids,
-                        dispatched_attempt,
-                    ),
-                ),
-            );
-        }
         if is_pause_probe {
             // Exactly one bounded probe batch is selected for a pause probe.
             // Record which scope actually got dispatched so its terminal
@@ -5064,8 +5275,8 @@ fn spawn_failure_notice(
     rest_client: Option<&relay::RestClient>,
     batch: &FlushBatch,
     content: String,
-) {
-    spawn_failure_notice_with_ack(rest_client, batch, content, None);
+) -> Result<(), String> {
+    spawn_failure_notice_with_ack(rest_client, batch, content, None)
 }
 
 /// Spawn a task that posts a failure notice to the relay and sends an
@@ -5075,24 +5286,67 @@ fn spawn_failure_notice_with_ack(
     batch: &FlushBatch,
     content: String,
     ack: Option<(mpsc::UnboundedSender<pool::NoticeAck>, pool::NoticeAck)>,
-) {
+) -> Result<(), String> {
     if let Some(rest) = rest_client {
         let thread_tags = batch
             .events
             .last()
             .map(|be| queue::parse_thread_tags(&be.event))
             .unwrap_or_default();
-        let rest = rest.clone();
-        let channel_id = batch.channel_id;
-        tokio::spawn(async move {
-            let ok = pool::post_failure_notice(&rest, channel_id, &thread_tags, &content).await;
-            if ok {
-                if let Some((ack_tx, ack_val)) = ack {
-                    let _ = ack_tx.send(ack_val);
-                }
-            }
-        });
+        let event = pool::build_failure_notice(rest, batch.channel_id, &thread_tags, &content)?;
+        reliability::notice_outbox::enqueue(rest, batch.batch_id, event, ack)
+    } else {
+        Err("failure notice requires an initialized relay and durable outbox".into())
     }
+}
+
+/// Reconstruct unsent notice intent from durable park custody. A receipt closes
+/// the enqueue/park-marker crash gap without submitting a second signed event.
+fn flush_pending_failure_notices(
+    runtime: &mut reliability::ReliabilityRuntime,
+    rest: &relay::RestClient,
+) -> Result<(), String> {
+    reliability::notice_outbox::initialize(runtime.dir(), rest)?;
+    let batches: Vec<_> = runtime.park().batches().to_vec();
+    let ids = batches.iter().map(|batch| batch.batch_id).collect();
+    reliability::notice_outbox::retain_for_parked_batches(rest, &ids)?;
+    for parked in batches.into_iter().filter(|batch| batch.notice_pending) {
+        if !reliability::notice_outbox::contains_batch(rest, parked.batch_id)? {
+            let batch = FlushBatch {
+                batch_id: parked.batch_id,
+                channel_id: parked.channel_id,
+                scope: parked.scope(),
+                events: parked.to_batch_events(),
+                cancelled_events: Vec::new(),
+                cancel_reason: None,
+                started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(parked.started)),
+            };
+            let content = if parked.started {
+                reliability::notices::needs_review()
+            } else {
+                reliability::notices::parked(parked.reason.as_str())
+            };
+            let thread_tags = batch
+                .events
+                .last()
+                .map(|event| queue::parse_thread_tags(&event.event))
+                .unwrap_or_default();
+            let timestamp = u64::try_from(parked.parked_at.timestamp())
+                .map_err(|_| "invalid parked notice timestamp")?;
+            let event = pool::build_failure_notice_at(
+                rest,
+                batch.channel_id,
+                &thread_tags,
+                &content,
+                nostr::Timestamp::from_secs(timestamp),
+            )?;
+            reliability::notice_outbox::enqueue(rest, batch.batch_id, event, None)?;
+        }
+        runtime
+            .mark_notice_enqueued(parked.batch_id)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 /// What the reliability path did with a failed batch.
@@ -5124,6 +5378,14 @@ fn apply_reliability(
 
     let scope = batch.scope.clone();
     match outcome {
+        PromptOutcome::Ok(_) => {
+            if let Err(error) = reliability.finish_live(&batch, now) {
+                tracing::error!(%error, "successful turn custody release awaits durable recovery");
+            }
+            Disposition::Handled {
+                preserve_retries: false,
+            }
+        }
         PromptOutcome::Timeout(pool::TimeoutKind::Hard { recently_active }) => {
             // A hard cap means the agent process is gone. Nothing about a
             // retry is safe, so the batch is parked either way; only whether
@@ -5159,6 +5421,9 @@ fn apply_reliability(
             let action = reliability.state().on_failure(&scope, class.clone(), now);
             match action {
                 reliability::Action::Retry => Disposition::Fallthrough(batch),
+                reliability::Action::ParkFor(reason) => {
+                    park_or_fallthrough(reliability, batch, reason, started, rest_client, now)
+                }
                 reliability::Action::Park => {
                     // Auth: a re-login fixes it, a retry never does.
                     park_or_fallthrough(
@@ -5191,7 +5456,7 @@ fn apply_reliability(
                             &notice_batch,
                             reliability::notices::pause("", until, waiting),
                             ack,
-                        );
+                        ).unwrap_or_else(|error| tracing::error!(%error, "failure notice enqueue refused; durable custody retains retry intent"));
                     }
                     park_or_fallthrough(
                         reliability,
@@ -5225,7 +5490,7 @@ fn apply_reliability(
                             &notice_batch,
                             reliability::notices::breaker(""),
                             ack,
-                        );
+                        ).unwrap_or_else(|error| tracing::error!(%error, "failure notice enqueue refused; durable custody retains retry intent"));
                     }
                     park_or_fallthrough(
                         reliability,
@@ -5262,7 +5527,7 @@ fn notice_ledger_write_failure(
             rest_client,
             batch,
             reliability::notices::state_write_failures(ledger_after, park_after),
-        );
+        ).unwrap_or_else(|error| tracing::error!(%error, "failure notice enqueue refused; durable custody retains retry intent"));
     }
 }
 
@@ -5286,7 +5551,7 @@ fn park_or_fallthrough(
             } else {
                 reliability::notices::parked(reason.as_str())
             };
-            spawn_failure_notice(rest_client, &batch, content);
+            spawn_failure_notice(rest_client, &batch, content).unwrap_or_else(|error| tracing::error!(%error, "failure notice enqueue refused; durable custody retains retry intent"));
             notice_ledger_write_failure(&batch, failures_before, reliability, rest_client);
             let preserve_retries = matches!(
                 reason,
@@ -5329,7 +5594,7 @@ fn drain_park_handoff(
                     rest_client,
                     &handoff.batch,
                     reliability::notices::parked(reason.as_str()),
-                );
+                ).unwrap_or_else(|error| tracing::error!(%error, "failure notice enqueue refused; durable custody retains retry intent"));
                 notice_ledger_write_failure(
                     &handoff.batch,
                     failures_before,
@@ -5345,28 +5610,7 @@ fn drain_park_handoff(
                     error = %error,
                     "park file write failed — holding the batch in memory for the next attempt"
                 );
-                if let Err(handoff) = queue.return_unparked(handoff) {
-                    // The hand-off itself is full (MAX_PARK_HANDOFF), on top of
-                    // the park file being unwritable. `return_unparked` gives
-                    // the exact same handoff straight back rather than
-                    // dropping it — fall back to the live per-scope queue so
-                    // the events stay in the harness's custody (at-least-once,
-                    // subject to the ordinary per-scope cap) instead of being
-                    // lost the moment this function returns (T16 delta 1,
-                    // finding 1).
-                    tracing::error!(
-                        channel_id = %handoff.batch.channel_id,
-                        batch_id = %handoff.batch.batch_id,
-                        events = handoff.batch.events.len(),
-                        "park hand-off overflowed while the park file was unwritable — \
-                         returning the batch to the live queue instead of losing it; \
-                         the operator must fix the state directory"
-                    );
-                    let handoff = *handoff;
-                    let scope = handoff.batch.scope.clone();
-                    queue.requeue_preserve_timestamps(handoff.batch);
-                    queue.mark_complete_preserving_retries(scope);
-                }
+                queue.return_unparked(handoff);
             }
         }
     }
@@ -5390,16 +5634,6 @@ pub(crate) fn replay_after_success(
     // (`batch_replayed`, `turn_finished`) is what tells a later start-up that
     // the replay completed and must not run again.
     let report = reliability.finish_replay(scope);
-    for batch_id in report.released {
-        reliability.record(
-            now,
-            LedgerBody::TurnFinished(led::TurnFinished {
-                batch_id,
-                channel_id: scope.channel_id(),
-                outcome: led::TurnOutcome::Ok,
-            }),
-        );
-    }
     if let Some(error) = report.error {
         tracing::error!(
             error = %error,
@@ -5424,30 +5658,24 @@ pub(crate) fn replay_after_success(
     let Some(plan) = reliability.plan_replay(scope) else {
         return;
     };
-    if !queue.can_stage_replay(scope) {
+    if !queue.can_stage_replay(scope) || !reliability.notices_ready() {
         // A real cancel carryover is already staged for this scope; framing a
         // replay as an interrupted turn would misdescribe both. The batches
         // stay parked and replay after the next successful turn.
         return;
     }
-    let new_batch_id = Uuid::new_v4();
-    if let Err(error) = reliability.commit_replay(&plan, new_batch_id, now) {
-        tracing::error!(
-            error = %error,
-            "could not record the replay durably — not replaying, the batches stay parked"
-        );
-        return;
-    }
-    if queue.stage_replay(plan.scope.clone(), plan.events.clone()) {
-        reliability.mark_replay_in_flight(&plan);
-        tracing::info!(
-            channel_id = %plan.channel_id,
-            batches = plan.batch_ids.len(),
-            events = plan.events.len(),
-            "staged parked messages for replay ahead of newer events"
-        );
+    let new_batch_id = match reliability.commit_replay(&plan, Uuid::new_v4(), now) {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::error!(%error, "replay transaction pending; no prompt staged");
+            return;
+        }
+    };
+    if queue.stage_replay_with_id(plan.scope.clone(), plan.events.clone(), new_batch_id) {
+        tracing::info!(channel_id = %plan.channel_id, replay_batch_id = %new_batch_id,
+            "scheduled parked messages ahead of newer events");
     } else {
-        reliability.abandon_replay(&plan.scope);
+        tracing::error!(replay_batch_id = %new_batch_id, "replay staging refused; durable records remain for recovery");
     }
 }
 
@@ -5569,7 +5797,7 @@ fn handle_prompt_result(
                             let content = format!(
                                 "⚠️ I couldn't process the last request after multiple retries ({reason}). Please re-send if it's still needed."
                             );
-                            spawn_failure_notice(rest_client, &dead, content);
+                            spawn_failure_notice(rest_client, &dead, content).unwrap_or_else(|error| tracing::error!(%error, "failure notice enqueue refused; durable custody retains retry intent"));
                         }
                         None
                     }
@@ -5614,7 +5842,7 @@ fn handle_prompt_result(
                     "⚠️ I couldn't process the last request (the turn exceeded the maximum duration ({}s)). Please re-send if it's still needed.",
                     config.max_turn_duration_secs
                 );
-                    spawn_failure_notice(rest_client, &batch, content);
+                    spawn_failure_notice(rest_client, &batch, content).unwrap_or_else(|error| tracing::error!(%error, "failure notice enqueue refused; durable custody retains retry intent"));
                     hard_timeout_fate_suffix = Some(" — dead-lettered (no recent activity)");
                 } else if matches!(
                     result.outcome,
@@ -5632,7 +5860,7 @@ fn handle_prompt_result(
                         "⚠️ I couldn't process the last request after multiple retries (the turn exceeded the maximum duration ({}s)). Please re-send if it's still needed.",
                         config.max_turn_duration_secs
                     );
-                        spawn_failure_notice(rest_client, &dead, content);
+                        spawn_failure_notice(rest_client, &dead, content).unwrap_or_else(|error| tracing::error!(%error, "failure notice enqueue refused; durable custody retains retry intent"));
                         hard_timeout_fate_suffix =
                             Some(" — dead-lettered (retry budget exhausted)");
                     } else {
@@ -5652,7 +5880,7 @@ fn handle_prompt_result(
                     Please re-authenticate the CLI (e.g. run `claude /login` or `codex login`) \
                     and then re-send."
                         .to_string();
-                    spawn_failure_notice(rest_client, &batch, content);
+                    spawn_failure_notice(rest_client, &batch, content).unwrap_or_else(|error| tracing::error!(%error, "failure notice enqueue refused; durable custody retains retry intent"));
                 } else if let Some(dead) = queue.requeue(batch) {
                     let reason = match &result.outcome {
                         PromptOutcome::Timeout(TimeoutKind::Idle) => {
@@ -5673,7 +5901,7 @@ fn handle_prompt_result(
                     let content = format!(
                     "⚠️ I couldn't process the last request after multiple retries ({reason}). Please re-send if it's still needed."
                 );
-                    spawn_failure_notice(rest_client, &dead, content);
+                    spawn_failure_notice(rest_client, &dead, content).unwrap_or_else(|error| tracing::error!(%error, "failure notice enqueue refused; durable custody retains retry intent"));
                 }
             }
         } else {
@@ -6010,7 +6238,7 @@ fn recover_panicked_agent(
                                 rest_client,
                                 &batch,
                                 reliability::notices::needs_review(),
-                            );
+                            ).unwrap_or_else(|error| tracing::error!(%error, "failure notice enqueue refused; durable custody retains retry intent"));
                             tracing::warn!(
                                 "parked already-started batch for panicked agent {i} — \
                                  held for operator review, not requeued for auto-replay"
@@ -13363,1283 +13591,4 @@ mod observer_payload_trim_tests {
 }
 
 #[cfg(test)]
-mod reliability_dispatch_tests {
-    use super::*;
-
-    fn make_test_prompt_context() -> PromptContext {
-        let agent_keys = nostr::Keys::generate();
-        PromptContext {
-            mcp_servers: crate::McpServerSet::from_servers(vec![]),
-            initial_message: None,
-            idle_timeout: std::time::Duration::from_secs(60),
-            max_turn_duration: std::time::Duration::from_secs(120),
-            turn_liveness_interval: std::time::Duration::ZERO,
-            dedup_mode: config::DedupMode::Drop,
-            system_prompt: None,
-            session_title: None,
-            team_instructions: None,
-            heartbeat_prompt: None,
-            base_prompt: None,
-            cwd: ".".to_string(),
-            rest_client: relay::RestClient {
-                http: reqwest::Client::new(),
-                base_url: "http://127.0.0.1:0".to_string(),
-                keys: agent_keys.clone(),
-                auth_tag_json: None,
-            },
-            channel_info: pool::ChannelInfoResolver::new(
-                std::collections::HashMap::new(),
-                relay::RestClient {
-                    http: reqwest::Client::new(),
-                    base_url: "http://127.0.0.1:0".to_string(),
-                    keys: agent_keys.clone(),
-                    auth_tag_json: None,
-                },
-            ),
-            context_message_limit: 0,
-            max_turns_per_session: 0,
-            permission_mode: config::PermissionMode::Default,
-            agent_keys,
-            agent_owner_pubkey: None,
-            memory_enabled: false,
-            harness_name: "test".to_string(),
-            relay_url: "http://127.0.0.1:0".to_string(),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_pending_does_not_leak_probe_permit_on_hold() {
-        let dir = tempfile::tempdir().unwrap();
-        let now = chrono::Utc::now();
-        let mut runtime =
-            reliability::ReliabilityRuntime::open_in(dir.path(), "test-agent", now).unwrap();
-
-        let channel_id = uuid::Uuid::new_v4();
-        let scope = scope::SessionScope::Conversation { channel_id };
-
-        // Set pause expired in the past: 40 mins ago, reset was at 30 mins (10 mins ago).
-        let t0 = now - chrono::Duration::minutes(40);
-        runtime.state().on_failure(
-            &scope,
-            reliability::ErrorClass::CapacityExhausted {
-                resets_at: Some(t0 + chrono::Duration::minutes(30)),
-            },
-            t0,
-        );
-
-        // Queue has a batch ready to dispatch.
-        let mut queue = EventQueue::new(config::DedupMode::Queue);
-        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "probe event")
-            .tags([])
-            .sign_with_keys(&nostr::Keys::generate())
-            .unwrap();
-        queue.push(queue::QueuedEvent {
-            channel_id,
-            scope: scope.clone(),
-            event,
-            received_at: std::time::Instant::now(),
-            prompt_tag: "p".into(),
-        });
-
-        // Pool has no available workers (simulating a hold / pool exhausted).
-        let mut pool = AgentPool::from_slots(vec![]);
-        let ctx = std::sync::Arc::new(make_test_prompt_context());
-        let mut last_activity = tokio::time::Instant::now();
-
-        // Calling dispatch_pending encounters the probe, but holds because pool is exhausted.
-        let dispatched = dispatch_pending(
-            &mut pool,
-            &mut queue,
-            &ctx,
-            &mut last_activity,
-            Some(&mut runtime),
-        );
-        assert!(
-            dispatched.is_empty(),
-            "no tasks should be dispatched with empty pool"
-        );
-
-        // A subsequent pause_gate(now) call MUST still return Probe (not stuck Held).
-        assert_eq!(
-            runtime.state().pause_gate(now),
-            reliability::PauseGate::Probe,
-            "probe permit must not be leaked on hold"
-        );
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn test_park_failure_does_not_discard_batch_on_hard_timeout_or_auth() {
-        use crate::error_outcome_emission_tests::{dummy_agent, test_config};
-        use crate::queue::BatchEvent;
-        use std::os::unix::fs::PermissionsExt;
-
-        let check = |outcome: PromptOutcome| async move {
-            let dir = tempfile::tempdir().unwrap();
-            let now = chrono::Utc::now();
-            let mut runtime =
-                reliability::ReliabilityRuntime::open_in(dir.path(), "test-agent", now).unwrap();
-
-            let channel_id = uuid::Uuid::new_v4();
-            let scope = scope::SessionScope::Conversation { channel_id };
-
-            let keys = nostr::Keys::generate();
-            let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "test")
-                .tags([])
-                .sign_with_keys(&keys)
-                .unwrap();
-            let batch = FlushBatch {
-                batch_id: uuid::Uuid::new_v4(),
-                channel_id,
-                scope: scope.clone(),
-                events: vec![BatchEvent {
-                    event,
-                    prompt_tag: "test".into(),
-                    received_at: std::time::Instant::now(),
-                }],
-                cancelled_events: vec![],
-                cancel_reason: None,
-                started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            };
-
-            let agent = dummy_agent(0).await;
-            let mut pool = AgentPool::from_slots(vec![None]);
-            let task_id = pool.join_set.spawn(async {}).id();
-            pool.task_map_mut().insert(
-                task_id,
-                crate::pool::TaskMeta {
-                    agent_index: 0,
-                    channel_id: None,
-                    scope: None,
-                    turn_id: "test-turn-id".to_string(),
-                    recoverable_batch: None,
-                    control_tx: None,
-                    steer_tx: None,
-                    successful_steer_deliveries: std::collections::HashSet::new(),
-                },
-            );
-
-            let mut queue = EventQueue::new(config::DedupMode::Queue);
-            let config = test_config();
-            let mut heartbeat_in_flight = false;
-            let removed_channels = std::collections::HashSet::new();
-            let mut crash_history = vec![SlotCircuit {
-                crash_times: Vec::new(),
-                open_until: None,
-                respawn_in_flight: false,
-            }];
-            let (respawn_tx, _respawn_rx) = tokio::sync::mpsc::channel(8);
-            let mut respawn_tasks = tokio::task::JoinSet::new();
-
-            let result = PromptResult {
-                started: false,
-                agent,
-                source: PromptSource::Channel(scope.clone()),
-                turn_id: "test-turn-id".to_string(),
-                outcome,
-                batch: Some(batch),
-            };
-
-            // Make the state dir unwritable so park_batch fails.
-            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
-
-            handle_prompt_result(
-                &mut pool,
-                &mut queue,
-                &config,
-                result,
-                &mut heartbeat_in_flight,
-                &removed_channels,
-                &mut crash_history,
-                &respawn_tx,
-                &mut respawn_tasks,
-                None,
-                None,
-                Some(&mut runtime),
-            );
-
-            // Restore permissions for tempdir cleanup.
-            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-
-            // Assert the batch is still present in the queue or park hand-off, never dropped.
-            let in_queue = queue.queued_event_count(channel_id) > 0;
-            let in_handoff = queue.has_parked_handoff();
-            assert!(
-                in_queue || in_handoff,
-                "batch must be present in queue or park hand-off, but was dropped"
-            );
-        };
-
-        // Case 1: Hard timeout with recently_active = false
-        check(PromptOutcome::Timeout(pool::TimeoutKind::Hard {
-            recently_active: false,
-        }))
-        .await;
-
-        // Case 2: Bare auth error
-        check(PromptOutcome::Error(acp::AcpError::AgentError {
-            code: -32000,
-            message: "API Error: 401 Unauthorized".to_string(),
-        }))
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_pause_held_batch_is_durable_across_restart() {
-        use crate::error_outcome_emission_tests::{dummy_agent, test_config};
-        use crate::queue::BatchEvent;
-
-        let dir = tempfile::tempdir().unwrap();
-        let pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let now = chrono::Utc::now();
-        let mut runtime =
-            reliability::ReliabilityRuntime::open_in(dir.path(), pubkey, now).unwrap();
-
-        let channel_id = uuid::Uuid::new_v4();
-        let scope = scope::SessionScope::Conversation { channel_id };
-
-        let keys = nostr::Keys::generate();
-        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "held message")
-            .tags([])
-            .sign_with_keys(&keys)
-            .unwrap();
-        let batch_id = uuid::Uuid::new_v4();
-        let batch = FlushBatch {
-            batch_id,
-            channel_id,
-            scope: scope.clone(),
-            events: vec![BatchEvent {
-                event,
-                prompt_tag: "test".into(),
-                received_at: std::time::Instant::now(),
-            }],
-            cancelled_events: vec![],
-            cancel_reason: None,
-            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        };
-
-        let agent = dummy_agent(0).await;
-        let mut pool = AgentPool::from_slots(vec![None]);
-        let task_id = pool.join_set.spawn(async {}).id();
-        pool.task_map_mut().insert(
-            task_id,
-            crate::pool::TaskMeta {
-                agent_index: 0,
-                channel_id: None,
-                scope: None,
-                turn_id: "test-turn-id".to_string(),
-                recoverable_batch: None,
-                control_tx: None,
-                steer_tx: None,
-                successful_steer_deliveries: std::collections::HashSet::new(),
-            },
-        );
-
-        let mut queue = EventQueue::new(config::DedupMode::Queue);
-        let config = test_config();
-        let mut heartbeat_in_flight = false;
-        let removed_channels = std::collections::HashSet::new();
-        let mut crash_history = vec![SlotCircuit {
-            crash_times: Vec::new(),
-            open_until: None,
-            respawn_in_flight: false,
-        }];
-        let (respawn_tx, _respawn_rx) = tokio::sync::mpsc::channel(8);
-        let mut respawn_tasks = tokio::task::JoinSet::new();
-
-        // Error that triggers Action::Pause: session limit resets at 4:20am
-        let outcome = PromptOutcome::Error(acp::AcpError::AgentError {
-            code: -32603,
-            message: "Internal error: You've hit your session limit · resets 4:20am (America/Los_Angeles)".to_string(),
-        });
-
-        let result = PromptResult {
-            started: false,
-            agent,
-            source: PromptSource::Channel(scope.clone()),
-            turn_id: "test-turn-id".to_string(),
-            outcome,
-            batch: Some(batch),
-        };
-
-        handle_prompt_result(
-            &mut pool,
-            &mut queue,
-            &config,
-            result,
-            &mut heartbeat_in_flight,
-            &removed_channels,
-            &mut crash_history,
-            &respawn_tx,
-            &mut respawn_tasks,
-            None,
-            None,
-            Some(&mut runtime),
-        );
-
-        // Process restarts: drop runtime, queue, and simulated relay state
-        drop(runtime);
-        drop(queue);
-
-        let restart_now = now + chrono::Duration::seconds(10);
-        let restarted =
-            reliability::ReliabilityRuntime::open_in(dir.path(), pubkey, restart_now).unwrap();
-
-        // The held message must be recoverable (present in park file)
-        assert!(
-            restarted.park().contains(batch_id),
-            "held message must be durable in park file across restart, not silently gone"
-        );
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn test_state_dir_failure_refuses_work_and_picks_up_on_reopen() {
-        use crate::error_outcome_emission_tests::dummy_agent;
-        use std::os::unix::fs::PermissionsExt;
-
-        let parent = tempfile::tempdir().unwrap();
-        let state_dir = parent.path().join("state");
-        let pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let now = chrono::Utc::now();
-
-        // 1. Start with an unwritable state dir (parent is read-only)
-        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
-        let initial_open = reliability::ReliabilityRuntime::open_in(&state_dir, pubkey, now);
-        assert!(
-            initial_open.is_err(),
-            "open must fail when state dir is unwritable"
-        );
-
-        // 2. Setup queue with pending work and an agent ready in the pool
-        let mut queue = EventQueue::new(config::DedupMode::Queue);
-        let channel_id = uuid::Uuid::new_v4();
-        let scope = scope::SessionScope::Conversation { channel_id };
-        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "work")
-            .tags([])
-            .sign_with_keys(&nostr::Keys::generate())
-            .unwrap();
-        queue.push(queue::QueuedEvent {
-            channel_id,
-            scope: scope.clone(),
-            event,
-            received_at: std::time::Instant::now(),
-            prompt_tag: "p".into(),
-        });
-
-        let agent = dummy_agent(0).await;
-        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
-        let ctx = std::sync::Arc::new(make_test_prompt_context());
-        let mut last_activity = tokio::time::Instant::now();
-
-        // 3. Dispatching with reliability = None MUST refuse to dispatch work
-        let dispatched = dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity, None);
-        assert!(
-            dispatched.is_empty(),
-            "must not dispatch work when reliability state is unavailable"
-        );
-        assert_eq!(
-            queue.queued_event_count(channel_id),
-            1,
-            "work must remain in the queue rather than being accepted/discarded"
-        );
-
-        // 4. Later, the directory is made writable
-        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let mut runtime = reliability::ReliabilityRuntime::open_in(&state_dir, pubkey, now)
-            .expect("reopen must succeed once dir is writable");
-
-        // 5. Work is now picked up and dispatched
-        let dispatched = dispatch_pending(
-            &mut pool,
-            &mut queue,
-            &ctx,
-            &mut last_activity,
-            Some(&mut runtime),
-        );
-        assert!(
-            !dispatched.is_empty(),
-            "work must be dispatched once reliability state is open"
-        );
-        assert_eq!(queue.queued_event_count(channel_id), 0);
-    }
-
-    #[tokio::test]
-    async fn test_probe_timer_fires_without_external_relay_event() {
-        use crate::error_outcome_emission_tests::dummy_agent;
-        let dir = tempfile::tempdir().unwrap();
-        let now = chrono::Utc::now();
-        let pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let mut runtime =
-            reliability::ReliabilityRuntime::open_in(dir.path(), pubkey, now).unwrap();
-
-        let channel_id = uuid::Uuid::new_v4();
-        let scope = scope::SessionScope::Conversation { channel_id };
-
-        // 1. Enter Paused with a short until (50ms in future)
-        let until = now + chrono::Duration::milliseconds(50);
-        runtime.state().on_failure(
-            &scope,
-            reliability::ErrorClass::CapacityExhausted {
-                resets_at: Some(until),
-            },
-            now,
-        );
-
-        // 2. Queue work for scope
-        let mut queue = EventQueue::new(config::DedupMode::Queue);
-        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "work")
-            .tags([])
-            .sign_with_keys(&nostr::Keys::generate())
-            .unwrap();
-        queue.push(queue::QueuedEvent {
-            channel_id,
-            scope: scope.clone(),
-            event,
-            received_at: std::time::Instant::now(),
-            prompt_tag: "p".into(),
-        });
-
-        // 3. Pool has an agent ready
-        let agent = dummy_agent(0).await;
-        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
-        let ctx = std::sync::Arc::new(make_test_prompt_context());
-        let mut last_activity = tokio::time::Instant::now();
-
-        // 4. All optional timers disabled:
-        let mut heartbeat: Option<tokio::time::Interval> = None;
-        let mut presence_heartbeat: Option<tokio::time::Interval> = None;
-        let mut typing_refresh: Option<tokio::time::Interval> = None;
-        let mut inactivity_reaper: Option<tokio::time::Interval> = None;
-        let mut idle_pool_sleep_reaper: Option<tokio::time::Interval> = None;
-
-        // 5. Probe timer arm is armed
-        let mut probe_timer = ProbeTimerArm::new();
-        probe_timer.rearm(Some(&mut runtime));
-
-        // 6. Run select with no external relay event
-        let dispatched = tokio::time::timeout(std::time::Duration::from_millis(500), async {
-            tokio::select! {
-                _ = async {
-                    match heartbeat.as_mut() {
-                        Some(t) => t.tick().await,
-                        None => std::future::pending().await,
-                    }
-                } => false,
-                _ = async {
-                    match presence_heartbeat.as_mut() {
-                        Some(t) => t.tick().await,
-                        None => std::future::pending().await,
-                    }
-                } => false,
-                _ = async {
-                    match typing_refresh.as_mut() {
-                        Some(t) => t.tick().await,
-                        None => std::future::pending().await,
-                    }
-                } => false,
-                _ = async {
-                    match inactivity_reaper.as_mut() {
-                        Some(t) => t.tick().await,
-                        None => std::future::pending().await,
-                    }
-                } => false,
-                _ = async {
-                    match idle_pool_sleep_reaper.as_mut() {
-                        Some(t) => t.tick().await,
-                        None => std::future::pending().await,
-                    }
-                } => false,
-                _ = std::future::pending::<()>() => false, // no external relay event
-                _ = probe_timer.tick() => {
-                    if probe_timer.is_valid_wake(Some(&runtime)) {
-                        let res = dispatch_pending(
-                            &mut pool,
-                            &mut queue,
-                            &ctx,
-                            &mut last_activity,
-                            Some(&mut runtime),
-                        );
-                        !res.is_empty()
-                    } else {
-                        false
-                    }
-                }
-            }
-        })
-        .await
-        .expect("probe timer must fire without external relay event before timeout");
-
-        assert!(dispatched, "probe must have been dispatched");
-        assert_eq!(
-            queue.queued_event_count(channel_id),
-            0,
-            "queued event should have been dispatched"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_dispatch_pending_short_circuits_global_pause_in_o1() {
-        use crate::error_outcome_emission_tests::dummy_agent;
-        let dir = tempfile::tempdir().unwrap();
-        let now = chrono::Utc::now();
-        let pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let mut runtime =
-            reliability::ReliabilityRuntime::open_in(dir.path(), pubkey, now).unwrap();
-
-        // 1. Enter Paused with until in the future (30 minutes)
-        let until = now + chrono::Duration::minutes(30);
-        let channel_id_0 = uuid::Uuid::new_v4();
-        let scope_0 = scope::SessionScope::Conversation {
-            channel_id: channel_id_0,
-        };
-        runtime.state().on_failure(
-            &scope_0,
-            reliability::ErrorClass::CapacityExhausted {
-                resets_at: Some(until),
-            },
-            now,
-        );
-
-        // 2. Queue work for 50 distinct scopes
-        let mut queue = EventQueue::new(config::DedupMode::Queue);
-        for _ in 0..50 {
-            let ch = uuid::Uuid::new_v4();
-            let sc = scope::SessionScope::Conversation { channel_id: ch };
-            let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "work")
-                .tags([])
-                .sign_with_keys(&nostr::Keys::generate())
-                .unwrap();
-            queue.push(queue::QueuedEvent {
-                channel_id: ch,
-                scope: sc,
-                event,
-                received_at: std::time::Instant::now(),
-                prompt_tag: "p".into(),
-            });
-        }
-        assert_eq!(queue.pending_channels(), 50);
-
-        let agent = dummy_agent(0).await;
-        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
-        let ctx = std::sync::Arc::new(make_test_prompt_context());
-        let mut last_activity = tokio::time::Instant::now();
-
-        let flushes_before = queue.flush_count();
-        let dispatched = dispatch_pending(
-            &mut pool,
-            &mut queue,
-            &ctx,
-            &mut last_activity,
-            Some(&mut runtime),
-        );
-
-        assert!(
-            dispatched.is_empty(),
-            "no work should be dispatched during pause"
-        );
-        let flushes_after = queue.flush_count();
-        // Without fix, flush_count increments by 51 (O(scopes)). With O(1) short-circuit, it increments by 0.
-        assert_eq!(
-            flushes_after - flushes_before,
-            0,
-            "dispatch_pending must short-circuit without calling flush_next when paused"
-        );
-        assert_eq!(queue.pending_channels(), 50, "all 50 scopes remain queued");
-    }
-
-    #[tokio::test]
-    async fn test_panicked_agent_after_output_parks_with_started_true_and_needs_review() {
-        let dir = tempfile::tempdir().unwrap();
-        let now = chrono::Utc::now();
-        let pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let mut runtime =
-            reliability::ReliabilityRuntime::open_in(dir.path(), pubkey, now).unwrap();
-
-        let mut queue = EventQueue::new(config::DedupMode::Queue);
-        let channel_id = uuid::Uuid::new_v4();
-        let scope = scope::SessionScope::Conversation { channel_id };
-
-        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "work")
-            .tags([])
-            .sign_with_keys(&nostr::Keys::generate())
-            .unwrap();
-        queue.push(queue::QueuedEvent {
-            channel_id,
-            scope: scope.clone(),
-            event,
-            received_at: std::time::Instant::now(),
-            prompt_tag: "p".into(),
-        });
-
-        let batch = queue.flush_next().unwrap();
-        // Agent started turn and emitted output before panicking
-        batch.mark_started();
-        assert!(batch.is_started());
-
-        // Exhaust retries: MAX_RETRIES attempts, then the next requeue moves it to parked_out
-        for _ in 0..queue::MAX_RETRIES {
-            let _ = queue.requeue(batch.clone());
-        }
-        let exhausted = queue.requeue(batch.clone());
-        assert!(
-            exhausted.is_none(),
-            "requeue must return None when retries are exhausted"
-        );
-
-        // Drain park handoff
-        drain_park_handoff(&mut runtime, &mut queue, None, now);
-
-        let parked = runtime.park().batches();
-        assert_eq!(parked.len(), 1, "exactly one batch should be parked");
-        let parked_batch = &parked[0];
-        assert!(
-            parked_batch.started,
-            "parked batch must have started == true"
-        );
-        assert!(
-            parked_batch.needs_review,
-            "parked batch must have needs_review == true"
-        );
-        assert_eq!(
-            parked_batch.needs_review_reason.as_deref(),
-            Some("interrupted after it had started")
-        );
-        assert!(
-            !parked_batch.replay_eligible(),
-            "parked batch that started must not be replay-eligible"
-        );
-    }
-
-    // T16 delta 1, finding 10 (prior #8): the production panic-recovery seam
-    // itself — not a hand-rolled `mark_started` + `queue.requeue` sequence —
-    // must carry `started` through to the park file. Before the fix,
-    // `recover_panicked_agent` called plain `queue.requeue(batch)`, which
-    // deconstructs the batch into `QueuedEvent`s and drops the shared
-    // `started` `Arc` entirely; the next flush built a fresh batch with
-    // `started` defaulting back to `false`.
-    #[tokio::test]
-    async fn panicked_agent_with_output_is_parked_directly_as_needs_review() {
-        let dir = tempfile::tempdir().unwrap();
-        let now = chrono::Utc::now();
-        let pubkey = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345678";
-        let mut runtime =
-            reliability::ReliabilityRuntime::open_in(dir.path(), pubkey, now).unwrap();
-
-        let mut pool = AgentPool::from_slots(vec![]);
-        let mut queue = EventQueue::new(config::DedupMode::Queue);
-        let channel_id = Uuid::new_v4();
-        let scope = scope::SessionScope::Conversation { channel_id };
-
-        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "work")
-            .tags([])
-            .sign_with_keys(&nostr::Keys::generate())
-            .unwrap();
-        queue.push(queue::QueuedEvent {
-            channel_id,
-            scope: scope.clone(),
-            event,
-            received_at: std::time::Instant::now(),
-            prompt_tag: "p".into(),
-        });
-        let batch = queue.flush_next().expect("flush batch");
-        // The agent produced output/a tool call before it panicked.
-        batch.mark_started();
-        assert!(batch.is_started());
-
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let abort_handle = pool.join_set.spawn(async move {
-            let _ = started_tx.send(());
-            std::future::pending::<()>().await;
-        });
-        pool.task_map_mut().insert(
-            abort_handle.id(),
-            crate::pool::TaskMeta {
-                agent_index: 0,
-                channel_id: Some(channel_id),
-                scope: Some(scope.clone()),
-                turn_id: "panic-turn-id".to_string(),
-                recoverable_batch: Some(batch),
-                control_tx: None,
-                steer_tx: None,
-                successful_steer_deliveries: HashSet::new(),
-            },
-        );
-        started_rx.await.unwrap();
-        abort_handle.abort();
-        let join_error = pool.join_set.join_next().await.unwrap().unwrap_err();
-
-        let config = crate::error_outcome_emission_tests::test_config();
-        let mut heartbeat_in_flight = false;
-        let removed_channels = HashSet::new();
-        let mut typing_channels = HashMap::new();
-        let mut crash_history = vec![SlotCircuit {
-            crash_times: Vec::new(),
-            open_until: Some(std::time::Instant::now() + Duration::from_secs(3600)),
-            respawn_in_flight: false,
-        }];
-        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
-        let mut respawn_tasks = tokio::task::JoinSet::new();
-
-        recover_panicked_agent(
-            &mut pool,
-            &mut queue,
-            &config,
-            join_error,
-            &mut heartbeat_in_flight,
-            &removed_channels,
-            &mut typing_channels,
-            &mut crash_history,
-            &respawn_tx,
-            &mut respawn_tasks,
-            None,
-            None,
-            Some(&mut runtime),
-        );
-
-        assert!(
-            !queue.has_undispatched_work(),
-            "an already-started batch must never re-enter the ordinary retry \
-             queue — it was parked directly instead"
-        );
-        let parked = runtime.park().batches();
-        assert_eq!(
-            parked.len(),
-            1,
-            "the panicked batch must be parked, not requeued"
-        );
-        assert!(
-            parked[0].started,
-            "batch that produced output before panicking must park with started == true"
-        );
-        assert!(
-            parked[0].needs_review,
-            "an already-started parked batch must be held for operator review"
-        );
-        assert!(
-            !parked[0].replay_eligible(),
-            "an already-started parked batch must not be auto-replay-eligible"
-        );
-    }
-
-    // T16 delta 1, finding 13 (prior #14b): `park_batch` durably writes the
-    // park file even when its OWN follow-up `batch_parked` ledger record
-    // fails to append. The batch is not lost — but nothing beyond a log line
-    // told the operator the audit trail was incomplete. `park_or_fallthrough`
-    // now checks `write_failures()` and sends the (previously dead-code)
-    // `state_write_failures` notice on exactly this gap.
-    #[test]
-    #[cfg(unix)]
-    fn park_or_fallthrough_reports_a_ledger_write_failure_even_though_the_batch_still_parks() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let now = chrono::Utc::now();
-        let pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let mut runtime =
-            reliability::ReliabilityRuntime::open_in(dir.path(), pubkey, now).unwrap();
-
-        let channel_id = Uuid::new_v4();
-        let scope = scope::SessionScope::Conversation { channel_id };
-        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "x")
-            .tags([])
-            .sign_with_keys(&nostr::Keys::generate())
-            .unwrap();
-        let batch = FlushBatch {
-            batch_id: Uuid::new_v4(),
-            channel_id,
-            scope,
-            events: vec![queue::BatchEvent {
-                event,
-                prompt_tag: "t".into(),
-                received_at: std::time::Instant::now(),
-            }],
-            cancelled_events: vec![],
-            cancel_reason: None,
-            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        };
-
-        // Ledger unwritable, park file (and its directory) stay writable.
-        let ledger_path = dir.path().join("ledger.jsonl");
-        let original_mode = std::fs::metadata(&ledger_path)
-            .unwrap()
-            .permissions()
-            .mode();
-        std::fs::set_permissions(&ledger_path, std::fs::Permissions::from_mode(0o400)).unwrap();
-
-        let failures_before = runtime.write_failures();
-        let disposition = park_or_fallthrough(
-            &mut runtime,
-            batch,
-            reliability::ParkReason::RetriesExhausted,
-            false,
-            None,
-            now,
-        );
-
-        let _ =
-            std::fs::set_permissions(&ledger_path, std::fs::Permissions::from_mode(original_mode));
-
-        assert!(
-            matches!(disposition, Disposition::Handled { .. }),
-            "the batch is durably parked and must count as Handled even though \
-             its ledger record failed"
-        );
-        assert_eq!(
-            runtime.park().batches().len(),
-            1,
-            "the batch itself must still be durably parked"
-        );
-        let failures_after = runtime.write_failures();
-        assert!(
-            failures_after.0 > failures_before.0,
-            "a ledger append failure inside park_batch must be visible through \
-             write_failures(), which is what gates the state_write_failures notice"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_failure_notice_not_consumed_until_ack_received() {
-        use crate::error_outcome_emission_tests::dummy_agent;
-
-        let dir = tempfile::tempdir().unwrap();
-        let now = chrono::Utc::now();
-        let pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let mut runtime =
-            reliability::ReliabilityRuntime::open_in(dir.path(), pubkey, now).unwrap();
-
-        let channel_id = uuid::Uuid::new_v4();
-        let scope = scope::SessionScope::Conversation { channel_id };
-
-        let mut queue = EventQueue::new(config::DedupMode::Queue);
-        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "work")
-            .tags([])
-            .sign_with_keys(&nostr::Keys::generate())
-            .unwrap();
-        queue.push(queue::QueuedEvent {
-            channel_id,
-            scope: scope.clone(),
-            event,
-            received_at: std::time::Instant::now(),
-            prompt_tag: "p".into(),
-        });
-        let batch = queue.flush_next().unwrap();
-
-        let mut pool = AgentPool::from_slots(vec![None]);
-        let task_id = pool.join_set.spawn(async {}).id();
-        pool.task_map_mut().insert(
-            task_id,
-            crate::pool::TaskMeta {
-                agent_index: 0,
-                channel_id: Some(channel_id),
-                scope: Some(scope.clone()),
-                turn_id: "test-turn-id".to_string(),
-                recoverable_batch: None,
-                control_tx: None,
-                steer_tx: None,
-                successful_steer_deliveries: std::collections::HashSet::new(),
-            },
-        );
-        let (ack_tx, mut _ack_rx) = tokio::sync::mpsc::unbounded_channel();
-        pool.set_notice_ack_tx(ack_tx);
-
-        let agent_for_result = dummy_agent(0).await;
-        let result = PromptResult {
-            started: false,
-            agent: agent_for_result,
-            source: PromptSource::Channel(scope.clone()),
-            turn_id: "test-turn-id".to_string(),
-            outcome: PromptOutcome::Error(acp::AcpError::AgentError {
-                code: 429,
-                message: "rate limit exceeded".into(),
-            }),
-            batch: Some(batch),
-        };
-
-        let config = super::error_outcome_emission_tests::test_config();
-        let mut heartbeat_in_flight = false;
-        let removed_channels = HashSet::new();
-        let mut crash_history = Vec::new();
-        let (respawn_tx, _respawn_rx) = tokio::sync::mpsc::channel(1);
-        let mut respawn_tasks = tokio::task::JoinSet::new();
-
-        handle_prompt_result(
-            &mut pool,
-            &mut queue,
-            &config,
-            result,
-            &mut heartbeat_in_flight,
-            &removed_channels,
-            &mut crash_history,
-            &respawn_tx,
-            &mut respawn_tasks,
-            None,
-            None,
-            Some(&mut runtime),
-        );
-
-        // Before ack is consumed, pause_needs_notice must still be true!
-        assert!(
-            runtime.state().pause_needs_notice(channel_id),
-            "pause_needs_notice must remain true until notice is successfully posted and acked"
-        );
-
-        // Once ack arrives, consume notice and verify pause_needs_notice becomes false
-        runtime.state().mark_pause_notice_consumed(channel_id);
-        assert!(
-            !runtime.state().pause_needs_notice(channel_id),
-            "pause_needs_notice must be false after notice is acked and consumed"
-        );
-
-        // Verify Breaker notice behavior:
-        let breaker_scope = scope::SessionScope::Conversation {
-            channel_id: uuid::Uuid::new_v4(),
-        };
-        for _ in 0..reliability::state::BREAKER_THRESHOLD {
-            runtime.state().on_failure(
-                &breaker_scope,
-                reliability::ErrorClass::ProviderInternal,
-                now,
-            );
-        }
-        assert!(
-            runtime.state().breaker_needs_notice(&breaker_scope),
-            "breaker_needs_notice must be true when breaker opens"
-        );
-        runtime.state().mark_breaker_notice_consumed(&breaker_scope);
-        assert!(
-            !runtime.state().breaker_needs_notice(&breaker_scope),
-            "breaker_needs_notice must be false after mark_breaker_notice_consumed"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_retry_counts_preserved_across_pause_and_breaker() {
-        use crate::error_outcome_emission_tests::dummy_agent;
-
-        let dir = tempfile::tempdir().unwrap();
-        let now = chrono::Utc::now();
-        let pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let mut runtime =
-            reliability::ReliabilityRuntime::open_in(dir.path(), pubkey, now).unwrap();
-
-        let channel_id = uuid::Uuid::new_v4();
-        let scope = scope::SessionScope::Conversation { channel_id };
-
-        let mut queue = EventQueue::new(config::DedupMode::Queue);
-
-        // 1. Accumulate 2 retries on `scope`
-        queue.set_retry_count_for_test(&scope, 2);
-        assert_eq!(queue.retry_count(&scope), 2);
-
-        // 2. Trigger Pause on the 3rd attempt
-        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "work")
-            .tags([])
-            .sign_with_keys(&nostr::Keys::generate())
-            .unwrap();
-        queue.push(queue::QueuedEvent {
-            channel_id,
-            scope: scope.clone(),
-            event: event.clone(),
-            received_at: std::time::Instant::now(),
-            prompt_tag: "p".into(),
-        });
-        let batch3 = queue.flush_next().unwrap();
-
-        let mut pool = AgentPool::from_slots(vec![None]);
-        let task_id = pool.join_set.spawn(async {}).id();
-        pool.task_map_mut().insert(
-            task_id,
-            crate::pool::TaskMeta {
-                agent_index: 0,
-                channel_id: Some(channel_id),
-                scope: Some(scope.clone()),
-                turn_id: "test-turn-id".to_string(),
-                recoverable_batch: None,
-                control_tx: None,
-                steer_tx: None,
-                successful_steer_deliveries: std::collections::HashSet::new(),
-            },
-        );
-
-        let agent_for_result = dummy_agent(0).await;
-        let result = PromptResult {
-            started: false,
-            agent: agent_for_result,
-            source: PromptSource::Channel(scope.clone()),
-            turn_id: "test-turn-id".to_string(),
-            outcome: PromptOutcome::Error(acp::AcpError::AgentError {
-                code: 429,
-                message: "rate limit exceeded".into(),
-            }),
-            batch: Some(batch3),
-        };
-
-        let config = super::error_outcome_emission_tests::test_config();
-        let mut heartbeat_in_flight = false;
-        let removed_channels = HashSet::new();
-        let mut crash_history = Vec::new();
-        let (respawn_tx, _respawn_rx) = tokio::sync::mpsc::channel(1);
-        let mut respawn_tasks = tokio::task::JoinSet::new();
-
-        handle_prompt_result(
-            &mut pool,
-            &mut queue,
-            &config,
-            result,
-            &mut heartbeat_in_flight,
-            &removed_channels,
-            &mut crash_history,
-            &respawn_tx,
-            &mut respawn_tasks,
-            None,
-            None,
-            Some(&mut runtime),
-        );
-
-        // Assert retry count is PRESERVED across Pause (still 2, not reset to 0)
-        assert_eq!(
-            queue.retry_count(&scope),
-            2,
-            "retry_count must be preserved across Pause"
-        );
-
-        // 3. Resume and trigger another failure: assert retry count continues from 3
-        queue.push(queue::QueuedEvent {
-            channel_id,
-            scope: scope.clone(),
-            event: event.clone(),
-            received_at: std::time::Instant::now(),
-            prompt_tag: "p".into(),
-        });
-        let batch4 = queue.flush_next().unwrap();
-        queue.requeue(batch4);
-        assert_eq!(
-            queue.retry_count(&scope),
-            3,
-            "retry_count must continue from 3 after Pause, not reset to 1"
-        );
-
-        // 4. Now verify BreakerOpen preserves retry_counts on another scope
-        let breaker_channel_id = uuid::Uuid::new_v4();
-        let breaker_scope = scope::SessionScope::Conversation {
-            channel_id: breaker_channel_id,
-        };
-        queue.set_retry_count_for_test(&breaker_scope, 2);
-        assert_eq!(queue.retry_count(&breaker_scope), 2);
-
-        // Fail until breaker opens: first BREAKER_THRESHOLD - 1 failures
-        for _ in 0..(reliability::state::BREAKER_THRESHOLD - 1) {
-            runtime.state().on_failure(
-                &breaker_scope,
-                reliability::ErrorClass::ProviderInternal,
-                now,
-            );
-        }
-
-        // Push and flush a batch that triggers BreakerOpen
-        queue.push(queue::QueuedEvent {
-            channel_id: breaker_channel_id,
-            scope: breaker_scope.clone(),
-            event: event.clone(),
-            received_at: std::time::Instant::now(),
-            prompt_tag: "p".into(),
-        });
-        let batch_breaker = queue.flush_next().unwrap();
-
-        let task_id2 = pool.join_set.spawn(async {}).id();
-        pool.task_map_mut().insert(
-            task_id2,
-            crate::pool::TaskMeta {
-                agent_index: 0,
-                channel_id: Some(breaker_channel_id),
-                scope: Some(breaker_scope.clone()),
-                turn_id: "test-turn-id-2".to_string(),
-                recoverable_batch: None,
-                control_tx: None,
-                steer_tx: None,
-                successful_steer_deliveries: std::collections::HashSet::new(),
-            },
-        );
-
-        let agent2 = dummy_agent(0).await;
-        let result2 = PromptResult {
-            started: false,
-            agent: agent2,
-            source: PromptSource::Channel(breaker_scope.clone()),
-            turn_id: "test-turn-id-2".to_string(),
-            outcome: PromptOutcome::Error(acp::AcpError::AgentError {
-                code: 500,
-                message: "internal server error".into(),
-            }),
-            batch: Some(batch_breaker),
-        };
-
-        handle_prompt_result(
-            &mut pool,
-            &mut queue,
-            &config,
-            result2,
-            &mut heartbeat_in_flight,
-            &removed_channels,
-            &mut crash_history,
-            &respawn_tx,
-            &mut respawn_tasks,
-            None,
-            None,
-            Some(&mut runtime),
-        );
-
-        // Assert retry count is PRESERVED across BreakerOpen (still 2, not reset to 0)
-        assert_eq!(
-            queue.retry_count(&breaker_scope),
-            2,
-            "retry_count must be preserved across BreakerOpen"
-        );
-
-        // Resume / next failure continues from 3
-        queue.push(queue::QueuedEvent {
-            channel_id: breaker_channel_id,
-            scope: breaker_scope.clone(),
-            event: event.clone(),
-            received_at: std::time::Instant::now(),
-            prompt_tag: "p".into(),
-        });
-        let batch_breaker_next = queue.flush_next().unwrap();
-        queue.requeue(batch_breaker_next);
-        assert_eq!(
-            queue.retry_count(&breaker_scope),
-            3,
-            "retry_count must continue from 3 after BreakerOpen, not reset to 1"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_error_boundary_sanitizes_diagnostic_and_preserves_raw_in_ledger() {
-        use crate::error_outcome_emission_tests::dummy_agent;
-
-        let dir = tempfile::tempdir().unwrap();
-        let now = chrono::Utc::now();
-        let pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let mut runtime =
-            reliability::ReliabilityRuntime::open_in(dir.path(), pubkey, now).unwrap();
-
-        let channel_id = uuid::Uuid::new_v4();
-        let scope = scope::SessionScope::Conversation { channel_id };
-
-        let mut queue = EventQueue::new(config::DedupMode::Queue);
-        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "work")
-            .tags([])
-            .sign_with_keys(&nostr::Keys::generate())
-            .unwrap();
-        queue.push(queue::QueuedEvent {
-            channel_id,
-            scope: scope.clone(),
-            event,
-            received_at: std::time::Instant::now(),
-            prompt_tag: "p".into(),
-        });
-        let batch = queue.flush_next().unwrap();
-
-        let mut pool = AgentPool::from_slots(vec![None]);
-        let task_id = pool.join_set.spawn(async {}).id();
-        pool.task_map_mut().insert(
-            task_id,
-            crate::pool::TaskMeta {
-                agent_index: 0,
-                channel_id: Some(channel_id),
-                scope: Some(scope.clone()),
-                turn_id: "test-turn-id".to_string(),
-                recoverable_batch: None,
-                control_tx: None,
-                steer_tx: None,
-                successful_steer_deliveries: std::collections::HashSet::new(),
-            },
-        );
-
-        let secret_key = "sk-ant-secretkey1234567890abcdef";
-        let bearer_token = "my-secret-bearer-token";
-        let massive_backtrace = "x".repeat(1000);
-        let long_msg = format!(
-            "provider error: token=secret123 and Bearer {} and {} and backtrace: {}",
-            bearer_token, secret_key, massive_backtrace
-        );
-        let err = acp::AcpError::AgentError {
-            code: 500,
-            message: long_msg,
-        };
-
-        let agent = dummy_agent(0).await;
-        let result = PromptResult {
-            started: false,
-            agent,
-            source: PromptSource::Channel(scope.clone()),
-            turn_id: "test-turn-id".to_string(),
-            outcome: PromptOutcome::Error(err),
-            batch: Some(batch),
-        };
-
-        let config = super::error_outcome_emission_tests::test_config();
-        let mut heartbeat_in_flight = false;
-        let removed_channels = HashSet::new();
-        let mut crash_history = Vec::new();
-        let (respawn_tx, _respawn_rx) = tokio::sync::mpsc::channel(1);
-        let mut respawn_tasks = tokio::task::JoinSet::new();
-        let observer = observer::ObserverHandle::in_process();
-
-        handle_prompt_result(
-            &mut pool,
-            &mut queue,
-            &config,
-            result,
-            &mut heartbeat_in_flight,
-            &removed_channels,
-            &mut crash_history,
-            &respawn_tx,
-            &mut respawn_tasks,
-            Some(observer.clone()),
-            None,
-            Some(&mut runtime),
-        );
-
-        // 1. Emitted observer turn_error must be capped <= 512 chars and redacted
-        let events = observer.snapshot();
-        let turn_error = events
-            .iter()
-            .find(|e| e.kind == "turn_error")
-            .expect("turn_error event must be emitted");
-        let emitted_err = turn_error.payload["error"].as_str().unwrap();
-        assert!(
-            emitted_err.chars().count() <= 512,
-            "emitted error must be <= 512 chars, got {}",
-            emitted_err.chars().count()
-        );
-        assert!(
-            !emitted_err.contains(secret_key),
-            "emitted error must redact secret key"
-        );
-        assert!(
-            !emitted_err.contains(bearer_token),
-            "emitted error must redact bearer token"
-        );
-        assert!(
-            !emitted_err.contains("token=secret123"),
-            "emitted error must redact token parameter"
-        );
-        assert!(
-            emitted_err.contains("<redacted>"),
-            "emitted error must contain <redacted>"
-        );
-
-        // 2. Ledger retains capped raw text without redaction
-        let ledger_content = std::fs::read_to_string(dir.path().join("ledger.jsonl")).unwrap();
-        assert!(
-            ledger_content.contains("token=secret123"),
-            "ledger must retain raw error text"
-        );
-        assert!(
-            ledger_content.contains(secret_key),
-            "ledger must retain raw secret key"
-        );
-    }
-}
+mod reliability_dispatch_tests;

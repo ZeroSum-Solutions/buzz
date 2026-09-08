@@ -248,6 +248,7 @@ pub struct EventQueue {
     /// Set by `requeue_as_cancelled`, consumed by `flush_next` to set
     /// `FlushBatch::cancel_reason`. Keyed by scope, cleared on flush.
     cancel_reasons: HashMap<SessionScope, CancelReason>,
+    replay_batch_ids: HashMap<SessionScope, Uuid>,
     /// Events withheld from `queues` while a goose-native steer is in flight
     /// for that event. Invisible to `flush_next` / `has_flushable_work` /
     /// `drain` (the events have been moved out of `queues`), so the queue's
@@ -320,6 +321,7 @@ impl EventQueue {
             dedup_mode,
             cancelled_batches: HashMap::new(),
             cancel_reasons: HashMap::new(),
+            replay_batch_ids: HashMap::new(),
             withheld_native_steer: HashMap::new(),
             in_flight_deadline: Duration::from_secs(DEFAULT_IN_FLIGHT_DEADLINE_SECS),
             parked_out: VecDeque::new(),
@@ -372,6 +374,30 @@ impl EventQueue {
                 *current = extended;
             }
         }
+    }
+
+    /// Whether another live event fits without evicting admitted work.
+    pub fn can_admit(&self, scope: &SessionScope) -> bool {
+        self.queues.get(scope).map_or(0, VecDeque::len) < MAX_PENDING_PER_SCOPE
+            && self.channel_event_total(scope.channel_id()) < MAX_PENDING_PER_CHANNEL
+    }
+
+    /// Whether an admitted event is already staged in a live queue.
+    pub fn contains_event(&self, id: &nostr::EventId) -> bool {
+        self.queues
+            .values()
+            .flatten()
+            .any(|event| &event.event.id == id)
+            || self
+                .cancelled_batches
+                .values()
+                .flatten()
+                .any(|event| &event.event.id == id)
+            || self
+                .withheld_native_steer
+                .values()
+                .flatten()
+                .any(|event| &event.event.id == id)
     }
 
     /// Push an event into the queue for its channel.
@@ -475,7 +501,26 @@ impl EventQueue {
     /// Otherwise picks the channel with the oldest pending event (FIFO fairness
     /// across channels), drains ALL events for that channel into a single batch,
     /// inserts into `in_flight_channels`, and returns the batch.
+    fn take_cancelled_chunk(
+        &mut self,
+        scope: &SessionScope,
+    ) -> (Vec<BatchEvent>, Option<CancelReason>) {
+        let mut events = self.cancelled_batches.remove(scope).unwrap_or_default();
+        let reason = self.cancel_reasons.get(scope).copied();
+        if events.len() > MAX_BATCH_EVENTS {
+            let remaining = events.split_off(MAX_BATCH_EVENTS);
+            self.cancelled_batches.insert(scope.clone(), remaining);
+        } else {
+            self.cancel_reasons.remove(scope);
+        }
+        (events, reason)
+    }
+
     pub fn flush_next(&mut self) -> Option<FlushBatch> {
+        // Reserve one handoff slot for every in-flight batch before dispatch.
+        if self.parked_out.len() + self.in_flight_scopes.len() >= MAX_PARK_HANDOFF {
+            return None;
+        }
         self.flush_count += 1;
         let now = Instant::now();
 
@@ -498,11 +543,8 @@ impl EventQueue {
             );
             self.in_flight_scopes.remove(&scope);
             self.in_flight_deadlines.remove(&scope);
-            // Recover any withheld goose-native steer events for the expired
-            // scope back to the queue front so normal dispatch delivers
-            // them. Unlike the in-flight batch above (already delivered to a
-            // now-hung prompt — nothing to recover), these events were never
-            // delivered to the agent.
+            // Expired native-steer acknowledgements leave durable review
+            // custody intact; they do not prove non-delivery.
             self.recover_withheld_for_expired_scope(&scope);
         }
 
@@ -528,21 +570,29 @@ impl EventQueue {
                 let cancelled_scope = self
                     .cancelled_batches
                     .keys()
-                    .find(|scope| !self.in_flight_scopes.contains(scope))
+                    .find(|scope| {
+                        !self.in_flight_scopes.contains(scope)
+                            && self
+                                .retry_after
+                                .get(*scope)
+                                .is_none_or(|&deadline| deadline <= now)
+                    })
                     .cloned();
                 match cancelled_scope {
                     Some(scope) => {
                         // Move cancelled events into the regular events slot.
                         // No new events to merge — re-dispatch the original batch.
-                        let cancelled = self.cancelled_batches.remove(&scope).unwrap_or_default();
-                        let cancel_reason = self.cancel_reasons.remove(&scope);
+                        let (cancelled, cancel_reason) = self.take_cancelled_chunk(&scope);
                         self.in_flight_scopes.insert(scope.clone());
                         self.in_flight_deadlines
                             .insert(scope.clone(), now + self.in_flight_deadline);
                         self.in_flight_batch_sizes
                             .insert(scope.clone(), cancelled.len());
                         return Some(FlushBatch {
-                            batch_id: Uuid::new_v4(),
+                            batch_id: self
+                                .replay_batch_ids
+                                .remove(&scope)
+                                .unwrap_or_else(Uuid::new_v4),
                             channel_id: scope.channel_id(),
                             scope,
                             events: cancelled,
@@ -557,9 +607,10 @@ impl EventQueue {
         };
         let channel_id = scope.channel_id();
 
-        // Drain up to MAX_BATCH_EVENTS; leave any remainder in the queue.
+        let (cancelled_events, cancel_reason) = self.take_cancelled_chunk(&scope);
+        // Bound the complete batch, including interrupted carryover.
         let queue = self.queues.entry(scope.clone()).or_default();
-        let drain_count = MAX_BATCH_EVENTS.min(queue.len());
+        let drain_count = (MAX_BATCH_EVENTS - cancelled_events.len()).min(queue.len());
         let mut events: Vec<BatchEvent> = queue
             .drain(..drain_count)
             .map(|qe| BatchEvent {
@@ -585,17 +636,11 @@ impl EventQueue {
         self.in_flight_batch_sizes
             .insert(scope.clone(), events.len());
 
-        // Merge any cancelled events stored by requeue_as_cancelled().
-        let cancelled_events = self.cancelled_batches.remove(&scope).unwrap_or_default();
-        let cancel_reason = if cancelled_events.is_empty() {
-            self.cancel_reasons.remove(&scope);
-            None
-        } else {
-            self.cancel_reasons.remove(&scope)
-        };
-
         Some(FlushBatch {
-            batch_id: Uuid::new_v4(),
+            batch_id: self
+                .replay_batch_ids
+                .remove(&scope)
+                .unwrap_or_else(Uuid::new_v4),
             channel_id,
             scope,
             events,
@@ -665,6 +710,15 @@ impl EventQueue {
     /// Note: does NOT remove from `in_flight_channels` — caller must call
     /// `mark_complete` separately.
     pub fn requeue(&mut self, batch: FlushBatch) -> Option<FlushBatch> {
+        if batch.is_started() {
+            // Preserve immutable provenance and original identity. Rebuilding
+            // this as fresh queue entries could auto-repeat side effects.
+            self.parked_out.push_back(ParkHandoff {
+                batch,
+                reason: ParkHandoffReason::RetriesExhausted,
+            });
+            return None;
+        }
         let channel_id = batch.channel_id;
         let scope = batch.scope.clone();
         let attempt = {
@@ -719,29 +773,7 @@ impl EventQueue {
             "requeueing failed batch with backoff"
         );
 
-        let queue = self.queues.entry(scope.clone()).or_default();
-        // Push to front in reverse order so original order is preserved.
-        for be in batch.events.into_iter().rev() {
-            queue.push_front(QueuedEvent {
-                channel_id,
-                scope: scope.clone(),
-                event: be.event,
-                prompt_tag: be.prompt_tag,
-                received_at: be.received_at, // preserve original timestamp (#46)
-            });
-        }
-        // Enforce per-scope cap: trim oldest (back) events if requeue pushed
-        // the partition over the limit. Without this, repeated requeue+push
-        // cycles can grow the queue unboundedly.
-        while queue.len() > MAX_PENDING_PER_SCOPE {
-            queue.pop_back();
-            tracing::warn!(
-                channel_id = %channel_id,
-                scope = %scope.telemetry_label(),
-                limit = MAX_PENDING_PER_SCOPE,
-                "requeue overflow — dropped oldest event to enforce cap"
-            );
-        }
+        self.requeue_preserve_timestamps(batch);
         self.retry_after.insert(scope, Instant::now() + delay);
         self.enforce_channel_cap(channel_id);
         None
@@ -763,25 +795,10 @@ impl EventQueue {
 
     /// Give a batch back to the hand-off after a park-file write failed.
     ///
-    /// Returns `Err(handoff)` — and logs — when the hand-off is at
-    /// [`MAX_PARK_HANDOFF`], handing the exact same handoff straight back to
-    /// the caller. The caller owns it again immediately: nothing is ever
-    /// dropped here even when the hand-off itself is full, unlike the old
-    /// `bool` return, which let a `false` result fall out of scope and take
-    /// the batch's messages with it (T16 delta 1, finding 1).
-    pub fn return_unparked(&mut self, handoff: ParkHandoff) -> Result<(), Box<ParkHandoff>> {
-        if self.parked_out.len() >= MAX_PARK_HANDOFF {
-            tracing::error!(
-                channel_id = %handoff.batch.channel_id,
-                batch_id = %handoff.batch.batch_id,
-                cap = MAX_PARK_HANDOFF,
-                events = handoff.batch.events.len(),
-                "park hand-off is full — the batch could not be held for a retry of the park write"
-            );
-            return Err(Box::new(handoff));
-        }
+    /// Return existing custody into its reserved slot. Capacity is reserved
+    /// before dispatch, so returning a worker's batch never evicts another.
+    pub fn return_unparked(&mut self, handoff: ParkHandoff) {
         self.parked_out.push_front(handoff);
-        Ok(())
     }
 
     /// Stage parked events for replay ahead of anything newer for `scope`.
@@ -809,29 +826,30 @@ impl EventQueue {
     /// harness never stamps a batch as replayed and then finds it cannot stage
     /// the prompt.
     pub fn can_stage_replay(&self, scope: &SessionScope) -> bool {
-        matches!(
-            self.cancel_reasons.get(scope),
-            Some(CancelReason::DeliveredLate) | None
-        )
+        !self.cancelled_batches.contains_key(scope) && !self.cancel_reasons.contains_key(scope)
     }
 
     pub fn stage_replay(&mut self, scope: SessionScope, events: Vec<BatchEvent>) -> bool {
-        if events.is_empty() {
+        if events.is_empty() || events.len() > MAX_BATCH_EVENTS || !self.can_stage_replay(&scope) {
             return false;
         }
-        match self.cancel_reasons.get(&scope) {
-            Some(CancelReason::DeliveredLate) | None => {}
-            Some(_) => return false,
-        }
-        let entry = self.cancelled_batches.entry(scope.clone()).or_default();
-        // Replayed events are older than anything already staged, so they go
-        // first — the conversation stays in order.
-        let mut merged = events;
-        merged.append(entry);
-        merged.truncate(MAX_BATCH_EVENTS);
-        *entry = merged;
+        self.cancelled_batches.insert(scope.clone(), events);
         self.cancel_reasons
             .insert(scope, CancelReason::DeliveredLate);
+        true
+    }
+
+    /// Stage a replay using the UUID recorded by its durable replay transaction.
+    pub fn stage_replay_with_id(
+        &mut self,
+        scope: SessionScope,
+        events: Vec<BatchEvent>,
+        batch_id: Uuid,
+    ) -> bool {
+        if !self.stage_replay(scope.clone(), events) {
+            return false;
+        }
+        self.replay_batch_ids.insert(scope, batch_id);
         true
     }
 
@@ -853,6 +871,10 @@ impl EventQueue {
     /// Does NOT set `retry_after`. Does NOT remove from `in_flight_scopes` —
     /// caller must call `mark_complete` separately.
     pub fn requeue_preserve_timestamps(&mut self, batch: FlushBatch) {
+        if batch.cancel_reason == Some(CancelReason::DeliveredLate) {
+            self.replay_batch_ids
+                .insert(batch.scope.clone(), batch.batch_id);
+        }
         let channel_id = batch.channel_id;
         let scope = batch.scope.clone();
 
@@ -1051,6 +1073,8 @@ impl EventQueue {
             .retain(|s, _| s.channel_id() != channel_id);
         self.cancel_reasons
             .retain(|s, _| s.channel_id() != channel_id);
+        self.replay_batch_ids
+            .retain(|s, _| s.channel_id() != channel_id);
         self.withheld_native_steer
             .retain(|s, _| s.channel_id() != channel_id);
         // Preserve in_flight_scopes AND in_flight_deadlines: the in-flight
@@ -1199,29 +1223,11 @@ impl EventQueue {
         let Some(entries) = self.withheld_native_steer.remove(scope) else {
             return;
         };
-        let n = entries.len();
-        let channel_id = scope.channel_id();
-        let queue = self.queues.entry(scope.clone()).or_default();
-        for qe in entries.into_iter().rev() {
-            queue.push_front(qe);
-        }
-        while queue.len() > MAX_PENDING_PER_SCOPE {
-            queue.pop_back();
-            tracing::warn!(
-                channel_id = %channel_id,
-                scope = %scope.telemetry_label(),
-                limit = MAX_PENDING_PER_SCOPE,
-                "withheld-steer recovery overflow — dropped newest event to enforce cap"
-            );
-        }
-        self.enforce_channel_cap(channel_id);
-        tracing::warn!(
-            channel_id = %channel_id,
-            scope = %scope.telemetry_label(),
-            recovered = n,
-            "in-flight expiry recovered withheld steer event(s) — \
-             steer ack never arrived; normal dispatch will deliver"
-        );
+        // Production persists uncertain-start custody before native transport.
+        // A missing acknowledgement is not evidence the input was unseen.
+        // Remove only these queue copies; durable review custody owns them.
+        tracing::error!(scope = %scope.telemetry_label(), retained_for_review = entries.len(),
+            "native steer acknowledgement missing at expiry; durable review custody retained, automatic replay suppressed");
     }
 
     /// Compact expired metadata entries to prevent unbounded map growth.
@@ -3910,6 +3916,124 @@ mod tests {
     }
 
     #[test]
+    fn staged_replay_refuses_second_batch_without_eviction() {
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let channel = Uuid::new_v4();
+        let events: Vec<_> = (0..MAX_BATCH_EVENTS)
+            .map(|i| BatchEvent {
+                event: make_event(&format!("original-{i}")),
+                prompt_tag: "test".into(),
+                received_at: Instant::now(),
+            })
+            .collect();
+        assert!(queue.stage_replay(conv(channel), events));
+        assert!(!queue.stage_replay(
+            conv(channel),
+            vec![BatchEvent {
+                event: make_event("later"),
+                prompt_tag: "test".into(),
+                received_at: Instant::now()
+            }]
+        ));
+        let batch = queue.flush_next().unwrap();
+        assert_eq!(batch.events.len(), MAX_BATCH_EVENTS);
+        assert!(batch
+            .events
+            .iter()
+            .all(|event| event.event.content.starts_with("original-")));
+    }
+
+    #[test]
+    fn merged_carryover_is_split_without_exceeding_durable_batch_cap() {
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let channel = Uuid::new_v4();
+        for _ in 0..MAX_BATCH_EVENTS {
+            queue.push(make_queued(channel, "old"));
+        }
+        let batch = queue.flush_next().unwrap();
+        queue.requeue_as_cancelled(batch, CancelReason::Interrupt);
+        queue.mark_complete(channel);
+        queue.push(make_queued(channel, "new"));
+        let first = queue.flush_next().unwrap();
+        assert!(first.events.len() + first.cancelled_events.len() <= MAX_BATCH_EVENTS);
+        queue.mark_complete(channel);
+        let second = queue.flush_next().unwrap();
+        assert_eq!(
+            first.events.len()
+                + first.cancelled_events.len()
+                + second.events.len()
+                + second.cancelled_events.len(),
+            MAX_BATCH_EVENTS + 1
+        );
+    }
+
+    #[test]
+    fn started_retry_retains_intact_handoff_provenance() {
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let channel = Uuid::new_v4();
+        queue.push(make_queued(channel, "already started"));
+        let batch = queue.flush_next().unwrap();
+        let id = batch.batch_id;
+        batch.mark_started();
+        queue.requeue(batch);
+        queue.mark_complete(channel);
+        assert!(queue.flush_next().is_none());
+        let handoffs = queue.take_parked();
+        assert_eq!(handoffs.len(), 1);
+        assert_eq!(handoffs[0].batch.batch_id, id);
+        assert!(handoffs[0].batch.is_started());
+    }
+
+    #[test]
+    fn test_retry_requeue_round_trips_cancelled_carryover() {
+        // Regression: a held/exhausted merged batch (cancel + re-prompt) must
+        // not lose its original request. requeue_preserve_timestamps must
+        // restore events AND cancelled_events + cancel_reason so the next flush
+        // reconstructs the same merged batch.
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let scope = conv(ch);
+        let batch = FlushBatch {
+            batch_id: Uuid::new_v4(),
+            channel_id: ch,
+            scope: scope.clone(),
+            events: vec![BatchEvent {
+                event: make_event("the follow-up"),
+                prompt_tag: "@mention".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![BatchEvent {
+                event: make_event("the original request"),
+                prompt_tag: "@mention".into(),
+                received_at: Instant::now(),
+            }],
+            cancel_reason: Some(CancelReason::Interrupt),
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        // Simulate the flushed-then-held state: scope is in-flight.
+        q.push(make_queued(ch, "placeholder"));
+        let _ = q.flush_next().expect("scope now in-flight");
+
+        q.requeue(batch);
+        q.retry_after.clear();
+        q.mark_complete(scope);
+
+        let restored = q.flush_next().expect("merged batch re-flushes");
+        assert_eq!(restored.events.len(), 1);
+        assert_eq!(restored.events[0].event.content, "the follow-up");
+        assert_eq!(
+            restored.cancelled_events.len(),
+            1,
+            "cancelled carryover (original request) must survive the requeue"
+        );
+        assert_eq!(
+            restored.cancelled_events[0].event.content,
+            "the original request"
+        );
+        assert_eq!(restored.cancel_reason, Some(CancelReason::Interrupt));
+    }
+
+    #[test]
     fn test_requeue_preserve_timestamps_round_trips_cancelled_carryover() {
         // Regression: a held/exhausted merged batch (cancel + re-prompt) must
         // not lose its original request. requeue_preserve_timestamps must
@@ -6134,107 +6258,27 @@ mod tests {
         assert!(q.withheld_native_steer.is_empty());
     }
 
-    /// If the steer ack never arrives — read loop hung, watcher never posted —
-    /// the `in_flight_deadline` auto-expiry block must bulk-recover the
-    /// withheld events back to the queue front so normal dispatch can deliver
-    /// them. Recover, not log-and-drop: the events were never seen by the
-    /// agent.
     #[test]
-    fn test_native_steer_expiry_recovers_withheld() {
+    fn test_native_steer_expiry_never_automatically_replays_unknown_delivery() {
         let mut q = EventQueue::new(DedupMode::Queue);
         let ch = Uuid::new_v4();
-
-        let qe = make_queued(ch, "withheld event");
-        let event_id = qe.event.id.to_hex();
-        q.push(qe);
-
-        // Simulate a prompt in flight for `ch`, then withhold the queued
-        // event for an in-flight goose-native steer.
-        q.in_flight_scopes.insert(conv(ch));
-        q.in_flight_deadlines.insert(conv(ch), Instant::now());
-        q.in_flight_batch_sizes.insert(conv(ch), 1);
-        assert!(q.mark_native_steer_pending(ch, &event_id));
-
-        // Force the in-flight deadline to be in the past, simulating the
-        // steer ack never arriving and the read loop hanging long enough
-        // for `in_flight_deadline` to elapse. Same expiry-simulation
-        // trick used by `test_retry_throttle_blocks_requeue_channel`.
-        q.in_flight_deadlines
-            .insert(conv(ch), Instant::now() - Duration::from_secs(1));
-
-        // `has_flushable_work` runs the expiry block first; it must recover
-        // the withheld event so the channel registers as flushable.
-        assert!(
-            q.has_flushable_work(),
-            "expired channel with withheld event must register as flushable after recovery"
-        );
-
-        // The withheld event has been moved back to `queues[ch]`.
-        assert!(q.withheld_native_steer.is_empty());
-        assert_eq!(pending_count(&q), 1);
-
-        // Normal dispatch delivers it.
-        let batch = q
-            .flush_next()
-            .expect("recovered event should flush via normal dispatch");
-        assert_eq!(batch.channel_id, ch);
-        assert_eq!(batch.events.len(), 1);
-        assert_eq!(batch.events[0].event.id.to_hex(), event_id);
-    }
-
-    /// Bulk-release on expiry must preserve original FIFO. The
-    /// implementation iterates the side-table entries in reverse and
-    /// `push_front`s each — composing to original-FIFO at the queue front.
-    /// Test ≥2 withheld entries (3 here) with staggered `received_at`.
-    #[test]
-    fn test_native_steer_bulk_release_preserves_fifo() {
-        let mut q = EventQueue::new(DedupMode::Queue);
-        let ch = Uuid::new_v4();
-
-        // Three events with staggered ages — e1 oldest, e3 newest.
-        let e1 = make_queued_at(ch, "e1", Duration::from_millis(30));
-        let e2 = make_queued_at(ch, "e2", Duration::from_millis(20));
-        let e3 = make_queued_at(ch, "e3", Duration::from_millis(10));
-        let e1_id = e1.event.id.to_hex();
-        let e2_id = e2.event.id.to_hex();
-        let e3_id = e3.event.id.to_hex();
-        q.push(e1);
-        q.push(e2);
-        q.push(e3);
-
-        // Withhold all three in FIFO arrival order (e1, e2, e3 → side table).
-        // This simulates a pathological repeated-steer flow; the more
-        // realistic case (one withhold at a time) is covered by the other
-        // tests. What matters here is that the bulk-recovery path
-        // (reverse iter + push_front) composes to original FIFO at the
-        // queue front.
-        assert!(q.mark_native_steer_pending(ch, &e1_id));
-        assert!(q.mark_native_steer_pending(ch, &e2_id));
-        assert!(q.mark_native_steer_pending(ch, &e3_id));
-        assert_eq!(pending_count(&q), 0);
-        assert_eq!(
-            q.withheld_native_steer.get(&conv(ch)).map(|v| v.len()),
-            Some(3)
-        );
-
-        // Trigger expiry → bulk-release path.
+        for content in ["first", "second", "third"] {
+            let event = make_queued(ch, content);
+            let id = event.event.id.to_hex();
+            q.push(event);
+            assert!(q.mark_native_steer_pending(ch, &id));
+        }
         q.in_flight_scopes.insert(conv(ch));
         q.in_flight_deadlines
             .insert(conv(ch), Instant::now() - Duration::from_secs(1));
         q.in_flight_batch_sizes.insert(conv(ch), 3);
-        assert!(q.has_flushable_work());
-
-        // After recovery, the queue front-to-back order must match the
-        // original FIFO: e1, e2, e3.
-        let recovered: Vec<String> = q
-            .queues
-            .get(&conv(ch))
-            .expect("queue restored")
-            .iter()
-            .map(|qe| qe.event.id.to_hex())
-            .collect();
-        assert_eq!(recovered, vec![e1_id, e2_id, e3_id]);
+        assert!(
+            !q.has_flushable_work(),
+            "missing ack must not become automatic re-delivery"
+        );
         assert!(q.withheld_native_steer.is_empty());
+        assert_eq!(pending_count(&q), 0);
+        assert!(q.flush_next().is_none());
     }
 
     // ── format_prompt: agent_canvas ─────────────────────────────────────────

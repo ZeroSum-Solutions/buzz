@@ -94,7 +94,9 @@ The desktop already sends control frames to the harness over the relay (`switch_
 | `resume_now` | leave Paused or BreakerOpen and probe immediately |
 | `keep_paused { until }` | extend a pause |
 
-CLI, this ticket: `buzz agents parked [--json]` lists parked batches from the state dir (no relay needed), `buzz agents replay <batch_id>` and `buzz agents discard <batch_id>` send the frames. The desktop buttons come with T17.
+CLI: `buzz agents parked [--json] [--state-root PATH] [--agent PUBKEY]` lists bounded local state without credentials or writes. `buzz agents replay --agent PUBKEY <batch_id>` and `buzz agents discard --agent PUBKEY <batch_id>` use the owner's signing key to send encrypted controls. The CLI subscribes before publishing and waits for a fresh, signed response from that agent matching the request UUID, batch UUID, and command. A relay publication acknowledgement alone is not success. Replay reports `scheduled` (including any blocking reason), not completed execution; timeouts report an unconfirmed outcome and require inspecting parked state before retrying. Desktop buttons come with T17.
+
+Failure notices are stored as signed events in a bounded outbox before submission. Failed delivery retries indefinitely, including after restart. A parked batch retains `notice_pending` until durable enqueue succeeds; capacity refusal blocks new admission and replay instead of losing custody. Delivered receipts remain while the corresponding parked batch exists to close the enqueue/marker crash gap. Corrupt outbox state fails startup without overwriting it.
 
 ## Notices in the channel
 

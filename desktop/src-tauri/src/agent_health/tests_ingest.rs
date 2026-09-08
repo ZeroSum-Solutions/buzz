@@ -470,6 +470,7 @@ fn minimal_parked_batch_line(batch_id: uuid::Uuid) -> String {
         replayed_at: None,
         forced: false,
         parked_at: chrono::Utc::now(),
+        notice_pending: false,
         events: Vec::new(),
     };
     serde_json::to_string(&batch).unwrap()

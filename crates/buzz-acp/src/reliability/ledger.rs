@@ -35,7 +35,7 @@ pub const TRUNCATE_INTERVAL_HOURS: i64 = 6;
 /// first; the count of dropped records is returned so the operator is told.
 pub const MAX_LEDGER_BYTES: u64 = 10 * 1024 * 1024;
 
-/// Longest single line read back. A longer line is skipped, not buffered.
+/// Longest single line read back. A longer line fails the read as incomplete.
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
 
 /// Most event ids recorded on one `turn_started`. Matches the queue's own
@@ -49,8 +49,8 @@ pub const MAX_ID_CHARS: usize = 64;
 /// Longest short text field (`scope`, `reason`, `class`).
 pub const MAX_LABEL_CHARS: usize = 128;
 
-/// Longest raw provider error stored beside its class, so a misclassification
-/// can be diagnosed without keeping an unbounded string.
+/// Longest redacted provider diagnostic stored beside its class. The legacy
+/// JSON field remains named `raw`; credentials are sanitized before storage.
 pub const MAX_RAW_CHARS: usize = 512;
 
 /// One line of the ledger.
@@ -222,7 +222,7 @@ impl TurnOutcome {
     pub fn error(class: &str, raw: &str) -> Self {
         Self::Error {
             class: truncate_chars(class, MAX_LABEL_CHARS),
-            raw: truncate_chars(raw, MAX_RAW_CHARS),
+            raw: super::error_class::sanitize_error_diagnostic(raw),
         }
     }
 
@@ -363,6 +363,10 @@ impl Ledger {
     /// reports as written survives a crash. A failure is returned, never
     /// swallowed; the caller keeps whatever the record described.
     pub fn append(&mut self, at: DateTime<Utc>, body: LedgerBody) -> io::Result<()> {
+        // A previous short write may have left a partial frame in this same
+        // process. Repair before every append, not only when reopening.
+        sanitize_dangling_final_line(&self.path)?;
+        self.len_bytes = std::fs::metadata(&self.path)?.len();
         let record = LedgerRecord {
             at,
             agent: self.agent.clone(),
@@ -495,7 +499,7 @@ fn serialized_len(record: &LedgerRecord) -> io::Result<u64> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-fn fit_to_cap(records: Vec<LedgerRecord>) -> io::Result<(Vec<LedgerRecord>, usize)> {
+pub(super) fn fit_to_cap(records: Vec<LedgerRecord>) -> io::Result<(Vec<LedgerRecord>, usize)> {
     fit_to_budget(records, MAX_LEDGER_BYTES)
 }
 
@@ -513,27 +517,39 @@ fn fit_to_budget(
     }
     let mut dropped = 0usize;
     let mut remaining = records;
-    while total > budget && !remaining.is_empty() {
-        let head = remaining.remove(0);
-        total = total.saturating_sub(serialized_len(&head)?);
+    while total > budget && dropped < remaining.len() {
+        total = total.saturating_sub(serialized_len(&remaining[dropped])?);
         dropped += 1;
     }
+    remaining.drain(..dropped);
     Ok((remaining, dropped))
 }
 
 /// Detect and truncate a dangling final line without a trailing newline, so
 /// future appends are not fused with corrupted partial lines.
 fn sanitize_dangling_final_line(path: &Path) -> io::Result<()> {
-    let mut file = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = match options.open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("ledger source is not a regular file"));
+    }
     let len = file.metadata()?.len();
+    if len > MAX_LEDGER_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ledger exceeds byte cap; recovery required",
+        ));
+    }
     if len == 0 {
         return Ok(());
     }
@@ -547,8 +563,9 @@ fn sanitize_dangling_final_line(path: &Path) -> io::Result<()> {
     let mut pos = len - 1;
     let mut found_nl = false;
     let mut buf = [0u8; 4096];
-    while pos > 0 {
-        let chunk_size = (pos as usize).min(buf.len());
+    let scan_floor = len.saturating_sub(MAX_LINE_BYTES as u64);
+    while pos > scan_floor {
+        let chunk_size = ((pos - scan_floor) as usize).min(buf.len());
         let chunk_start = pos - chunk_size as u64;
         file.seek(SeekFrom::Start(chunk_start))?;
         file.read_exact(&mut buf[..chunk_size])?;
@@ -560,6 +577,12 @@ fn sanitize_dangling_final_line(path: &Path) -> io::Result<()> {
         pos = chunk_start;
     }
     if !found_nl {
+        if scan_floor > 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unterminated ledger record exceeds line cap",
+            ));
+        }
         file.set_len(0)?;
     }
     file.sync_all()?;
@@ -573,50 +596,58 @@ fn sanitize_dangling_final_line(path: &Path) -> io::Result<()> {
 /// Read a JSONL ledger file in a read-only manner with a hard byte cap on the
 /// input and a hard cap per line.
 ///
-/// Returns all parsed records. Lines that are malformed or exceed
-/// [`MAX_LINE_BYTES`] are skipped without modifying or rewriting the file on
-/// disk. If the file does not exist, returns an empty vector.
+/// Returns a complete parsed image, or an explicit incomplete-input error for
+/// malformed or over-cap input. Never modifies the source. A missing file is empty.
 pub fn read_ledger_file(path: &Path) -> io::Result<Vec<LedgerRecord>> {
-    let file = match std::fs::File::open(path) {
+    let file = match state_dir::open_read(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    let mut reader = io::BufReader::new(file.take(MAX_LEDGER_BYTES));
+    if file.metadata()?.len() > MAX_LEDGER_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "incomplete ledger: file exceeds byte cap",
+        ));
+    }
+    let mut reader = io::BufReader::new(file.take(MAX_LEDGER_BYTES + 1));
     let mut records = Vec::new();
-    let mut skipped = 0usize;
     let mut line = Vec::new();
+    let mut total = 0;
     loop {
         line.clear();
-        let read = reader.read_until(b'\n', &mut line)?;
+        let read = reader
+            .by_ref()
+            .take(MAX_LINE_BYTES as u64 + 1)
+            .read_until(b'\n', &mut line)?;
         if read == 0 {
             break;
         }
-        if line.len() > MAX_LINE_BYTES {
-            skipped += 1;
-            continue;
+        total += read as u64;
+        if line.len() > MAX_LINE_BYTES || total > MAX_LEDGER_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "incomplete ledger: input exceeds cap",
+            ));
         }
-        let text = match std::str::from_utf8(&line) {
-            Ok(text) => text.trim(),
-            Err(_) => {
-                skipped += 1;
-                continue;
-            }
-        };
+        let text = std::str::from_utf8(&line)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "incomplete ledger: invalid UTF-8",
+                )
+            })?
+            .trim();
         if text.is_empty() {
             continue;
         }
-        match serde_json::from_str::<LedgerRecord>(text) {
-            Ok(record) => records.push(record),
-            Err(_) => skipped += 1,
-        }
-    }
-    if skipped > 0 {
-        tracing::warn!(
-            skipped,
-            path = %path.display(),
-            "skipped unreadable ledger lines"
-        );
+        let record = serde_json::from_str::<LedgerRecord>(text).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "incomplete ledger: malformed record",
+            )
+        })?;
+        records.push(record);
     }
     Ok(records)
 }
@@ -651,7 +682,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn read_ledger_file_skips_malformed_lines_and_does_not_rewrite() {
+    fn read_ledger_byte_cap_boundaries_are_explicit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        for size in [MAX_LEDGER_BYTES - 1, MAX_LEDGER_BYTES, MAX_LEDGER_BYTES + 1] {
+            // Small blank lines exercise the whole-file cap independently of
+            // the per-record cap.
+            std::fs::write(&path, vec![b'\n'; size as usize]).unwrap();
+            assert_eq!(read_ledger_file(&path).is_ok(), size <= MAX_LEDGER_BYTES);
+        }
+    }
+
+    #[test]
+    fn read_ledger_line_cap_boundaries_are_explicit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        for size in [MAX_LINE_BYTES - 1, MAX_LINE_BYTES, MAX_LINE_BYTES + 1] {
+            let mut line = vec![b' '; size];
+            line[size - 1] = b'\n';
+            std::fs::write(&path, line).unwrap();
+            assert_eq!(read_ledger_file(&path).is_ok(), size <= MAX_LINE_BYTES);
+        }
+    }
+
+    #[test]
+    fn append_repairs_a_partial_tail_without_reopening() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = Ledger::open(dir.path(), "test-agent", Utc::now()).unwrap();
+        std::fs::write(ledger.path(), b"{partial").unwrap();
+        ledger
+            .append(
+                Utc::now(),
+                LedgerBody::TurnFinished(TurnFinished {
+                    batch_id: Uuid::new_v4(),
+                    channel_id: Uuid::new_v4(),
+                    outcome: TurnOutcome::Ok,
+                }),
+            )
+            .unwrap();
+        assert_eq!(ledger.read_all().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn oversized_ledger_recovery_fails_before_scanning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_LEDGER_BYTES + 1).unwrap();
+        assert!(sanitize_dangling_final_line(&path).is_err());
+        assert_eq!(file.metadata().unwrap().len(), MAX_LEDGER_BYTES + 1);
+    }
+
+    #[test]
+    fn read_ledger_file_reports_incomplete_input_and_does_not_rewrite() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger.jsonl");
 
@@ -687,11 +770,8 @@ mod tests {
 
         let original_bytes = std::fs::read(&path).unwrap();
 
-        let records = read_ledger_file(&path).expect("read_ledger_file should succeed");
-
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0], rec_1);
-        assert_eq!(records[1], rec_2);
+        let error = read_ledger_file(&path).unwrap_err();
+        assert!(error.to_string().contains("incomplete"));
 
         let bytes_after = std::fs::read(&path).unwrap();
         assert_eq!(

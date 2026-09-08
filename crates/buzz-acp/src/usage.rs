@@ -454,6 +454,23 @@ pub(crate) struct UsageTracker {
 }
 
 impl UsageTracker {
+    /// Whether this snapshot proves new output beyond the committed turn.
+    pub(crate) fn output_advanced(&self, session_id: &str, output: Option<u64>) -> bool {
+        if self
+            .in_flight_session
+            .as_deref()
+            .is_some_and(|active| active != session_id)
+        {
+            return false;
+        }
+        let baseline = self
+            .sessions
+            .get(session_id)
+            .and_then(|state| state.last_output)
+            .unwrap_or(0);
+        output.is_some_and(|current| current > baseline)
+    }
+
     /// Mark the start of a new prompt turn for `session_id`.
     ///
     /// Clears any leftover `pending` record and records which session is

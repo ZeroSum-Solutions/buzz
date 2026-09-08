@@ -12,6 +12,13 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+thread_local! { static WRITTEN_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+pub(super) fn take_written_bytes() -> u64 {
+    WRITTEN_BYTES.with(|count| count.replace(0))
+}
+
 /// Environment variable naming the state directory. Set explicitly by the
 /// desktop at spawn; never inherited by accident (it is on the desktop's
 /// reserved-env-key list, so a saved user env cannot supply it).
@@ -75,6 +82,34 @@ pub fn pubkey_prefix(pubkey_hex: &str) -> String {
 
 /// Create `dir` (and its parents) and set owner-only permissions on it.
 pub fn ensure_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+        if dir.as_os_str().as_bytes().len() >= libc::PATH_MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "state directory exceeds platform path limit",
+            ));
+        }
+        let mut ancestor = PathBuf::new();
+        for component in dir.components() {
+            ancestor.push(component);
+            match fs::symlink_metadata(&ancestor) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    // macOS exposes root-owned /var and /tmp as aliases. They
+                    // are OS authority, unlike a user-supplied state alias.
+                    let system_alias =
+                        meta.uid() == 0 && matches!(ancestor.to_str(), Some("/var" | "/tmp"));
+                    if !system_alias {
+                        return Err(io::Error::other("state directory contains a symlink"));
+                    }
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
     fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {
@@ -84,6 +119,22 @@ pub fn ensure_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Open a regular state file without following a final-component symlink.
+pub(super) fn open_read(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("state source is not a regular file"));
+    }
+    Ok(file)
+}
+
 /// Open `path` for appending, creating it 0600 if it does not exist.
 pub fn open_append(path: &Path) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
@@ -91,10 +142,15 @@ pub fn open_append(path: &Path) -> io::Result<fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(FILE_MODE);
+        options
+            .mode(FILE_MODE)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = options.open(path)?;
-    harden(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("state destination is not a regular file"));
+    }
+    harden(&file)?;
     Ok(file)
 }
 
@@ -105,23 +161,28 @@ pub fn open_create(path: &Path) -> io::Result<fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(FILE_MODE);
+        options
+            .mode(FILE_MODE)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = options.open(path)?;
-    harden(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("state destination is not a regular file"));
+    }
+    harden(&file)?;
     Ok(file)
 }
 
 /// Re-apply 0600 to a file that may pre-date this code (or a looser umask).
-fn harden(path: &Path) -> io::Result<()> {
+fn harden(file: &fs::File) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(FILE_MODE))?;
+        file.set_permissions(fs::Permissions::from_mode(FILE_MODE))?;
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
+        let _ = file;
     }
     Ok(())
 }
@@ -130,6 +191,20 @@ fn harden(path: &Path) -> io::Result<()> {
 /// it, then rename over the target. A crash leaves either the old file or the
 /// new one, never a half-written one.
 pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
+    #[cfg(test)]
+    WRITTEN_BYTES.with(|count| count.set(count.get() + contents.len() as u64));
+    write_atomic_with_sync(path, contents, sync_dir)
+}
+
+pub(super) fn sync_dir(dir: &Path) -> io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
+fn write_atomic_with_sync(
+    path: &Path,
+    contents: &[u8],
+    sync: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     use std::io::Write as _;
 
     let parent = path.parent().ok_or_else(|| {
@@ -149,32 +224,14 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
         file.sync_all()?;
     }
     fs::rename(&temp, path)?;
-    // The rename above is what commits the write: `path` now holds
-    // `contents` regardless of anything below. Syncing the parent directory
-    // entry only hardens against an OS crash landing in the narrow window
-    // before that entry itself reaches disk — a best-effort durability
-    // improvement, not the thing that decides whether the write happened.
-    //
-    // So a failure here must never turn into `Err`: an earlier version
-    // propagated it, which meant a caller (e.g. `ParkFile::commit`) that
-    // sees `Err` assumes NOTHING was written and keeps its own copy for a
-    // future retry — while the target file, on disk, right now, already
-    // holds the new content. That caller then falls through to a legacy
-    // path that requeues/re-parks the same batch, producing two live copies
-    // of one message (T16 delta 1, finding 5). Log and move on instead.
-    match fs::File::open(parent).and_then(|dir| dir.sync_all()) {
-        Ok(()) => {}
-        Err(error) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %error,
-                "could not fsync the state directory entry after an atomic rename — \
-                 the write itself already landed; durability is degraded only against \
-                 an OS crash in the next instant, not lost"
-            );
-        }
-    }
-    Ok(())
+    // A visible rename is not a durable commit. The pending-operation journal
+    // retains custody until this succeeds, so callers must propagate failure.
+    sync(parent).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("state rename committed but durability is unconfirmed: {error}"),
+        )
+    })
 }
 
 #[cfg(unix)]
@@ -189,43 +246,53 @@ fn home_dir() -> Option<PathBuf> {
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn state_directory_rejects_user_symlinks_and_overlong_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("actual");
+        std::fs::create_dir(&target).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        assert!(super::ensure_dir(&alias.join("state")).is_err());
+        assert!(!target.join("state").exists());
+        assert!(super::ensure_dir(&dir.path().join("x".repeat(libc::PATH_MAX as usize))).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_file_open_never_follows_symlink_or_changes_target_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"preserve bytes").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        assert!(super::open_create(&alias).is_err());
+        assert!(super::open_append(&alias).is_err());
+        assert!(super::open_read(&alias).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"preserve bytes");
+        assert_eq!(
+            std::fs::metadata(target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
     use super::*;
 
     #[test]
-    fn test_write_atomic_survives_parent_dir_fsync_error() {
-        use std::os::unix::fs::PermissionsExt;
-
+    fn test_write_atomic_reports_committed_but_unconfirmed_directory_sync() {
         let dir = tempfile::tempdir().unwrap();
-        let sub = dir.path().join("sub");
-        fs::create_dir(&sub).unwrap();
-
-        // 0o300: write + execute, but NO read permission.
-        // Creating and renaming temp files succeeds (needs only write+exec on
-        // the directory), but fs::File::open(parent) — used only for the
-        // trailing directory-entry fsync — fails with PermissionDenied.
-        fs::set_permissions(&sub, fs::Permissions::from_mode(0o300)).unwrap();
-
-        let target = sub.join("target.txt");
-        let result = write_atomic(&target, b"test payload");
-
-        // Restore permissions for clean tempdir teardown and to read the file back.
-        let _ = fs::set_permissions(&sub, fs::Permissions::from_mode(0o700));
-
-        // T16 delta 1, finding 5: the rename already committed the write
-        // before the directory-fsync step ever runs, so a failure there
-        // must never be reported as "nothing was written" — a caller that
-        // saw `Err` here would keep its own copy and retry, producing two
-        // live copies of the same durably-written batch.
-        assert!(
-            result.is_ok(),
-            "write_atomic must not fail the whole write just because the \
-             trailing directory-entry fsync could not run: {result:?}"
-        );
-        assert_eq!(
-            fs::read(&target).unwrap(),
-            b"test payload",
-            "the content must be exactly what was requested — the rename \
-             already committed it before the fsync step"
-        );
+        let path = dir.path().join("state.json");
+        let error = write_atomic_with_sync(&path, b"new image", |_| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected sync failure",
+            ))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("durability is unconfirmed"));
+        assert_eq!(fs::read(&path).unwrap(), b"new image");
     }
 }

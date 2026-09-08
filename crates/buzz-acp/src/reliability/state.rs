@@ -157,7 +157,7 @@ impl ReliabilityState {
                 self.breakers.remove(scope);
                 self.consecutive.remove(scope);
                 self.generation = self.generation.wrapping_add(1);
-                return Action::Park;
+                return Action::ParkFor(super::ParkReason::BreakerExpired);
             }
             breaker.next_probe = now + Duration::minutes(BREAKER_PROBE_MINUTES);
             breaker.probe_issued = false;
@@ -180,18 +180,9 @@ impl ReliabilityState {
         let consecutive = *count;
         self.consecutive.remove(scope);
         if self.breakers.len() >= MAX_OPEN_BREAKERS && !self.breakers.contains_key(scope) {
-            // Evict the longest-open breaker to admit this one rather than
-            // growing without bound. This is a bounded-memory safety valve,
-            // not a substitute for `sweep_breakers` actually expiring stale
-            // entries — normal operation should never reach this cap.
-            if let Some(oldest_scope) = self
-                .breakers
-                .iter()
-                .min_by_key(|(_, b)| b.opened_at)
-                .map(|(s, _)| s.clone())
-            {
-                self.breakers.remove(&oldest_scope);
-            }
+            // Preserve existing containment; the new scope's batch is parked
+            // rather than evicting a breaker or growing the map.
+            return Action::ParkFor(super::ParkReason::BreakerOpen);
         }
         self.breakers.insert(
             scope.clone(),
@@ -429,6 +420,27 @@ impl ReliabilityState {
         }
     }
 
+    /// Read-only eligibility for selecting a durably parked probe input.
+    pub fn parked_probe_due(&self, scope: &SessionScope, now: DateTime<Utc>) -> bool {
+        let pause_due = self
+            .pause
+            .as_ref()
+            .is_some_and(|pause| now >= pause.until && !pause.probe_issued);
+        let breaker_due = self
+            .breakers
+            .get(scope)
+            .is_some_and(|breaker| now >= breaker.next_probe && !breaker.probe_issued);
+        let pause_allows = self
+            .pause
+            .as_ref()
+            .is_none_or(|pause| now >= pause.until && !pause.probe_issued);
+        let breaker_allows = self
+            .breakers
+            .get(scope)
+            .is_none_or(|breaker| now >= breaker.next_probe && !breaker.probe_issued);
+        (pause_due || breaker_due) && pause_allows && breaker_allows
+    }
+
     /// Number of scopes currently tracked for consecutive failures.
     pub fn consecutive_len(&self) -> usize {
         self.consecutive.len()
@@ -596,6 +608,35 @@ mod tests {
         for _ in 0..BREAKER_THRESHOLD {
             state.on_failure(scope, ErrorClass::ProviderInternal, now);
         }
+    }
+
+    #[test]
+    fn expired_breaker_preserves_park_reason() {
+        let mut state = ReliabilityState::default();
+        let scope = scope();
+        let now = Utc::now();
+        open_breaker(&mut state, &scope, now);
+        assert_eq!(
+            state.on_failure(
+                &scope,
+                ErrorClass::ProviderInternal,
+                now + Duration::hours(7)
+            ),
+            Action::ParkFor(super::super::ParkReason::BreakerExpired)
+        );
+    }
+
+    #[test]
+    fn breaker_capacity_never_lifts_existing_containment() {
+        let mut state = ReliabilityState::default();
+        let now = Utc::now();
+        let first = scope();
+        open_breaker(&mut state, &first, now);
+        for _ in 1..=MAX_OPEN_BREAKERS {
+            open_breaker(&mut state, &scope(), now + Duration::seconds(1));
+        }
+        assert!(state.breaker_opened_at(&first).is_some());
+        assert!(state.breakers.len() <= MAX_OPEN_BREAKERS);
     }
 
     // T16 delta 1, finding 7: a breaker whose scope never sends anything
