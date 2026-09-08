@@ -197,7 +197,24 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
 }
 
 pub(super) fn sync_dir(dir: &Path) -> io::Result<()> {
-    fs::File::open(dir)?.sync_all()
+    #[cfg(windows)]
+    let directory = {
+        use std::os::windows::fs::OpenOptionsExt;
+        // CreateFile requires BACKUP_SEMANTICS for directory handles, and
+        // FlushFileBuffers (sync_all) requires GENERIC_WRITE. A read-only
+        // File::open handle cannot confirm custody durability on Windows.
+        // https://learn.microsoft.com/en-us/windows/win32/fileio/obtaining-a-handle-to-a-directory
+        // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)?
+    };
+    #[cfg(not(windows))]
+    let directory = fs::File::open(dir)?;
+    directory.sync_all()
 }
 
 fn write_atomic_with_sync(
@@ -244,7 +261,7 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE").map(PathBuf::from)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     #[cfg(unix)]
     #[test]
@@ -280,6 +297,19 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn atomic_replace_and_unlink_confirm_directory_durability() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("custody.json");
+        write_atomic(&path, b"accepted").unwrap();
+        write_atomic(&path, b"started").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"started");
+        fs::remove_file(&path).unwrap();
+        sync_dir(dir.path()).unwrap();
+        assert!(!path.exists());
+        assert!(sync_dir(&dir.path().join("missing")).is_err());
+    }
 
     #[test]
     fn test_write_atomic_reports_committed_but_unconfirmed_directory_sync() {

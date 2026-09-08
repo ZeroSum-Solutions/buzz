@@ -1430,10 +1430,20 @@ impl Drop for SandboxedHome {
 }
 
 fn mock_app() -> tauri::App<tauri::test::MockRuntime> {
-    tauri::test::mock_builder()
+    use tauri::Manager;
+    let data = tempfile::tempdir().unwrap();
+    let expected_data_dir = data.path().to_path_buf();
+    let mut context = tauri::test::mock_context(tauri::test::noop_assets());
+    // KnownFolder ignores HOME/XDG on Windows; retain an absolute sandbox in
+    // app state and let Tauri resolve its real app_data_dir against that path.
+    context.config_mut().identifier = expected_data_dir.to_str().unwrap().to_owned();
+    let app = tauri::test::mock_builder()
+        .manage(data)
         .manage(crate::app_state::build_app_state())
-        .build(tauri::test::mock_context(tauri::test::noop_assets()))
-        .expect("mock app builds headless")
+        .build(context)
+        .expect("mock app builds headless");
+    assert_eq!(app.path().app_data_dir().unwrap(), expected_data_dir);
+    app
 }
 
 #[path = "apply_config_tests.rs"]

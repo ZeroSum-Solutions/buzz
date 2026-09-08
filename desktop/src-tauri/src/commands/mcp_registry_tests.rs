@@ -127,14 +127,23 @@ fn mock_app() -> tauri::App<tauri::test::MockRuntime> {
     *state.keys.lock().unwrap() = nostr::Keys::generate();
     *state.relay_url_override.lock().unwrap() = Some("ws://127.0.0.1:1".to_string());
 
-    tauri::test::mock_builder()
+    let data = tempfile::tempdir().unwrap();
+    let expected_data_dir = data.path().to_path_buf();
+    let mut context = tauri::test::mock_context(tauri::test::noop_assets());
+    // Windows KnownFolder ignores HOME/XDG. An absolute test identifier makes
+    // Tauri's data_dir.join(identifier) resolve inside this retained sandbox.
+    context.config_mut().identifier = expected_data_dir.to_str().unwrap().to_owned();
+    let app = tauri::test::mock_builder()
+        .manage(data)
         .invoke_handler(tauri::generate_handler![
             super::save_mcp_registry_server,
             super::set_agent_mcp_servers
         ])
         .manage(state)
-        .build(tauri::test::mock_context(tauri::test::noop_assets()))
-        .expect("mock app builds headless")
+        .build(context)
+        .expect("mock app builds headless");
+    assert_eq!(app.path().app_data_dir().unwrap(), expected_data_dir);
+    app
 }
 
 fn bare_agent_record(pubkey: &str) -> ManagedAgentRecord {
@@ -1149,7 +1158,13 @@ fn mcp_registry_ipc_rejects_oversized_arguments_before_materializing_dtos() {
                 cmd: cmd.into(),
                 callback: tauri::ipc::CallbackFn(0),
                 error: tauri::ipc::CallbackFn(1),
-                url: "tauri://localhost".parse().unwrap(),
+                url: if cfg!(windows) {
+                    "http://tauri.localhost"
+                } else {
+                    "tauri://localhost"
+                }
+                .parse()
+                .unwrap(),
                 body: tauri::ipc::InvokeBody::Json(body),
                 headers: Default::default(),
                 invoke_key: tauri::test::INVOKE_KEY.to_string(),
@@ -1186,3 +1201,15 @@ fn mcp_registry_writer_never_installs_bytes_above_its_reader_cap() {
 
 #[path = "mcp_runtime_change_tests.rs"]
 mod runtime_change_tests;
+
+#[test]
+fn mcp_registry_mock_apps_have_independent_data_directories() {
+    let (_guard, _) = EnvGuard::new();
+    let first = mock_app();
+    let second = mock_app();
+    let first_path = document_path(first.handle()).unwrap();
+    let second_path = document_path(second.handle()).unwrap();
+    assert_ne!(first_path, second_path);
+    fs::write(first_path, b"sentinel").unwrap();
+    assert!(!second_path.exists());
+}

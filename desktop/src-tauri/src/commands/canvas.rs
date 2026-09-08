@@ -101,6 +101,21 @@ mod tests {
                     assert!(request.len() < 16_384, "bounded HTTP request headers");
                     request.push(stream.read_u8().await.unwrap());
                 }
+                // Drain the POST body before closing the socket. Windows can
+                // reset a connection with unread request bytes, discarding the
+                // response before reqwest consumes it.
+                let headers = std::str::from_utf8(&request).unwrap();
+                let content_length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                assert!(content_length <= 16_384, "bounded HTTP request body");
+                let mut request_body = vec![0; content_length];
+                stream.read_exact(&mut request_body).await.unwrap();
                 let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                 stream.write_all(response.as_bytes()).await.unwrap();
             });
@@ -116,7 +131,11 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(result.is_ok(), size == events::MAX_CONTENT_BYTES);
+            assert_eq!(
+                result.is_ok(),
+                size == events::MAX_CONTENT_BYTES,
+                "{result:?}"
+            );
             if let Ok(value) = result {
                 assert_eq!(value["content"].as_str().unwrap().len(), size);
             }
