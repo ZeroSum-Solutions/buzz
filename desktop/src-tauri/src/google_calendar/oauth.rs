@@ -7,11 +7,9 @@
 //! without a refresh token, or short of the requested scopes, writes no
 //! binding at all.
 //!
-//! Signature verification is a seam, not a default:
-//! [`IdTokenSignatureVerifier`] has no implementation in this module, so no
-//! path here can produce validated claims without one being supplied. Wiring
-//! Google's JWKS to it is part of the connect flow (see the module docs of
-//! [`super`] for the slice boundary).
+//! Production signature verification is supplied by `provider::GoogleVerifier`.
+//! The native connect command fetches a bounded Google JWKS and pins RS256
+//! before any claims can become an active binding.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -148,7 +146,7 @@ impl AuthRequest {
         push("code_challenge_method", "S256");
         push("access_type", "offline");
         if self.prompt_consent {
-            push("prompt", "consent");
+            push("prompt", "consent select_account");
         }
         url
     }
@@ -432,14 +430,15 @@ pub fn verify_id_token(
     let header_bytes = URL_SAFE_NO_PAD
         .decode(header)
         .map_err(|_| IdTokenError::Malformed("the header is not base64url"))?;
-    let key_id = serde_json::from_slice::<serde_json::Value>(&header_bytes)
-        .ok()
-        .and_then(|header| {
-            header
-                .get("kid")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        });
+    let header_value: serde_json::Value = serde_json::from_slice(&header_bytes)
+        .map_err(|_| IdTokenError::Malformed("invalid header"))?;
+    if header_value.get("alg").and_then(serde_json::Value::as_str) != Some("RS256") {
+        return Err(IdTokenError::Malformed("only RS256 is accepted"));
+    }
+    let key_id = header_value
+        .get("kid")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
     let signing_input = &raw[..header.len() + 1 + payload.len()];
     verifier
         .verify(signing_input, &signature_bytes, key_id.as_deref())

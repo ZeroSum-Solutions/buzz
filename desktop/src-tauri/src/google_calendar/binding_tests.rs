@@ -622,3 +622,102 @@ fn google_calendar_no_agent_capability_resolves_the_calendar_credential() {
         }
     }
 }
+
+#[test]
+fn google_calendar_held_grant_retains_retry_custody_on_identity_change() {
+    let mut envelope = CalendarEnvelope::default();
+    Change::HoldGrant(Box::new(binding(91)))
+        .apply(&mut envelope, &context(0))
+        .unwrap();
+    let changed = CommitContext {
+        current_identity_pubkey_hex: Some("another-identity".into()),
+        now_ms: 1,
+    };
+    assert!(Change::ActivateHeldGrant(Box::new(binding(91)))
+        .apply(&mut envelope, &changed)
+        .is_err());
+    assert!(envelope.active_binding.is_none());
+    assert!(envelope.pending.contains_key(&91));
+    Change::ActivateHeldGrant(Box::new(binding(91)))
+        .apply(&mut envelope, &context(2))
+        .unwrap();
+    assert!(envelope.pending.is_empty());
+    assert_eq!(envelope.active_binding.unwrap().generation, 91);
+}
+#[test]
+fn google_calendar_held_grant_cannot_activate_after_revocation_started() {
+    let mut envelope = CalendarEnvelope::default();
+    Change::HoldGrant(Box::new(binding(92)))
+        .apply(&mut envelope, &context(0))
+        .unwrap();
+    Change::JournalProgress {
+        generation: 92,
+        expected_revision: 0,
+        step: JournalStep::RevocationAttempt(None),
+    }
+    .apply(&mut envelope, &context(1))
+    .unwrap();
+    assert!(Change::ActivateHeldGrant(Box::new(binding(92)))
+        .apply(&mut envelope, &context(2))
+        .is_err());
+    assert!(envelope.pending.contains_key(&92));
+}
+
+#[test]
+fn google_calendar_failed_rotated_refresh_keeps_new_token_in_revocation_custody() {
+    let mut envelope = CalendarEnvelope::default();
+    Change::Connect(Box::new(binding(101)))
+        .apply(&mut envelope, &context(0))
+        .unwrap();
+    Change::DisconnectWithToken {
+        generation: 101,
+        refresh_token: Redacted::new("rotated-fixture-token".into()),
+    }
+    .apply(&mut envelope, &context(1))
+    .unwrap();
+    assert!(envelope.active_binding.is_none());
+    assert_eq!(
+        envelope.pending[&101].refresh_token.expose(),
+        "rotated-fixture-token"
+    );
+    assert!(Change::DisconnectWithToken {
+        generation: 102,
+        refresh_token: Redacted::new("wrong-fixture-token".into())
+    }
+    .apply(&mut envelope, &context(2))
+    .is_err());
+    assert_eq!(
+        envelope.pending[&101].refresh_token.expose(),
+        "rotated-fixture-token"
+    );
+}
+
+#[test]
+fn google_calendar_explicit_abandon_and_clear_never_claim_provider_revocation() {
+    let mut envelope = CalendarEnvelope::default();
+    Change::HoldGrant(Box::new(binding(111)))
+        .apply(&mut envelope, &context(0))
+        .unwrap();
+    assert!(Change::ClearRevocation { generation: 111 }
+        .apply(&mut envelope, &context(1))
+        .is_err());
+    Change::AbandonRevocation { generation: 111 }
+        .apply(&mut envelope, &context(2))
+        .unwrap();
+    assert!(!envelope.pending[&111].revocation_confirmed);
+    assert!(Change::ClearRevocation { generation: 111 }
+        .apply(&mut envelope, &context(3))
+        .is_err());
+    let revision = envelope.pending[&111].revision;
+    Change::JournalProgress {
+        generation: 111,
+        expected_revision: revision,
+        step: JournalStep::PurgeConfirmed,
+    }
+    .apply(&mut envelope, &context(4))
+    .unwrap();
+    Change::ClearRevocation { generation: 111 }
+        .apply(&mut envelope, &context(5))
+        .unwrap();
+    assert!(envelope.pending.is_empty());
+}

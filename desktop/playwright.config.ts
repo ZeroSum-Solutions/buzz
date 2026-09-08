@@ -36,6 +36,7 @@ export default defineConfig({
         "**/mcp-registry-settings.spec.ts",
         "**/channel-files-index.spec.ts",
         "**/channel-files-facets.spec.ts",
+        "**/calendar.spec.ts",
         "**/auxiliary-pane-close-visibility.spec.ts",
         "**/channel-composer-overflow.spec.ts",
         "**/badge.spec.ts",

@@ -249,6 +249,7 @@ pub fn run() {
         .manage(agent_health::AgentHealthStore::default())
         .manage(channel_head_cache::ChannelHeadCacheStore::default())
         .setup(move |app| {
+            commands::calendar::start_retry_worker(app.handle().clone());
             let app_handle = app.handle().clone();
             #[cfg(target_os = "macos")]
             {
@@ -555,6 +556,15 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::calendar_status,
+            commands::calendar_abandon_revocation,
+            commands::calendar_clear_revocation,
+            commands::calendar_connect,
+            commands::calendar_disconnect,
+            commands::calendar_events,
+            commands::calendar_create,
+            commands::calendar_update,
+            commands::calendar_delete,
             list_mcp_registry_servers,
             save_mcp_registry_server,
             delete_mcp_registry_server,

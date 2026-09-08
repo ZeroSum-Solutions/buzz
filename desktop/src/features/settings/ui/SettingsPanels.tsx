@@ -1,7 +1,9 @@
+import { CalendarConnectionPanel } from "@/features/calendar/CalendarConnectionPanel";
 import { useMemo, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import {
   Archive,
+  CalendarDays,
   BellRing,
   Bot,
   ChevronDown,
@@ -82,6 +84,7 @@ import { SettingsSectionHeader } from "./SettingsSectionHeader";
 import { VoiceSettingsCard } from "./VoiceSettingsCard";
 
 export type SettingsSection =
+  | "calendar"
   | "profile"
   | "notifications"
   | "voice"
@@ -102,6 +105,7 @@ export type SettingsSection =
 export const DEFAULT_SETTINGS_SECTION: SettingsSection = "profile";
 
 const SETTINGS_SECTION_VALUES: readonly SettingsSection[] = [
+  "calendar",
   "profile",
   "notifications",
   "voice",
@@ -151,6 +155,7 @@ export type SettingsPanelProps = {
 };
 
 export const settingsSections: SettingsSectionDescriptor[] = [
+  { value: "calendar", label: "Calendar", icon: CalendarDays },
   {
     value: "appearance",
     label: "Appearance",
@@ -804,6 +809,8 @@ export function renderSettingsSection(
   props: SettingsPanelProps,
 ): React.ReactNode {
   switch (section) {
+    case "calendar":
+      return <CalendarConnectionPanel />;
     case "profile":
       return (
         <ProfileSettingsCard

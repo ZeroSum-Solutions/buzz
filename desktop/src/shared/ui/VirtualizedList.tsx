@@ -63,6 +63,8 @@ type VirtualizedListProps<T> = {
   className?: string;
   /** Class name for the inner spacer div that holds the virtual rows. */
   innerClassName?: string;
+  /** Opt-in list semantics for non-chat surfaces. */
+  listLabel?: string;
   /** Overscan — number of items to render outside the visible area. */
   overscan?: number;
   /** Receives the virtualizer instance (for `scrollToIndex`, etc). */
@@ -79,6 +81,7 @@ export function VirtualizedList<T>({
   scrollRef,
   className,
   innerClassName,
+  listLabel,
   overscan = 5,
   onVirtualizer,
 }: VirtualizedListProps<T>) {
@@ -147,12 +150,20 @@ export function VirtualizedList<T>({
     <>
       {headerHost && header ? createPortal(header, headerHost) : null}
       <div
+        {...(listLabel ? { role: "list", "aria-label": listLabel } : {})}
         className={cn("relative w-full", innerClassName)}
         ref={spacerRef}
         style={{ height: `${virtualizer.getTotalSize()}px` }}
       >
         {virtualItems.map((virtualRow) => (
           <div
+            {...(listLabel
+              ? {
+                  role: "listitem",
+                  "aria-posinset": virtualRow.index + 1,
+                  "aria-setsize": items.length,
+                }
+              : {})}
             data-index={virtualRow.index}
             key={virtualRow.key}
             ref={virtualizer.measureElement}
