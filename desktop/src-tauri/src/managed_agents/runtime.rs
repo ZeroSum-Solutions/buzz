@@ -131,18 +131,11 @@ pub(crate) fn apply_system_prompt_env(
 
 pub(crate) const STATE_DIR_ENV_VAR: &str = "BUZZ_ACP_STATE_DIR";
 
-/// Proof token for the state-dir env application, consumed by
-/// `spawn_with_effort_proof` the same way `EffortApplied`/`McpEnvApplied`
-/// are. `#[must_use]`; the only way to obtain one is
-/// [`apply_state_dir_env`], and the real spawn site cannot compile without
-/// passing it through — deleting the `apply_state_dir_env` call, or moving it
-/// before the `descriptor.env` loop it must override, leaves `state_dir_applied`
-/// undefined at the spawn call, a compile error CI catches before any test
-/// runs (T16 delta 1, finding 16 / prior #20 — the added tests before this
-/// exercised `apply_state_dir_env` in isolation, never binding it to the real
-/// command-builder seam).
+/// Carries the authoritative path to the final spawn boundary. The spawn
+/// wrapper reapplies it immediately before spawning, so later descriptor
+/// layers cannot override it even if command construction is reordered.
 #[must_use]
-pub(crate) struct StateDirApplied(());
+pub(crate) struct StateDirApplied(Option<std::path::PathBuf>);
 
 /// Apply the harness reliability state-dir env to an agent spawn command.
 ///
@@ -162,7 +155,7 @@ pub(crate) fn apply_state_dir_env(
             command.env_remove(STATE_DIR_ENV_VAR);
         }
     }
-    StateDirApplied(())
+    StateDirApplied(state_dir.map(std::path::Path::to_path_buf))
 }
 
 /// Classify an agent's persona against the live catalog for the Agents-menu
@@ -571,8 +564,10 @@ pub(crate) fn spawn_with_effort_proof(
     _effort: EffortApplied,
     _prompt: SystemPromptApplied,
     _mcp: McpEnvApplied,
-    _state_dir: StateDirApplied,
+    state_dir: StateDirApplied,
 ) -> std::io::Result<std::process::Child> {
+    // This is the actual spawn seam: no user/descriptor env layer runs later.
+    let _ = apply_state_dir_env(cmd, state_dir.0.as_deref());
     cmd.spawn()
 }
 

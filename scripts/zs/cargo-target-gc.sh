@@ -8,7 +8,8 @@ for arg in "$@"; do
             MODE="dry-run"
             ;;
         --apply)
-            MODE="apply"
+            echo "Cargo cache GC is report-only: --apply is disabled because Cargo writers do not share a deletion lease. Run without --apply to inventory caches; retire and verify inactive worktrees before manual cleanup." >&2
+            exit 2
             ;;
         *)
             echo "usage: cargo-target-gc.sh [--dry-run|--apply]" >&2
@@ -19,7 +20,6 @@ done
 
 python3 - "$MODE" << 'PY'
 import datetime
-import fcntl
 import hashlib
 import json
 import os
@@ -243,7 +243,25 @@ def has_unrecognized_content(entry_path, allowed_names):
         names = os.listdir(entry_path)
     except OSError:
         return True
-    return any(n not in allowed_names for n in names)
+    for name in names:
+        if name in allowed_names:
+            continue
+        # A killed atomic marker write may leave a partial sibling. Only
+        # recognize regular, bounded prefixes of the authenticated marker;
+        # arbitrary files remain unknown. Reporting never deletes either.
+        if ".worktree-path" in allowed_names and re.fullmatch(r"\.worktree-path\.[A-Za-z0-9_-]{6,}", name):
+            valid, owner = marker_valid(entry_path, os.path.basename(entry_path))
+            temporary = os.path.join(entry_path, name)
+            if valid and not os.path.islink(temporary) and os.path.isfile(temporary):
+                try:
+                    with open(temporary, "rb") as residue:
+                        data = residue.read(len(os.fsencode(owner)) + 1)
+                    if os.fsencode(owner).startswith(data):
+                        continue
+                except OSError:
+                    pass
+        return True
+    return False
 
 
 def contains_git(entry_path):
@@ -273,13 +291,13 @@ def marker_valid(entry_path, expected_key):
     if not os.path.isfile(sidecar) or os.path.islink(sidecar):
         return False, None
     try:
-        with open(sidecar, "r", encoding="utf-8") as sf:
-            recorded_path = sf.read().strip()
+        with open(sidecar, "r", encoding="utf-8", errors="surrogateescape", newline="") as sf:
+            recorded_path = sf.read()
     except OSError:
         return False, None
     if not recorded_path:
         return False, None
-    if hashlib.sha256(recorded_path.encode()).hexdigest()[:12] != expected_key:
+    if hashlib.sha256(os.fsencode(recorded_path)).hexdigest()[:12] != expected_key:
         return False, None
     return True, recorded_path
 
@@ -600,7 +618,7 @@ if skipped:
     print()
 
 if candidates:
-    print("--- Eviction Candidates ---")
+    print("--- Inactive Cache Review Candidates (not deletion authorization) ---")
     for r in candidates:
         size_str = format_bytes(r["cache_bytes"])
         branch_str = r["branch"] or "N/A"
@@ -614,136 +632,7 @@ if candidates:
     print()
 
 total_bytes = sum(r["cache_bytes"] for r in candidates)
-print(f"Total candidates: {len(candidates)} ({format_bytes(total_bytes)} reclaimable)")
+print(f"Total review candidates: {len(candidates)} ({format_bytes(total_bytes)} reclaimable)")
 
-if mode == "dry-run":
-    print("Dry-run complete: no files deleted. Use --apply to execute deletion.")
-    sys.exit(0)
-
-# --- Apply: fence the whole pass, then revalidate each candidate immediately
-# before removing it -----------------------------------------------------
-# The scan above can be arbitrarily stale by the time we get here (this loop
-# itself takes time, and nothing but this same process's own sequencing
-# stands between "scanned" and "deleted"). Two defenses, neither of which
-# alone is sufficient:
-#
-#   1. An exclusive lock over the cache root for the ENTIRE apply pass, so
-#      two `cargo-target-gc.sh --apply` invocations (including one that
-#      bypasses the Justfile's broader with-gate-lock.sh wrapper via direct
-#      invocation) can never revalidate-then-delete the same entries at
-#      once.
-#   2. A full re-authentication of each candidate immediately before its own
-#      deletion — not just "is it still there", but every check that made it
-#      eligible in the first place (marker, content allowlist, nested-.git,
-#      build-output marker, byte/mtime identity since the scan) — because an
-#      ordinary `cargo build` takes none of this GC's locks and can start
-#      writing into a candidate at any point between the scan and the
-#      delete. This narrows that race to the gap between the last
-#      revalidation check and the `rmtree` call itself, which is the
-#      smallest window achievable without making Cargo itself lock-aware
-#      (out of scope here — see storage-build-spec.md).
-
-APPLY_LOCK_PATH = os.path.join(new_cache_root, ".gc-apply.lock")
-_lock_fd = os.open(APPLY_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o644)
-try:
-    fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-except BlockingIOError:
-    fatal(
-        f"another cargo-target-gc.sh --apply is already running ({APPLY_LOCK_PATH} "
-        "is held); refusing to run concurrently."
-    )
-os.ftruncate(_lock_fd, 0)
-os.write(_lock_fd, f"{os.getpid()}\n".encode())
-# _lock_fd is intentionally never closed: the flock is held until this
-# process exits, which is the entire remaining apply pass.
-
-
-def revalidate(row, path):
-    if not os.path.isdir(path):
-        return False, "path-gone"
-    real_now = os.path.realpath(path)
-    if real_now != path:
-        return False, "path-changed-identity"
-    in_root = any(
-        root and os.path.dirname(real_now) == root
-        for root in (canonical_new_root, canonical_legacy_root)
-    )
-    if not in_root:
-        fatal(f"delete path '{real_now}' escaped the allowed cache roots! Aborting run.")
-    if os.path.islink(path):
-        return False, "became-symlink"
-    if lsof_active(path):
-        return False, "active-use-detected"
-
-    # Refuse if the entry's content changed since it was scanned: an
-    # unrelated size/mtime shift under a cache dir this GC is about to
-    # delete means something (almost certainly a build) wrote to it after
-    # the plan was made.
-    try:
-        bytes_now, _iso_now, mtime_now = get_dir_stats(path)
-    except StatError:
-        return False, "stat-error"
-    if bytes_now != row.get("cache_bytes") or mtime_now != row.get("mtime_epoch"):
-        return False, "changed-since-plan"
-
-    if contains_git(path):
-        return False, "contains-git-at-apply"
-    if not looks_like_build_output(path):
-        return False, "no-build-marker-at-apply"
-
-    if row["status"] == "orphaned":
-        cache_key = row.get("cache_key")
-        if cache_key:
-            marker_ok, _recorded = marker_valid(path, cache_key)
-            if not marker_ok:
-                return False, "marker-invalid-at-apply"
-        if has_unrecognized_content(path, SIDECAR_ALLOWED_NAMES):
-            return False, "unrecognized-content-at-apply"
-        wt_list_now = worktree_list_z()
-        if wt_list_now is None:
-            return False, "probe-failed"
-        live_now = {wt["path"] for wt in wt_list_now if wt["path"]}
-        wt_path = row.get("worktree_path")
-        if wt_path and wt_path in live_now:
-            return False, "worktree-reappeared"
-        return True, "ok"
-
-    # status == "candidate": a live, clean, pushed, idle worktree cache.
-    wt_path = row["worktree_path"]
-    if wt_path == main_worktree:
-        return False, "is-main"
-    if not os.path.isdir(wt_path):
-        return False, "worktree-path-gone"
-    status_out = git_probe(["git", "-C", wt_path, "status", "--porcelain=v1"])
-    if status_out is None or status_out.strip():
-        return False, "now-dirty-or-probe-failed"
-    up_out = git_probe(
-        ["git", "-C", wt_path, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]
-    )
-    if up_out is None:
-        return False, "now-no-upstream"
-    rev_out = git_probe(["git", "-C", wt_path, "rev-list", "@{u}..HEAD"])
-    if rev_out is None or rev_out.strip():
-        return False, "now-unpushed-or-probe-failed"
-    if mtime_now >= time.time() - FOURTEEN_DAYS:
-        return False, "now-recent"
-    return True, "ok"
-
-
-if not candidates:
-    print("No candidates to delete.")
-    sys.exit(0)
-
-deleted = 0
-for r in candidates:
-    path = r["delete_path"]
-    ok, why = revalidate(r, path)
-    if not ok:
-        print(f"Skipping (revalidation: {why}): {path}")
-        continue
-    print(f"Deleting: {path}")
-    shutil.rmtree(path)
-    deleted += 1
-
-print(f"Successfully deleted {deleted} candidate director{'y' if deleted == 1 else 'ies'}.")
+print("Report only: no cache is deleted. --apply is disabled until Cargo writers share a deletion lease.")
 PY

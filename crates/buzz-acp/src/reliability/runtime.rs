@@ -25,6 +25,7 @@ use super::ledger::{self, Ledger, LedgerBody, TruncateReport};
 use super::park::{ParkError, ParkFile, ParkReason, ParkedBatch, ReconcileReport};
 use super::state::ReliabilityState;
 use super::state_dir;
+use super::transaction::{self, Operation, OperationKind};
 
 /// One replay's worth of parked events for a single scope.
 #[derive(Debug, Clone)]
@@ -68,6 +69,12 @@ pub struct FinishReplayReport {
 
 /// The harness's reliability state for one agent.
 pub struct ReliabilityRuntime {
+    _lock: std::fs::File,
+    replay_floor: u64,
+    channel_access: Option<tokio::sync::watch::Receiver<crate::relay::ChannelAccessState>>,
+    started_event_ids: std::collections::HashSet<String>,
+    transaction_failed: bool,
+    transaction_failures: u64,
     dir: PathBuf,
     agent: String,
     ledger: Ledger,
@@ -91,9 +98,21 @@ impl ReliabilityRuntime {
     /// Open the state in an explicit directory. Used by tests and by any caller
     /// that resolved the directory itself.
     pub fn open_in(dir: &Path, pubkey_hex: &str, now: DateTime<Utc>) -> io::Result<Self> {
+        state_dir::ensure_dir(dir)?;
+        let lock = state_dir::open_append(&dir.join("runtime.lock"))?;
+        fs2::FileExt::try_lock_exclusive(&lock)?;
+        transaction::recover(dir, pubkey_hex)?;
+        let replay_floor = transaction::replay_floor(dir, now.timestamp().max(0) as u64)?;
+        let started_event_ids = transaction::read_receipts(dir)?;
         let ledger = Ledger::open(dir, pubkey_hex, now)?;
         let park = ParkFile::open(dir)?;
         Ok(Self {
+            _lock: lock,
+            replay_floor,
+            channel_access: None,
+            started_event_ids,
+            transaction_failed: false,
+            transaction_failures: 0,
             dir: dir.to_path_buf(),
             agent: pubkey_hex.to_string(),
             ledger,
@@ -108,6 +127,173 @@ impl ReliabilityRuntime {
     pub fn with_observer(mut self, observer: impl IntoObserverHandle) -> Self {
         self.observer = observer.into_observer();
         self
+    }
+
+    /// Whether all custody transitions are durably committed.
+    pub fn is_ready(&self) -> bool {
+        !self.transaction_failed
+            && !self.dir.join(transaction::PENDING_FILE).exists()
+            && self
+                .channel_access
+                .as_ref()
+                .is_none_or(|rx| !rx.borrow().overflowed)
+    }
+
+    /// Whether every new parked batch has a durable notice outbox entry.
+    pub fn notices_ready(&self) -> bool {
+        self.park
+            .batches()
+            .iter()
+            .all(|batch| !batch.notice_pending)
+    }
+
+    /// Finish a pending custody transition before accepting new work. Replays
+    /// recovered outside their original dispatch are marked for operator review.
+    pub fn recover_pending(&mut self, now: DateTime<Utc>) -> io::Result<()> {
+        let recovered = self.recover_operation(now)?;
+        if matches!(recovered, Some(OperationKind::Replay { .. })) {
+            self.reconcile_on_start(now).map_err(io::Error::other)?;
+        }
+        Ok(())
+    }
+
+    fn recover_operation(&mut self, now: DateTime<Utc>) -> io::Result<Option<OperationKind>> {
+        let recovered = transaction::recover(&self.dir, &self.agent)?;
+        if recovered.is_some() || self.transaction_failed {
+            self.started_event_ids = transaction::read_receipts(&self.dir)?;
+            self.park = ParkFile::open(&self.dir)?;
+            self.ledger = Ledger::open(&self.dir, &self.agent, now)?;
+        }
+        self.transaction_failed = false;
+        Ok(recovered)
+    }
+
+    fn transact(
+        &mut self,
+        kind: OperationKind,
+        after: Vec<ParkedBatch>,
+        bodies: Vec<LedgerBody>,
+        now: DateTime<Utc>,
+    ) -> Result<(), ParkError> {
+        self.transact_with_receipts(kind, after, bodies, None, now)
+    }
+
+    fn transact_with_receipts(
+        &mut self,
+        kind: OperationKind,
+        after: Vec<ParkedBatch>,
+        bodies: Vec<LedgerBody>,
+        receipts: Option<Vec<String>>,
+        now: DateTime<Utc>,
+    ) -> Result<(), ParkError> {
+        // Pure custody updates do not rewrite the audit file. The optional
+        // ledger image is still atomic with park changes when records exist.
+        let records = if bodies.is_empty() {
+            None
+        } else {
+            let mut records = self.ledger.read_all().inspect_err(|_error| {
+                self.transaction_failed = true;
+                self.transaction_failures = self.transaction_failures.saturating_add(1);
+            })?;
+            records.extend(bodies.iter().cloned().map(|body| ledger::LedgerRecord {
+                at: now,
+                agent: self.agent.clone(),
+                body,
+            }));
+            let (records, dropped) = ledger::fit_to_cap(records)?;
+            if dropped > 0 {
+                tracing::warn!(dropped, "ledger retention cap removed oldest audit records; durable event receipts remain intact");
+            }
+            Some(records)
+        };
+        let op = Operation {
+            id: Uuid::new_v4(),
+            agent: self.agent.clone(),
+            kind,
+            before: self.park.batches().to_vec(),
+            after,
+            ledger: records,
+            receipts,
+        };
+        self.transaction_failed = true;
+        let result = transaction::prepare(&self.dir, &op)
+            .and_then(|()| transaction::commit_prepared(&self.dir, &op))
+            .and_then(|()| {
+                self.park.accept_committed(op.after.clone());
+                if op.ledger.is_some() {
+                    self.ledger = Ledger::open(&self.dir, &self.agent, now)?;
+                }
+                Ok(())
+            });
+        if let Err(error) = result {
+            self.transaction_failures = self.transaction_failures.saturating_add(1);
+            return Err(ParkError::Io(error));
+        }
+        self.transaction_failed = false;
+        if let Some(ids) = op.receipts {
+            self.started_event_ids = ids.into_iter().collect();
+        }
+        if let Some(observer) = &self.observer {
+            for body in bodies {
+                Self::emit_health_frame(observer, &self.agent, now, &body);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn with_channel_access(
+        mut self,
+        access: tokio::sync::watch::Receiver<crate::relay::ChannelAccessState>,
+    ) -> Self {
+        self.channel_access = Some(access);
+        self
+    }
+
+    fn channel_allowed(&self, channel_id: Uuid) -> bool {
+        self.channel_access.as_ref().is_none_or(|rx| {
+            let access = rx.borrow();
+            !access.overflowed
+                && access.permitted.contains(&channel_id)
+                && !access.denied.contains(&channel_id)
+        })
+    }
+
+    /// Retain revoked channel inputs visibly for review, including pending
+    /// notice intent which cannot be posted into a channel without access.
+    pub fn retain_revoked_channel(
+        &mut self,
+        channel_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<(), ParkError> {
+        self.recover_pending(now)?;
+        let mut next = self.park.batches().to_vec();
+        let mut bodies = vec![];
+        for batch in &mut next {
+            if batch.channel_id == channel_id
+                && (batch.needs_review_reason.as_deref() != Some("channel access revoked")
+                    || batch.forced
+                    || batch.notice_pending)
+            {
+                batch.needs_review = true;
+                batch.forced = false;
+                batch.notice_pending = false;
+                batch.needs_review_reason = Some("channel access revoked".into());
+                bodies.push(LedgerBody::BatchNeedsReview(ledger::BatchNeedsReview {
+                    batch_id: batch.batch_id,
+                    channel_id,
+                    reason: "channel access revoked".into(),
+                }));
+            }
+        }
+        if bodies.is_empty() {
+            return Ok(());
+        }
+        self.transact(OperationKind::Update, next, bodies, now)
+    }
+
+    /// Fixed epoch boundary: never advanced from untrusted event timestamps.
+    pub fn replay_floor(&self) -> u64 {
+        self.replay_floor
     }
 
     /// The state directory.
@@ -149,7 +335,12 @@ impl ReliabilityRuntime {
     /// total means the durable record is incomplete and the operator has to be
     /// told.
     pub fn write_failures(&self) -> (u64, u64) {
-        (self.ledger.write_failures(), self.park.write_failures())
+        (
+            self.ledger
+                .write_failures()
+                .saturating_add(self.transaction_failures),
+            self.park.write_failures(),
+        )
     }
 
     /// Append a ledger record.
@@ -158,26 +349,20 @@ impl ReliabilityRuntime {
     /// readable through [`write_failures`](Self::write_failures) and surfaces in
     /// the next notice. The return value says whether the record landed.
     pub fn record(&mut self, now: DateTime<Utc>, body: LedgerBody) -> bool {
+        if !self.is_ready() {
+            tracing::error!("ledger mutation refused while a custody operation is pending");
+            return false;
+        }
         let kind = body.kind();
-        let body_for_observer = if self.observer.is_some() {
-            Some(body.clone())
-        } else {
-            None
-        };
-        match self.ledger.append(now, body) {
-            Ok(()) => {
-                if let (Some(observer), Some(body)) = (&self.observer, body_for_observer) {
-                    Self::emit_health_frame(observer, &self.agent, now, &body);
-                }
-                true
-            }
+        match self.transact(
+            OperationKind::Update,
+            self.park.batches().to_vec(),
+            vec![body],
+            now,
+        ) {
+            Ok(()) => true,
             Err(error) => {
-                tracing::error!(
-                    kind,
-                    agent = %self.agent,
-                    error = %error,
-                    "ledger append failed — the durable record for this event is missing"
-                );
+                tracing::error!(kind, error = %error, "ledger transaction failed; dispatch is blocked until recovery");
                 false
             }
         }
@@ -261,10 +446,287 @@ impl ReliabilityRuntime {
         observer.emit(emit_kind, None, &context, payload);
     }
 
+    /// Persist listener input before admitting it to the live queue.
+    pub fn admit_event(
+        &mut self,
+        event: &crate::queue::QueuedEvent,
+        now: DateTime<Utc>,
+    ) -> Result<bool, ParkError> {
+        if event.event.created_at.as_secs()
+            < self
+                .replay_floor
+                .saturating_sub(crate::relay::SINCE_SKEW_SECS)
+        {
+            // Apply the same epoch boundary as the relay REQ even if a relay
+            // sends an out-of-filter event. Such input was never admitted.
+            return Ok(false);
+        }
+        self.recover_pending(now)?;
+        if self.started_event_ids.contains(&event.event.id.to_hex())
+            || self.park.batches().iter().any(|batch| {
+                batch
+                    .events
+                    .iter()
+                    .any(|stored| stored.event.id == event.event.id)
+            })
+        {
+            return Ok(false);
+        }
+        if self.started_event_ids.len() >= transaction::MAX_RECEIPTS {
+            return Err(ParkError::Io(io::Error::other("ingress epoch receipt capacity reached; admission paused; reconcile and archive the current epoch before an explicit operator rollover")));
+        }
+        let batch = FlushBatch {
+            batch_id: Uuid::new_v4(),
+            channel_id: event.channel_id,
+            scope: event.scope.clone(),
+            events: vec![BatchEvent {
+                event: event.event.clone(),
+                prompt_tag: event.prompt_tag.clone(),
+                received_at: event.received_at,
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        if !self.channel_allowed(event.channel_id) {
+            let mut parked = ParkedBatch::from_batch(&batch, ParkReason::Ingress, false, now)?;
+            parked.needs_review = true;
+            parked.notice_pending = false;
+            parked.needs_review_reason = Some("channel access revoked".into());
+            let mut next = self.park.batches().to_vec();
+            next.push(parked);
+            self.transact(
+                OperationKind::Park(batch.batch_id),
+                next,
+                vec![LedgerBody::BatchNeedsReview(ledger::BatchNeedsReview {
+                    batch_id: batch.batch_id,
+                    channel_id: batch.channel_id,
+                    reason: "channel access revoked".into(),
+                })],
+                now,
+            )?;
+            return Ok(false);
+        }
+        self.park_batch(&batch, ParkReason::Ingress, false, now)?;
+        Ok(true)
+    }
+
+    /// Restore admitted, never-dispatched input without evicting live work.
+    pub fn refill_ingress(&self, queue: &mut crate::queue::EventQueue) {
+        let channels = self
+            .park
+            .batches()
+            .iter()
+            .map(|batch| batch.channel_id)
+            .collect();
+        self.refill_ingress_for(queue, &channels);
+    }
+
+    pub(crate) fn refill_ingress_for(
+        &self,
+        queue: &mut crate::queue::EventQueue,
+        allowed_channels: &std::collections::HashSet<Uuid>,
+    ) {
+        for batch in self.park.batches().iter().filter(|batch| {
+            batch.reason == ParkReason::Ingress
+                && !batch.started
+                && !batch.needs_review
+                && self.channel_allowed(batch.channel_id)
+                && allowed_channels.contains(&batch.channel_id)
+        }) {
+            for event in batch.to_batch_events() {
+                if queue.can_admit(&batch.scope()) && !queue.contains_event(&event.event.id) {
+                    queue.push(crate::queue::QueuedEvent {
+                        channel_id: batch.channel_id,
+                        scope: batch.scope(),
+                        event: event.event,
+                        prompt_tag: event.prompt_tag,
+                        received_at: event.received_at,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Persist uncertain-start custody and the event IDs before spawning work.
+    pub fn prepare_dispatch(
+        &mut self,
+        batch: &FlushBatch,
+        attempt: u32,
+        now: DateTime<Utc>,
+    ) -> Result<(), ParkError> {
+        if !self.channel_allowed(batch.channel_id) {
+            return Err(ParkError::Io(io::Error::other(
+                "channel access revoked; dispatch custody retained for review",
+            )));
+        }
+        self.recover_pending(now)?;
+        let mut parked = ParkedBatch::from_batch(batch, ParkReason::Ingress, true, now)?;
+        parked.notice_pending = false;
+        let ids: Vec<_> = parked.events.iter().map(|event| event.event.id).collect();
+        let mut next: Vec<_> = self
+            .park
+            .batches()
+            .iter()
+            .filter(|existing| {
+                existing.batch_id != batch.batch_id
+                    && !(existing.reason == ParkReason::Ingress
+                        && existing
+                            .events
+                            .iter()
+                            .any(|event| ids.contains(&event.event.id)))
+            })
+            .cloned()
+            .collect();
+        next.push(parked);
+        let body = LedgerBody::TurnStarted(ledger::TurnStarted::new(
+            batch.batch_id,
+            batch.channel_id,
+            &batch.scope.telemetry_label(),
+            ids.iter().map(|id| id.to_hex()),
+            attempt,
+        ));
+        let mut receipts = self.started_event_ids.clone();
+        receipts.extend(ids.iter().map(|id| id.to_hex()));
+        if receipts.len() > transaction::MAX_RECEIPTS {
+            return Err(ParkError::Io(io::Error::other("ingress epoch receipt capacity reached; dispatch paused; reconcile and archive the current epoch before an explicit operator rollover")));
+        }
+        let mut receipts: Vec<_> = receipts.into_iter().collect();
+        receipts.sort_unstable();
+        self.transact_with_receipts(OperationKind::Update, next, vec![body], Some(receipts), now)?;
+        let replay_ids = self
+            .ledger
+            .read_all()?
+            .iter()
+            .filter_map(|record| match &record.body {
+                LedgerBody::BatchReplayed(replay) if replay.replay_of == batch.batch_id => {
+                    Some(replay.batch_id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !replay_ids.is_empty() {
+            self.in_flight_replays
+                .insert(batch.scope.clone(), replay_ids);
+        }
+        Ok(())
+    }
+
+    /// Fence a native steer before its transport can observe the input.
+    pub fn prepare_steer(
+        &mut self,
+        event_id: nostr::EventId,
+        now: DateTime<Utc>,
+    ) -> Result<(), ParkError> {
+        self.recover_pending(now)?;
+        let parked = self
+            .park
+            .batches()
+            .iter()
+            .find(|batch| {
+                batch.reason == ParkReason::Ingress
+                    && batch.events.iter().any(|event| event.event.id == event_id)
+            })
+            .ok_or_else(|| {
+                ParkError::Io(io::Error::other("native steer has no durable admission"))
+            })?;
+        let batch = FlushBatch {
+            batch_id: parked.batch_id,
+            channel_id: parked.channel_id,
+            scope: parked.scope(),
+            events: parked.to_batch_events(),
+            cancelled_events: vec![],
+            cancel_reason: None,
+            started: Default::default(),
+        };
+        self.prepare_dispatch(&batch, 1, now)
+    }
+
+    /// A transport-proven rejection permits normal queued delivery again.
+    pub fn reject_steer(&mut self, event_id: &str, now: DateTime<Utc>) -> Result<(), ParkError> {
+        self.recover_pending(now)?;
+        let mut next = self.park.batches().to_vec();
+        for batch in &mut next {
+            if batch.reason == ParkReason::Ingress
+                && batch
+                    .events
+                    .iter()
+                    .any(|event| event.event.id.to_hex() == event_id)
+            {
+                batch.started = false;
+                batch.needs_review = false;
+                batch.needs_review_reason = None;
+            }
+        }
+        self.transact(OperationKind::Update, next, vec![], now)
+    }
+
+    /// A successful native injection is durably delivered; an uncertain ack
+    /// leaves the pre-send review record intact and must not auto-repeat it.
+    pub fn finish_steer(&mut self, event_id: &str, now: DateTime<Utc>) -> Result<(), ParkError> {
+        self.recover_pending(now)?;
+        let mut bodies = vec![];
+        let next = self
+            .park
+            .batches()
+            .iter()
+            .filter(|batch| {
+                if batch.reason == ParkReason::Ingress
+                    && batch
+                        .events
+                        .iter()
+                        .any(|event| event.event.id.to_hex() == event_id)
+                {
+                    bodies.push(LedgerBody::TurnFinished(ledger::TurnFinished {
+                        batch_id: batch.batch_id,
+                        channel_id: batch.channel_id,
+                        outcome: ledger::TurnOutcome::Ok,
+                    }));
+                    false
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+        self.transact(OperationKind::Update, next, bodies, now)
+    }
+
+    /// Release a successful live batch and its admission records with its audit.
+    pub fn finish_live(&mut self, batch: &FlushBatch, now: DateTime<Utc>) -> Result<(), ParkError> {
+        self.recover_pending(now)?;
+        let ids: Vec<_> = batch
+            .cancelled_events
+            .iter()
+            .chain(&batch.events)
+            .map(|event| event.event.id)
+            .collect();
+        let next = self
+            .park
+            .batches()
+            .iter()
+            .filter(|existing| {
+                !(existing.reason == ParkReason::Ingress
+                    && existing
+                        .events
+                        .iter()
+                        .any(|event| ids.contains(&event.event.id)))
+            })
+            .cloned()
+            .collect();
+        let body = LedgerBody::TurnFinished(ledger::TurnFinished {
+            batch_id: batch.batch_id,
+            channel_id: batch.channel_id,
+            outcome: ledger::TurnOutcome::Ok,
+        });
+        self.transact(OperationKind::Update, next, vec![body], now)
+    }
+
     /// Park a batch: the park file is written and fsynced first, then the
     /// `batch_parked` ledger record.
     ///
-    /// On failure nothing was written and the caller still owns the batch.
+    /// On failure the caller retains the batch; a prepared operation may also
+    /// own durable custody until recovery confirms all destination writes.
     pub fn park_batch(
         &mut self,
         batch: &FlushBatch,
@@ -272,30 +734,52 @@ impl ReliabilityRuntime {
         started: bool,
         now: DateTime<Utc>,
     ) -> Result<(), ParkError> {
-        let parked = ParkedBatch::from_batch(batch, reason, started, now)?;
+        self.recover_pending(now)?;
+        if self
+            .park
+            .get(batch.batch_id)
+            .is_some_and(|parked| parked.reason != ParkReason::Ingress)
+        {
+            return Ok(());
+        }
+        let mut parked = ParkedBatch::from_batch(batch, reason, started, now)?;
+        parked.notice_pending = reason != ParkReason::Ingress;
         let events = parked.events.len();
-        self.park.park(parked)?;
-        self.record(
-            now,
-            LedgerBody::BatchParked(ledger::BatchParked {
+        let ids: Vec<_> = parked.events.iter().map(|event| event.event.id).collect();
+        let mut next: Vec<_> = self
+            .park
+            .batches()
+            .iter()
+            .filter(|existing| {
+                existing.batch_id != batch.batch_id
+                    && !(existing.reason == ParkReason::Ingress
+                        && existing
+                            .events
+                            .iter()
+                            .any(|event| ids.contains(&event.event.id)))
+            })
+            .cloned()
+            .collect();
+        next.push(parked);
+        super::park::apply_scope_cap(&mut next);
+        let mut bodies = vec![LedgerBody::BatchParked(ledger::BatchParked {
+            batch_id: batch.batch_id,
+            channel_id: batch.channel_id,
+            reason: reason.as_str().to_string(),
+            started,
+            events,
+        })];
+        if started {
+            bodies.push(LedgerBody::BatchNeedsReview(ledger::BatchNeedsReview {
                 batch_id: batch.batch_id,
                 channel_id: batch.channel_id,
-                reason: reason.as_str().to_string(),
-                started,
-                events,
-            }),
-        );
-        if started {
-            self.record(
-                now,
-                LedgerBody::BatchNeedsReview(ledger::BatchNeedsReview {
-                    batch_id: batch.batch_id,
-                    channel_id: batch.channel_id,
-                    reason: "interrupted after it had started".to_string(),
-                }),
-            );
+                reason: "interrupted after it had started".to_string(),
+            }));
         }
-        Ok(())
+        if reason == ParkReason::Ingress {
+            bodies.clear();
+        }
+        self.transact(OperationKind::Park(batch.batch_id), next, bodies, now)
     }
 
     /// The replay-eligible parked batches for `scope`, oldest first, merged
@@ -348,48 +832,47 @@ impl ReliabilityRuntime {
         plan: &ReplayPlan,
         new_batch_id: Uuid,
         now: DateTime<Utc>,
-    ) -> Result<(), ParkError> {
-        // Mark every batch in the plan as replayed, but if any mark fails
-        // partway through, roll back the ones that already landed rather
-        // than propagating immediately: an unrolled-back partial mark would
-        // leave an earlier batch durably stamped `replayed_at` (making it
-        // permanently ineligible for replay) even though this replay attempt
-        // as a whole is being reported as failed and nothing is being sent
-        // (T16 delta 1, finding 4a).
-        let mut marked = Vec::with_capacity(plan.batch_ids.len());
-        for batch_id in &plan.batch_ids {
-            match self.park.mark_replayed(*batch_id, now) {
-                Ok(()) => marked.push(*batch_id),
-                Err(error) => {
-                    for done in &marked {
-                        let _ = self.park.unmark_replayed(*done);
-                    }
-                    return Err(error);
-                }
+    ) -> Result<Uuid, ParkError> {
+        if let Some(OperationKind::Replay { batches, replay_id }) = self.recover_operation(now)? {
+            if batches == plan.batch_ids {
+                return Ok(replay_id);
             }
+            self.reconcile_on_start(now)?;
         }
-        let mut all_recorded = true;
-        for batch_id in &plan.batch_ids {
-            if !self.record(
-                now,
+        let mut next = self.park.batches().to_vec();
+        for id in &plan.batch_ids {
+            let batch = next
+                .iter_mut()
+                .find(|batch| batch.batch_id == *id)
+                .ok_or_else(|| ParkError::Io(io::Error::other("replay batch no longer exists")))?;
+            if batch.notice_pending {
+                return Err(ParkError::Io(io::Error::other(
+                    "replay awaits durable failure notice",
+                )));
+            }
+            batch.replayed_at = Some(now);
+        }
+        let bodies = plan
+            .batch_ids
+            .iter()
+            .map(|id| {
                 LedgerBody::BatchReplayed(ledger::BatchReplayed {
-                    batch_id: *batch_id,
+                    batch_id: *id,
                     channel_id: plan.channel_id,
                     replay_of: new_batch_id,
-                }),
-            ) {
-                all_recorded = false;
-            }
-        }
-        if !all_recorded {
-            for batch_id in &plan.batch_ids {
-                let _ = self.park.unmark_replayed(*batch_id);
-            }
-            return Err(ParkError::Io(std::io::Error::other(
-                "could not append batch_replayed to ledger",
-            )));
-        }
-        Ok(())
+                })
+            })
+            .collect();
+        self.transact(
+            OperationKind::Replay {
+                batches: plan.batch_ids.clone(),
+                replay_id: new_batch_id,
+            },
+            next,
+            bodies,
+            now,
+        )?;
+        Ok(new_batch_id)
     }
 
     /// Note that `plan`'s batches are riding on an in-flight turn for its scope.
@@ -417,49 +900,58 @@ impl ReliabilityRuntime {
                 error: None,
             };
         };
-        let mut released = Vec::new();
-        let mut remaining = Vec::new();
-        let mut first_error = None;
-        for batch_id in batch_ids {
-            match self.park.remove(batch_id) {
-                Ok(Some(_)) => released.push(batch_id),
-                // Already gone (e.g. a previous partial attempt already
-                // removed it) — nothing left to track for this id.
-                Ok(None) => {}
-                Err(error) => {
-                    remaining.push(batch_id);
-                    if first_error.is_none() {
-                        first_error = Some(error);
-                    }
+        let next = self
+            .park
+            .batches()
+            .iter()
+            .filter(|batch| !batch_ids.contains(&batch.batch_id))
+            .cloned()
+            .collect();
+        let bodies = batch_ids
+            .iter()
+            .map(|id| {
+                LedgerBody::TurnFinished(ledger::TurnFinished {
+                    batch_id: *id,
+                    channel_id: scope.channel_id(),
+                    outcome: ledger::TurnOutcome::Ok,
+                })
+            })
+            .collect();
+        match self.transact(OperationKind::Update, next, bodies, Utc::now()) {
+            Ok(()) => {
+                self.in_flight_replays.remove(scope);
+                FinishReplayReport {
+                    released: batch_ids,
+                    error: None,
                 }
             }
-        }
-        if remaining.is_empty() {
-            self.in_flight_replays.remove(scope);
-        } else {
-            self.in_flight_replays.insert(scope.clone(), remaining);
-        }
-        FinishReplayReport {
-            released,
-            error: first_error,
+            Err(error) => FinishReplayReport {
+                released: vec![],
+                error: Some(error),
+            },
         }
     }
 
-    /// A turn for `scope` failed: its replayed batches stay parked and go back
-    /// to being eligible, so the next successful probe replays them again.
-    /// At-least-once delivery, never at-most-once.
+    /// A dispatched replay failed: retain its batches for operator review,
+    /// because side effects may already have started.
     pub fn abandon_replay(&mut self, scope: &SessionScope) {
-        let Some(batch_ids) = self.in_flight_replays.remove(scope) else {
+        let Some(batch_ids) = self.in_flight_replays.get(scope).cloned() else {
             return;
         };
-        for batch_id in batch_ids {
-            if let Err(error) = self.park.unmark_replayed(batch_id) {
-                tracing::error!(
-                    %batch_id,
-                    error = %error,
-                    "could not clear the replay stamp — the batch moves to needs_review at the next start"
-                );
+        let mut next = self.park.batches().to_vec();
+        for batch in &mut next {
+            if batch_ids.contains(&batch.batch_id) {
+                // A failed dispatched replay may already have performed side
+                // effects. Keep it review-only until an explicit operator retry.
+                batch.needs_review = true;
+                batch.needs_review_reason = Some("replay failed after dispatch".into());
+                batch.replayed_at = None;
             }
+        }
+        if let Err(error) = self.transact(OperationKind::Update, next, vec![], Utc::now()) {
+            tracing::error!(error = %error, "replay recovery remains pending");
+        } else {
+            self.in_flight_replays.remove(scope);
         }
     }
 
@@ -477,31 +969,73 @@ impl ReliabilityRuntime {
         by: &str,
         now: DateTime<Utc>,
     ) -> Result<DiscardOutcome, ParkError> {
-        let Some(removed) = self.park.remove(batch_id)? else {
+        if self.recover_operation(now)? == Some(OperationKind::Discard(batch_id)) {
+            return Ok(DiscardOutcome::Discarded);
+        }
+        let Some(removed) = self.park.get(batch_id) else {
             return Ok(DiscardOutcome::NotFound);
         };
-        let recorded = self.record(
-            now,
-            LedgerBody::BatchDiscarded(ledger::BatchDiscarded {
-                batch_id,
-                channel_id: removed.channel_id,
-                by: super::error_class::truncate_chars(by, ledger::MAX_LABEL_CHARS),
-            }),
-        );
-        if recorded {
-            Ok(DiscardOutcome::Discarded)
-        } else {
-            Ok(DiscardOutcome::DiscardedUnrecorded)
+        if removed.notice_pending {
+            return Err(ParkError::Io(io::Error::other(
+                "discard awaits durable failure notice",
+            )));
         }
+        let body = LedgerBody::BatchDiscarded(ledger::BatchDiscarded {
+            batch_id,
+            channel_id: removed.channel_id,
+            by: super::error_class::truncate_chars(by, ledger::MAX_LABEL_CHARS),
+        });
+        let next = self
+            .park
+            .batches()
+            .iter()
+            .filter(|batch| batch.batch_id != batch_id)
+            .cloned()
+            .collect();
+        self.transact(OperationKind::Discard(batch_id), next, vec![body], now)?;
+        Ok(DiscardOutcome::Discarded)
+    }
+
+    /// Clear a park's notice intent only after the durable outbox accepted it.
+    pub fn mark_notice_enqueued(&mut self, batch_id: Uuid) -> Result<(), ParkError> {
+        self.recover_pending(Utc::now())?;
+        let mut next = self.park.batches().to_vec();
+        let Some(batch) = next.iter_mut().find(|batch| batch.batch_id == batch_id) else {
+            return Err(ParkError::Io(io::Error::other(
+                "notice custody batch not found",
+            )));
+        };
+        if !batch.notice_pending {
+            return Ok(());
+        }
+        batch.notice_pending = false;
+        self.transact(OperationKind::Update, next, vec![], Utc::now())
     }
 
     /// Operator control frame `replay_batch`: make one parked batch eligible
     /// again whatever its `started` flag.
     pub fn force_replay(&mut self, batch_id: Uuid) -> Result<bool, ParkError> {
+        self.recover_pending(Utc::now())?;
         if self.park.get(batch_id).is_none() {
             return Ok(false);
         }
-        self.park.clear_review(batch_id)?;
+        if self
+            .park
+            .get(batch_id)
+            .is_some_and(|batch| !self.channel_allowed(batch.channel_id))
+        {
+            return Err(ParkError::Io(io::Error::other(
+                "channel access revoked; operator replay refused",
+            )));
+        }
+        let mut next = self.park.batches().to_vec();
+        if let Some(batch) = next.iter_mut().find(|batch| batch.batch_id == batch_id) {
+            batch.needs_review = false;
+            batch.needs_review_reason = None;
+            batch.replayed_at = None;
+            batch.forced = true;
+        }
+        self.transact(OperationKind::Update, next, vec![], Utc::now())?;
         Ok(true)
     }
 
@@ -509,30 +1043,128 @@ impl ReliabilityRuntime {
     /// `turn_finished` moves to the review list, never to a second automatic
     /// replay.
     pub fn reconcile_on_start(&mut self, now: DateTime<Utc>) -> Result<ReconcileReport, ParkError> {
-        let crashed = self.ledger.replays_without_finish().unwrap_or_else(|error| {
-            tracing::error!(error = %error, "could not read the ledger for start-up reconciliation");
-            Vec::new()
-        });
-        let report = self.park.reconcile_on_start(&crashed, now)?;
-        for batch_id in &crashed {
-            if let Some(batch) = self.park.get(*batch_id) {
-                let channel_id = batch.channel_id;
-                self.record(
-                    now,
+        let crashed = self.ledger.replays_without_finish()?;
+        let (next, report) = self.park.preview_reconcile(&crashed, now);
+        if !report.is_empty() {
+            let bodies = next
+                .iter()
+                .filter(|batch| batch.needs_review)
+                .map(|batch| {
                     LedgerBody::BatchNeedsReview(ledger::BatchNeedsReview {
-                        batch_id: *batch_id,
-                        channel_id,
-                        reason: "replay was sent but the turn never finished".to_string(),
-                    }),
-                );
-            }
+                        batch_id: batch.batch_id,
+                        channel_id: batch.channel_id,
+                        reason: batch
+                            .needs_review_reason
+                            .clone()
+                            .unwrap_or_else(|| "operator review required".into()),
+                    })
+                })
+                .collect();
+            self.transact(OperationKind::Update, next, bodies, now)?;
         }
         Ok(report)
+    }
+
+    /// A timer may probe using never-started parked input even with no newer
+    /// live traffic. Selecting input does not consume a dispatch probe lease.
+    pub fn stage_due_probes(
+        &mut self,
+        queue: &mut crate::queue::EventQueue,
+        allowed_channels: &std::collections::HashSet<Uuid>,
+        now: DateTime<Utc>,
+    ) -> Result<(), ParkError> {
+        if !self.is_ready() || !self.notices_ready() {
+            return Ok(());
+        }
+        let candidates: Vec<_> = self
+            .park
+            .batches()
+            .iter()
+            .filter(|batch| {
+                matches!(batch.reason, ParkReason::Pause | ParkReason::BreakerOpen)
+                    && batch.replay_eligible()
+                    && allowed_channels.contains(&batch.channel_id)
+                    && self.channel_allowed(batch.channel_id)
+                    && self.state.parked_probe_due(&batch.scope(), now)
+            })
+            .cloned()
+            .collect();
+        for batch in candidates {
+            let scope = batch.scope();
+            if !queue.can_stage_replay(&scope) {
+                continue;
+            }
+            let plan = ReplayPlan {
+                batch_ids: vec![batch.batch_id],
+                channel_id: batch.channel_id,
+                scope: scope.clone(),
+                events: batch.to_batch_events(),
+            };
+            let id = self.commit_replay(&plan, Uuid::new_v4(), now)?;
+            if !queue.stage_replay_with_id(scope, plan.events, id) {
+                return Err(ParkError::Io(io::Error::other(
+                    "probe staging refused; custody remains durable",
+                )));
+            }
+            if self.state.paused_until().is_some() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Retry explicit replay requests after transient notice/queue blockage.
+    /// This does not treat scheduling as provider success or lift containment.
+    pub fn stage_forced_replays(
+        &mut self,
+        queue: &mut crate::queue::EventQueue,
+        allowed_channels: &std::collections::HashSet<Uuid>,
+        now: DateTime<Utc>,
+    ) -> Result<(), ParkError> {
+        if !self.is_ready() || !self.notices_ready() {
+            return Ok(());
+        }
+        let candidates: Vec<_> = self
+            .park
+            .batches()
+            .iter()
+            .filter(|batch| {
+                batch.forced
+                    && batch.replay_eligible()
+                    && allowed_channels.contains(&batch.channel_id)
+                    && self.channel_allowed(batch.channel_id)
+            })
+            .cloned()
+            .collect();
+        for batch in candidates {
+            let scope = batch.scope();
+            if !queue.can_stage_replay(&scope) {
+                continue;
+            }
+            let plan = ReplayPlan {
+                batch_ids: vec![batch.batch_id],
+                channel_id: batch.channel_id,
+                scope: scope.clone(),
+                events: batch.to_batch_events(),
+            };
+            let id = self.commit_replay(&plan, Uuid::new_v4(), now)?;
+            if !queue.stage_replay_with_id(scope, plan.events, id) {
+                return Err(ParkError::Io(io::Error::other(
+                    "forced replay staging refused; durable custody remains",
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Periodic maintenance: truncate the ledger to its retention window every
     /// six hours.
     pub fn maintain(&mut self, now: DateTime<Utc>) -> TruncateReport {
+        if let Err(error) = self.recover_pending(now) {
+            self.transaction_failed = true;
+            tracing::error!(error = %error, "custody recovery failed; dispatch remains blocked");
+            return TruncateReport::default();
+        }
         match self.ledger.maybe_truncate(now) {
             Ok(report) => report,
             Err(error) => {
@@ -561,642 +1193,4 @@ impl IntoObserverHandle for Option<crate::observer::ObserverHandle> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::DedupMode;
-    use crate::observer::ObserverHandle;
-    use crate::queue::{CancelReason, EventQueue, QueuedEvent};
-    use chrono::Utc;
-    use nostr::{EventBuilder, Keys, Kind};
-    use std::time::Instant;
-    use uuid::Uuid;
-
-    fn make_test_event(content: &str) -> (nostr::Event, nostr::EventId) {
-        let keys = Keys::generate();
-        let event = EventBuilder::new(Kind::Custom(9), content)
-            .sign_with_keys(&keys)
-            .unwrap();
-        let id = event.id;
-        (event, id)
-    }
-
-    fn make_flush_batch(
-        channel_id: Uuid,
-        scope: SessionScope,
-        content: &str,
-    ) -> (FlushBatch, nostr::EventId) {
-        let (event, id) = make_test_event(content);
-        (
-            FlushBatch {
-                batch_id: Uuid::new_v4(),
-                channel_id,
-                scope,
-                events: vec![BatchEvent {
-                    event,
-                    prompt_tag: "test".into(),
-                    received_at: Instant::now(),
-                }],
-                cancelled_events: vec![],
-                cancel_reason: None,
-                started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            },
-            id,
-        )
-    }
-
-    // Fixture #5: after a successful probe, a parked batch with started=true is
-    // NOT replayed and one with started=false IS, before newer events of the same scope.
-    #[test]
-    fn test_fixture_5_successful_probe_replays_not_started_before_newer_events() {
-        let dir = tempfile::tempdir().unwrap();
-        let pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let now = Utc::now();
-        let mut runtime = ReliabilityRuntime::open_in(dir.path(), pubkey, now).unwrap();
-
-        let channel_id = Uuid::new_v4();
-        let scope = SessionScope::Conversation { channel_id };
-
-        // 1. Parked batch with started = true
-        let (batch_started, _) = make_flush_batch(channel_id, scope.clone(), "started msg");
-        let batch_started_id = batch_started.batch_id;
-        runtime
-            .park_batch(&batch_started, ParkReason::HardTimeout, true, now)
-            .unwrap();
-
-        // 2. Parked batch with started = false
-        let (batch_not_started, not_started_event_id) =
-            make_flush_batch(channel_id, scope.clone(), "not started msg");
-        let batch_not_started_id = batch_not_started.batch_id;
-        runtime
-            .park_batch(&batch_not_started, ParkReason::RetriesExhausted, false, now)
-            .unwrap();
-
-        // Verify initial parked state
-        assert!(runtime.park().get(batch_started_id).unwrap().needs_review);
-        assert!(!runtime
-            .park()
-            .get(batch_started_id)
-            .unwrap()
-            .replay_eligible());
-        assert!(
-            !runtime
-                .park()
-                .get(batch_not_started_id)
-                .unwrap()
-                .needs_review
-        );
-        assert!(runtime
-            .park()
-            .get(batch_not_started_id)
-            .unwrap()
-            .replay_eligible());
-
-        // 3. A newer event arrives for the same scope in the queue
-        let mut queue = EventQueue::new(DedupMode::Queue);
-        let (newer_event, newer_event_id) = make_test_event("newer msg");
-        queue.push(QueuedEvent {
-            channel_id,
-            scope: scope.clone(),
-            event: newer_event,
-            received_at: Instant::now(),
-            prompt_tag: "newer".into(),
-        });
-
-        // 4. A probe succeeds! Bind the production function `replay_after_success`.
-        crate::replay_after_success(&mut runtime, &mut queue, &scope, now);
-
-        // Assert that started=true was NOT replayed
-        let parked_started = runtime.park().get(batch_started_id).unwrap();
-        assert!(
-            parked_started.replayed_at.is_none(),
-            "batch with started=true must NOT be marked replayed"
-        );
-        assert!(
-            parked_started.needs_review,
-            "batch with started=true must stay on needs_review list"
-        );
-
-        // Assert that started=false WAS replayed
-        let parked_not_started = runtime.park().get(batch_not_started_id).unwrap();
-        assert!(
-            parked_not_started.replayed_at.is_some(),
-            "batch with started=false IS replayed (replayed_at stamped)"
-        );
-
-        // Assert replay ordering: staged before newer events of the same scope
-        let flushed = queue.flush_next().expect("flushed batch");
-        assert_eq!(flushed.scope, scope);
-        assert_eq!(
-            flushed.cancel_reason,
-            Some(CancelReason::DeliveredLate),
-            "replayed events staged with DeliveredLate framing"
-        );
-        assert_eq!(flushed.cancelled_events.len(), 1);
-        assert_eq!(
-            flushed.cancelled_events[0].event.id, not_started_event_id,
-            "replayed not-started event is in cancelled_events (preceding newer events)"
-        );
-        assert_eq!(flushed.events.len(), 1);
-        assert_eq!(
-            flushed.events[0].event.id, newer_event_id,
-            "newer event is in events (after replayed events)"
-        );
-    }
-
-    // Fixture #6: a `batch_replayed` ledger record with no matching `turn_finished`
-    // at start moves the batch to needs_review (reconcile_on_start).
-    #[test]
-    fn test_fixture_6_batch_replayed_without_turn_finished_moves_to_needs_review_on_start() {
-        let dir = tempfile::tempdir().unwrap();
-        let pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let now = Utc::now();
-        let mut runtime = ReliabilityRuntime::open_in(dir.path(), pubkey, now).unwrap();
-
-        let channel_id = Uuid::new_v4();
-        let scope = SessionScope::Conversation { channel_id };
-        let (batch, _) = make_flush_batch(channel_id, scope.clone(), "crashed mid-replay");
-        let batch_id = batch.batch_id;
-
-        // Park the batch (not started -> replay-eligible)
-        runtime
-            .park_batch(&batch, ParkReason::RetriesExhausted, false, now)
-            .unwrap();
-        assert!(!runtime.park().get(batch_id).unwrap().needs_review);
-        assert!(runtime.park().get(batch_id).unwrap().replay_eligible());
-
-        // Stage and commit replay: this writes `batch_replayed` to the ledger and stamps the park file
-        let plan = runtime.plan_replay(&scope).expect("replay plan");
-        assert_eq!(plan.batch_ids, vec![batch_id]);
-        runtime.commit_replay(&plan, Uuid::new_v4(), now).unwrap();
-
-        // Simulate crash mid-replay: process exits WITHOUT writing `turn_finished`.
-        drop(runtime);
-
-        // Process restarts at a later time
-        let restart_now = now + chrono::Duration::seconds(30);
-        let mut restarted = ReliabilityRuntime::open_in(dir.path(), pubkey, restart_now).unwrap();
-
-        // Run start-up reconciliation using the production function
-        let report = restarted.reconcile_on_start(restart_now).unwrap();
-        assert_eq!(
-            report.crashed_mid_replay, 1,
-            "reconcile_on_start must report the crashed mid-replay batch"
-        );
-
-        // The batch must now be in needs_review, never to be automatically replayed
-        let parked = restarted.park().get(batch_id).expect("batch still parked");
-        assert!(
-            parked.needs_review,
-            "crashed mid-replay batch must have needs_review = true"
-        );
-        assert_eq!(
-            parked.needs_review_reason.as_deref(),
-            Some("replay was sent but the turn never finished")
-        );
-        assert!(
-            !parked.replay_eligible(),
-            "batch in needs_review must not be replay-eligible"
-        );
-
-        // A BatchNeedsReview record must have been appended to the ledger
-        let records = restarted.ledger.read_all().unwrap();
-        assert!(
-            records.iter().any(
-                |r| matches!(&r.body, LedgerBody::BatchNeedsReview(nr) if nr.batch_id == batch_id)
-            ),
-            "ledger must contain a batch_needs_review record for the crashed batch"
-        );
-    }
-
-    #[test]
-    fn test_discard_of_unknown_batch_is_not_found_not_discarded() {
-        let dir = tempfile::tempdir().unwrap();
-        let pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let now = Utc::now();
-        let mut runtime = ReliabilityRuntime::open_in(dir.path(), pubkey, now).unwrap();
-
-        let result = runtime.discard(Uuid::new_v4(), "operator", now);
-        assert!(
-            matches!(result, Ok(DiscardOutcome::NotFound)),
-            "discarding an id that was never parked must report NotFound, \
-             distinct from a destructive outcome: got {result:?}"
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn test_discard_fails_contract_when_ledger_append_fails() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let now = Utc::now();
-        let mut runtime = ReliabilityRuntime::open_in(dir.path(), pubkey, now).unwrap();
-
-        let channel_id = Uuid::new_v4();
-        let scope = SessionScope::Conversation { channel_id };
-        let (batch, _) = make_flush_batch(channel_id, scope, "to discard");
-        let batch_id = batch.batch_id;
-
-        // Park the batch first.
-        runtime
-            .park_batch(&batch, ParkReason::RetriesExhausted, false, now)
-            .unwrap();
-        assert!(runtime.park().contains(batch_id));
-
-        // Make ledger.jsonl unwritable while keeping the directory and park file writable.
-        let ledger_path = dir.path().join("ledger.jsonl");
-        let original_mode = std::fs::metadata(&ledger_path)
-            .unwrap()
-            .permissions()
-            .mode();
-        std::fs::set_permissions(&ledger_path, std::fs::Permissions::from_mode(0o400)).unwrap();
-
-        let result = runtime.discard(batch_id, "operator", now);
-
-        // Restore permissions for cleanup
-        let _ =
-            std::fs::set_permissions(&ledger_path, std::fs::Permissions::from_mode(original_mode));
-
-        // The batch was removed from park, but ledger write failed. It must
-        // be reported as destroyed-but-unrecorded — never as a clean
-        // `Discarded` (unconditional success) and never as `NotFound`
-        // (which would collapse a genuine destructive action into the same
-        // signal as "no such batch", inviting a pointless retry).
-        assert!(
-            matches!(result, Ok(DiscardOutcome::DiscardedUnrecorded)),
-            "discard must distinguish a destroyed-but-unrecorded batch from \
-             both a clean success and an unknown batch: got {result:?}"
-        );
-    }
-
-    /// The largest content length for which `runtime.park_batch(..)` still
-    /// succeeds — i.e. the batch's own serialized line is at (or a hair
-    /// under) `MAX_LINE_BYTES`. Used to build a batch whose line has no
-    /// headroom left for the extra bytes `mark_replayed` adds.
-    fn max_parkable_content_len(
-        runtime: &mut ReliabilityRuntime,
-        channel_id: Uuid,
-        scope: SessionScope,
-        now: DateTime<Utc>,
-    ) -> usize {
-        let (mut low, mut high) = (0usize, crate::reliability::park::MAX_LINE_BYTES);
-        while low < high {
-            let mid = low + (high - low).div_ceil(2);
-            let content = "x".repeat(mid);
-            let (probe, _) = make_flush_batch(channel_id, scope.clone(), &content);
-            let fits = runtime
-                .park_batch(&probe, ParkReason::RetriesExhausted, false, now)
-                .is_ok();
-            if fits {
-                let _ = runtime.discard(probe.batch_id, "test-calibration", now);
-                low = mid;
-            } else {
-                high = mid - 1;
-            }
-        }
-        low
-    }
-
-    #[test]
-    fn test_commit_replay_rolls_back_earlier_marks_when_a_later_one_fails() {
-        // T16 delta 1, finding 4a: `commit_replay` marks every batch in the
-        // plan as replayed one at a time. If an EARLIER mark durably lands
-        // and a LATER one in the same call fails, the earlier one must not
-        // stay stamped `replayed_at` — that would make it permanently
-        // ineligible for replay even though this whole replay attempt is
-        // being reported as failed and nothing was sent.
-        let dir = tempfile::tempdir().unwrap();
-        let pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let now = Utc::now();
-        let mut runtime = ReliabilityRuntime::open_in(dir.path(), pubkey, now).unwrap();
-
-        let channel_id = Uuid::new_v4();
-        let scope = SessionScope::Conversation { channel_id };
-
-        // batch1: tiny, parks and marks-replayed with room to spare.
-        let (batch1, _) = make_flush_batch(channel_id, scope.clone(), "small");
-        let batch1_id = batch1.batch_id;
-        runtime
-            .park_batch(&batch1, ParkReason::RetriesExhausted, false, now)
-            .unwrap();
-
-        // batch2: calibrated to the exact line-length ceiling, so it parks
-        // successfully now but `mark_replayed`'s extra `replayed_at` field
-        // pushes its line over MAX_LINE_BYTES.
-        let max_len = max_parkable_content_len(&mut runtime, channel_id, scope.clone(), now);
-        let (batch2, _) = make_flush_batch(channel_id, scope.clone(), &"x".repeat(max_len));
-        let batch2_id = batch2.batch_id;
-        runtime
-            .park_batch(&batch2, ParkReason::RetriesExhausted, false, now)
-            .expect("batch2 must park at the calibrated max length");
-
-        let plan = ReplayPlan {
-            batch_ids: vec![batch1_id, batch2_id],
-            events: vec![],
-            scope: scope.clone(),
-            channel_id,
-        };
-
-        let result = runtime.commit_replay(&plan, Uuid::new_v4(), now);
-        assert!(
-            result.is_err(),
-            "marking the oversized batch2 as replayed must fail: {result:?}"
-        );
-
-        let batches = runtime.park().batches();
-        let find = |id: Uuid| batches.iter().find(|b| b.batch_id == id).unwrap();
-        assert!(
-            find(batch1_id).replayed_at.is_none(),
-            "batch1's successful mark must be rolled back when batch2's mark fails"
-        );
-        assert!(
-            find(batch2_id).replayed_at.is_none(),
-            "batch2 must never have been marked replayed"
-        );
-    }
-
-    fn make_multi_event_batch(
-        channel_id: Uuid,
-        scope: SessionScope,
-        count: usize,
-        prefix: &str,
-    ) -> FlushBatch {
-        let mut events = Vec::with_capacity(count);
-        for i in 0..count {
-            let (event, _) = make_test_event(&format!("{prefix}-{i}"));
-            events.push(BatchEvent {
-                event,
-                prompt_tag: "test".into(),
-                received_at: Instant::now(),
-            });
-        }
-        FlushBatch {
-            batch_id: Uuid::new_v4(),
-            channel_id,
-            scope,
-            events,
-            cancelled_events: vec![],
-            cancel_reason: None,
-            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        }
-    }
-
-    #[test]
-    fn test_replay_plan_respects_max_batch_events_and_preserves_unincluded_batches() {
-        let dir = tempfile::tempdir().unwrap();
-        let pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let now = Utc::now();
-        let mut runtime = ReliabilityRuntime::open_in(dir.path(), pubkey, now).unwrap();
-
-        let channel_id = Uuid::new_v4();
-        let scope = SessionScope::Conversation { channel_id };
-
-        // Park > 50 replay-eligible events across multiple batches for one scope.
-        // Batch 1: 30 events
-        let batch1 = make_multi_event_batch(channel_id, scope.clone(), 30, "batch1");
-        let batch1_id = batch1.batch_id;
-        runtime
-            .park_batch(&batch1, ParkReason::RetriesExhausted, false, now)
-            .unwrap();
-
-        // Batch 2: 30 events (total 60 > 50)
-        let batch2 = make_multi_event_batch(channel_id, scope.clone(), 30, "batch2");
-        let batch2_id = batch2.batch_id;
-        runtime
-            .park_batch(
-                &batch2,
-                ParkReason::RetriesExhausted,
-                false,
-                now + chrono::Duration::seconds(1),
-            )
-            .unwrap();
-
-        let mut queue = EventQueue::new(DedupMode::Queue);
-
-        // Run a successful probe (binds replay_after_success)
-        crate::replay_after_success(
-            &mut runtime,
-            &mut queue,
-            &scope,
-            now + chrono::Duration::seconds(2),
-        );
-
-        // The turn for this scope finishes successfully (clearing in-flight replay)
-        let report = runtime.finish_replay(&scope);
-        assert!(report.error.is_none(), "no removal should fail here");
-        assert_eq!(
-            report.released,
-            vec![batch1_id],
-            "only the included batch should be finished/released"
-        );
-
-        // The park file must STILL hold batch2, whose events were not included in the dispatched turn
-        assert!(
-            runtime.park().contains(batch2_id),
-            "batch 2 was not included in the dispatched replay turn and must remain in the park file"
-        );
-        let parked2 = runtime
-            .park()
-            .get(batch2_id)
-            .expect("batch 2 still in park");
-        assert!(
-            parked2.replay_eligible(),
-            "batch 2 must still be replay-eligible"
-        );
-    }
-
-    #[test]
-    fn record_mirrors_health_kinds_to_observer() {
-        let temp = tempfile::tempdir().unwrap();
-        let now = Utc::now();
-        let agent = "test_agent_pk";
-        let observer = ObserverHandle::in_process();
-        let mut rx = observer.subscribe();
-
-        let mut runtime = ReliabilityRuntime::open_in(temp.path(), agent, now)
-            .unwrap()
-            .with_observer(observer);
-
-        let batch_id = Uuid::new_v4();
-        let channel_id = Uuid::new_v4();
-        let body = LedgerBody::BatchParked(ledger::BatchParked {
-            batch_id,
-            channel_id,
-            reason: "retries_exhausted".to_string(),
-            started: false,
-            events: 3,
-        });
-
-        assert!(runtime.record(now, body));
-
-        let event = rx.try_recv().expect("should receive observer frame");
-        assert_eq!(event.kind, "batch_parked");
-        assert_eq!(event.channel_id, Some(channel_id.to_string()));
-        assert_eq!(event.payload["batchId"], batch_id.to_string());
-        assert_eq!(event.payload["events"], 3);
-        assert_eq!(event.payload["at"], serde_json::to_value(now).unwrap());
-        assert_eq!(event.payload["reason"], "retries_exhausted");
-        assert_eq!(event.payload["started"], false);
-
-        // batch_replayed
-        let replay_id = Uuid::new_v4();
-        let replayed = LedgerBody::BatchReplayed(ledger::BatchReplayed {
-            batch_id,
-            channel_id,
-            replay_of: replay_id,
-        });
-        assert!(runtime.record(now, replayed));
-        let event = rx.try_recv().expect("should receive batch_replayed frame");
-        assert_eq!(event.kind, "batch_replayed");
-        assert_eq!(event.payload["replayOf"], replay_id.to_string());
-
-        // agent_paused
-        let paused = LedgerBody::AgentPaused(ledger::AgentPaused {
-            class: "capacity_exhausted".to_string(),
-            until: now,
-            waiting: 2,
-        });
-        assert!(runtime.record(now, paused));
-        let event = rx.try_recv().expect("should receive agent_paused frame");
-        assert_eq!(event.kind, "agent_paused");
-        assert_eq!(event.payload["class"], "capacity_exhausted");
-        assert_eq!(event.channel_id, None);
-
-        // breaker_opened
-        let breaker = LedgerBody::BreakerOpened(ledger::BreakerOpened {
-            scope: "scope1".to_string(),
-            consecutive: 3,
-        });
-        assert!(runtime.record(now, breaker));
-        let event = rx.try_recv().expect("should receive breaker_opened frame");
-        assert_eq!(event.kind, "breaker_opened");
-        assert_eq!(event.payload["consecutive"], 3);
-
-        // batch_needs_review
-        let needs_review_id = Uuid::new_v4();
-        let needs_review = LedgerBody::BatchNeedsReview(ledger::BatchNeedsReview {
-            batch_id: needs_review_id,
-            channel_id,
-            reason: "interrupted after it had started".to_string(),
-        });
-        assert!(runtime.record(now, needs_review));
-        let event = rx
-            .try_recv()
-            .expect("should receive batch_needs_review frame");
-        assert_eq!(event.kind, "batch_needs_review");
-        assert_eq!(event.payload["batchId"], needs_review_id.to_string());
-        assert_eq!(event.payload["reason"], "interrupted after it had started");
-
-        // agent_resumed
-        let resumed = LedgerBody::AgentResumed(ledger::AgentResumed {});
-        assert!(runtime.record(now, resumed));
-        let event = rx.try_recv().expect("should receive agent_resumed frame");
-        assert_eq!(event.kind, "agent_resumed");
-
-        // breaker_closed
-        let breaker_closed = LedgerBody::BreakerClosed(ledger::BreakerClosed {
-            scope: "scope1".to_string(),
-        });
-        assert!(runtime.record(now, breaker_closed));
-        let event = rx.try_recv().expect("should receive breaker_closed frame");
-        assert_eq!(event.kind, "breaker_closed");
-        assert_eq!(event.payload["scope"], "scope1");
-
-        // relay_reconnected
-        let relay_reconnected =
-            LedgerBody::RelayReconnected(ledger::RelayReconnected { after_secs: 42 });
-        assert!(runtime.record(now, relay_reconnected));
-        let event = rx
-            .try_recv()
-            .expect("should receive relay_reconnected frame");
-        assert_eq!(event.kind, "relay_reconnected");
-        assert_eq!(event.payload["afterSecs"], 42);
-    }
-
-    #[test]
-    fn turn_failed_frame_carries_class_but_never_raw() {
-        let temp = tempfile::tempdir().unwrap();
-        let now = Utc::now();
-        let agent = "test_agent_pk";
-        let observer = ObserverHandle::in_process();
-        let mut rx = observer.subscribe();
-
-        let mut runtime = ReliabilityRuntime::open_in(temp.path(), agent, now)
-            .unwrap()
-            .with_observer(observer);
-
-        let batch_id = Uuid::new_v4();
-        let channel_id = Uuid::new_v4();
-        let raw_secret = "secret provider raw error stack trace";
-        let body = LedgerBody::TurnFinished(ledger::TurnFinished {
-            batch_id,
-            channel_id,
-            outcome: ledger::TurnOutcome::error("capacity_exhausted", raw_secret),
-        });
-
-        assert!(runtime.record(now, body));
-
-        let event = rx.try_recv().expect("should receive observer frame");
-        assert_eq!(event.kind, "turn_failed");
-        assert_eq!(event.payload["class"], "capacity_exhausted");
-        assert!(event.payload.get("raw").is_none());
-        if let Some(outcome) = event.payload.get("outcome") {
-            assert!(outcome.get("raw").is_none());
-        }
-        let serialized = event.payload.to_string();
-        assert!(!serialized.contains(raw_secret));
-        assert!(!serialized.contains("\"raw\""));
-    }
-
-    #[test]
-    fn turn_ok_and_turn_started_emit_no_frame() {
-        let temp = tempfile::tempdir().unwrap();
-        let now = Utc::now();
-        let agent = "test_agent_pk";
-        let observer = ObserverHandle::in_process();
-        let mut rx = observer.subscribe();
-
-        let mut runtime = ReliabilityRuntime::open_in(temp.path(), agent, now)
-            .unwrap()
-            .with_observer(observer);
-
-        let batch_id = Uuid::new_v4();
-        let channel_id = Uuid::new_v4();
-
-        let started = LedgerBody::TurnStarted(ledger::TurnStarted::new(
-            batch_id,
-            channel_id,
-            "test_scope",
-            vec!["e1".to_string()],
-            1,
-        ));
-        assert!(runtime.record(now, started));
-        assert!(
-            rx.try_recv().is_err(),
-            "turn_started must not emit health frame"
-        );
-
-        let ok = LedgerBody::TurnFinished(ledger::TurnFinished {
-            batch_id,
-            channel_id,
-            outcome: ledger::TurnOutcome::Ok,
-        });
-        assert!(runtime.record(now, ok));
-        assert!(
-            rx.try_recv().is_err(),
-            "turn_finished Ok must not emit health frame"
-        );
-
-        let discarded = LedgerBody::BatchDiscarded(ledger::BatchDiscarded {
-            batch_id,
-            channel_id,
-            by: "operator".to_string(),
-        });
-        assert!(runtime.record(now, discarded));
-        assert!(
-            rx.try_recv().is_err(),
-            "batch_discarded must not emit health frame"
-        );
-    }
-}
+mod tests;

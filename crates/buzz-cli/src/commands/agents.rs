@@ -13,6 +13,17 @@ use crate::{AgentsCmd, RespondToArg};
 
 pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), CliError> {
     match command {
+        AgentsCmd::Parked {
+            state_root,
+            agent,
+            json,
+        } => super::agents_reliability::cmd_parked(state_root.as_deref(), agent.as_deref(), json),
+        AgentsCmd::Replay { agent, batch } => {
+            super::agents_reliability::control(client, &agent, batch, true).await
+        }
+        AgentsCmd::Discard { agent, batch } => {
+            super::agents_reliability::control(client, &agent, batch, false).await
+        }
         AgentsCmd::Health {
             since,
             json,
@@ -504,7 +515,7 @@ pub fn cmd_health_to_writer<W: std::io::Write>(
         }
     };
 
-    let state_dirs = discover_state_dirs(state_root);
+    let state_dirs = discover_state_dirs(state_root)?;
     let now = chrono::Utc::now();
     let mut rows = Vec::new();
 
@@ -585,90 +596,92 @@ pub fn cmd_health_to_writer<W: std::io::Write>(
     Ok(())
 }
 
-/// Find agent state directories to inspect.
-fn discover_state_dirs(state_root: Option<&Path>) -> Vec<PathBuf> {
-    let mut state_dirs = Vec::new();
+/// Maximum directory entries inspected by one health command, across all roots.
+const MAX_HEALTH_DISCOVERY_ENTRIES: usize = 1024;
 
-    if let Some(root) = state_root {
-        if root.is_dir() {
-            if root
-                .join(buzz_acp::reliability::ledger::LEDGER_FILE)
-                .is_file()
-            {
-                state_dirs.push(root.to_path_buf());
-            }
-            if let Ok(entries) = std::fs::read_dir(root) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        state_dirs.push(path);
-                    }
-                }
-            }
+/// Find agent state directories without following directory symlinks or hiding
+/// discovery failures behind a successful empty/partial health report.
+pub(super) fn discover_state_dirs(state_root: Option<&Path>) -> Result<Vec<PathBuf>, CliError> {
+    let env_root = std::env::var_os(buzz_acp::reliability::state_dir::STATE_DIR_ENV);
+    let explicit = state_root.is_some() || env_root.is_some();
+    let env_fallback = state_root.is_none() && env_root.is_some();
+    let mut roots = if let Some(root) = state_root {
+        vec![root.to_path_buf()]
+    } else if let Some(root) = env_root {
+        if root.is_empty() {
+            return Ok(Vec::new());
         }
-    } else if let Ok(env_dir) = std::env::var(buzz_acp::reliability::state_dir::STATE_DIR_ENV) {
-        let trimmed = env_dir.trim();
-        if !trimmed.is_empty() {
-            let p = PathBuf::from(trimmed);
-            if p.is_dir() {
-                if p.join(buzz_acp::reliability::ledger::LEDGER_FILE).is_file() {
-                    state_dirs.push(p.clone());
-                }
-                let mut found_sub = false;
-                if let Ok(entries) = std::fs::read_dir(&p) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_dir() {
-                            state_dirs.push(path);
-                            found_sub = true;
-                        }
-                    }
-                }
-                if !found_sub && !state_dirs.contains(&p) {
-                    state_dirs.push(p);
-                }
-            }
-        }
+        vec![PathBuf::from(root)]
     } else {
-        let mut candidate_roots = Vec::new();
+        let mut roots = Vec::new();
         if let Some(home) = dirs::home_dir() {
-            candidate_roots.push(home.join(".buzz").join(".state"));
+            roots.push(home.join(".buzz").join(".state"));
+            roots.push(home.join("Library/Application Support/xyz.block.buzz.app/agents/state"));
         }
-        if let Some(data_dir) = dirs::data_dir() {
-            candidate_roots.push(
-                data_dir
-                    .join("xyz.block.buzz.app")
-                    .join("agents")
-                    .join("state"),
-            );
+        if let Some(data) = dirs::data_dir() {
+            roots.push(data.join("xyz.block.buzz.app/agents/state"));
         }
-        if let Some(home) = dirs::home_dir() {
-            candidate_roots.push(
-                home.join("Library")
-                    .join("Application Support")
-                    .join("xyz.block.buzz.app")
-                    .join("agents")
-                    .join("state"),
-            );
+        roots
+    };
+    roots.sort();
+    roots.dedup();
+    let mut state_dirs = Vec::new();
+    let mut inspected = 0usize;
+    for root in roots {
+        let metadata = match std::fs::symlink_metadata(&root) {
+            Ok(metadata) => metadata,
+            Err(error) if !explicit && error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(CliError::Other(format!("health state discovery: {error}"))),
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(CliError::Other(
+                "health state root must be a real directory, not a symlink".into(),
+            ));
         }
-
-        for root in candidate_roots {
-            if root.is_dir() {
-                if let Ok(entries) = std::fs::read_dir(&root) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_dir() {
-                            state_dirs.push(path);
-                        }
+        let before = state_dirs.len();
+        if explicit {
+            for filename in [
+                buzz_acp::reliability::ledger::LEDGER_FILE,
+                buzz_acp::reliability::park::PARK_FILE,
+            ] {
+                match std::fs::symlink_metadata(root.join(filename)) {
+                    Ok(metadata) if metadata.is_file() => {
+                        state_dirs.push(root.clone());
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(CliError::Other(format!("health ledger discovery: {error}")))
                     }
                 }
             }
+        }
+        let entries = std::fs::read_dir(&root)
+            .map_err(|error| CliError::Other(format!("health state discovery: {error}")))?;
+        for entry in entries {
+            inspected += 1;
+            if inspected > MAX_HEALTH_DISCOVERY_ENTRIES {
+                return Err(CliError::Other(format!(
+                    "health state discovery exceeds {MAX_HEALTH_DISCOVERY_ENTRIES} entries"
+                )));
+            }
+            let entry = entry
+                .map_err(|error| CliError::Other(format!("health state discovery: {error}")))?;
+            let kind = entry
+                .file_type()
+                .map_err(|error| CliError::Other(format!("health state discovery: {error}")))?;
+            if kind.is_dir() {
+                state_dirs.push(entry.path());
+            }
+        }
+        if env_fallback && state_dirs.len() == before {
+            state_dirs.push(root);
         }
     }
-
     state_dirs.sort();
     state_dirs.dedup();
-    state_dirs
+    Ok(state_dirs)
 }
 
 /// Pure verification of a kind:13535 archived-identities event.
@@ -740,6 +753,70 @@ fn verify_archived_event<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn health_discovery_rejects_excess_entries() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..1025 {
+            std::fs::create_dir(root.path().join(format!("agent-{index}"))).unwrap();
+        }
+        let mut output = Vec::new();
+        let result = super::cmd_health_to_writer(&mut output, "24h", true, Some(root.path()));
+        assert!(
+            result.is_err(),
+            "oversized discovery must not silently return a partial report"
+        );
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn health_discovery_accepts_exact_entry_limit() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..1024 {
+            std::fs::create_dir(root.path().join(format!("agent-{index}"))).unwrap();
+        }
+        let mut output = Vec::new();
+        super::cmd_health_to_writer(&mut output, "24h", true, Some(root.path())).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Vec<serde_json::Value>>(&output)
+                .unwrap()
+                .len(),
+            1024
+        );
+    }
+
+    #[test]
+    fn health_discovery_rejects_non_directory_root() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("not-a-directory");
+        std::fs::write(&file, "not agent state").unwrap();
+        assert!(super::cmd_health_to_writer(&mut Vec::new(), "24h", true, Some(&file)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn health_discovery_does_not_follow_agent_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("linked-agent")).unwrap();
+        let mut output = Vec::new();
+        super::cmd_health_to_writer(&mut output, "24h", true, Some(root.path())).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Vec<serde_json::Value>>(&output)
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn health_discovery_rejects_symlinked_root() {
+        let root = tempfile::tempdir().unwrap();
+        let linked = root.path().join("linked-root");
+        std::os::unix::fs::symlink(root.path(), &linked).unwrap();
+        assert!(super::cmd_health_to_writer(&mut Vec::new(), "24h", true, Some(&linked)).is_err());
+    }
+
     use super::*;
     use buzz_core::kind::KIND_IA_ARCHIVED_LIST;
     use nostr::{EventBuilder, Keys, Kind, Tag};

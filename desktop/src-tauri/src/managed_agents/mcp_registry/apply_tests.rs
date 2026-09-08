@@ -1430,56 +1430,21 @@ impl Drop for SandboxedHome {
 }
 
 fn mock_app() -> tauri::App<tauri::test::MockRuntime> {
-    tauri::test::mock_builder()
+    use tauri::Manager;
+    let data = tempfile::tempdir().unwrap();
+    let expected_data_dir = data.path().to_path_buf();
+    let mut context = tauri::test::mock_context(tauri::test::noop_assets());
+    // KnownFolder ignores HOME/XDG on Windows; retain an absolute sandbox in
+    // app state and let Tauri resolve its real app_data_dir against that path.
+    context.config_mut().identifier = expected_data_dir.to_str().unwrap().to_owned();
+    let app = tauri::test::mock_builder()
+        .manage(data)
         .manage(crate::app_state::build_app_state())
-        .build(tauri::test::mock_context(tauri::test::noop_assets()))
-        .expect("mock app builds headless")
+        .build(context)
+        .expect("mock app builds headless");
+    assert_eq!(app.path().app_data_dir().unwrap(), expected_data_dir);
+    app
 }
 
-/// [PRIOR F7] `converge_now_with_records` used to read personas and the
-/// global agent config with `.unwrap_or_default()`, treating "corrupt" the
-/// same as "absent" — silently computing every agent's effective runtime,
-/// and therefore its convergence, from defaults instead of surfacing that the
-/// store could not be read. A corrupt `managed-agents.json` must now be
-/// propagated as an error, and the current generation must be left exactly as
-/// it was: nothing is adopted from defaults.
-#[test]
-fn mcp_registry_a_corrupt_personas_store_is_propagated_and_leaves_the_generation_unchanged() {
-    let sandbox = SandboxedHome::new();
-    let app = mock_app();
-
-    let base =
-        crate::managed_agents::managed_agents_base_dir(app.handle()).expect("base dir resolves");
-    std::fs::write(base.join("managed-agents.json"), b"{ not json")
-        .expect("write a corrupt agent store");
-
-    // `generations_root` is rooted at `managed_agents_base_dir`, i.e. Tauri's
-    // real `app_data_dir()` — `dirs::data_dir()` on Windows resolves via
-    // `SHGetKnownFolderPath`, a Win32 call that reads neither `HOME` nor
-    // `XDG_DATA_HOME`, so `SandboxedHome` cannot isolate this path on that
-    // platform the way it does on unix. What this test can still assert
-    // platform-independently — and what its guard actually protects — is
-    // that the pointer this convergence attempt found is exactly the pointer
-    // it leaves behind, whatever value that happens to be.
-    let generations_root = RegistryPaths::new(base, sandbox.home()).generations_root();
-    let before = GenerationStore::open(&generations_root)
-        .expect("open")
-        .current()
-        .expect("readable");
-
-    let error = super::apply::converge_now_with_records(app.handle(), &[], &BTreeMap::new())
-        .expect_err("a corrupt personas store must be propagated, not defaulted away");
-    assert!(
-        error.contains("personas"),
-        "the error must name what failed to read, got {error}"
-    );
-
-    let after = GenerationStore::open(&generations_root)
-        .expect("open")
-        .current()
-        .expect("readable");
-    assert_eq!(
-        before, after,
-        "a propagated read failure must leave the current generation unchanged"
-    );
-}
+#[path = "apply_config_tests.rs"]
+mod config_failures;

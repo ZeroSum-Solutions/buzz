@@ -896,3 +896,22 @@ fn google_calendar_id_token_over_the_byte_cap_is_refused_before_it_is_split() {
         "the byte cap runs before the token is split, so nothing downstream sees it"
     );
 }
+
+#[test]
+fn google_calendar_rejects_non_rs256_before_signature_verifier() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let token = format!("{}.{}.AA", URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","kid":"k1"}"#), URL_SAFE_NO_PAD.encode(json!({"iss":"https://accounts.google.com","aud":CLIENT_ID,"sub":"subject","exp":9999999999i64,"nonce":"nonce"}).to_string()));
+    let result = verify_id_token(
+        &token,
+        &AcceptSignature,
+        &IdTokenExpectations {
+            client_id: CLIENT_ID.to_string(),
+            nonce: Redacted::new("nonce".to_string()),
+            now_ms: 1,
+        },
+    );
+    assert!(
+        result.is_err(),
+        "the token algorithm must be pinned before trusting claims"
+    );
+}

@@ -130,7 +130,7 @@ pub(super) const MAX_JOURNAL_BYTES: usize = 1024 * 1024;
 /// ([`MAX_PLAN_FILES`]-scale): a legitimate journal never approaches it, so it
 /// exists only to bound the retry loop a corrupted or replaced `journal.json`
 /// could otherwise drive over an unbounded array.
-pub(super) const MAX_JOURNAL_DELETIONS: usize = 65536;
+pub(super) const MAX_JOURNAL_DELETIONS: usize = 8192;
 
 /// The durable record of an in-flight change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,6 +188,13 @@ impl GenerationPlan {
                 "the configuration change stages {} files, over the {MAX_PLAN_FILES} cap",
                 self.files.len()
             )));
+        }
+        if self.deletions.len() >= MAX_JOURNAL_DELETIONS
+            || self.secrets.len() > MAX_JOURNAL_DELETIONS
+        {
+            return Err(plan(
+                "the configuration change exceeds the journal entry cap".to_string(),
+            ));
         }
         let mut total = 0usize;
         for (relative, body) in &self.files {
@@ -768,6 +775,14 @@ impl GenerationStore {
     fn write_journal(&self, journal: &Journal) -> Result<(), GenerationError> {
         let body =
             serde_json::to_string(journal).map_err(|e| GenerationError::Journal(e.to_string()))?;
+        if body.len() > MAX_JOURNAL_BYTES
+            || journal.deletions.len() > MAX_JOURNAL_DELETIONS
+            || journal.rollback.len() > MAX_JOURNAL_DELETIONS
+        {
+            return Err(GenerationError::Journal(
+                "the configuration change exceeds the journal cap".to_string(),
+            ));
+        }
         let staging = self.journal_staging_path();
         write_file_synced(&staging, &body)?;
         std::fs::rename(&staging, self.journal_path()).map_err(|e| GenerationError::Io {

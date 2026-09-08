@@ -100,6 +100,8 @@ pub enum TransitionError {
     RevocationPending(u64),
     /// The journal is full; the user must clear an entry.
     JournalFull,
+    /// Retry is still live or local purge remains unconfirmed.
+    RevocationNotClearable,
     /// The journal has no entry for that generation.
     NoSuchJournalEntry(u64),
     /// The journal entry moved since the caller read it.
@@ -124,6 +126,10 @@ impl std::fmt::Display for TransitionError {
             TransitionError::RevocationPending(generation) => write!(
                 f,
                 "a disconnect for generation {generation} is still being revoked"
+            ),
+            TransitionError::RevocationNotClearable => write!(
+                f,
+                "stop revocation retries and confirm local purge before clearing"
             ),
             TransitionError::JournalFull => write!(
                 f,
@@ -169,6 +175,15 @@ pub enum JournalStep {
 /// re-callable closure; the clone never leaves the commit.
 #[derive(Debug, Clone)]
 pub enum Change {
+    /// Own a newly exchanged grant durably before validating or adopting it.
+    HoldGrant(Box<Binding>),
+    /// Retain a rotated token if its refresh cannot be safely adopted.
+    DisconnectWithToken {
+        generation: u64,
+        refresh_token: Redacted<String>,
+    },
+    /// Atomically adopt a validated grant and release its temporary retry custody.
+    ActivateHeldGrant(Box<Binding>),
     /// Write the first binding, or the one after a disconnect.
     Connect(Box<Binding>),
     /// Replace the tokens on the active binding.
@@ -203,6 +218,8 @@ pub enum Change {
         /// The generation the entry revokes.
         generation: u64,
     },
+    /// Explicit user cleanup; never asserts provider revocation succeeded.
+    ClearRevocation { generation: u64 },
 }
 
 impl Change {
@@ -220,6 +237,60 @@ impl Change {
         context: &CommitContext,
     ) -> Result<(), TransitionError> {
         match self {
+            Change::DisconnectWithToken {
+                generation,
+                refresh_token,
+            } => {
+                let mut candidate = envelope.clone();
+                let binding = candidate
+                    .active_binding
+                    .as_mut()
+                    .filter(|binding| binding.generation == generation)
+                    .ok_or(TransitionError::GenerationChanged)?;
+                binding.refresh_token = refresh_token;
+                Change::Disconnect { generation }.apply(&mut candidate, context)?;
+                *envelope = candidate;
+                Ok(())
+            }
+            Change::HoldGrant(binding) => {
+                if envelope.active_binding.is_some() {
+                    return Err(TransitionError::AlreadyBound);
+                }
+                if envelope.pending.len() >= MAX_PENDING_REVOCATIONS {
+                    return Err(TransitionError::JournalFull);
+                }
+                if envelope.pending.contains_key(&binding.generation) {
+                    return Err(TransitionError::GenerationChanged);
+                }
+                envelope.pending.insert(
+                    binding.generation,
+                    PendingRevocation::open(
+                        binding.generation,
+                        binding.client_id,
+                        binding.sub,
+                        binding.refresh_token,
+                        context.now_ms,
+                    ),
+                );
+                Ok(())
+            }
+            Change::ActivateHeldGrant(binding) => {
+                let held = envelope
+                    .pending
+                    .get(&binding.generation)
+                    .ok_or(TransitionError::GenerationChanged)?;
+                if held.revision != 0
+                    || held.client_id != binding.client_id
+                    || held.refresh_token.expose() != binding.refresh_token.expose()
+                {
+                    return Err(TransitionError::GenerationChanged);
+                }
+                let mut candidate = envelope.clone();
+                candidate.pending.remove(&binding.generation);
+                Change::Connect(binding).apply(&mut candidate, context)?;
+                *envelope = candidate;
+                Ok(())
+            }
             Change::Connect(binding) => {
                 if envelope.active_binding.is_some() {
                     return Err(TransitionError::AlreadyBound);
@@ -309,6 +380,17 @@ impl Change {
                 if entry.is_clearable() {
                     envelope.pending.remove(&generation);
                 }
+                Ok(())
+            }
+            Change::ClearRevocation { generation } => {
+                let entry = envelope
+                    .pending
+                    .get(&generation)
+                    .ok_or(TransitionError::NoSuchJournalEntry(generation))?;
+                if entry.state == RevocationState::Retryable || !entry.purge_confirmed {
+                    return Err(TransitionError::RevocationNotClearable);
+                }
+                envelope.pending.remove(&generation);
                 Ok(())
             }
             Change::AbandonRevocation { generation } => {
@@ -454,7 +536,11 @@ pub fn serialize_envelope(envelope: &CalendarEnvelope) -> Result<String, String>
             })
             .collect(),
     };
-    serde_json::to_string(&wire).map_err(|error| error.to_string())
+    let raw = serde_json::to_string(&wire).map_err(|error| error.to_string())?;
+    if raw.len() > 256 * 1024 {
+        return Err("calendar envelope exceeded byte cap".into());
+    }
+    Ok(raw)
 }
 
 /// Read an envelope back.
@@ -464,7 +550,13 @@ pub fn serialize_envelope(envelope: &CalendarEnvelope) -> Result<String, String>
 /// this build understands. A stored value is never silently replaced with the
 /// empty envelope: that would drop a live journal entry.
 pub fn deserialize_envelope(raw: &str) -> Result<CalendarEnvelope, String> {
+    if raw.len() > 256 * 1024 {
+        return Err("calendar envelope exceeded byte cap".into());
+    }
     let wire: wire::Envelope = serde_json::from_str(raw).map_err(|error| error.to_string())?;
+    if wire.pending.len() > MAX_PENDING_REVOCATIONS {
+        return Err("calendar journal exceeded count cap".into());
+    }
     if wire.version != ENVELOPE_VERSION {
         return Err(format!(
             "stored calendar envelope is version {}, expected {ENVELOPE_VERSION}",
@@ -473,6 +565,9 @@ pub fn deserialize_envelope(raw: &str) -> Result<CalendarEnvelope, String> {
     }
     let mut pending = BTreeMap::new();
     for entry in wire.pending {
+        if pending.contains_key(&entry.generation) {
+            return Err("duplicate calendar journal generation".into());
+        }
         let state = match entry.state.as_str() {
             "retryable" => RevocationState::Retryable,
             "revocation_unconfirmed" => RevocationState::Unconfirmed,

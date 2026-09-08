@@ -62,6 +62,8 @@ pub const MAX_REASON_CHARS: usize = 128;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ParkReason {
+    /// Durable custody for an admitted listener event or dispatched batch.
+    Ingress,
     /// The retry budget ran out.
     RetriesExhausted,
     /// The turn hit the hard wall-clock cap.
@@ -84,6 +86,7 @@ impl ParkReason {
     /// The `reason` string written to the ledger.
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Ingress => "ingress",
             Self::RetriesExhausted => "retries_exhausted",
             Self::HardTimeout => "hard_timeout",
             Self::Auth => "auth",
@@ -191,10 +194,46 @@ pub struct ParkedBatch {
     #[serde(default)]
     pub forced: bool,
     pub parked_at: DateTime<Utc>,
+    /// New parks retain notice intent until the durable outbox accepts it.
+    #[serde(default)]
+    pub notice_pending: bool,
     pub events: Vec<ParkedEvent>,
 }
 
 impl ParkedBatch {
+    pub(super) fn validate(&self) -> io::Result<()> {
+        let invalid = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "park record signature or scope is inconsistent",
+            )
+        };
+        if self.channel_id != self.scope.channel_id || self.events.len() > MAX_PARKED_EVENTS {
+            return Err(invalid());
+        }
+        if self.scope.root_event_id.as_ref().is_some_and(|root| {
+            root.len() != 64
+                || !root
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }) {
+            return Err(invalid());
+        }
+        for stored in &self.events {
+            stored.event.verify().map_err(|_| invalid())?;
+            for tag in stored.event.tags.iter() {
+                let values = tag.as_slice();
+                if values.first().is_some_and(|value| value == "h")
+                    && values.get(1).and_then(|value| Uuid::parse_str(value).ok())
+                        != Some(self.channel_id)
+                {
+                    return Err(invalid());
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Park a live batch. Events past [`MAX_PARKED_EVENTS`] are refused rather
     /// than silently trimmed — the queue never builds a larger batch, so a
     /// larger one is a bug, not a message to drop.
@@ -239,13 +278,16 @@ impl ParkedBatch {
             replayed_at: None,
             forced: false,
             parked_at: now,
+            notice_pending: true,
             events,
         })
     }
 
     /// Whether this batch may replay on its own after a successful probe.
     pub fn replay_eligible(&self) -> bool {
-        (!self.started || self.forced) && !self.needs_review && self.replayed_at.is_none()
+        (self.forced || self.reason != ParkReason::Ingress && !self.started)
+            && !self.needs_review
+            && self.replayed_at.is_none()
     }
 
     /// Rebuild the batch events for a replay prompt.
@@ -438,6 +480,19 @@ impl ParkFile {
         crashed: &[Uuid],
         now: DateTime<Utc>,
     ) -> Result<ReconcileReport, ParkError> {
+        let (next, report) = self.preview_reconcile(crashed, now);
+        if !report.is_empty() {
+            let bytes = serialize(&next)?;
+            self.commit(next, bytes)?;
+        }
+        Ok(report)
+    }
+
+    pub(super) fn preview_reconcile(
+        &self,
+        crashed: &[Uuid],
+        now: DateTime<Utc>,
+    ) -> (Vec<ParkedBatch>, ReconcileReport) {
         let cutoff = now - Duration::days(REPLAY_MAX_AGE_DAYS);
         let mut report = ReconcileReport::default();
         let mut next = self.batches.clone();
@@ -460,11 +515,7 @@ impl ParkFile {
             }
         }
         report.over_scope_cap = apply_scope_cap(&mut next);
-        if !report.is_empty() {
-            let bytes = serialize(&next)?;
-            self.commit(next, bytes)?;
-        }
-        Ok(report)
+        (next, report)
     }
 
     /// Demote the oldest replay-eligible batches of any scope over
@@ -498,6 +549,11 @@ impl ParkFile {
     /// Write the new image atomically, then adopt it. The in-memory image only
     /// changes once the bytes are on disk, so a failed write leaves the caller
     /// looking at exactly what the file holds.
+    /// Publish the already validated image after a transaction committed it.
+    pub(super) fn accept_committed(&mut self, next: Vec<ParkedBatch>) {
+        self.batches = next;
+    }
+
     fn commit(&mut self, next: Vec<ParkedBatch>, bytes: Vec<u8>) -> Result<(), ParkError> {
         if let Err(error) = state_dir::write_atomic(&self.path, &bytes) {
             self.write_failures = self.write_failures.saturating_add(1);
@@ -516,7 +572,7 @@ impl ParkFile {
 
 /// Demote the oldest replay-eligible batches of any scope over
 /// [`MAX_PARKED_PER_SCOPE`] to the review list. Returns how many moved.
-fn apply_scope_cap(batches: &mut [ParkedBatch]) -> usize {
+pub(super) fn apply_scope_cap(batches: &mut [ParkedBatch]) -> usize {
     use std::collections::HashMap;
 
     let mut per_scope: HashMap<SessionScope, Vec<usize>> = HashMap::new();
@@ -541,7 +597,7 @@ fn apply_scope_cap(batches: &mut [ParkedBatch]) -> usize {
     demote_count
 }
 
-fn serialize(batches: &[ParkedBatch]) -> Result<Vec<u8>, ParkError> {
+pub(super) fn serialize(batches: &[ParkedBatch]) -> Result<Vec<u8>, ParkError> {
     let mut buffer = Vec::new();
     for batch in batches {
         let start = buffer.len();
@@ -556,133 +612,64 @@ fn serialize(batches: &[ParkedBatch]) -> Result<Vec<u8>, ParkError> {
     Ok(buffer)
 }
 
-/// Suffix of the sibling file an unreadable park line is copied to, verbatim,
-/// before it is dropped from the live in-memory image.
-const QUARANTINE_SUFFIX: &str = ".corrupt";
+/// Read a bounded complete park image. Corruption fails closed: the original
+/// source remains the recovery record and cannot be overwritten by a subset.
+/// Read a bounded, validated snapshot without creating or modifying state files.
+pub fn read_snapshot(dir: &Path) -> io::Result<Vec<ParkedBatch>> {
+    read_batches(&dir.join(PARK_FILE))
+}
 
-/// Read the park file with a hard byte cap on the input and a hard cap per
-/// line.
-///
-/// A line this cannot use — too long, not UTF-8, not valid JSON, or (once
-/// parsed) carrying more events than [`MAX_PARKED_EVENTS`] — is never
-/// silently modified or dropped without a trace. Every such line is copied
-/// verbatim to a `.corrupt` sibling file (best-effort) before being excluded
-/// from the live batches, so an operator can recover the original bytes
-/// instead of the client messages in it simply vanishing on the next read (T16
-/// delta 1, finding 6).
 fn read_batches(path: &Path) -> io::Result<Vec<ParkedBatch>> {
-    let file = match std::fs::File::open(path) {
+    let file = match state_dir::open_read(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    let mut reader = io::BufReader::new(file.take(MAX_PARK_BYTES));
+    if file.metadata()?.len() > MAX_PARK_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "park file exceeds byte cap; recovery required",
+        ));
+    }
+    let mut reader = io::BufReader::new(file.take(MAX_PARK_BYTES + 1));
     let mut batches = Vec::new();
-    let mut skipped = 0usize;
     let mut line = Vec::new();
+    let mut total = 0;
     loop {
-        if batches.len() >= MAX_PARKED_TOTAL {
-            tracing::warn!(
-                cap = MAX_PARKED_TOTAL,
-                path = %path.display(),
-                "park file holds more batches than the cap — ignoring the rest of the file"
-            );
-            break;
-        }
         line.clear();
-        let read = reader.read_until(b'\n', &mut line)?;
+        let read = reader
+            .by_ref()
+            .take(MAX_LINE_BYTES as u64 + 1)
+            .read_until(b'\n', &mut line)?;
         if read == 0 {
             break;
         }
-        if line.len() > MAX_LINE_BYTES {
-            skipped += 1;
-            quarantine_line(path, &line);
-            continue;
+        total += read as u64;
+        if line.len() > MAX_LINE_BYTES || total > MAX_PARK_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "park input exceeds cap; recovery required",
+            ));
         }
-        let text = match std::str::from_utf8(&line) {
-            Ok(text) => text.trim(),
-            Err(_) => {
-                skipped += 1;
-                quarantine_line(path, &line);
-                continue;
-            }
-        };
+        let text = std::str::from_utf8(&line)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+            .trim();
         if text.is_empty() {
             continue;
         }
-        match serde_json::from_str::<ParkedBatch>(text) {
-            Ok(batch) if batch.events.len() > MAX_PARKED_EVENTS => {
-                // A syntactically valid record with more events than the
-                // cap allows is corruption (or a future/incompatible
-                // format), not a batch to admit with its tail silently cut
-                // off — every event past the cap would otherwise vanish
-                // with the read reporting success.
-                tracing::error!(
-                    batch_id = %batch.batch_id,
-                    events = batch.events.len(),
-                    cap = MAX_PARKED_EVENTS,
-                    path = %path.display(),
-                    "parked batch carries more events than the cap allows — \
-                     quarantining the whole record rather than truncating it"
-                );
-                skipped += 1;
-                quarantine_line(path, &line);
-            }
-            Ok(batch) => batches.push(batch),
-            Err(_) => {
-                skipped += 1;
-                quarantine_line(path, &line);
-            }
+        let batch: ParkedBatch = serde_json::from_str(text)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if batch.events.len() > MAX_PARKED_EVENTS || batches.len() >= MAX_PARKED_TOTAL {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "park record count exceeds cap; recovery required",
+            ));
         }
-    }
-    if skipped > 0 {
-        tracing::error!(
-            skipped,
-            path = %path.display(),
-            "unreadable park file lines were quarantined to a .corrupt sibling \
-             file rather than dropped — operator recovery required"
-        );
+        batch.validate()?;
+        batches.push(batch);
     }
     batches.sort_by_key(|b| b.parked_at);
     Ok(batches)
-}
-
-/// Best-effort: append `line` verbatim to `<path>.corrupt`. A failure here is
-/// logged, never propagated — quarantining is a courtesy on top of the
-/// primary guarantee (the line is excluded from the live batches either way),
-/// not itself load-bearing for correctness.
-fn quarantine_line(path: &Path, line: &[u8]) {
-    use std::io::Write as _;
-
-    let quarantine_path = {
-        let mut name = path.as_os_str().to_owned();
-        name.push(QUARANTINE_SUFFIX);
-        PathBuf::from(name)
-    };
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // Same 0600 owner-only mode every other state file gets — this file
-        // can hold client message content.
-        options.mode(0o600);
-    }
-    let result = options.open(&quarantine_path).and_then(|mut file| {
-        file.write_all(line)?;
-        if line.last() != Some(&b'\n') {
-            file.write_all(b"\n")?;
-        }
-        Ok(())
-    });
-    if let Err(error) = result {
-        tracing::error!(
-            path = %quarantine_path.display(),
-            error = %error,
-            "could not quarantine an unreadable park file line — it is still \
-             excluded from the live batches, but its original bytes are lost"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -716,6 +703,48 @@ mod tests {
             cancel_reason: None,
             started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    #[test]
+    fn park_reader_rejects_tampered_signed_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let ch = Uuid::new_v4();
+        let batch = dummy_batch(
+            ch,
+            Uuid::new_v4(),
+            SessionScope::Conversation { channel_id: ch },
+            "signed content",
+        );
+        let mut parked =
+            ParkedBatch::from_batch(&batch, ParkReason::Auth, false, Utc::now()).unwrap();
+        parked.events[0].event.content = "tampered content".into();
+        std::fs::write(
+            dir.path().join(PARK_FILE),
+            serde_json::to_vec(&parked).unwrap(),
+        )
+        .unwrap();
+        assert!(ParkFile::open(dir.path()).is_err());
+    }
+
+    #[test]
+    fn park_reader_rejects_inconsistent_stored_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let ch = Uuid::new_v4();
+        let batch = dummy_batch(
+            ch,
+            Uuid::new_v4(),
+            SessionScope::Conversation { channel_id: ch },
+            "content",
+        );
+        let mut parked =
+            ParkedBatch::from_batch(&batch, ParkReason::Auth, false, Utc::now()).unwrap();
+        parked.scope.channel_id = Uuid::new_v4();
+        std::fs::write(
+            dir.path().join(PARK_FILE),
+            serde_json::to_vec(&parked).unwrap(),
+        )
+        .unwrap();
+        assert!(ParkFile::open(dir.path()).is_err());
     }
 
     #[test]
@@ -820,11 +849,33 @@ mod tests {
         assert!(park.batches().is_empty());
     }
 
+    #[test]
+    fn corrupt_source_fails_closed_without_growing_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PARK_FILE);
+        std::fs::write(&path, b"invalid record\n").unwrap();
+        for _ in 0..3 {
+            assert!(ParkFile::open(dir.path()).is_err());
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"invalid record\n");
+        assert!(!dir.path().join("parked.jsonl.corrupt").exists());
+    }
+
+    #[test]
+    fn oversized_park_source_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PARK_FILE);
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_PARK_BYTES + 1).unwrap();
+        assert!(ParkFile::open(dir.path()).is_err());
+        assert_eq!(file.metadata().unwrap().len(), MAX_PARK_BYTES + 1);
+    }
+
     // T16 delta 1, finding 6: a syntactically valid on-disk record with more
     // events than MAX_PARKED_EVENTS must be quarantined whole, never
     // silently truncated and admitted as if nothing were wrong.
     #[test]
-    fn test_read_batches_quarantines_rather_than_truncates_an_oversized_record() {
+    fn test_read_batches_rejects_rather_than_truncates_an_oversized_record() {
         let dir = tempfile::tempdir().unwrap();
         let channel_id = Uuid::new_v4();
         let batch_id = Uuid::new_v4();
@@ -839,6 +890,7 @@ mod tests {
             replayed_at: None,
             forced: false,
             parked_at: Utc::now(),
+            notice_pending: true,
             events: (0..MAX_PARKED_EVENTS + 1)
                 .map(|i| ParkedEvent {
                     event: dummy_event(&format!("event-{i}")),
@@ -852,22 +904,10 @@ mod tests {
         let park_path = dir.path().join(PARK_FILE);
         std::fs::write(&park_path, format!("{line}\n")).unwrap();
 
-        let park = ParkFile::open(dir.path()).unwrap();
-        assert!(
-            !park.contains(batch_id),
-            "an over-cap record must never be admitted, truncated or otherwise"
-        );
-        assert!(
-            park.batches().is_empty(),
-            "no events from the over-cap record may survive into the live image"
-        );
-
-        let quarantine_path = dir.path().join(format!("{PARK_FILE}{QUARANTINE_SUFFIX}"));
-        let quarantined = std::fs::read_to_string(&quarantine_path)
-            .expect("the original record must be preserved in the quarantine file");
-        assert!(
-            quarantined.contains(&batch_id.to_string()),
-            "the quarantined line must be the original record, recoverable by an operator"
+        assert!(ParkFile::open(dir.path()).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&park_path).unwrap(),
+            format!("{line}\n")
         );
     }
 

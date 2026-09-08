@@ -7,6 +7,50 @@ use super::{
 };
 use serde::Deserialize;
 
+#[tokio::test]
+async fn successful_json_body_is_bounded_before_deserialization() {
+    use std::io::{Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut request = [0u8; 4096];
+        let _ = stream.read(&mut request);
+        // No Content-Length: the reader must enforce actual streamed bytes.
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n\"",
+        );
+        let chunk = [b'x'; 8192];
+        for _ in 0..1025 {
+            if stream.write_all(&chunk).is_err() {
+                return;
+            }
+        }
+        let _ = stream.write_all(b"\"");
+    });
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(format!("http://{addr}/"))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .unwrap();
+    let result = super::parse_json_response::<String>(response).await;
+    server.join().unwrap();
+    assert!(
+        result.is_err(),
+        "oversized valid JSON must be rejected before parsing"
+    );
+}
+
 // ── extract_retry_in_hint ────────────────────────────────────────────────
 
 #[test]

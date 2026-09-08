@@ -5005,16 +5005,29 @@ pub(crate) async fn reaction_add(rest: &crate::relay::RestClient, event_id: &str
     }
 }
 
-/// Best-effort: post a visible failure notice (kind:9) to a channel after a
-/// batch is dead-lettered. Replies into the thread of `thread_tags` when the
-/// triggering event was threaded. Errors are logged and swallowed — the
-/// notice must never take down the main loop.
-pub(crate) async fn post_failure_notice(
+/// Build a signed notice for durable storage before any relay delivery.
+pub(crate) fn build_failure_notice(
     rest: &crate::relay::RestClient,
     channel_id: Uuid,
     thread_tags: &ThreadTags,
     content: &str,
-) -> bool {
+) -> Result<nostr::Event, String> {
+    build_failure_notice_at(
+        rest,
+        channel_id,
+        thread_tags,
+        content,
+        nostr::Timestamp::now(),
+    )
+}
+
+pub(crate) fn build_failure_notice_at(
+    rest: &crate::relay::RestClient,
+    channel_id: Uuid,
+    thread_tags: &ThreadTags,
+    content: &str,
+    created_at: nostr::Timestamp,
+) -> Result<nostr::Event, String> {
     let thread_ref = thread_tags.root_event_id.as_deref().and_then(|root| {
         let root_id = nostr::EventId::from_hex(root).ok()?;
         let parent_id = thread_tags
@@ -5027,7 +5040,7 @@ pub(crate) async fn post_failure_notice(
             parent_event_id: parent_id,
         })
     });
-    let builder = match buzz_sdk::build_message(
+    let builder = buzz_sdk::build_message(
         channel_id,
         content,
         thread_ref.as_ref(),
@@ -5035,19 +5048,25 @@ pub(crate) async fn post_failure_notice(
         false,
         &[],
         &[],
-    ) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(channel = %channel_id, "failure notice: build failed: {e}");
-            return false;
-        }
-    };
-    let event = match builder.sign_with_keys(&rest.keys) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!(channel = %channel_id, "failure notice: sign failed: {e}");
-            return false;
-        }
+    )
+    .map_err(|error| error.to_string())?;
+    builder
+        .custom_created_at(created_at)
+        .sign_with_keys(&rest.keys)
+        .map_err(|error| error.to_string())
+}
+
+/// Exercise bounded immediate relay retry independently of the durable worker.
+#[cfg(test)]
+pub(crate) async fn post_failure_notice(
+    rest: &crate::relay::RestClient,
+    channel_id: Uuid,
+    thread_tags: &ThreadTags,
+    content: &str,
+) -> bool {
+    let event = match build_failure_notice(rest, channel_id, thread_tags, content) {
+        Ok(event) => event,
+        Err(_) => return false,
     };
     // T16 delta 1, finding 14 (prior #15): 3 attempts spanning well under a
     // minute gives up long before a typical relay blip (seconds to several

@@ -186,6 +186,80 @@ async function seedFiles(page: Page, channelName: string, total: number) {
 }
 
 test.describe("channel files facets", () => {
+  test("resolves the author of a file outside the loaded chat window", async ({
+    page,
+  }) => {
+    const author = "a".repeat(64);
+    await installMockBridge(page, {
+      searchProfiles: [
+        { pubkey: author, displayName: "Historical File Author" },
+      ],
+    });
+    await page.goto("/");
+    await page.waitForFunction(() => !!window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__);
+    await page.evaluate(
+      ({ author }) => {
+        const emit = window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__!;
+        const base = Math.floor(Date.now() / 1000) - 500;
+        emit({
+          channelName: "general",
+          content: "Old attachment",
+          pubkey: author,
+          createdAt: base,
+          extraTags: [
+            [
+              "imeta",
+              "url http://localhost:3000/media/history.pdf",
+              "m application/pdf",
+              "filename history.pdf",
+            ],
+          ],
+        });
+        for (let i = 1; i <= 350; i++)
+          emit({
+            channelName: "general",
+            content: `Recent message ${i}`,
+            createdAt: base + i,
+          });
+      },
+      { author },
+    );
+    await page.getByTestId(`channel-${CHANNEL_NAME}`).click();
+    await waitForMockLiveSubscription(page, CHANNEL_NAME);
+    await page.getByRole("tab", { name: "Files" }).click();
+    await expect(page.getByTestId("channel-files-list")).toContainText(
+      "history.pdf",
+    );
+    await expect(page.getByTestId("channel-files-list")).toContainText(
+      "Historical File Author",
+    );
+  });
+
+  test("a long expanded canvas leaves the file list usable", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1100, height: 700 });
+    await installMockBridge(page, {
+      canvasContent:
+        "# Long canvas\n\n" + "A paragraph of project notes.\n\n".repeat(150),
+    });
+    await page.goto("/");
+    await page.getByTestId(`channel-${CHANNEL_NAME}`).click();
+    await waitForMockLiveSubscription(page, CHANNEL_NAME);
+    await seedFiles(page, CHANNEL_NAME, 20);
+    await page.getByRole("tab", { name: "Files" }).click();
+    await waitForFacetCount(page, "All", 20);
+    await page.getByTestId("channel-files-canvas-row").click();
+    const surface = page.getByTestId("channel-files-canvas-surface");
+    await expect(surface).toBeVisible();
+    await expect
+      .poll(() => surface.evaluate((el) => el.scrollHeight > el.clientHeight))
+      .toBe(true);
+    const list = await page.getByTestId("channel-files-list").boundingBox();
+    expect(list).not.toBeNull();
+    expect(list!.height).toBeGreaterThan(100);
+    expect(list!.y + list!.height).toBeLessThanOrEqual(700);
+  });
   test("sorts and filters the loaded index inside the budget", async ({
     page,
   }) => {

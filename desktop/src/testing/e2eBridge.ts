@@ -8613,6 +8613,7 @@ type MockMcpEntry = {
   args: string[];
   url: string | null;
   auth_scheme: string | null;
+  auth_secret: string | null;
   env: MockMcpEnvEntry[];
   rejection: string | null;
 };
@@ -8694,6 +8695,7 @@ function handleSaveMcpRegistryServer(payload: {
     args: entry.transport === "http" ? [] : (entry.args ?? []),
     url: entry.transport === "http" ? (entry.url ?? "") : null,
     auth_scheme: entry.auth?.scheme ?? null,
+    auth_secret: entry.auth?.secret ?? null,
     env: Object.entries(entry.env ?? {}).map(([name, value]) => ({
       name,
       reference: value.startsWith("mcp:") ? value : null,

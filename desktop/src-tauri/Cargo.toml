@@ -68,6 +68,7 @@ keyring = { version = "3.6.3", default-features = false, features = ["windows-na
 user-idle = { version = "0.6", default-features = false }
 
 [dependencies]
+jsonwebtoken = { version = "10.4.0", default-features = false, features = ["aws_lc_rs"] }
 atomic-write-file = "0.3"
 # Cross-process advisory file lock for the configuration-mutation lock. Kept off
 # std's `File::lock` so the crate stays buildable on the declared 1.88 MSRV.

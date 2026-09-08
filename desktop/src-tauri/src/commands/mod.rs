@@ -12,6 +12,7 @@ mod agent_settings;
 mod agent_update_rollback;
 mod agents;
 mod bestie;
+pub(crate) mod calendar;
 mod canvas;
 mod channel_reconnect_repair;
 mod channel_templates;
@@ -144,3 +145,5 @@ pub use window_chrome::*;
 pub use window_vibrancy::*;
 pub use workflows::*;
 pub use workspace::*;
+
+pub use calendar::*;

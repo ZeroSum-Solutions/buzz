@@ -5,12 +5,10 @@
 //! and `docs/plans/2026-09-04-calendar-view-design.md` (T12a). Every decision
 //! this module implements is cited by number where it is implemented.
 //!
-//! **Slice boundary.** This is the first half of T12: the contract and the data
-//! layer. Nothing here is wired to a Tauri command, to the webview or to the
-//! sidebar, and no event is persisted yet. The second half — the SQLite render
-//! cache with T11 decision 6's bounds, the commands, and T12a's month and
-//! agenda views — builds on these types. The split follows the memos' own
-//! seam, and it keeps the credential path reviewable on its own.
+//! Native production wiring lives in `commands::calendar`: human UI commands,
+//! a personal primary calendar per Buzz identity, bounded OAuth/JWKS transport,
+//! generation-fenced credentials and a separate SQLite render cache. The
+//! renderer receives status and bounded event data, never grant tokens.
 //!
 //! The pieces, and the decisions each answers:
 //!
@@ -33,18 +31,18 @@
 //! * [`client`] — the bounded `events.list` walk and the three mutations
 //!   (T11 decision 6, T12a decisions 5, 11 and 13).
 //!
-//! **What an agent may reach: nothing** (T11 decision 9). The credential lives
-//! under a key outside the `mcp:` namespace the launcher sidecar resolves, and
-//! this module registers no command, so absence — not a caller check — is the
-//! denial seam.
+//! Calendar remains unavailable to agent/CLI/MCP adapters. The credential key
+//! stays outside `mcp:`; only explicit native UI commands are registered.
 
 pub mod binding;
+pub mod cache;
 pub mod client;
 pub mod dto;
 pub mod failure;
 pub mod interval;
 pub mod loopback;
 pub mod oauth;
+pub mod provider;
 pub mod redact;
 pub mod revocation;
 

@@ -28,6 +28,15 @@ function fileRow(overrides = {}) {
 
 // ── Classification ───────────────────────────────────────────────────────────
 
+test("MIME classification is case insensitive and ignores surrounding whitespace", () => {
+  assert.equal(classifyFile(fileRow({ mimeType: " IMAGE/PNG " })), "image");
+  assert.equal(classifyFile(fileRow({ mimeType: "Video/MP4" })), "video");
+  assert.equal(
+    classifyFile(fileRow({ mimeType: "TEXT/PLAIN; charset=UTF-8" })),
+    "document",
+  );
+});
+
 test("a .md sent as application/octet-stream is a document", () => {
   assert.equal(
     classifyFile(

@@ -301,6 +301,11 @@ const EVENTS_INVENTORY: &[(&str, usize, usize)] = &[
     ("src/google_calendar/client.rs", 1, 0), // `events_path`
     ("src/google_calendar/client_tests.rs", 3, 0), // list/walk/percent-encoding fixtures
     ("src/google_calendar/mock_server.rs", 1, 0), // mock Calendar route
+    // Native personal-calendar authority checks: two GET paths handed to the
+    // pinned Google HttpTransport, plus two route strings in WriterTransport
+    // fixtures. Neither serializes a Nostr event or addresses a relay. Keep
+    // this exact count: the mutation test below rejects any fifth site.
+    ("src/commands/calendar.rs", 4, 0),
 ];
 
 // Needles are assembled at runtime so this scan file itself contains no
@@ -424,6 +429,33 @@ fn inventory_scan_catches_removed_guard_call() {
     assert!(
         violations.iter().any(|v| v.contains("src/relay.rs")),
         "a removed guard call in relay.rs must trip the scan: {violations:?}"
+    );
+}
+
+/// The Google-only classification is site-counted, never a whole-file bypass.
+/// A new path in the command file still requires a fresh boundary review.
+#[test]
+fn inventory_scan_fences_google_calendar_command_sites() {
+    let mut files = read_src_files();
+    assert!(
+        !events_inventory_violations(&files)
+            .iter()
+            .any(|violation| violation.contains("src/commands/calendar.rs")),
+        "the reviewed Google paths must match their exact inventory count"
+    );
+    let calendar = files
+        .iter_mut()
+        .find(|(path, _)| path.ends_with("src/commands/calendar.rs"))
+        .expect("calendar commands must be inventoried");
+    calendar.1.push_str(&format!(
+        "\nfn new_egress(base: &str) -> String {{ format!(\"{{base}}{}\") }}\n",
+        events_needle()
+    ));
+    assert!(
+        events_inventory_violations(&files)
+            .iter()
+            .any(|violation| violation.contains("src/commands/calendar.rs")),
+        "a fifth site must not inherit the Google classification"
     );
 }
 

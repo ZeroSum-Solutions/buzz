@@ -246,6 +246,9 @@ pub async fn get_users_batch(
         ));
     }
     let events = query_relay(&state, &[build_users_batch_filter(&pubkeys)]).await?;
+    if events.len() > pubkeys.len() {
+        return Err("relay returned more profiles than requested".to_string());
+    }
 
     Ok(nostr_convert::users_batch_from_events(&events, &pubkeys))
 }
@@ -457,6 +460,12 @@ mod tests {
     /// rejection happens *before* the relay round trip, not merely that the
     /// command errors for some incidental reason (e.g. no relay configured).
     async fn spawn_recording_relay() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        spawn_recording_relay_body("[]".to_string()).await
+    }
+
+    async fn spawn_recording_relay_body(
+        body: String,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -475,7 +484,6 @@ mod tests {
                 hits_for_task.fetch_add(1, Ordering::SeqCst);
                 let mut buf = [0u8; 4096];
                 let _ = stream.read(&mut buf).await;
-                let body = "[]";
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
@@ -484,6 +492,27 @@ mod tests {
             }
         });
         (format!("ws://{addr}"), hits)
+    }
+
+    #[tokio::test]
+    async fn users_batch_rejects_relay_results_above_requested_count() {
+        let keys = nostr::Keys::generate();
+        let event = nostr::EventBuilder::new(nostr::Kind::Metadata, "{}")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let body = serde_json::to_string(&vec![event.clone(), event]).unwrap();
+        let (relay_url, _) = spawn_recording_relay_body(body).await;
+        let state = crate::app_state::build_app_state();
+        *state.relay_url_override.lock().unwrap() = Some(relay_url);
+        let app = tauri::test::mock_builder()
+            .manage(state)
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let result = get_users_batch(vec![keys.public_key().to_hex()], app.state()).await;
+        assert!(
+            result.is_err(),
+            "dishonest relay result count must fail closed"
+        );
     }
 
     #[tokio::test]

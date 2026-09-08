@@ -13,6 +13,7 @@ import {
 import { setAgentMcpServers } from "@/shared/api/tauriMcpRegistry";
 import type { AcpRuntimeCatalogEntry } from "@/shared/api/types";
 import { Switch } from "@/shared/ui/switch";
+import { Button } from "@/shared/ui/button";
 import { cn } from "@/shared/lib/cn";
 
 /** Copy for the badge one entry gets on this runtime. */
@@ -82,6 +83,9 @@ export function AgentMcpServersField({
   const isLoaded = selectionState.status === "loaded";
   const selection = isLoaded ? selectionState.enabled : [];
   const servers = registry.data?.servers ?? [];
+  const stale = selection.filter(
+    (id) => !servers.some((entry) => entry.id === id),
+  );
 
   if (registry.isError) {
     return (
@@ -90,7 +94,7 @@ export function AgentMcpServersField({
       </p>
     );
   }
-  if (servers.length === 0) {
+  if (servers.length === 0 && stale.length === 0) {
     return (
       <p
         className="text-sm text-muted-foreground/70"
@@ -114,6 +118,7 @@ export function AgentMcpServersField({
       // never recomputes it), so it cannot be relied on to surface this.
       const ownRefusal = view.refused.find(([agentId]) => agentId === pubkey);
       setRefusal(ownRefusal ? ownRefusal[1] : null);
+      queryClient.setQueryData(MCP_REGISTRY_QUERY_KEY, view);
       void queryClient.invalidateQueries({ queryKey: MCP_REGISTRY_QUERY_KEY });
     } catch (error) {
       // Surfaced, not swallowed: the write failed, so the agent will spawn
@@ -124,6 +129,29 @@ export function AgentMcpServersField({
 
   return (
     <div className="space-y-2" data-testid="agent-mcp-servers">
+      {stale.length > 0 ? (
+        <div className="flex items-center justify-between gap-3 text-sm">
+          <span>{stale.join(", ")} (no longer registered)</span>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            aria-label={
+              stale.length === 1
+                ? `Remove ${stale[0]}`
+                : "Remove unavailable servers"
+            }
+            disabled={!isLoaded}
+            onClick={() =>
+              void apply(
+                selection.filter((selected) => !stale.includes(selected)),
+              )
+            }
+          >
+            Remove unavailable servers
+          </Button>
+        </div>
+      ) : null}
       {selectionState.status === "error" ? (
         <p
           className="text-sm text-amber-600"

@@ -106,19 +106,23 @@ export async function getUserProfile(pubkey?: string): Promise<Profile> {
 export async function getUsersBatch(
   pubkeys: string[],
 ): Promise<UsersBatchResponse> {
-  const response = await invokeTauri<RawUsersBatchResponse>("get_users_batch", {
-    pubkeys,
-  });
-
-  return {
-    profiles: Object.fromEntries(
-      Object.entries(response.profiles).map(([pubkey, profile]) => [
-        pubkey,
-        fromRawUserProfileSummary(profile),
-      ]),
-    ),
-    missing: response.missing,
-  };
+  const result: UsersBatchResponse = { profiles: {}, missing: [] };
+  const uniquePubkeys = [...new Set(pubkeys)];
+  // Historical file authors can exceed a single native request. Keep network
+  // concurrency at one and fail the whole fetch if any partition fails.
+  for (let offset = 0; offset < uniquePubkeys.length; offset += 256) {
+    const response = await invokeTauri<RawUsersBatchResponse>(
+      "get_users_batch",
+      {
+        pubkeys: uniquePubkeys.slice(offset, offset + 256),
+      },
+    );
+    for (const [pubkey, profile] of Object.entries(response.profiles)) {
+      result.profiles[pubkey] = fromRawUserProfileSummary(profile);
+    }
+    result.missing.push(...response.missing);
+  }
+  return result;
 }
 
 export async function searchUsers(

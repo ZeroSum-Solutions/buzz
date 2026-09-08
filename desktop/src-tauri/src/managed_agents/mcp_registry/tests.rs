@@ -716,11 +716,12 @@ fn mcp_registry_the_journal_rejects_an_excessive_deletion_array() {
         "deletions": deletions,
         "rollback": [],
     });
-    std::fs::write(
-        root.join("journal.json"),
-        serde_json::to_vec(&body).expect("serialize"),
-    )
-    .expect("write");
+    let bytes = serde_json::to_vec(&body).expect("serialize");
+    assert!(
+        bytes.len() < super::generation::MAX_JOURNAL_BYTES,
+        "the count regression must not be caught by the byte cap instead"
+    );
+    std::fs::write(root.join("journal.json"), bytes).expect("write");
 
     let error = store
         .journal()
@@ -1312,4 +1313,115 @@ fn mcp_registry_staging_tree_keeps_at_most_two_generations() {
         "retention is the current generation plus one rollback"
     );
     assert_eq!(read_current(&store, "a.json").as_deref(), Some("gen4"));
+}
+
+#[test]
+fn mcp_registry_commit_refuses_a_journal_its_reader_cannot_recover() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = GenerationStore::open(dir.path()).unwrap();
+    let result = store.commit(
+        |_, _| {
+            Ok(GenerationPlan {
+                deletions: vec![Deletion::Secret {
+                    key: format!("mcp:{}", "x".repeat(super::generation::MAX_JOURNAL_BYTES)),
+                }],
+                ..Default::default()
+            })
+        },
+        &NoSecrets,
+        &NoHooks,
+    );
+    assert!(
+        result.is_err(),
+        "the writer must reject an unrecoverable journal before adopting"
+    );
+    assert_eq!(store.current().unwrap(), None);
+    assert!(store.journal().unwrap().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_registry_cross_process_lock_holder() {
+    let Some(root) = std::env::var_os("BUZZ_TEST_REGISTRY_LOCK_ROOT") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join("mutation.lock"))
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&file).unwrap();
+    std::fs::write(root.join("holder-ready"), b"ready").unwrap();
+    // Bound even a regressed production acquisition: it returns too late and
+    // succeeds after release, which the parent rejects instead of hanging CI.
+    std::thread::sleep(std::time::Duration::from_secs(15));
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_registry_production_commit_times_out_against_another_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = GenerationStore::open(dir.path()).unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "managed_agents::mcp_registry::tests::mcp_registry_cross_process_lock_holder",
+        ])
+        .env("BUZZ_TEST_REGISTRY_LOCK_ROOT", dir.path())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !dir.path().join("holder-ready").exists() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("holder did not become ready");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let started = std::time::Instant::now();
+    let result = store.commit(|_, _| Ok(GenerationPlan::default()), &NoSecrets, &NoHooks);
+    let elapsed = started.elapsed();
+    let _ = child.kill();
+    child.wait().unwrap();
+    assert!(
+        matches!(result, Err(GenerationError::Lock(_))),
+        "{result:?}"
+    );
+    assert!(elapsed < std::time::Duration::from_secs(13));
+}
+
+#[test]
+fn mcp_registry_near_limit_journal_plan_remains_recoverable() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = GenerationStore::open(dir.path()).unwrap();
+    let keys: Vec<_> = (0..4000)
+        .map(|i| format!("mcp:agent:{i}:{}", "x".repeat(80)))
+        .collect();
+    let secrets = keys
+        .iter()
+        .map(|key| (key.clone(), "value".to_string()))
+        .collect();
+    let deletions = keys
+        .iter()
+        .map(|key| Deletion::Secret { key: key.clone() })
+        .collect();
+    store
+        .commit(
+            |_, _| {
+                Ok(GenerationPlan {
+                    secrets,
+                    deletions,
+                    ..Default::default()
+                })
+            },
+            &NoSecrets,
+            &NoHooks,
+        )
+        .unwrap();
+    assert_eq!(store.current().unwrap(), Some(1));
+    store.journal().unwrap();
+    store.reconcile(&NoSecrets, &NoHooks).unwrap();
 }

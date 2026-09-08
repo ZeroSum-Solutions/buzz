@@ -9,12 +9,9 @@ use crate::{
 /// Reject canvas content larger than [`events::MAX_CONTENT_BYTES`] before it
 /// is folded into the DTO returned to the frontend.
 ///
-/// `get_canvas` returns `event.content` verbatim from the relay query, and
-/// the relay read path applies no response-size ceiling of its own — only
-/// the write path (`events::build_set_canvas`) bounds what a well-behaved
-/// client publishes. Without this check, a hostile or nonconforming relay
-/// peer can push an arbitrarily large kind:40100 body through this command
-/// and into the Files tab's eager `useCanvasQuery` cache.
+/// The relay reader bounds the serialized response before deserialization.
+/// This tighter, content-specific cap protects the Files tab cache and matches
+/// the write-side canvas limit.
 fn enforce_canvas_content_cap(content: &str) -> Result<(), String> {
     if content.len() > events::MAX_CONTENT_BYTES {
         return Err(format!(
@@ -84,6 +81,67 @@ pub async fn set_canvas(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tauri::Manager;
+
+    #[tokio::test]
+    async fn actual_canvas_command_enforces_content_limit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for size in [events::MAX_CONTENT_BYTES, events::MAX_CONTENT_BYTES + 1] {
+            let keys = nostr::Keys::generate();
+            let event = nostr::EventBuilder::new(nostr::Kind::Custom(40100), "a".repeat(size))
+                .sign_with_keys(&keys)
+                .unwrap();
+            let body = serde_json::to_string(&vec![event]).unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    assert!(request.len() < 16_384, "bounded HTTP request headers");
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                // Drain the POST body before closing the socket. Windows can
+                // reset a connection with unread request bytes, discarding the
+                // response before reqwest consumes it.
+                let headers = std::str::from_utf8(&request).unwrap();
+                let content_length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                assert!(content_length <= 16_384, "bounded HTTP request body");
+                let mut request_body = vec![0; content_length];
+                stream.read_exact(&mut request_body).await.unwrap();
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+            let state = crate::app_state::build_app_state();
+            *state.relay_url_override.lock().unwrap() = Some(format!("ws://{addr}"));
+            let app = tauri::test::mock_builder()
+                .manage(state)
+                .build(tauri::test::mock_context(tauri::test::noop_assets()))
+                .unwrap();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                get_canvas(uuid::Uuid::new_v4().to_string(), app.state()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                result.is_ok(),
+                size == events::MAX_CONTENT_BYTES,
+                "{result:?}"
+            );
+            if let Ok(value) = result {
+                assert_eq!(value["content"].as_str().unwrap().len(), size);
+            }
+            server.await.unwrap();
+        }
+    }
 
     #[test]
     fn content_at_the_cap_is_accepted() {

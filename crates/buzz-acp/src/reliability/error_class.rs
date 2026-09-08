@@ -147,7 +147,10 @@ fn is_sensitive_key(k: &str) -> bool {
 /// Redacts sensitive tokens (bearer tokens, secret keys, passwords, credentials)
 /// and trims excessive stack traces.
 pub fn sanitize_error_diagnostic(raw: &str) -> String {
-    let mut text = raw.to_string();
+    // Bound work before allocating/normalizing untrusted provider text. Extra
+    // context beyond the output cap lets us consume complete credential values.
+    let mut text: String = raw.chars().take(MAX_RAW_ERROR_CHARS * 8).collect();
+    text = redact_assignments(&text);
 
     // 1. Redact stack backtrace if present
     if let Some(idx) = text.to_lowercase().find("stack backtrace:") {
@@ -205,6 +208,68 @@ pub fn sanitize_error_diagnostic(raw: &str) -> String {
     }
     let sanitized = words.join(" ");
     truncate_chars(&sanitized, MAX_RAW_ERROR_CHARS)
+}
+
+// Scan assignments before whitespace tokenization so a key and its value stay
+// associated, including JSON strings containing spaces and escaped quotes.
+fn redact_assignments(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::new();
+    let mut copied = 0;
+    let mut pos = 0;
+    while pos < bytes.len() {
+        if !matches!(bytes[pos], b':' | b'=') {
+            pos += 1;
+            continue;
+        }
+        let mut key_end = pos;
+        while key_end > 0 && bytes[key_end - 1].is_ascii_whitespace() {
+            key_end -= 1;
+        }
+        let mut key_start = key_end;
+        while key_start > copied
+            && !bytes[key_start - 1].is_ascii_whitespace()
+            && !matches!(bytes[key_start - 1], b'{' | b',' | b';')
+        {
+            key_start -= 1;
+        }
+        if !is_sensitive_key(&text[key_start..key_end]) {
+            pos += 1;
+            continue;
+        }
+        let mut value_start = pos + 1;
+        while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace() {
+            value_start += 1;
+        }
+        let mut end = value_start;
+        if end < bytes.len() && matches!(bytes[end], b'"' | b'\'') {
+            let quote = bytes[end];
+            end += 1;
+            while end < bytes.len() {
+                if bytes[end] == b'\\' {
+                    end = (end + 2).min(bytes.len());
+                } else if bytes[end] == quote {
+                    end += 1;
+                    break;
+                } else {
+                    end += 1;
+                }
+            }
+        } else {
+            while end < bytes.len()
+                && !bytes[end].is_ascii_whitespace()
+                && !matches!(bytes[end], b',' | b';' | b'}')
+            {
+                end += 1;
+            }
+        }
+        out.push_str(&text[copied..pos + 1]);
+        out.push_str("<redacted>");
+        copied = end;
+        pos = end;
+    }
+    out.push_str(&text[copied..]);
+    out
 }
 
 fn has_marker(lower: &str, markers: &[&str]) -> bool {
@@ -369,6 +434,25 @@ mod redaction_tests {
         let out = sanitize_error_diagnostic("token=abcdef123456 password=hunter2");
         assert!(!out.contains("abcdef123456"));
         assert!(!out.contains("hunter2"));
+    }
+
+    #[test]
+    fn redacts_credentials_across_whitespace_and_quoted_values() {
+        for raw in [
+            "X-API-Key: secret-value",
+            r#"{"api_key": "secret-value"}"#,
+            "api_key = secret-value",
+            "api_key : secret-value",
+            r#"{"api_key": "secret-value with spaces"}"#,
+            "Authorization: Bearer secret-value",
+        ] {
+            let out = sanitize_error_diagnostic(raw);
+            assert!(!out.contains("secret-value"), "credential leaked: {out}");
+            assert!(
+                !out.contains("with spaces"),
+                "quoted credential suffix leaked: {out}"
+            );
+        }
     }
 
     #[test]

@@ -35,9 +35,18 @@ before(() => {
 
 after(() => dom.window.close());
 
+const queryClients = new Set();
+
 afterEach(async () => {
   const { cleanup } = await import("@testing-library/react");
   cleanup();
+  for (const client of queryClients) {
+    // QueryClient.clear removes mutation records but does not stop their GC timers.
+    for (const mutation of client.getMutationCache().getAll())
+      mutation.destroy();
+    client.clear();
+  }
+  queryClients.clear();
 });
 
 let invokeHandler = () => Promise.reject(new Error("unmocked invoke"));
@@ -102,6 +111,7 @@ test("a toggle whose response refuses this agent renders the refusal, not a clea
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
+  queryClients.add(queryClient);
   queryClient.setQueryData(["mcp-registry"], {
     servers: [SERVER],
     document_path: "/test/doc.json",
@@ -173,6 +183,7 @@ test("a toggle whose response refuses a DIFFERENT agent does not render a refusa
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
+  queryClients.add(queryClient);
   queryClient.setQueryData(["mcp-registry"], {
     servers: [SERVER],
     document_path: "/test/doc.json",
@@ -212,4 +223,40 @@ test("a toggle whose response refuses a DIFFERENT agent does not render a refusa
     null,
     "a refusal naming a different agent must not surface on this field",
   );
+});
+
+test("stale selected ids remain removable even when the registry is empty", async () => {
+  const { render, screen, fireEvent, waitFor } = await import(
+    "@testing-library/react"
+  );
+  const React = await import("react");
+  const { QueryClient, QueryClientProvider } = await import(
+    "@tanstack/react-query"
+  );
+  const { AgentMcpServersField } = await import("./AgentMcpServersField.tsx");
+  const view = { servers: [], document_path: "/test/doc.json", refused: [] };
+  let selected;
+  invokeHandler = (command, args) => {
+    if (command === "set_agent_mcp_servers") selected = args.enabled;
+    return Promise.resolve(view);
+  };
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+  });
+  queryClients.add(client);
+  client.setQueryData(["mcp-registry"], view);
+  render(
+    React.createElement(
+      QueryClientProvider,
+      { client },
+      React.createElement(AgentMcpServersField, {
+        selection: { status: "loaded", enabled: ["ghost-server"] },
+        onEnabledChange: () => {},
+        pubkey: PUBKEY,
+        runtime: RUNTIME,
+      }),
+    ),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Remove ghost-server" }));
+  await waitFor(() => assert.deepEqual(selected, []));
 });

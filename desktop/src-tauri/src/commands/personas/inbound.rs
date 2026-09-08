@@ -219,6 +219,10 @@ fn reconcile_inbound_persona_event_blocking<R: tauri::Runtime>(
         None => event_d_tag(&event)?,
     };
 
+    let _registry_guard = state
+        .mcp_registry_store_lock
+        .lock()
+        .map_err(|e| e.to_string())?;
     let _store_guard = state
         .managed_agents_store_lock
         .lock()
@@ -274,7 +278,12 @@ fn reconcile_inbound_persona_event_blocking<R: tauri::Runtime>(
                     &mut personas,
                     inbound_persona.expect("persona parsed above"),
                 );
-                save_personas(&app, &personas)
+                save_personas(&app, &personas)?;
+                let records = load_managed_agents(&app)?;
+                crate::managed_agents::mcp_registry::apply::reconverge_after_runtime_change(
+                    &app, &records,
+                )
+                .map(|_| ())
             })?;
             if outcome == InboundOutcome::Skipped {
                 return Ok(None);
@@ -396,6 +405,9 @@ fn reconcile_inbound_persona_event_blocking<R: tauri::Runtime>(
                 }
             }
             save_managed_agents(&app, &agents)?;
+            crate::managed_agents::mcp_registry::apply::reconverge_after_runtime_change(
+                &app, &agents,
+            )?;
             let outcome = retain_inbound_event(&conn, &inbound_retained_event)?;
             debug_assert_eq!(outcome, InboundOutcome::Applied);
         }
@@ -549,6 +561,10 @@ fn reconcile_inbound_tombstone<R: tauri::Runtime>(
         return Ok(()); // deletion for a kind we don't track locally
     }
 
+    let _registry_guard = state
+        .mcp_registry_store_lock
+        .lock()
+        .map_err(|e| e.to_string())?;
     let _store_guard = state
         .managed_agents_store_lock
         .lock()
@@ -615,7 +631,12 @@ fn reconcile_inbound_tombstone<R: tauri::Runtime>(
                 }
                 let mut personas = load_personas(app)?;
                 personas.retain(|record| persona_d_tag(record) != target_d_tag);
-                save_personas(app, &personas)
+                save_personas(app, &personas)?;
+                let records = load_managed_agents(app)?;
+                crate::managed_agents::mcp_registry::apply::reconverge_after_runtime_change(
+                    app, &records,
+                )
+                .map(|_| ())
             }
             KIND_TEAM => {
                 let mut teams = load_teams(app)?;
@@ -625,7 +646,11 @@ fn reconcile_inbound_tombstone<R: tauri::Runtime>(
             KIND_MANAGED_AGENT => {
                 let mut agents = load_managed_agents(app)?;
                 agents.retain(|record| record.pubkey != target_d_tag);
-                save_managed_agents(app, &agents)
+                save_managed_agents(app, &agents)?;
+                crate::managed_agents::mcp_registry::apply::reconverge_after_runtime_change(
+                    app, &agents,
+                )
+                .map(|_| ())
             }
             // A 30178 catalog head has no local JSON record — it lives only in
             // the retention store as this device's publication witness. The

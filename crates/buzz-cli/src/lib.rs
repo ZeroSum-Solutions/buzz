@@ -268,6 +268,27 @@ impl RespondToArg {
 
 #[derive(Subcommand)]
 pub enum AgentsCmd {
+    /// List durable parked batches from local state (no credentials required)
+    Parked {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// Ask the owning harness to schedule a parked batch; wait for its signed acknowledgement
+    Replay {
+        #[arg(long)]
+        agent: String,
+        batch: uuid::Uuid,
+    },
+    /// Discard a parked batch through its owning harness; wait for its signed acknowledgement
+    Discard {
+        #[arg(long)]
+        agent: String,
+        batch: uuid::Uuid,
+    },
     /// View agent health counters and state from local ledgers
     Health {
         /// Time window: "24h" or "7d"
@@ -2089,6 +2110,19 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         return commands::agents::cmd_health(since, json, state_root.as_deref());
     }
 
+    if let Cmd::Agents(AgentsCmd::Parked {
+        ref state_root,
+        ref agent,
+        json,
+    }) = cli.command
+    {
+        return commands::agents_reliability::cmd_parked(
+            state_root.as_deref(),
+            agent.as_deref(),
+            json,
+        );
+    }
+
     // Auth: private key is required for all relay operations.
     // The keypair IS the identity — no tokens, no other auth.
     let private_key_str = cli.private_key.ok_or_else(|| {
@@ -2346,9 +2380,12 @@ mod tests {
             vec![
                 "archive",
                 "archived",
+                "discard",
                 "draft-create",
                 "draft-update",
                 "health",
+                "parked",
+                "replay",
                 "unarchive"
             ]
         );
@@ -2488,7 +2525,7 @@ mod tests {
     #[test]
     fn subcommand_counts_are_stable() {
         let expected: Vec<(&str, usize)> = vec![
-            ("agents", 6),
+            ("agents", 9),
             ("canvas", 2),
             ("channels", 16),
             ("dms", 4),

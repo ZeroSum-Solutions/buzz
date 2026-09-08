@@ -56,7 +56,7 @@ const WS_SEND_TIMEOUT_SECS: u64 = 10;
 /// drop after a long healthy run retries at the short end of the ladder again.
 const STABLE_CONNECTION_SECS: u64 = 60;
 /// Seconds subtracted from `since` on resubscribe to tolerate clock skew.
-const SINCE_SKEW_SECS: u64 = 5;
+pub(crate) const SINCE_SKEW_SECS: u64 = 5;
 /// Timeout for the NIP-42 auth handshake steps.
 ///
 /// Raised from 5s to 20s (≈2 RTTs at the observed 10s max round-trip on degraded
@@ -693,7 +693,37 @@ type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 ///
 /// A background tokio task owns the WebSocket connection and responds to
 /// Ping frames, preventing disconnection during long agent turns.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ChannelAccessState {
+    // Empty on startup: durable custody does not confer current channel access.
+    pub permitted: HashSet<Uuid>,
+    pub denied: HashSet<Uuid>,
+    pub overflowed: bool,
+}
+
+impl ChannelAccessState {
+    fn permit(&mut self, channel_id: Uuid) {
+        if self.permitted.len() >= 1024 && !self.permitted.contains(&channel_id) {
+            self.overflowed = true;
+        } else {
+            self.permitted.insert(channel_id);
+            self.denied.remove(&channel_id);
+        }
+    }
+
+    fn deny(&mut self, channel_id: Uuid) {
+        self.permitted.remove(&channel_id);
+        if self.denied.len() >= 1024 && !self.denied.contains(&channel_id) {
+            self.overflowed = true;
+        } else {
+            self.denied.insert(channel_id);
+        }
+    }
+}
+
 pub struct HarnessRelay {
+    channel_access_tx: tokio::sync::watch::Sender<ChannelAccessState>,
+    channel_access_rx: tokio::sync::watch::Receiver<ChannelAccessState>,
     /// Receiver for events forwarded by the background task.
     event_rx: mpsc::Receiver<Option<BuzzEvent>>,
     /// Receiver for encrypted observer control events addressed to this agent.
@@ -773,7 +803,10 @@ impl HarnessRelay {
         let (observer_control_tx, observer_control_rx) =
             mpsc::channel::<Event>(event_channel_capacity());
         let (cmd_tx, cmd_rx) = mpsc::channel::<RelayCommand>(CMD_CHANNEL_CAPACITY);
+        let (channel_access_tx, channel_access_rx) =
+            tokio::sync::watch::channel(ChannelAccessState::default());
 
+        let access_tx_for_harness = channel_access_tx.clone();
         let bg_keys = keys.clone();
         let bg_relay_url = relay_url.to_string();
         let bg_agent_pubkey_hex = agent_pubkey_hex.to_string();
@@ -785,6 +818,7 @@ impl HarnessRelay {
                 handshake_buffer,
                 event_tx,
                 observer_control_tx,
+                channel_access_tx,
                 cmd_rx,
                 bg_keys,
                 bg_relay_url,
@@ -795,6 +829,8 @@ impl HarnessRelay {
         });
 
         Ok(Self {
+            channel_access_tx: access_tx_for_harness,
+            channel_access_rx,
             event_rx,
             observer_control_rx: Some(observer_control_rx),
             cmd_tx,
@@ -970,6 +1006,17 @@ impl HarnessRelay {
     ///
     /// Reads from the background task's event channel. Returns `None` on
     /// connection loss — the caller should call [`reconnect`](Self::reconnect).
+    pub(crate) fn note_channel_revoked(&self, channel_id: Uuid) {
+        self.channel_access_tx
+            .send_modify(|access| access.deny(channel_id));
+    }
+
+    pub(crate) fn channel_access_receiver(
+        &self,
+    ) -> tokio::sync::watch::Receiver<ChannelAccessState> {
+        self.channel_access_rx.clone()
+    }
+
     pub async fn next_event(&mut self) -> Option<BuzzEvent> {
         // The background task sends `None` to signal connection loss.
         self.event_rx.recv().await.flatten()
@@ -1136,6 +1183,7 @@ impl TwoGenDedup {
 
 /// State maintained by the background WebSocket task.
 struct BgState {
+    channel_access_tx: tokio::sync::watch::Sender<ChannelAccessState>,
     /// Active subscriptions: channel_id → subscription_id string.
     active_subscriptions: HashMap<Uuid, String>,
     /// Most recent `created_at` timestamp seen per channel (for `since` filter).
@@ -1228,6 +1276,7 @@ struct BgState {
 impl BgState {
     fn new() -> Self {
         Self {
+            channel_access_tx: tokio::sync::watch::channel(ChannelAccessState::default()).0,
             active_subscriptions: HashMap::new(),
             last_seen: HashMap::new(),
             seen_ids: TwoGenDedup::new(SEEN_ID_LIMIT),
@@ -1280,24 +1329,26 @@ impl BgState {
     /// that were dropped due to queue pressure. Falls back to the per-channel
     /// `subscribe_since` (set at first subscribe) or `startup_watermark`.
     fn channel_since(&self, channel_id: &Uuid) -> Option<u64> {
-        let last_seen = self.last_seen.get(channel_id).copied();
-        let dropped = self.channel_dropped_since.get(channel_id).copied();
-        match (last_seen, dropped) {
-            (Some(l), Some(d)) => Some(l.min(d)),
-            (Some(l), None) => Some(l),
-            (None, Some(d)) => Some(d),
-            (None, None) => self
-                .subscribe_since
-                .get(channel_id)
-                .copied()
-                .or(self.startup_watermark),
-        }
+        // Receipt custody is acknowledged by the application, not by a
+        // socket receive. Keep the fixed subscription epoch on reconnect.
+        [
+            self.subscribe_since.get(channel_id).copied(),
+            self.last_seen.get(channel_id).copied(),
+            self.channel_dropped_since.get(channel_id).copied(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .or(self.startup_watermark)
     }
 
     /// Clear all per-channel state for a channel that is being unsubscribed.
     /// Prevents stale replay on re-subscribe and avoids unbounded state growth
     /// for channels that are removed and never re-added.
     fn clear_channel_state(&mut self, channel_id: &Uuid) {
+        self.channel_access_tx.send_modify(|access| {
+            access.permitted.remove(channel_id);
+        });
         self.last_seen.remove(channel_id);
         self.subscribe_since.remove(channel_id);
         self.channel_dropped_since.remove(channel_id);
@@ -1449,6 +1500,9 @@ fn apply_command_to_state(state: &mut BgState, cmd: RelayCommand) {
             filter,
             replay_since,
         } => {
+            state.channel_access_tx.send_modify(|access| {
+                access.permit(channel_id);
+            });
             state
                 .active_subscriptions
                 .insert(channel_id, channel_sub_id(channel_id));
@@ -1556,6 +1610,9 @@ async fn execute_connected_command(
             filter,
             replay_since,
         } => {
+            state.channel_access_tx.send_modify(|access| {
+                access.permit(channel_id);
+            });
             // Rate-gated: defer this REQ to prevent flooding a saturated relay.
             // The gate holds until the relay's retry hint expires.
             if let Some(retry_after) = state.check_rate_gate() {
@@ -1737,6 +1794,7 @@ async fn run_background_task(
     initial_handshake_buffer: std::collections::VecDeque<RelayMessage>,
     event_tx: mpsc::Sender<Option<BuzzEvent>>,
     observer_control_tx: mpsc::Sender<Event>,
+    channel_access_tx: tokio::sync::watch::Sender<ChannelAccessState>,
     mut cmd_rx: mpsc::Receiver<RelayCommand>,
     keys: Keys,
     relay_url: String,
@@ -1744,6 +1802,7 @@ async fn run_background_task(
     auth_tag: Option<nostr::Tag>,
 ) {
     let mut state = BgState::new();
+    state.channel_access_tx = channel_access_tx;
 
     let handshake_ok = process_handshake_buffer(
         &mut ws,
@@ -3749,7 +3808,11 @@ fn drop_channel_on_access_denied(state: &mut BgState, sub_id: &str, message: &st
     warn!(
         "channel {channel_id} access denied by relay: {message} — dropping subscription, keeping connection"
     );
-    state.active_subscriptions.remove(&channel_id);
+    if state.active_subscriptions.remove(&channel_id).is_some() {
+        state
+            .channel_access_tx
+            .send_modify(|access| access.deny(channel_id));
+    }
     state.clear_channel_state(&channel_id);
     true
 }
@@ -5240,6 +5303,17 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_does_not_advance_fixed_floor_after_socket_receipt() {
+        let mut state = BgState::new();
+        let ch = Uuid::new_v4();
+        state.subscribe_since.insert(ch, 1000);
+        state.last_seen.insert(ch, 9000);
+        assert_eq!(state.channel_since(&ch), Some(1000));
+        state.channel_dropped_since.insert(ch, 8000);
+        assert_eq!(state.channel_since(&ch), Some(1000));
+    }
+
+    #[test]
     fn dynamic_subscribe_records_membership_replay_floor() {
         let mut state = BgState::new();
         state.startup_watermark = Some(2_000);
@@ -5346,6 +5420,33 @@ mod tests {
     }
 
     #[test]
+    fn channel_authority_is_bounded_and_removed_on_unsubscribe() {
+        let mut state = BgState::new();
+        let channel_id = Uuid::new_v4();
+        subscribe_channel(&mut state, channel_id);
+        assert!(state
+            .channel_access_tx
+            .borrow()
+            .permitted
+            .contains(&channel_id));
+        apply_command_to_state(&mut state, RelayCommand::Unsubscribe { channel_id });
+        assert!(!state
+            .channel_access_tx
+            .borrow()
+            .permitted
+            .contains(&channel_id));
+        let mut access = ChannelAccessState::default();
+        for _ in 0..1024 {
+            access.permit(Uuid::new_v4());
+        }
+        assert!(!access.overflowed);
+        access.permit(channel_id);
+        assert!(access.overflowed);
+        assert_eq!(access.permitted.len(), 1024);
+        assert!(!access.permitted.contains(&channel_id));
+    }
+
+    #[test]
     fn not_a_channel_member_drops_channel_without_reconnect() {
         let mut state = BgState::new();
         let channel_id = Uuid::new_v4();
@@ -5366,6 +5467,113 @@ mod tests {
             !state.active_filters.contains_key(&channel_id),
             "channel state must be cleared (Unsubscribe cleanup)"
         );
+    }
+
+    #[tokio::test]
+    async fn closed_revocation_blocks_runtime_dispatch_even_when_event_queue_is_full() {
+        use crate::{
+            config::DedupMode,
+            queue::{EventQueue, QueuedEvent},
+            reliability::ReliabilityRuntime,
+            scope::SessionScope,
+        };
+        let mut state = BgState::new();
+        let ch = Uuid::new_v4();
+        subscribe_channel(&mut state, ch);
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+        let mut runtime = ReliabilityRuntime::open_in(dir.path(), "test-agent", now)
+            .unwrap()
+            .with_channel_access(state.channel_access_tx.subscribe());
+        let keys = Keys::generate();
+        let event = nostr::EventBuilder::new(Kind::Custom(9), "retained before revocation")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let input = QueuedEvent {
+            channel_id: ch,
+            scope: SessionScope::Conversation { channel_id: ch },
+            event,
+            prompt_tag: "test".into(),
+            received_at: std::time::Instant::now(),
+        };
+        assert!(runtime.admit_event(&input, now).unwrap());
+        let parked_id = runtime.park().batches()[0].batch_id;
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        runtime.refill_ingress_for(&mut queue, &HashSet::from([ch]));
+        let batch = queue.flush_next().unwrap();
+        let (mut ws, _server) = test_ws_pair().await;
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        event_tx.try_send(None).unwrap();
+        let (control_tx, _control_rx) = mpsc::channel(1);
+        let frame = serde_json::json!([
+            "CLOSED",
+            channel_sub_id(ch),
+            "restricted: channel access revoked"
+        ]);
+        assert!(
+            handle_ws_message(
+                Message::Text(frame.to_string().into()),
+                &mut ws,
+                &event_tx,
+                &control_tx,
+                &mut state,
+                &keys,
+                "ws://127.0.0.1",
+                &keys.public_key().to_hex(),
+                None
+            )
+            .await
+        );
+        assert!(
+            runtime.prepare_dispatch(&batch, 1, now).is_err(),
+            "known CLOSED must fence dispatch before main-loop notification handling"
+        );
+        assert!(runtime.force_replay(parked_id).is_err());
+        let mut stale_queue = EventQueue::new(DedupMode::Queue);
+        runtime.refill_ingress_for(&mut stale_queue, &HashSet::from([ch]));
+        assert!(
+            !stale_queue.has_flushable_work(),
+            "stale subscription cache cannot override relay denial"
+        );
+        // Crash before the main-loop sweep persists the revocation. On restart,
+        // discovery excludes this channel, so no new subscription/CLOSED occurs.
+        drop(runtime);
+        let mut restarted_state = BgState::new();
+        subscribe_channel(&mut restarted_state, Uuid::new_v4());
+        let mut runtime = ReliabilityRuntime::open_in(dir.path(), "test-agent", now)
+            .unwrap()
+            .with_channel_access(restarted_state.channel_access_tx.subscribe());
+        assert!(!runtime.park().batches()[0].needs_review);
+        assert!(
+            runtime.force_replay(parked_id).is_err(),
+            "immediate operator replay must require current subscription authority"
+        );
+        assert!(
+            runtime.prepare_dispatch(&batch, 1, now).is_err(),
+            "final dispatch must reject stale custody before persisted review sweep"
+        );
+        runtime.retain_revoked_channel(ch, now).unwrap();
+        assert!(runtime.park().batches()[0].needs_review);
+        assert_eq!(
+            runtime.park().batches()[0].needs_review_reason.as_deref(),
+            Some("channel access revoked")
+        );
+        drop(runtime);
+        let runtime = ReliabilityRuntime::open_in(dir.path(), "test-agent", now).unwrap();
+        runtime.refill_ingress_for(&mut stale_queue, &HashSet::from([ch]));
+        assert!(
+            !stale_queue.has_flushable_work(),
+            "persisted revocation remains review-only across restart"
+        );
+        assert_eq!(
+            runtime.park().batches().len(),
+            1,
+            "revocation preserves complete input custody"
+        );
+        let ledger =
+            crate::reliability::ledger::read_ledger_file(&dir.path().join("ledger.jsonl")).unwrap();
+        assert!(ledger.iter().any(|record| matches!(&record.body,
+            crate::reliability::ledger::LedgerBody::BatchNeedsReview(review) if review.reason == "channel access revoked")));
     }
 
     #[test]

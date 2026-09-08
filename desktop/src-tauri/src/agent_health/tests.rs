@@ -10,6 +10,62 @@ pub(super) fn db() -> (tempfile::TempDir, Connection) {
 }
 
 #[test]
+fn sync_rejects_incomplete_ledger_without_reporting_partial_success() {
+    let (_d, conn) = db();
+    let ledger_dir = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    let mut ledger = Ledger::open(ledger_dir.path(), "agent_alpha", now).unwrap();
+    ledger
+        .append(
+            now,
+            LedgerBody::AgentPaused(AgentPaused {
+                class: "capacity_exhausted".to_string(),
+                until: now,
+                waiting: 1,
+            }),
+        )
+        .unwrap();
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(ledger.path())
+        .unwrap();
+    file.write_all(b"{broken record}\n").unwrap();
+    let error = sync_ledger(&conn, "agent_alpha", ledger.path(), now).unwrap_err();
+    assert!(error.contains("incomplete ledger"), "{error}");
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM health_events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "an incomplete scan must not look like a complete partial import"
+    );
+}
+
+#[test]
+fn last_failure_query_materializes_one_row_per_agent_at_scale() {
+    let (_d, conn) = db();
+    conn.execute_batch("BEGIN").unwrap();
+    for at in 0..10_000 {
+        conn.execute("INSERT INTO health_events(agent, event_key, at, kind, class) VALUES ('scale', ?1, ?2, 'turn_failed', 'provider_error')", params![at.to_string(), at]).unwrap();
+    }
+    conn.execute_batch("COMMIT").unwrap();
+    let mut statement = conn.prepare(LATEST_FAILURES_SQL).unwrap();
+    let rows = statement
+        .query_map(params![Option::<i64>::None], |row| row.get::<_, i64>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(rows, vec![9_999]);
+    let rows = statement
+        .query_map(params![10_000], |row| row.get::<_, i64>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(rows.is_empty());
+}
+
+#[test]
 fn insert_ignores_duplicate_event_key() {
     let (_d, conn) = db();
     let event = HealthEvent {
@@ -847,6 +903,7 @@ fn parked_batches_excerpt_is_cut_to_120_chars_and_carries_no_full_text() {
         replayed_at: None,
         forced: false,
         parked_at: now,
+        notice_pending: false,
         events: vec![buzz_acp_pkg::reliability::park::ParkedEvent {
             event: event.clone(),
             prompt_tag: "prompt".to_string(),

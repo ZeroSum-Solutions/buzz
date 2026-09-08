@@ -385,11 +385,13 @@ export function ChannelScreen({
         ...messageEventProfilePubkeys,
         ...activeDmParticipantPubkeys,
         ...knownAgentPubkeys,
+        ...channelFiles.files.map((file) => file.pubkey),
         ...typingEntries.map((entry) => entry.pubkey),
       ]),
     ],
     [
       activeDmParticipantPubkeys,
+      channelFiles.files,
       knownAgentPubkeys,
       messageEventProfilePubkeys,
       typingEntries,

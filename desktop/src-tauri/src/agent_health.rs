@@ -672,17 +672,8 @@ pub(crate) fn query_agent_health_summary(
     }
 
     // 2. Last failure within window
-    let failure_sql = if cutoff.is_some() {
-        "SELECT agent, at, class FROM health_events
-         WHERE kind = 'turn_failed' AND at >= ?1
-         ORDER BY agent ASC, at DESC"
-    } else {
-        "SELECT agent, at, class FROM health_events
-         WHERE kind = 'turn_failed'
-         ORDER BY agent ASC, at DESC"
-    };
     let mut fail_stmt = conn
-        .prepare(failure_sql)
+        .prepare(LATEST_FAILURES_SQL)
         .map_err(|e| format!("prepare agent-health last failure query: {e}"))?;
 
     let map_fail = |row: &Row<'_>| -> rusqlite::Result<(String, i64, Option<String>)> {
@@ -693,14 +684,11 @@ pub(crate) fn query_agent_health_summary(
         ))
     };
 
-    let fail_rows = if let Some(cutoff_val) = cutoff {
-        fail_stmt.query_map(params![cutoff_val], map_fail)
-    } else {
-        fail_stmt.query_map([], map_fail)
-    }
-    .map_err(|e| format!("query agent-health last failure: {e}"))?
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(|e| format!("read agent-health last failure: {e}"))?;
+    let fail_rows = fail_stmt
+        .query_map(params![cutoff], map_fail)
+        .map_err(|e| format!("query agent-health last failure: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read agent-health last failure: {e}"))?;
 
     for (agent, at, class) in fail_rows {
         let entry = by_agent.entry(agent).or_default();
@@ -1450,3 +1438,15 @@ mod tests;
 #[cfg(test)]
 #[path = "agent_health/tests_ingest.rs"]
 mod tests_ingest;
+
+// SQL emits one row per agent, not every retained failed turn.
+const LATEST_FAILURES_SQL: &str = "SELECT agent, at, class FROM (
+    SELECT agent, at, class, ROW_NUMBER() OVER (
+        PARTITION BY agent ORDER BY at DESC, event_key DESC
+    ) AS ordinal FROM health_events
+    WHERE kind = 'turn_failed' AND (?1 IS NULL OR at >= ?1)
+) WHERE ordinal = 1";
+
+#[cfg(all(test, unix))]
+#[path = "agent_health/tests_pipeline.rs"]
+mod tests_pipeline;

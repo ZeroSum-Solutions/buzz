@@ -31,6 +31,23 @@ use crate::managed_agents::types::{AgentMcpServers, AGENT_MCP_SERVERS_VERSION};
 use crate::managed_agents::ManagedAgentRecord;
 use buzz_secret_store_pkg::{looks_like_reference, McpSecretRef};
 
+#[path = "mcp_registry_ipc.rs"]
+mod ipc;
+/// A save entry bounded before IPC DTO allocation.
+pub type IpcRegistryEntry = ipc::BoundedArgument<RegistryEntry, MAX_ENTRY_BYTES, 16>;
+/// A secret map bounded before IPC DTO allocation.
+pub type IpcSecrets = ipc::BoundedArgument<
+    BTreeMap<String, String>,
+    { MAX_SECRETS_PER_SAVE * (MAX_ENV_VALUE_LEN + MAX_ID_LEN + 4) * 6 },
+    MAX_SECRETS_PER_SAVE,
+>;
+/// A selection bounded before IPC DTO allocation.
+pub type IpcSelection = ipc::BoundedArgument<
+    Vec<String>,
+    { MAX_SERVERS_PER_AGENT * (MAX_ID_LEN + 4) * 6 },
+    MAX_SERVERS_PER_AGENT,
+>;
+
 /// One registry entry as the panel renders it.
 ///
 /// The approve step needs the *exact* command line or URL the operator is
@@ -54,6 +71,8 @@ pub struct McpRegistryEntryView {
     pub url: Option<String>,
     /// Auth scheme for an http entry that declares one.
     pub auth_scheme: Option<String>,
+    /// Safe MCP reference spelling, never the stored credential value.
+    pub auth_secret: Option<String>,
     /// Declared environment, as `(name, reference-or-literal)` pairs. A
     /// reference is the `mcp:<id>` spelling; a literal is one the sentinel
     /// scan already cleared as non-credential.
@@ -123,10 +142,20 @@ fn view_of(loaded: &LoadedEntry) -> McpRegistryEntryView {
             // itself can be credential-shaped (e.g. `/tmp/sk-live-.../server`)
             // and the panel must not render what caused the refusal (Sol T7c
             // round 2, item 6).
-            let (effective_command, effective_args) = if loaded.rejection.is_some() {
+            let (effective_command, effective_args) = if command
+                .split(['/', '\\'])
+                .any(|part| buzz_secret_store_pkg::sentinel::scan_value(part).is_some())
+            {
                 ("<redacted>".to_string(), redact_args(args))
             } else {
-                (command.clone(), args.clone())
+                (
+                    command.clone(),
+                    if loaded.rejection.is_some() {
+                        redact_args(args)
+                    } else {
+                        args.clone()
+                    },
+                )
             };
             ("stdio", Some(effective_command), effective_args, None, None)
         }
@@ -135,11 +164,12 @@ fn view_of(loaded: &LoadedEntry) -> McpRegistryEntryView {
             // carry a query-string or userinfo credential, which is exactly
             // why it was rejected — the panel must show the rejection
             // message, not the URL that triggered it.
-            let effective_url = if loaded.rejection.is_some() {
-                "<redacted>".to_string()
-            } else {
-                url.clone()
-            };
+            let effective_url =
+                if buzz_mcp_launch_pkg::proxy::upstream::validate_upstream(url).is_err() {
+                    "<redacted>".to_string()
+                } else {
+                    url.clone()
+                };
             (
                 "http",
                 None,
@@ -157,6 +187,12 @@ fn view_of(loaded: &LoadedEntry) -> McpRegistryEntryView {
         args,
         url,
         auth_scheme,
+        auth_secret: match &entry.transport {
+            RegistryTransport::Http {
+                auth: Some(auth), ..
+            } if McpSecretRef::parse(&auth.secret).is_ok() => Some(auth.secret.clone()),
+            _ => None,
+        },
         env: entry
             .env
             .iter()
@@ -369,10 +405,38 @@ pub fn list_mcp_registry_servers<R: tauri::Runtime>(
 ) -> Result<McpRegistryView, String> {
     let path = document_path(&app)?;
     let registry = load_registry(&path).map_err(|e| e.to_string())?;
+    let mut refused = Vec::new();
+    if let Some(paths) = apply::registry_paths(&app)? {
+        use crate::managed_agents::mcp_registry::{
+            generation::GenerationStore,
+            paths::{RegistryPaths, REFUSAL_FILE},
+        };
+        let store = GenerationStore::open(&paths.generations_root()).map_err(|e| e.to_string())?;
+        if let Some(generation) = store.current().map_err(|e| e.to_string())? {
+            let records = crate::managed_agents::load_managed_agents(&app)?;
+            if records.len() > crate::managed_agents::mcp_registry::converge::MAX_CONVERGED_AGENTS {
+                return Err("the managed agent count exceeds the MCP convergence cap".to_string());
+            }
+            for record in records {
+                let staged =
+                    RegistryPaths::agent_dir(&store.generation_dir(generation), &record.pubkey)
+                        .map_err(|e| e.to_string())?;
+                if let Some(bytes) =
+                    crate::managed_agents::mcp_registry::load::read_bounded_no_follow(
+                        &staged.join(REFUSAL_FILE),
+                    )
+                    .map_err(|e| e.to_string())?
+                {
+                    let reason = String::from_utf8(bytes).map_err(|e| e.to_string())?;
+                    refused.push((record.pubkey, reason));
+                }
+            }
+        }
+    }
     Ok(McpRegistryView {
         servers: registry.entries.iter().map(view_of).collect(),
         document_path: path.display().to_string(),
-        refused: Vec::new(),
+        refused,
     })
 }
 
@@ -395,11 +459,11 @@ pub fn list_mcp_registry_servers<R: tauri::Runtime>(
 #[tauri::command]
 pub fn save_mcp_registry_server<R: tauri::Runtime>(
     app: AppHandle<R>,
-    entry: RegistryEntry,
-    secrets: BTreeMap<String, String>,
+    entry: IpcRegistryEntry,
+    secrets: IpcSecrets,
 ) -> Result<McpRegistryView, String> {
     let secret_store = apply::DesktopSecrets::new(crate::app_state::keyring_service());
-    save_mcp_registry_server_internal(&app, entry, secrets, &secret_store)
+    save_mcp_registry_server_internal(&app, entry.0, secrets.0, &secret_store)
 }
 
 /// Internal implementation of `save_mcp_registry_server` taking the
@@ -432,6 +496,7 @@ pub fn save_mcp_registry_server_internal<R: tauri::Runtime, S: SecretStoreIo>(
     }
     let path = document_path(app)?;
     let mut document = read_document(&path)?;
+    crate::managed_agents::mcp_registry::load::validate_entry(&entry)?;
     match document.servers.iter().position(|e| e.id == entry.id) {
         Some(index) => document.servers[index] = entry,
         None => {
@@ -456,6 +521,8 @@ pub fn save_mcp_registry_server_internal<R: tauri::Runtime, S: SecretStoreIo>(
             prospective_bytes.len()
         ));
     }
+    crate::managed_agents::mcp_registry::load::parse_registry(&prospective_bytes)
+        .map_err(|e| e.to_string())?;
     write_document(&path, &document)?;
     let records = crate::managed_agents::load_managed_agents(app)?;
     let converged =
@@ -583,8 +650,9 @@ pub fn delete_mcp_registry_server<R: tauri::Runtime>(
 pub fn set_agent_mcp_servers<R: tauri::Runtime>(
     app: AppHandle<R>,
     pubkey: String,
-    enabled: Vec<String>,
+    enabled: IpcSelection,
 ) -> Result<McpRegistryView, String> {
+    let enabled = enabled.0;
     use tauri::Manager;
     let state = app.state::<AppState>();
     let _lock = state
@@ -652,6 +720,9 @@ fn read_document(path: &std::path::Path) -> Result<RegistryDocument, String> {
 fn write_document(path: &std::path::Path, document: &RegistryDocument) -> Result<(), String> {
     let body = serde_json::to_vec_pretty(document)
         .map_err(|e| format!("cannot serialize the mcp registry: {e}"))?;
+    if body.len() > MAX_DOCUMENT_BYTES {
+        return Err("the formatted registry exceeds the document byte cap".to_string());
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
@@ -675,11 +746,19 @@ fn write_document(path: &std::path::Path, document: &RegistryDocument) -> Result
             ));
         }
     }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &body).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    // NamedTempFile uses an unpredictable sibling name and exclusive creation;
+    // an existing symlink or hard link can never be opened for truncation.
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "registry path has no parent".to_string())?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| format!("cannot create registry staging file: {e}"))?;
+    tmp.write_all(&body)
+        .and_then(|()| tmp.as_file().sync_all())
+        .map_err(|e| format!("cannot sync registry staging file: {e}"))?;
     if let Ok(meta) = std::fs::symlink_metadata(path) {
         if meta.file_type().is_symlink() {
-            let _ = std::fs::remove_file(&tmp);
             return Err(format!(
                 "refusing to write {}: a symbolic link now occupies the mcp registry \
                  document's path",
@@ -687,7 +766,13 @@ fn write_document(path: &std::path::Path, document: &RegistryDocument) -> Result
             ));
         }
     }
-    std::fs::rename(&tmp, path).map_err(|e| format!("cannot rename {}: {e}", path.display()))
+    tmp.persist(path)
+        .map_err(|e| format!("cannot rename {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|e| format!("cannot sync registry directory: {e}"))?;
+    Ok(())
 }
 
 #[cfg(test)]

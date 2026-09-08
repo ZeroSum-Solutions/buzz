@@ -48,7 +48,7 @@ export type McpServerDraft = {
   /** Reference id (the part after the `mcp:` prefix) for the credential. */
   authSecretName: string;
   /** Declared variables, as typed. Values are reference ids, never secrets. */
-  env: { name: string; reference: string }[];
+  env: { name: string; reference: string; literal?: string; rowKey?: string }[];
   /**
    * Values the operator typed, keyed by reference id. Held only until the save
    * that consumes them; no command ever reads one back.
@@ -167,7 +167,7 @@ function envDraftProblem(draft: McpServerDraft): string | null {
     if (entry.name.includes("=") || entry.name.includes(NUL)) {
       return `${entry.name} holds a NUL or an equals sign, which no NAME=VALUE argument can carry.`;
     }
-    if (!/^[a-z0-9_-]+$/.test(entry.reference)) {
+    if (entry.literal === undefined && !/^[a-z0-9_-]+$/.test(entry.reference)) {
       return `${entry.name} does not name a usable secret; a reference id may only use lowercase letters, digits, underscore and hyphen.`;
     }
   }
@@ -225,8 +225,10 @@ export type McpApprovalSummary = {
  * never a value.
  */
 export function approvalSummary(draft: McpServerDraft): McpApprovalSummary {
-  const references = draft.env.map(
-    (entry) => `${entry.name} = mcp:${entry.reference}`,
+  const references = draft.env.map((entry) =>
+    entry.literal === undefined
+      ? `${entry.name} = mcp:${entry.reference}`
+      : `${entry.name} = ${JSON.stringify(entry.literal)}`,
   );
   if (draft.transport === "http" && draft.authSecretName.length > 0) {
     references.push(
@@ -240,7 +242,11 @@ export function approvalSummary(draft: McpServerDraft): McpApprovalSummary {
         : "This sends requests, with the credential attached, to:",
     target:
       draft.transport === "stdio"
-        ? [draft.command, ...draftArgs(draft)].join(" ")
+        ? [draft.command, ...draftArgs(draft)]
+            .map((arg) =>
+              /^[a-zA-Z0-9_./:@%+=,-]+$/.test(arg) ? arg : JSON.stringify(arg),
+            )
+            .join(" ")
         : draft.url,
     references,
     newSecrets: Object.keys(draft.secrets).sort(),
@@ -251,7 +257,7 @@ export function approvalSummary(draft: McpServerDraft): McpApprovalSummary {
 export function draftToInput(draft: McpServerDraft): McpRegistryInput {
   const env: Record<string, string> = {};
   for (const entry of draft.env) {
-    env[entry.name] = `mcp:${entry.reference}`;
+    env[entry.name] = entry.literal ?? `mcp:${entry.reference}`;
   }
   if (draft.transport === "stdio") {
     return {
@@ -276,7 +282,7 @@ export function draftToInput(draft: McpServerDraft): McpRegistryInput {
           },
         }
       : {}),
-    env,
+    env: {},
   };
 }
 
@@ -290,10 +296,14 @@ export function entryToDraft(entry: McpRegistryEntry): McpServerDraft {
     argsText: entry.args.join("\n"),
     url: entry.url ?? "",
     authScheme: entry.auth_scheme ?? "bearer",
-    authSecretName: "",
+    authSecretName: (entry.auth_secret ?? "").replace(/^mcp:/, ""),
     env: entry.env.map((variable) => ({
+      rowKey: variable.name,
       name: variable.name,
       reference: (variable.reference ?? "").replace(/^mcp:/, ""),
+      ...(variable.reference === null
+        ? { literal: variable.literal ?? "" }
+        : {}),
     })),
     // Deliberately empty. A stored value is never returned by any command, so
     // an edit that does not retype one leaves the stored value untouched.

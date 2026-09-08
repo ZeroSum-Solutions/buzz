@@ -2009,7 +2009,10 @@ impl AcpClient {
         match serde_json::from_value::<GooseSessionUpdateNotification>(params.clone()) {
             Ok(notif) => {
                 if let GooseSessionUpdateVariant::UsageUpdate(payload) = &notif.update {
-                    if payload.accumulated_output_tokens.unwrap_or(0) > 0 {
+                    if self
+                        .goose_usage
+                        .output_advanced(&notif.session_id, payload.accumulated_output_tokens)
+                    {
                         self.mark_turn_saw_output();
                     }
                     tracing::debug!(
@@ -3419,6 +3422,47 @@ echo '{"jsonrpc":"2.0","id":44,"result":{"stopReason":"end_turn"}}'
         assert!(
             client2.turn_saw_output(),
             "tool_call must set turn_saw_output"
+        );
+    }
+
+    #[tokio::test]
+    async fn wire_goose_previous_turn_usage_does_not_start_new_turn() {
+        let script = r#"
+echo '{"jsonrpc":"2.0","method":"_goose/unstable/session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"usage_update","accumulatedInputTokens":20,"accumulatedOutputTokens":10}}}'
+echo '{"jsonrpc":"2.0","id":45,"result":{"stopReason":"end_turn"}}'
+echo '{"jsonrpc":"2.0","method":"_goose/unstable/session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"usage_update","accumulatedInputTokens":20,"accumulatedOutputTokens":10}}}'
+echo '{"jsonrpc":"2.0","id":46,"error":{"code":500,"message":"provider unavailable"}}'
+"#;
+        let mut client = spawn_script(script).await;
+        let duration = std::time::Duration::from_secs(5);
+        client.goose_usage.begin_turn("s1");
+        assert!(client
+            .read_until_response_with_idle_timeout(
+                "test",
+                45,
+                duration,
+                tokio::time::Instant::now() + duration,
+                duration
+            )
+            .await
+            .is_ok());
+        assert!(client.turn_saw_output());
+        client.goose_usage.take();
+        client.goose_usage.begin_turn("s1");
+        client.turn_saw_output = false;
+        assert!(client
+            .read_until_response_with_idle_timeout(
+                "test",
+                46,
+                duration,
+                tokio::time::Instant::now() + duration,
+                duration
+            )
+            .await
+            .is_err());
+        assert!(
+            !client.turn_saw_output(),
+            "previous turn usage must not start a new turn"
         );
     }
 

@@ -1,5 +1,25 @@
 # Buzz Disk-Growth Prevention Plan (fork-only)
 
+**Current implementation safety update (2026-09-08):** The automatic deletion
+design below is superseded. `scripts/zs/cargo-target-gc.sh` is report-only;
+`--apply` exits with an actionable error before scanning or deleting. Snapshot
+Git, age, and open-file checks cannot fence arbitrary Cargo writers, so neither
+live-worktree nor orphan caches are automatically deleted. A reported candidate
+is a review aid, not deletion authorization. Retire and verify inactive worktrees
+before manual cleanup, preserving unique source and app/session data.
+
+The target helper preserves worktree path bytes, including trailing whitespace.
+It recognizes explicit `BUZZ_ROOT_TARGET_DIR` and `BUZZ_DESKTOP_TARGET_DIR`
+overrides for separate shared build lanes. Standalone build wrappers preserve an
+explicit `CARGO_TARGET_DIR`; recipe root/desktop switches remain distinct. CI
+keeps repository-local target paths unless explicitly overridden. Remaining
+build/test/relay/Goose/Sprig and direct Tauri entry points now select managed
+targets, and Sprig/Goose binary lookup follows the selected target. The committed
+`scripts/test-cargo-target-lifecycle.py` suite runs in disposable homes/worktrees
+and is required by the CI changes job. Interrupted atomic-marker siblings are
+recognized only as bounded prefixes of an authenticated marker and are never
+removed by the report.
+
 Scope: prevention design only, no implementation. Repo: `/Users/zero-suminc./projects/buzz`
 (zs/main). Worktrees under `/Users/zero-suminc./projects/buzz-wt/`. Incident:
 `~/Inbox/notes/buzz-storage-debug-init-2026-09-06.md`.

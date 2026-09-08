@@ -78,18 +78,6 @@ impl EnvGuard {
         let old_xdg = std::env::var_os("XDG_DATA_HOME");
         let old_path = std::env::var_os("PATH");
 
-        #[cfg(target_os = "macos")]
-        {
-            if let Some(ref real_home) = old_home {
-                let real_keychains = PathBuf::from(real_home).join("Library/Keychains");
-                if real_keychains.exists() {
-                    let temp_lib = home.join("Library");
-                    let _ = fs::create_dir_all(&temp_lib);
-                    let _ = std::os::unix::fs::symlink(&real_keychains, temp_lib.join("Keychains"));
-                }
-            }
-        }
-
         std::env::set_var("HOME", &home);
         std::env::set_var("XDG_DATA_HOME", &home);
 
@@ -139,10 +127,23 @@ fn mock_app() -> tauri::App<tauri::test::MockRuntime> {
     *state.keys.lock().unwrap() = nostr::Keys::generate();
     *state.relay_url_override.lock().unwrap() = Some("ws://127.0.0.1:1".to_string());
 
-    tauri::test::mock_builder()
+    let data = tempfile::tempdir().unwrap();
+    let expected_data_dir = data.path().to_path_buf();
+    let mut context = tauri::test::mock_context(tauri::test::noop_assets());
+    // Windows KnownFolder ignores HOME/XDG. An absolute test identifier makes
+    // Tauri's data_dir.join(identifier) resolve inside this retained sandbox.
+    context.config_mut().identifier = expected_data_dir.to_str().unwrap().to_owned();
+    let app = tauri::test::mock_builder()
+        .manage(data)
+        .invoke_handler(tauri::generate_handler![
+            super::save_mcp_registry_server,
+            super::set_agent_mcp_servers
+        ])
         .manage(state)
-        .build(tauri::test::mock_context(tauri::test::noop_assets()))
-        .expect("mock app builds headless")
+        .build(context)
+        .expect("mock app builds headless");
+    assert_eq!(app.path().app_data_dir().unwrap(), expected_data_dir);
+    app
 }
 
 fn bare_agent_record(pubkey: &str) -> ManagedAgentRecord {
@@ -274,7 +275,8 @@ fn mcp_registry_save_refuses_a_document_over_the_byte_cap() {
         },
         env: BTreeMap::new(),
     };
-    let err = save_mcp_registry_server(app.handle().clone(), entry, BTreeMap::new()).unwrap_err();
+    let err = save_mcp_registry_server(app.handle().clone(), entry.into(), BTreeMap::new().into())
+        .unwrap_err();
     assert!(
         err.contains("cap") || err.contains("65536"),
         "expected error mentioning byte cap, got: {err}"
@@ -306,7 +308,8 @@ fn mcp_registry_save_does_not_follow_a_symlinked_document() {
         },
         env: BTreeMap::new(),
     };
-    let err = save_mcp_registry_server(app.handle().clone(), entry, BTreeMap::new()).unwrap_err();
+    let err = save_mcp_registry_server(app.handle().clone(), entry.into(), BTreeMap::new().into())
+        .unwrap_err();
     assert!(
         err.contains("symbolic link") || err.contains("symlink"),
         "expected error mentioning symlink, got: {err}"
@@ -453,7 +456,7 @@ fn mcp_registry_concurrent_mutations_do_not_clobber_each_other() {
     let (tx, rx) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || {
         tx.send("started").unwrap();
-        let res = set_agent_mcp_servers(app_handle, "nonexistent".to_string(), vec![]);
+        let res = set_agent_mcp_servers(app_handle, "nonexistent".to_string(), vec![].into());
         assert!(res.is_err());
         tx.send("finished").unwrap();
     });
@@ -506,6 +509,13 @@ fn mcp_registry_save_surfaces_a_refused_agent_not_just_an_error() {
         !view.refused.is_empty(),
         "view.refused must contain the refused agent"
     );
+    assert_eq!(
+        list_mcp_registry_servers(app.handle().clone())
+            .unwrap()
+            .refused,
+        view.refused,
+        "a refetch must report the adopted generation's refusals"
+    );
     let (agent_id, reason) = &view.refused[0];
     assert_eq!(agent_id, "agent-refused");
     assert!(
@@ -553,8 +563,8 @@ fn mcp_registry_set_agent_servers_rejects_a_selection_over_the_16_server_cap() {
         .collect();
     assert_eq!(enabled.len(), MAX_SERVERS_PER_AGENT + 1);
 
-    let err =
-        set_agent_mcp_servers(app.handle().clone(), "agent-17".to_string(), enabled).unwrap_err();
+    let err = set_agent_mcp_servers(app.handle().clone(), "agent-17".to_string(), enabled.into())
+        .unwrap_err();
     assert!(
         err.contains(&MAX_SERVERS_PER_AGENT.to_string()) || err.contains("cap"),
         "expected an error naming the server cap, got: {err}"
@@ -602,7 +612,7 @@ fn mcp_registry_set_agent_servers_rejects_duplicate_ids_before_writing() {
     let err = set_agent_mcp_servers(
         app.handle().clone(),
         "agent-dup".to_string(),
-        vec!["srv1".to_string(), "srv1".to_string()],
+        vec!["srv1".to_string(), "srv1".to_string()].into(),
     )
     .unwrap_err();
     assert!(
@@ -642,7 +652,7 @@ fn mcp_registry_set_agent_servers_rejects_an_id_the_registry_does_not_declare() 
     let err = set_agent_mcp_servers(
         app.handle().clone(),
         "agent-unknown".to_string(),
-        vec!["ghost-server".to_string()],
+        vec!["ghost-server".to_string()].into(),
     )
     .unwrap_err();
     assert!(
@@ -740,7 +750,8 @@ fn mcp_registry_save_rejects_an_oversized_entry_before_writing() {
         },
         env: BTreeMap::new(),
     };
-    let err = save_mcp_registry_server(app.handle().clone(), entry, BTreeMap::new()).unwrap_err();
+    let err = save_mcp_registry_server(app.handle().clone(), entry.into(), BTreeMap::new().into())
+        .unwrap_err();
     assert!(
         err.contains("argument") && err.contains("cap"),
         "expected an error naming the argument cap, got: {err}"
@@ -780,7 +791,8 @@ fn mcp_registry_save_rejects_an_oversized_secrets_map_before_writing() {
     let mut secrets = BTreeMap::new();
     secrets.insert("ref1".to_string(), "x".repeat(10_000));
 
-    let err = save_mcp_registry_server(app.handle().clone(), entry, secrets).unwrap_err();
+    let err =
+        save_mcp_registry_server(app.handle().clone(), entry.into(), secrets.into()).unwrap_err();
     assert!(
         err.contains("cap") || err.contains("byte"),
         "expected an error naming the value-size cap, got: {err}"
@@ -865,4 +877,339 @@ fn mcp_registry_an_unrejected_http_entrys_url_is_not_redacted() {
     };
     let view = view_of(&loaded);
     assert_eq!(view.url.as_deref(), Some("https://api.example.com/mcp"));
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_registry_writer_never_follows_a_planted_temp_symlink() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("mcp_servers.json");
+    let victim = temp.path().join("victim");
+    fs::write(&victim, b"untouched").unwrap();
+    std::os::unix::fs::symlink(&victim, path.with_extension("json.tmp")).unwrap();
+    let document = RegistryDocument {
+        version: 1,
+        servers: vec![],
+    };
+    let _ = write_document(&path, &document);
+    assert_eq!(fs::read(&victim).unwrap(), b"untouched");
+    if path.exists() {
+        assert!(!fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+}
+
+#[tokio::test]
+async fn mcp_registry_persona_cleanup_failure_retains_durable_cascade_for_retry() {
+    let (_guard, _home) = EnvGuard::new();
+    let app = mock_app();
+    let persona = crate::managed_agents::AgentDefinition {
+        description: None,
+        id: "cascade-test".into(),
+        display_name: "Cascade".into(),
+        avatar_url: None,
+        system_prompt: String::new(),
+        runtime: None,
+        model: None,
+        provider: None,
+        name_pool: vec![],
+        is_builtin: false,
+        is_active: true,
+        shared: false,
+        source_team: None,
+        source_team_persona_slug: None,
+        catalog_source: None,
+        team_catalog_source: None,
+        env_vars: BTreeMap::new(),
+        respond_to: None,
+        respond_to_allowlist: vec![],
+        parallelism: None,
+        created_at: "2026-09-07T00:00:00Z".into(),
+        updated_at: "2026-09-07T00:00:00Z".into(),
+    };
+    crate::managed_agents::save_personas(app.handle(), &[persona]).unwrap();
+    let mut agent = bare_agent_record("cascade-agent");
+    agent.persona_id = Some("cascade-test".into());
+    save_managed_agents(app.handle(), &[agent]).unwrap();
+    let path = document_path(app.handle()).unwrap();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // Corrupt registry fails before any keychain access.
+    fs::write(&path, b"not json").unwrap();
+    for _ in 0..2 {
+        let result =
+            crate::commands::personas::delete_persona("cascade-test".into(), app.handle().clone())
+                .await;
+        assert!(
+            result.is_err(),
+            "cleanup must propagate, not report deletion success"
+        );
+        assert!(
+            crate::managed_agents::load_managed_agents(app.handle())
+                .unwrap()
+                .iter()
+                .any(|a| a.pubkey == "cascade-agent"),
+            "durable cascade identity must survive to retry cleanup"
+        );
+        assert!(crate::managed_agents::load_personas(app.handle())
+            .unwrap()
+            .iter()
+            .any(|p| p.id == "cascade-test"));
+    }
+}
+
+#[test]
+fn mcp_registry_save_rejects_credentials_before_persisting() {
+    let (_guard, _home) = EnvGuard::new();
+    let app = mock_app();
+    let path = document_path(app.handle()).unwrap();
+    let entry = RegistryEntry {
+        id: "safe".into(),
+        name: "safe".into(),
+        transport: RegistryTransport::Stdio {
+            command: "/tmp/sk-live-secret123/server".into(),
+            args: vec![],
+        },
+        env: BTreeMap::new(),
+    };
+    let result = save_mcp_registry_server_internal(
+        app.handle(),
+        entry,
+        BTreeMap::new(),
+        &FakeStore::default(),
+    );
+    assert!(result.is_err());
+    assert!(!path.exists(), "invalid candidate must never be persisted");
+}
+
+#[test]
+fn mcp_registry_duplicate_name_save_preserves_document() {
+    let (_guard, _home) = EnvGuard::new();
+    let app = mock_app();
+    let path = document_path(app.handle()).unwrap();
+    let entry = RegistryEntry {
+        id: "first".into(),
+        name: "same".into(),
+        transport: RegistryTransport::Stdio {
+            command: "/usr/bin/true".into(),
+            args: vec![],
+        },
+        env: BTreeMap::new(),
+    };
+    write_document(
+        &path,
+        &RegistryDocument {
+            version: 1,
+            servers: vec![entry.clone()],
+        },
+    )
+    .unwrap();
+    let before = fs::read(&path).unwrap();
+    let mut candidate = entry;
+    candidate.id = "second".into();
+    assert!(save_mcp_registry_server_internal(
+        app.handle(),
+        candidate,
+        BTreeMap::new(),
+        &FakeStore::default()
+    )
+    .is_err());
+    assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn mcp_registry_name_rejection_preserves_safe_command_for_repair() {
+    let loaded = LoadedEntry {
+        entry: RegistryEntry {
+            id: "safe".into(),
+            name: "buzz-reserved".into(),
+            transport: RegistryTransport::Stdio {
+                command: "/usr/bin/true".into(),
+                args: vec![],
+            },
+            env: BTreeMap::new(),
+        },
+        rejection: Some("reserved name".into()),
+    };
+    assert_eq!(view_of(&loaded).command.as_deref(), Some("/usr/bin/true"));
+}
+
+#[test]
+fn mcp_registry_http_view_preserves_auth_reference_without_value() {
+    let loaded = LoadedEntry {
+        entry: RegistryEntry {
+            id: "http".into(),
+            name: "http".into(),
+            transport: RegistryTransport::Http {
+                url: "https://example.com/mcp".into(),
+                auth: Some(crate::managed_agents::mcp_registry::schema::HttpAuth {
+                    scheme: "bearer".into(),
+                    secret: "mcp:reference-name".into(),
+                }),
+            },
+            env: BTreeMap::new(),
+        },
+        rejection: None,
+    };
+    let view = serde_json::to_value(view_of(&loaded)).unwrap();
+    assert_eq!(view["auth_secret"], "mcp:reference-name");
+}
+
+#[test]
+fn mcp_registry_selection_waits_for_canonical_agent_edit_and_preserves_it() {
+    let (_guard, _home) = EnvGuard::new();
+    let app = mock_app();
+    let agent = bare_agent_record("locking-agent");
+    save_managed_agents(app.handle(), &[agent]).unwrap();
+    let path = document_path(app.handle()).unwrap();
+    write_document(
+        &path,
+        &RegistryDocument {
+            version: 1,
+            servers: vec![],
+        },
+    )
+    .unwrap();
+    let state = app.state::<AppState>();
+    let canonical = state.managed_agents_store_lock.lock().unwrap();
+    let handle = app.handle().clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        tx.send(set_agent_mcp_servers(
+            handle,
+            "locking-agent".into(),
+            vec![].into(),
+        ))
+        .unwrap();
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while state.mcp_registry_store_lock.try_lock().is_ok() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    // The actual selection command has entered, but cannot write while a
+    // canonical agent edit owns its read/modify/write transaction.
+    assert!(rx
+        .recv_timeout(std::time::Duration::from_millis(100))
+        .is_err());
+    let mut edited = crate::managed_agents::load_managed_agents(app.handle()).unwrap();
+    edited[0].name = "Edited concurrently".into();
+    save_managed_agents(app.handle(), &edited).unwrap();
+    // Fail convergence before secret access, after the selection persist.
+    fs::write(&path, b"not json").unwrap();
+    drop(canonical);
+    assert!(rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap()
+        .is_err());
+    worker.join().unwrap();
+    let saved = crate::managed_agents::load_managed_agents(app.handle()).unwrap();
+    assert_eq!(saved[0].name, "Edited concurrently");
+    assert!(saved[0].mcp_servers.is_some());
+}
+
+#[test]
+fn mcp_registry_future_selection_version_is_not_reinterpreted() {
+    let (_guard, _home) = EnvGuard::new();
+    let app = mock_app();
+    let mut record = bare_agent_record("future-agent");
+    record.mcp_servers = Some(AgentMcpServers {
+        version: 2,
+        enabled: vec![],
+    });
+    let result = apply::converge_now_with_records_and_secrets(
+        app.handle(),
+        &[record],
+        &BTreeMap::new(),
+        &FakeStore::default(),
+    );
+    assert!(
+        result.is_err(),
+        "future selection versions must fail closed"
+    );
+    assert!(result.unwrap_err().contains("version"));
+}
+
+#[test]
+fn mcp_registry_ipc_rejects_oversized_arguments_before_materializing_dtos() {
+    let (_guard, _home) = EnvGuard::new();
+    let app = mock_app();
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .unwrap();
+    for (cmd, body) in [
+        (
+            "set_agent_mcp_servers",
+            serde_json::json!({ "pubkey": "unknown", "enabled": vec!["server"; 17] }),
+        ),
+        (
+            "save_mcp_registry_server",
+            serde_json::json!({ "entry": { "id": "s", "name": "s", "transport": "stdio", "command": "/usr/bin/true", "args": ["x".repeat(MAX_ENTRY_BYTES + 1)] }, "secrets": {} }),
+        ),
+        (
+            "save_mcp_registry_server",
+            serde_json::json!({ "entry": { "id": "s", "name": "s", "transport": "stdio", "command": "/usr/bin/true" }, "secrets": (0..34).map(|i| (format!("secret-{i}"), "value")).collect::<BTreeMap<_, _>>() }),
+        ),
+    ] {
+        let error = tauri::test::get_ipc_response(
+            &webview,
+            tauri::webview::InvokeRequest {
+                cmd: cmd.into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: if cfg!(windows) {
+                    "http://tauri.localhost"
+                } else {
+                    "tauri://localhost"
+                }
+                .parse()
+                .unwrap(),
+                body: tauri::ipc::InvokeBody::Json(body),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.to_string(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("IPC argument cap"),
+            "wrong boundary: {error}"
+        );
+        assert!(!document_path(app.handle()).unwrap().exists());
+    }
+}
+
+#[test]
+fn mcp_registry_writer_never_installs_bytes_above_its_reader_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp_servers.json");
+    let document = RegistryDocument {
+        version: 1,
+        servers: vec![RegistryEntry {
+            id: "big".into(),
+            name: "big".into(),
+            env: BTreeMap::new(),
+            transport: RegistryTransport::Stdio {
+                command: "x".repeat(MAX_DOCUMENT_BYTES),
+                args: vec![],
+            },
+        }],
+    };
+    assert!(write_document(&path, &document).is_err());
+    assert!(!path.exists());
+}
+
+#[path = "mcp_runtime_change_tests.rs"]
+mod runtime_change_tests;
+
+#[test]
+fn mcp_registry_mock_apps_have_independent_data_directories() {
+    let (_guard, _) = EnvGuard::new();
+    let first = mock_app();
+    let second = mock_app();
+    let first_path = document_path(first.handle()).unwrap();
+    let second_path = document_path(second.handle()).unwrap();
+    assert_ne!(first_path, second_path);
+    fs::write(first_path, b"sentinel").unwrap();
+    assert!(!second_path.exists());
 }

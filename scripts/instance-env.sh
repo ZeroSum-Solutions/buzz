@@ -82,7 +82,7 @@ if git rev-parse --is-inside-work-tree &>/dev/null; then
             fi
         fi
 
-        ICON_DIR="$WORKTREE_ROOT/desktop/src-tauri/target/dev-icons"
+        ICON_DIR="$("$(dirname "${BASH_SOURCE[0]}")/zs/cargo-target-dir.sh" desktop)/dev-icons/$BUZZ_INSTANCE_SLUG"
         mkdir -p "$ICON_DIR"
         DEV_ICON="$ICON_DIR/icon.icns"
         GENERATE_DEV_ICON="$WORKTREE_ROOT/scripts/generate-dev-icon.swift"

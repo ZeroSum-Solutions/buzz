@@ -86,11 +86,11 @@ logs *ARGS:
 
 # Build the Rust workspace
 build:
-    cargo build --workspace
+    CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh root)" cargo build --workspace
 
 # Build the Rust workspace in release mode
 build-release:
-    cargo build --workspace --release
+    CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh root)" cargo build --workspace --release
 
 # Run repo lint, formatting, and repository policy checks
 check: fmt-check clippy desktop-check desktop-tauri-fmt-check desktop-tauri-clippy web-check mobile-check security-review-check file-size-check
@@ -116,11 +116,11 @@ fmt:
 
 # Check formatting without modifying files
 fmt-check:
-    cargo fmt --all -- --check
+    CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh root)" cargo fmt --all -- --check
 
 # Run clippy with warnings as errors
 clippy:
-    cargo clippy --workspace --all-targets -- -D warnings
+    CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh root)" cargo clippy --workspace --all-targets -- -D warnings
 
 # Install JS dependencies (pnpm workspace — installs all packages from root)
 desktop-install:
@@ -223,13 +223,18 @@ desktop-tauri-test: _ensure-sidecar-stubs
     #!/usr/bin/env bash
     set -euo pipefail
     export CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh desktop)"
-    cd desktop/src-tauri && cargo test --workspace
+    cd desktop/src-tauri
+    # Full unit coverage uses synthetic/file storage, never the developer keychain.
+    cargo test --workspace --no-default-features
+    # Preserve all eight feature-gated cache/lock/pure secret-store regressions.
+    # Real OS-keychain integration tests remain explicitly #[ignore]d.
+    cargo test -p buzz-desktop --lib secret_store::tests::
 
 # Run the native terminal latency gate explicitly on a known-idle host.
 # This is intentionally excluded from shared CI: scheduler contention makes a
 # wall-clock assertion flaky, and the release profile is the shipped shape.
 desktop-terminal-performance-test:
-    cargo test --manifest-path desktop/src-tauri/crates/buzz-terminal/Cargo.toml --release --test latency g3_renderer_acquire_stays_within_frame_budget -- --ignored --exact --nocapture
+    CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh desktop)" cargo test --manifest-path desktop/src-tauri/crates/buzz-terminal/Cargo.toml --release --test latency g3_renderer_acquire_stays_within_frame_budget -- --ignored --exact --nocapture
 
 # Measure the markdown document viewer's panel-ready and main-thread budgets.
 # Excluded from shared CI for the same reason as the terminal latency gate: the
@@ -244,6 +249,7 @@ desktop-markdown-doc-performance-test:
 desktop-tauri-test-compiled-flags: _ensure-sidecar-stubs
     #!/usr/bin/env bash
     set -euo pipefail
+    export CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh desktop)"
     cd desktop/src-tauri
     echo "=== Clean build (no flag) → expect false ==="
     env -u BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY \
@@ -296,6 +302,7 @@ desktop-release-build target="aarch64-apple-darwin":
     touch "desktop/src-tauri/binaries/git-credential-nostr-$TARGET"
     touch "desktop/src-tauri/binaries/buzz-$TARGET"
     pnpm install
+    export CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh desktop)"
     cd {{desktop_dir}} && pnpm tauri build --features mesh-llm --target {{target}}
 
 # Build an unsigned named macOS demo DMG with isolated app and runtime identities.
@@ -443,7 +450,7 @@ test-unit:
         # DB-free /probe route, and its Host/Origin gating is covered here by
         # disabled_mode_still_requires_the_correct_host / _a_matching_origin.
         cargo nextest run -p buzz-relay --lib \
-            -E 'test(/^api::admin::/) - test(=api::admin::tests::disabled_mode_allows_unauthenticated_requests_on_the_admin_host) - test(=api::admin::tests::nip98_mode_unrostered_signer_does_not_consume_a_replay_slot)'
+            -E 'test(/^api::admin::/) - test(=api::admin::postgres_tests::disabled_mode_allows_unauthenticated_requests_on_the_admin_host) - test(=api::admin::postgres_tests::nip98_mode_unrostered_signer_does_not_consume_a_replay_slot)'
         # ACP author-gate and queue tests protect the trust boundary between
         # relay events and agent prompts. They are infra-free; ignored lifecycle
         # tests remain excluded and run in their dedicated integration lanes.
@@ -474,12 +481,12 @@ test-integration:
 # any model-capabilities.json edit, then commit the regenerated file. The
 # `corpus_matches_generated_snapshot` gate fails CI if the committed file drifts.
 regen-model-corpus:
-    cargo test -p buzz-agent --lib model_capabilities::tests::regen_corpus_file -- --ignored --exact
+    CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh root)" cargo test -p buzz-agent --lib model_capabilities::tests::regen_corpus_file -- --ignored --exact
 
 # Buzz shared compute e2e: current desktop discovery/admission logic and
 # Playwright UI coverage.
 mesh-e2e:
-    cargo test --manifest-path {{desktop_dir}}/src-tauri/Cargo.toml --features mesh-llm mesh_llm --lib
+    CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh desktop)" cargo test --manifest-path {{desktop_dir}}/src-tauri/Cargo.toml --features mesh-llm mesh_llm --lib
     cd {{desktop_dir}} && pnpm test:e2e:smoke -- mesh-compute.spec.ts
 
 # Reset only development state, seed deterministic local channels, and launch
@@ -504,6 +511,7 @@ mesh-dev-fresh:
 mesh-e2e-hardware:
     #!/usr/bin/env bash
     set -euo pipefail
+    export CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh root)"
     cargo run -p buzz-relay --example mesh_serve_client_smoke
 
 # Three isolated node processes: trusted member joins and infers; stranger is rejected.
@@ -511,12 +519,14 @@ mesh-e2e-hardware:
 mesh-e2e-admission:
     #!/usr/bin/env bash
     set -euo pipefail
+    export CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh root)"
     cargo run -p buzz-relay --example mesh_admission_smoke
 
 # Full hardware confidence suite: routing, owner admission, and real agent inference.
 mesh-e2e-confidence:
     #!/usr/bin/env bash
     set -euo pipefail
+    export CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh root)"
     cargo build --release -p buzz-agent -p buzz-dev-mcp
     cargo run -p buzz-relay --example mesh_serve_client_smoke
     cargo run -p buzz-relay --example mesh_admission_smoke
@@ -541,6 +551,7 @@ desktop-screenshot *ARGS:
 relay: bootstrap _ensure-migrations
     #!/usr/bin/env bash
     set -euo pipefail
+    export CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh root)"
     export PATH="{{justfile_directory()}}/bin:$PATH"
     set -o allexport
     source .env
@@ -557,12 +568,13 @@ relay-web: bootstrap _ensure-migrations
     set +o allexport
     [[ -d node_modules ]] || pnpm install
     pnpm -C web build
-    BUZZ_WEB_DIR=./web/dist cargo run -p buzz-relay
+    CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh root)" BUZZ_WEB_DIR=./web/dist cargo run -p buzz-relay
 
 # Build and run the private admin dashboard
 admin: bootstrap _ensure-migrations
     #!/usr/bin/env bash
     set -euo pipefail
+    export CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh root)"
     export PATH="{{justfile_directory()}}/bin:$PATH"
     set -o allexport
     source .env
@@ -586,9 +598,9 @@ admin-seed: _ensure-migrations
 
 # Run focused relay and browser checks for the admin dashboard
 admin-check: fmt-check
-    cargo check -p buzz-relay --all-targets
-    cargo test -p buzz-relay api::admin
-    cargo test -p buzz-relay router::tests
+    CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh root)" cargo check -p buzz-relay --all-targets
+    CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh root)" cargo test -p buzz-relay api::admin
+    CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh root)" cargo test -p buzz-relay router::tests
     pnpm -C admin-web check
     pnpm -C admin-web test:e2e
 
@@ -596,6 +608,7 @@ admin-check: fmt-check
 relay-release: bootstrap _ensure-migrations
     #!/usr/bin/env bash
     set -euo pipefail
+    export CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh root)"
     set -o allexport
     source .env
     set +o allexport
@@ -880,7 +893,7 @@ clean:
     CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh root)" cargo clean
     CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh desktop)" cargo clean --manifest-path desktop/src-tauri/Cargo.toml
 
-# Garbage-collect idle or orphaned cargo target directories
+# Report idle or orphaned cargo targets; --apply refuses unfenced deletion
 cargo-target-gc *ARGS:
     scripts/zs/with-gate-lock.sh scripts/zs/cargo-target-gc.sh {{ARGS}}
 
@@ -1132,7 +1145,7 @@ goose relay="ws://localhost:3000" agents="1" heartbeat="0" prompt="" key="$BUZZ_
     set -euo pipefail
     export PATH="{{justfile_directory()}}/bin:$PATH"
     source ./scripts/_goose-env.sh "{{relay}}" "{{key}}" "{{agents}}" "{{heartbeat}}" "{{prompt}}"
-    exec env "${env_args[@]}" ./target/release/buzz-acp
+    exec env "${env_args[@]}" "$BUZZ_GOOSE_BINARY"
 
 # Run a goose agent in the background (screen session named 'goose-agent-N')
 goose-bg relay="ws://localhost:3000" agents="1" heartbeat="0" prompt="" key="$BUZZ_PRIVATE_KEY":
@@ -1140,7 +1153,7 @@ goose-bg relay="ws://localhost:3000" agents="1" heartbeat="0" prompt="" key="$BU
     set -euo pipefail
     export PATH="{{justfile_directory()}}/bin:$PATH"
     source ./scripts/_goose-env.sh "{{relay}}" "{{key}}" "{{agents}}" "{{heartbeat}}" "{{prompt}}"
-    screen -dmS goose-agent-{{agents}} bash -c "$(printf '%q ' env "${env_args[@]}") ./target/release/buzz-acp"
+    screen -dmS goose-agent-{{agents}} bash -c "$(printf '%q ' env "${env_args[@]}" "$BUZZ_GOOSE_BINARY")"
     echo "Agent running in screen session 'goose-agent-{{agents}}'. Attach with: screen -r goose-agent-{{agents}}"
 
 # ─── Benchmarking ─────────────────────────────────────────────────────────────

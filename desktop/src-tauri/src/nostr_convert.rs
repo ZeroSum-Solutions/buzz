@@ -120,12 +120,14 @@ pub(crate) fn truncate_profile_name(name: Option<&str>) -> Option<String> {
 /// while cutting the untrusted payload down at the boundary.
 pub(crate) const PROFILE_PICTURE_MAX_BYTES: usize = 2 * 1024;
 
-/// Truncate a kind-0 `picture` URL to at most [`PROFILE_PICTURE_MAX_BYTES`]
-/// bytes on a UTF-8 character boundary. Used by the batch DTO
+/// Omit a kind-0 `picture` URL above [`PROFILE_PICTURE_MAX_BYTES`]. A prefix
+/// would name a different resource. Used by the batch DTO
 /// ([`crate::models::UserProfileSummaryInfo`]); the `get_profile` detail
 /// path keeps the full value, exactly as it does for `about`.
 pub(crate) fn truncate_profile_picture(picture: Option<&str>) -> Option<String> {
-    truncate_utf8(picture, PROFILE_PICTURE_MAX_BYTES)
+    picture
+        .filter(|url| url.len() <= PROFILE_PICTURE_MAX_BYTES)
+        .map(str::to_string)
 }
 
 /// Truncate `value` to at most `max_bytes`, cutting on a UTF-8 character
@@ -425,8 +427,13 @@ pub fn users_batch_from_events(
 ) -> UsersBatchResponse {
     // Keep only the most recent kind:0 per pubkey.
     let mut latest: HashMap<String, &Event> = HashMap::new();
+    let requested: std::collections::HashSet<&str> =
+        requested_pubkeys.iter().map(String::as_str).collect();
     for ev in events {
         let pk = ev.pubkey.to_hex();
+        if ev.kind != nostr::Kind::Metadata || !requested.contains(pk.as_str()) {
+            continue;
+        }
         let take = match latest.get(&pk) {
             None => true,
             Some(prev) => ev.created_at > prev.created_at,
