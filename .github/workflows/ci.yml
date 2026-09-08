@@ -15,6 +15,7 @@ env:
   BUZZ_TEST_POSTGRES_PASSWORD: buzz_dev
   PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.cache/ms-playwright
 
+# zs fork: pull_request runs skip the desktop smoke, desktop integration, backend integration, and relay E2E jobs; the merge queue (merge_group) and direct pushes still run all of them.
 jobs:
   changes:
     name: Detect Changed Paths
@@ -345,7 +346,12 @@ jobs:
       - name: Check Backend Integration result
         env:
           RESULT: ${{ needs.relay-domain.outputs.backend_integration_result }}
-        run: test "$RESULT" = success
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            test "$RESULT" = success || test "$RESULT" = skipped
+          else
+            test "$RESULT" = success
+          fi
 
   postgres-tests:
     name: PostgreSQL Tests
@@ -371,7 +377,12 @@ jobs:
       - name: Check Relay E2E result
         env:
           RESULT: ${{ needs.relay-domain.outputs.relay_e2e_result }}
-        run: test "$RESULT" = success
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            test "$RESULT" = success || test "$RESULT" = skipped
+          else
+            test "$RESULT" = success
+          fi
 
   web:
     name: Web
