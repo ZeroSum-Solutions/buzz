@@ -23,6 +23,7 @@ path = "src/main.rs"
 delivery-seam-test-api = []
 
 [dependencies]
+fs2 = "0.4.3"
 # Internal
 buzz-core = { workspace = true }
 buzz-sdk = { workspace = true }
