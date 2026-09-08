@@ -38,6 +38,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
+TARGET_DIR="$(cargo metadata --format-version 1 --no-deps | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).target_directory")"
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -89,10 +90,10 @@ trap cleanup EXIT
 check_deps() {
     local missing=()
 
-    if [[ ! -x "${REPO_ROOT}/target/release/buzz-relay" ]]; then
+    if [[ ! -x "${TARGET_DIR}/release/buzz-relay" ]]; then
         missing+=("buzz-relay (cargo build --release --bin buzz-relay)")
     fi
-    if [[ ! -x "${REPO_ROOT}/target/release/git-credential-nostr" ]]; then
+    if [[ ! -x "${TARGET_DIR}/release/git-credential-nostr" ]]; then
         missing+=("git-credential-nostr (cargo build --release --bin git-credential-nostr)")
     fi
     if ! command -v python3 &>/dev/null; then
@@ -159,7 +160,7 @@ print(format(pub[0], '064x'))
 
 # ── Git clone/push helpers ────────────────────────────────────────────────────
 
-CRED_HELPER="${REPO_ROOT}/target/release/git-credential-nostr"
+CRED_HELPER="${TARGET_DIR}/release/git-credential-nostr"
 
 # Clone a repo with nostr credential helper configured.
 # Usage: git_clone <privkey> <repo_url> <dest_dir>
@@ -343,7 +344,7 @@ export BUZZ_REQUIRE_AUTH_TOKEN=false
 rm -rf "${REPO_ROOT}/repos"
 mkdir -p "${REPO_ROOT}/repos"
 
-./target/release/buzz-relay > /tmp/buzz-relay-e2e.log 2>&1 &
+"${TARGET_DIR}/release/buzz-relay" > /tmp/buzz-relay-e2e.log 2>&1 &
 RELAY_PID=$!
 
 # Wait for relay to be ready (poll, not sleep)
@@ -571,7 +572,7 @@ success "=== PHASE 1 COMPLETE: Transport + RBAC ==="
 # PHASE 2 — Commit Signing (NIP-GS)
 # =============================================================================
 
-SIGNER="${REPO_ROOT}/target/release/git-sign-nostr"
+SIGNER="${TARGET_DIR}/release/git-sign-nostr"
 
 if [[ ! -x "$SIGNER" ]]; then
     warn "git-sign-nostr not built — skipping signing tests"

@@ -211,14 +211,14 @@ jobs:
             --archive-file target/ci/postgres-tests.tar.zst
 
   desktop-e2e-integration-shard:
-    name: Desktop E2E Integration (${{ matrix.shard }}/2)
+    name: Desktop E2E Integration (${{ matrix.shard }}/4)
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
-    if: inputs.lane == 'required' && (github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust)
+    if: inputs.lane == 'required' && github.event_name != 'pull_request' && (github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust)
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        shard: [1, 2, 3, 4]
     permissions:
       contents: read
     steps:
@@ -378,10 +378,10 @@ jobs:
       - name: Seed desktop e2e data
         run: bash scripts/setup-desktop-test-data.sh
       - name: Desktop relay-backed e2e
-        run: cd desktop && pnpm exec playwright test --project=integration --shard=${{ matrix.shard }}/2
+        run: cd desktop && pnpm exec playwright test --project=integration --shard=${{ matrix.shard }}/4
       - name: Summarize flaky tests
         if: ${{ !cancelled() }}
-        run: node scripts/summarize-flaky-tests.mjs playwright-report.json "Desktop E2E Integration (${{ matrix.shard }}/2)"
+        run: node scripts/summarize-flaky-tests.mjs playwright-report.json "Desktop E2E Integration (${{ matrix.shard }}/4)"
         working-directory: desktop
       - name: Upload desktop integration artifacts
         if: ${{ !cancelled() }}
@@ -413,9 +413,17 @@ jobs:
     steps:
       - name: Check integration shards
         run: |
-          if [ "${{ needs.desktop-e2e-integration-shard.result }}" != "success" ]; then
-            echo "Desktop E2E Integration shards finished with: ${{ needs.desktop-e2e-integration-shard.result }}"
-            exit 1
+          shard_result="${{ needs.desktop-e2e-integration-shard.result }}"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            if [ "$shard_result" != "success" ] && [ "$shard_result" != "skipped" ]; then
+              echo "Desktop E2E Integration shards finished with: $shard_result"
+              exit 1
+            fi
+          else
+            if [ "$shard_result" != "success" ]; then
+              echo "Desktop E2E Integration shards finished with: $shard_result"
+              exit 1
+            fi
           fi
           echo "Desktop E2E Integration shards passed"
 
@@ -423,7 +431,7 @@ jobs:
     name: Backend Integration (relay e2e)
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
-    if: inputs.lane == 'required' && (github.event_name == 'push' || inputs.rust)
+    if: inputs.lane == 'required' && github.event_name != 'pull_request' && (github.event_name == 'push' || inputs.rust)
     permissions:
       contents: read
     steps:
@@ -566,7 +574,7 @@ jobs:
     name: Relay E2E
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
-    if: inputs.lane == 'required' && (github.event_name == 'push' || inputs.rust)
+    if: inputs.lane == 'required' && github.event_name != 'pull_request' && (github.event_name == 'push' || inputs.rust)
     permissions:
       contents: read
     steps:

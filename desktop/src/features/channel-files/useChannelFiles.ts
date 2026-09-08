@@ -52,50 +52,6 @@ export type ChannelFileSourceEvent = Pick<
  */
 export const MAX_CHANNEL_FILES = 2_000;
 
-/** File type categories for filtering. */
-export type FileCategory = "all" | "image" | "video" | "document" | "other";
-
-export function categorizeFile(mimeType: string): FileCategory {
-  if (mimeType.startsWith("image/")) return "image";
-  if (mimeType.startsWith("video/")) return "video";
-  if (
-    mimeType.includes("pdf") ||
-    mimeType.includes("document") ||
-    mimeType.includes("spreadsheet") ||
-    mimeType.includes("presentation") ||
-    mimeType.startsWith("text/") ||
-    mimeType.includes("json") ||
-    mimeType.includes("xml")
-  )
-    return "document";
-  return "other";
-}
-
-export type FileSort = "newest" | "oldest" | "name" | "size";
-
-export function sortFiles(files: ChannelFile[], sort: FileSort): ChannelFile[] {
-  const sorted = [...files];
-  switch (sort) {
-    case "oldest":
-      sorted.sort((a, b) => a.createdAt - b.createdAt);
-      break;
-    case "name":
-      sorted.sort((a, b) => {
-        const na = (a.filename ?? "").toLowerCase();
-        const nb = (b.filename ?? "").toLowerCase();
-        return na.localeCompare(nb);
-      });
-      break;
-    case "size":
-      sorted.sort((a, b) => (b.size ?? 0) - (a.size ?? 0));
-      break;
-    default:
-      sorted.sort((a, b) => b.createdAt - a.createdAt);
-      break;
-  }
-  return sorted;
-}
-
 /**
  * Project a list of channel message events into a flat, newest-first list of
  * {@link ChannelFile} rows. Pure, bounded, and exported so the parsing rules

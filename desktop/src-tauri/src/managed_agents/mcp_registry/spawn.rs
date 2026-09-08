@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use buzz_secret_store_pkg::{binding_key_for, AgentCapability, CAPABILITY_ENV_VAR};
 
 use super::generate::BUZZ_ACP_REGISTRY_ENV_VAR;
-use super::generation::GenerationStore;
+use super::generation::{create_no_follow, sync_dir, GenerationStore};
 use super::paths::{RegistryPaths, BUZZ_ACP_REGISTRY_FILE, MAX_ARTEFACT_BYTES, REFUSAL_FILE};
 use crate::managed_agents::McpConfigPlacement;
 
@@ -108,7 +108,7 @@ where
         .map_err(|e| e.to_string())?;
 
     let refusal = staged.join(REFUSAL_FILE);
-    if refusal.exists() {
+    if staged_file_present(&refusal)? {
         return Err(read_artefact(&refusal)?);
     }
 
@@ -185,18 +185,63 @@ fn artefact(
         McpConfigPlacement::EnvRootedDir { file, .. } => file,
     };
     let path = staged.join(name);
-    if !path.exists() {
+    if !staged_file_present(&path)? {
         return Ok(None);
     }
     let body = read_artefact(&path)?;
     Ok(Some((path, body)))
 }
 
+/// Whether a staged artefact is present **and** is a plain file.
+///
+/// `Path::exists` answers "a `stat` succeeded", which is true of a FIFO, a
+/// device and a symlink to either. Opening a FIFO blocks until a writer
+/// appears, so a spawn that probed with `exists` and then opened would hang
+/// forever rather than refuse — with no timeout anywhere on the path. The type
+/// is read from `symlink_metadata`, which does not traverse the final
+/// component, so a link planted over the artefact is refused rather than
+/// followed (Sol N9). The open itself repeats the regular-file check on the
+/// **opened handle**, so a swap between this call and the open cannot slip
+/// through.
+///
+/// # Errors
+/// A message when the path exists but is not a regular file, or when its type
+/// cannot be read at all. Neither is reported as absent: read as "no
+/// artefact", a planted FIFO would silently turn a configured agent into an
+/// unconfigured one.
+fn staged_file_present(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => Ok(true),
+        Ok(meta) => Err(format!(
+            "{} is not a regular file ({:?}); this agent's mcp configuration was not written by \
+             this desktop",
+            path.display(),
+            meta.file_type()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!(
+            "failed to read the type of {}: {e}",
+            path.display()
+        )),
+    }
+}
+
 /// Read one staged file, bounded at [`MAX_ARTEFACT_BYTES`].
+///
+/// The open does not follow a symlink at the final component and the opened
+/// handle must be a regular file, so neither a link nor a FIFO swapped in
+/// after [`staged_file_present`] can redirect or block the read.
 fn read_artefact(path: &Path) -> Result<String, String> {
     use std::io::Read as _;
-    let file =
-        std::fs::File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    let file = open_artefact_no_follow(path)
+        .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    let kind = file
+        .metadata()
+        .map_err(|e| format!("failed to read the type of {}: {e}", path.display()))?
+        .file_type();
+    if !kind.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
     // One byte past the cap, so the exhausted limit is what reports an
     // oversized file rather than a truncated read passing as a whole one.
     let mut bounded = file.take(MAX_ARTEFACT_BYTES as u64 + 1);
@@ -221,19 +266,65 @@ fn create_workdir(paths: &RegistryPaths, agent_id: &str) -> Result<PathBuf, Stri
     Ok(workdir)
 }
 
+/// Open a staged artefact for reading without following a symlink at its final
+/// component.
+fn open_artefact_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the path is a symbolic link",
+            ));
+        }
+        std::fs::File::open(path)
+    }
+}
+
 /// Write `body` to `path` through a temporary file and a rename.
 ///
 /// A harness reading the file while it is rewritten must see one whole
 /// generation's configuration or the previous one, never a prefix of the new.
+///
+/// The temporary file's bytes and the parent directory's new entry are both
+/// fsynced (PR 23 follow-up 3). Without the first, a crash after the rename
+/// can leave the harness's config file present, named and empty; without the
+/// second, the rename itself can be lost while the temporary file survives, so
+/// the agent starts from the previous generation while the desktop believes it
+/// installed this one. `write_file_synced` in `generation.rs` already had this
+/// shape; this is the same one, and it is also what refuses a symlink planted
+/// at the fixed `.tmp` name.
 fn write_atomically(path: &Path, body: &str) -> Result<(), String> {
+    use std::io::Write as _;
     let temporary = path.with_extension("tmp");
-    std::fs::write(&temporary, body)
-        .map_err(|e| format!("failed to write {}: {e}", temporary.display()))?;
+    let install = |result: std::io::Result<()>, what: &str| {
+        result.map_err(|e| format!("failed to {what} {}: {e}", temporary.display()))
+    };
+    let mut file = create_no_follow(&temporary)
+        .map_err(|e| format!("failed to create {}: {e}", temporary.display()))?;
+    install(file.write_all(body.as_bytes()), "write")?;
+    install(file.sync_all(), "sync")?;
+    drop(file);
     std::fs::rename(&temporary, path).map_err(|e| {
         // A failed rename leaves the temporary file behind; remove it so a
         // retry does not read a stale one, and report the rename failure
         // rather than the cleanup.
         let _ = std::fs::remove_file(&temporary);
         format!("failed to install {}: {e}", path.display())
-    })
+    })?;
+    // The rename is durable only once the directory entry is. Reported, never
+    // discarded: a lost rename is the torn state this function exists to
+    // prevent.
+    if let Some(parent) = path.parent() {
+        sync_dir(parent).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }

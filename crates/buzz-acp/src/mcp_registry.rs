@@ -892,18 +892,26 @@ mod tests {
         let good = staged_path(base.path(), "agent-a", 7);
         confine_registry_path(&good, &capability).expect("the staged path is accepted");
 
-        for (path, why) in [
+        // Each case names the cause it must be refused for, not merely that it
+        // was refused (PR 23 follow-up 4). `..` in particular is refused by the
+        // shape check rather than by the tail comparison, and asserting only
+        // `is_err()` would keep passing if the shape check were deleted and the
+        // tail happened to disagree for an unrelated reason.
+        for (path, why, cause) in [
             (
                 staged_path(base.path(), "agent-b", 7),
                 "another agent's directory",
+                "outside this agent's directory",
             ),
             (
                 staged_path(base.path(), "agent-a", 6),
                 "a superseded generation",
+                "outside this agent's directory",
             ),
             (
                 base.path().join("elsewhere").join(REGISTRY_FILE_NAME),
                 "a path outside the staging tree",
+                "outside this agent's directory",
             ),
             (
                 base.path()
@@ -915,19 +923,21 @@ mod tests {
                     .join("agent-b")
                     .join(REGISTRY_FILE_NAME),
                 "a `..` traversal",
+                "holds a `.` or `..` component",
+            ),
+            (
+                PathBuf::from("relative/registry.json"),
+                "a relative path",
+                "is not an absolute path",
             ),
         ] {
+            let error = confine_registry_path(&path, &capability)
+                .expect_err(&format!("{why} was accepted: {}", path.display()));
             assert!(
-                confine_registry_path(&path, &capability).is_err(),
-                "{why} was accepted: {}",
-                path.display()
+                error.contains(cause),
+                "{why} was refused for the wrong reason; expected {cause:?}, got {error}"
             );
         }
-
-        assert!(
-            confine_registry_path(Path::new("relative/registry.json"), &capability).is_err(),
-            "a relative path was accepted"
-        );
     }
 
     /// The open refuses a symlink and anything that is not a regular file.

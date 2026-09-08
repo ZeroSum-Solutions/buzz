@@ -1,12 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import {
-  MAX_CHANNEL_FILES,
-  categorizeFile,
-  parseChannelFiles,
-  sortFiles,
-} from "./useChannelFiles.ts";
+import { MAX_CHANNEL_FILES, parseChannelFiles } from "./useChannelFiles.ts";
+import { classifyFile } from "./fileFacets.ts";
 import { MAX_IMETA_TAGS_SCANNED } from "./boundedImeta.ts";
 
 const SHA = "d".repeat(64);
@@ -80,7 +76,7 @@ test("parseChannelFiles labels a Markdown attachment by its imeta filename, not 
 
   assert.equal(file.filename, "notes.md");
   assert.notEqual(file.filename, "deadbeefdeadbeef.bin");
-  assert.equal(categorizeFile(file.mimeType), "document");
+  assert.equal(classifyFile(file), "document");
 });
 
 test("parseChannelFiles orders files newest-first regardless of input event order", () => {
@@ -151,31 +147,6 @@ test("parseChannelFiles yields no caption when the first content line is only th
 
   const [file] = parse([event]);
   assert.equal(file.caption, undefined);
-});
-
-test("sortFiles orders newest-first by default and supports name/size/oldest", () => {
-  const files = [
-    { filename: "b.txt", size: 10, createdAt: 100 },
-    { filename: "a.txt", size: 30, createdAt: 300 },
-    { filename: "c.txt", size: 20, createdAt: 200 },
-  ];
-
-  assert.deepEqual(
-    sortFiles(files, "newest").map((f) => f.filename),
-    ["a.txt", "c.txt", "b.txt"],
-  );
-  assert.deepEqual(
-    sortFiles(files, "oldest").map((f) => f.filename),
-    ["b.txt", "c.txt", "a.txt"],
-  );
-  assert.deepEqual(
-    sortFiles(files, "name").map((f) => f.filename),
-    ["a.txt", "b.txt", "c.txt"],
-  );
-  assert.deepEqual(
-    sortFiles(files, "size").map((f) => f.filename),
-    ["a.txt", "c.txt", "b.txt"],
-  );
 });
 
 test("parseChannelFiles caps an oversized relay-sourced filename and caption", () => {
@@ -312,14 +283,6 @@ test("parseChannelFiles caps the total row count and reports truncation", () => 
   assert.equal(result.files.length, MAX_CHANNEL_FILES);
   assert.equal(result.truncated, true, "a capped list must not read as whole");
   assert.equal(parseChannelFiles(events.slice(0, 3)).truncated, false);
-});
-
-test("categorizeFile maps mime types to categories", () => {
-  assert.equal(categorizeFile("image/png"), "image");
-  assert.equal(categorizeFile("video/mp4"), "video");
-  assert.equal(categorizeFile("application/pdf"), "document");
-  assert.equal(categorizeFile("text/markdown"), "document");
-  assert.equal(categorizeFile("application/octet-stream"), "other");
 });
 
 test("parseChannelFiles bounds the tag scan by every tag, not only imeta tags", () => {

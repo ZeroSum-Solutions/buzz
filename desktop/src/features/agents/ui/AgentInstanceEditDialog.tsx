@@ -30,7 +30,7 @@ import { setManagedAgentAutoRestart } from "@/shared/api/tauriManagedAgents";
 import { EffortPickerField } from "./EffortPickerField";
 import { EditAgentAdvancedFields } from "./EditAgentAdvancedFields";
 import {
-  ADVANCED_FIELDS_MOTION_TRANSITION,
+  advancedFieldsMotion,
   AUTO_PROVIDER_DROPDOWN_VALUE,
   BLOCK_BUILD_HIDDEN_PROVIDER_IDS,
   CUSTOM_PROVIDER_DROPDOWN_VALUE,
@@ -901,9 +901,7 @@ export function AgentInstanceEditDialog({
 
   const previewLabel = name.trim() || "Agent name";
   const previewAvatarUrl = avatarUrl.trim() || null;
-  const advancedFieldsTransition = shouldReduceMotion
-    ? { duration: 0 }
-    : ADVANCED_FIELDS_MOTION_TRANSITION;
+  const advancedFieldsTransition = advancedFieldsMotion(shouldReduceMotion);
   // Displayed inline when either the locked update or a standalone setter fails.
   // setterError takes precedence — the update already committed when it fires.
   const displayError =
@@ -1173,6 +1171,7 @@ export function AgentInstanceEditDialog({
                     transition={advancedFieldsTransition}
                   >
                     <EditAgentAdvancedFields
+                      agentPubkey={agent.pubkey}
                       acpCommand={acpCommand}
                       agentArgs={agentArgs}
                       autoRestartOnConfigChange={autoRestartOnConfigChange}

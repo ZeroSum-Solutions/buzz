@@ -43,7 +43,7 @@ mod relay_mesh;
 mod repos;
 mod restore;
 pub mod retention;
-mod runtime;
+pub(crate) mod runtime;
 mod runtime_commands;
 mod runtime_types;
 mod session_policy;
@@ -55,7 +55,7 @@ pub(crate) mod team_events;
 mod team_repair;
 pub(crate) use team_repair::team_persona_key;
 mod teams;
-mod types;
+pub(crate) mod types;
 
 // Shared lock for tests that call `lock_path_mutex` or `lock_env_mutex`.
 // Both helpers delegate here so any two tests using either helper are mutually

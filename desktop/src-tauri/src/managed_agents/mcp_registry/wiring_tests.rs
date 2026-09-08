@@ -15,7 +15,9 @@ use buzz_secret_store_pkg::{
     CAPABILITY_ENV_VAR,
 };
 
-use super::converge::{converge, AgentSelection, ConvergeError, NonceSource, SecretStoreIo};
+use super::converge::{
+    converge, AgentSelection, ConvergeError, GenerationInputs, NonceSource, SecretStoreIo,
+};
 use super::generate::BUZZ_ACP_REGISTRY_ENV_VAR;
 use super::generation::SecretRemover;
 use super::load::{parse_registry, LoadedRegistry};
@@ -180,8 +182,11 @@ fn mcp_registry_deleted_server_stops_authenticating() {
             McpConfigPlacement::Unsupported,
             &["gh", "sn"],
         )],
-        LAUNCHER,
-        SERVICE,
+        &GenerationInputs {
+            launcher: LAUNCHER,
+            keychain_service: SERVICE,
+            pending: &BTreeMap::new(),
+        },
         &store,
         &nonces,
     )
@@ -224,8 +229,11 @@ fn mcp_registry_deleted_server_stops_authenticating() {
         &paths,
         &one,
         &[selection(AGENT_A, McpConfigPlacement::Unsupported, &["sn"])],
-        LAUNCHER,
-        SERVICE,
+        &GenerationInputs {
+            launcher: LAUNCHER,
+            keychain_service: SERVICE,
+            pending: &BTreeMap::new(),
+        },
         &store,
         &nonces,
     )
@@ -307,8 +315,11 @@ fn mcp_registry_a_failed_revocation_is_owed_not_abandoned() {
             McpConfigPlacement::Unsupported,
             &["gh", "sn"],
         )],
-        LAUNCHER,
-        SERVICE,
+        &GenerationInputs {
+            launcher: LAUNCHER,
+            keychain_service: SERVICE,
+            pending: &BTreeMap::new(),
+        },
         &store,
         &nonces,
     )
@@ -331,8 +342,11 @@ fn mcp_registry_a_failed_revocation_is_owed_not_abandoned() {
         &paths,
         &one,
         &[selection(AGENT_A, McpConfigPlacement::Unsupported, &["sn"])],
-        LAUNCHER,
-        SERVICE,
+        &GenerationInputs {
+            launcher: LAUNCHER,
+            keychain_service: SERVICE,
+            pending: &BTreeMap::new(),
+        },
         &store,
         &nonces,
     )
@@ -347,8 +361,11 @@ fn mcp_registry_a_failed_revocation_is_owed_not_abandoned() {
         &paths,
         &one,
         &[selection(AGENT_A, McpConfigPlacement::Unsupported, &["sn"])],
-        LAUNCHER,
-        SERVICE,
+        &GenerationInputs {
+            launcher: LAUNCHER,
+            keychain_service: SERVICE,
+            pending: &BTreeMap::new(),
+        },
         &store,
         &nonces,
     )
@@ -370,8 +387,11 @@ fn mcp_registry_spawn_hands_over_the_generation_file_and_the_capability() {
         &paths,
         &registry(&stdio("gh", "github")),
         &[selection(AGENT_A, McpConfigPlacement::Unsupported, &["gh"])],
-        LAUNCHER,
-        SERVICE,
+        &GenerationInputs {
+            launcher: LAUNCHER,
+            keychain_service: SERVICE,
+            pending: &BTreeMap::new(),
+        },
         &store,
         &CountingNonces::default(),
     )
@@ -440,8 +460,11 @@ fn mcp_registry_a_toggle_changes_only_the_named_agents_config() {
             selection(AGENT_A, placement, &["gh"]),
             selection(AGENT_B, placement, &["sn"]),
         ],
-        LAUNCHER,
-        SERVICE,
+        &GenerationInputs {
+            launcher: LAUNCHER,
+            keychain_service: SERVICE,
+            pending: &BTreeMap::new(),
+        },
         &store,
         &nonces,
     )
@@ -478,8 +501,11 @@ fn mcp_registry_a_toggle_changes_only_the_named_agents_config() {
             selection(AGENT_A, placement, &["gh", "sn"]),
             selection(AGENT_B, placement, &["sn"]),
         ],
-        LAUNCHER,
-        SERVICE,
+        &GenerationInputs {
+            launcher: LAUNCHER,
+            keychain_service: SERVICE,
+            pending: &BTreeMap::new(),
+        },
         &store,
         &nonces,
     )
@@ -526,8 +552,11 @@ fn mcp_registry_a_regenerated_config_is_installed_by_rename() {
         &paths,
         &both,
         &[selection(AGENT_A, placement, &["gh"])],
-        LAUNCHER,
-        SERVICE,
+        &GenerationInputs {
+            launcher: LAUNCHER,
+            keychain_service: SERVICE,
+            pending: &BTreeMap::new(),
+        },
         &store,
         &nonces,
     )
@@ -545,8 +574,11 @@ fn mcp_registry_a_regenerated_config_is_installed_by_rename() {
         &paths,
         &both,
         &[selection(AGENT_A, placement, &["gh", "sn"])],
-        LAUNCHER,
-        SERVICE,
+        &GenerationInputs {
+            launcher: LAUNCHER,
+            keychain_service: SERVICE,
+            pending: &BTreeMap::new(),
+        },
         &store,
         &nonces,
     )
@@ -601,8 +633,11 @@ fn mcp_registry_an_env_rooted_placement_gets_its_own_root() {
         &paths,
         &registry(&stdio("gh", "github")),
         &[selection(AGENT_A, placement, &["gh"])],
-        LAUNCHER,
-        SERVICE,
+        &GenerationInputs {
+            launcher: LAUNCHER,
+            keychain_service: SERVICE,
+            pending: &BTreeMap::new(),
+        },
         &store,
         &CountingNonces::default(),
     )
@@ -642,8 +677,11 @@ fn mcp_registry_a_staged_refusal_refuses_the_spawn() {
         &registry(&stdio("gh", "github")),
         // `sn` is not in the registry at all.
         &[selection(AGENT_A, McpConfigPlacement::Unsupported, &["sn"])],
-        LAUNCHER,
-        SERVICE,
+        &GenerationInputs {
+            launcher: LAUNCHER,
+            keychain_service: SERVICE,
+            pending: &BTreeMap::new(),
+        },
         &store,
         &CountingNonces::default(),
     )
@@ -673,8 +711,11 @@ fn mcp_registry_generated_servers_without_a_binding_refuse_the_spawn() {
         &paths,
         &registry(&stdio("gh", "github")),
         &[selection(AGENT_A, McpConfigPlacement::Unsupported, &["gh"])],
-        LAUNCHER,
-        SERVICE,
+        &GenerationInputs {
+            launcher: LAUNCHER,
+            keychain_service: SERVICE,
+            pending: &BTreeMap::new(),
+        },
         &store,
         &CountingNonces::default(),
     )
@@ -717,8 +758,11 @@ fn mcp_registry_an_agent_with_no_servers_gets_an_empty_plan() {
         &paths,
         &registry(&stdio("gh", "github")),
         &[selection(AGENT_A, McpConfigPlacement::Unsupported, &["gh"])],
-        LAUNCHER,
-        SERVICE,
+        &GenerationInputs {
+            launcher: LAUNCHER,
+            keychain_service: SERVICE,
+            pending: &BTreeMap::new(),
+        },
         &store,
         &CountingNonces::default(),
     )
@@ -759,8 +803,11 @@ fn mcp_registry_managed_variables_cover_what_a_plan_sets() {
             &paths,
             &registry(&stdio("gh", "github")),
             &[selection(AGENT_A, placement, &["gh"])],
-            LAUNCHER,
-            SERVICE,
+            &GenerationInputs {
+                launcher: LAUNCHER,
+                keychain_service: SERVICE,
+                pending: &BTreeMap::new(),
+            },
             &store,
             &CountingNonces::default(),
         )
@@ -844,8 +891,11 @@ fn mcp_registry_converge_refuses_a_partial_agent_set() {
             selection(AGENT_A, McpConfigPlacement::Unsupported, &["gh"]),
             selection(AGENT_B, McpConfigPlacement::Unsupported, &["ln"]),
         ],
-        LAUNCHER,
-        SERVICE,
+        &GenerationInputs {
+            launcher: LAUNCHER,
+            keychain_service: SERVICE,
+            pending: &BTreeMap::new(),
+        },
         &store,
         &CountingNonces::default(),
     )
@@ -857,8 +907,11 @@ fn mcp_registry_converge_refuses_a_partial_agent_set() {
         &paths,
         &registry,
         &[selection(AGENT_A, McpConfigPlacement::Unsupported, &["gh"])],
-        LAUNCHER,
-        SERVICE,
+        &GenerationInputs {
+            launcher: LAUNCHER,
+            keychain_service: SERVICE,
+            pending: &BTreeMap::new(),
+        },
         &store,
         &CountingNonces::default(),
     )
@@ -899,8 +952,11 @@ fn mcp_registry_generated_argv_names_the_desktops_keychain_service() {
         &paths,
         &registry(&stdio("gh", "github")),
         &[selection(AGENT_A, McpConfigPlacement::Unsupported, &["gh"])],
-        LAUNCHER,
-        service,
+        &GenerationInputs {
+            launcher: LAUNCHER,
+            keychain_service: service,
+            pending: &BTreeMap::new(),
+        },
         &store,
         &CountingNonces::default(),
     )
@@ -961,8 +1017,11 @@ fn mcp_registry_a_hostile_agent_id_reaches_no_path() {
                 &paths,
                 &registry(&stdio("gh", "github")),
                 &[selection(hostile, McpConfigPlacement::Unsupported, &["gh"])],
-                LAUNCHER,
-                SERVICE,
+                &GenerationInputs {
+                    launcher: LAUNCHER,
+                    keychain_service: SERVICE,
+                    pending: &BTreeMap::new(),
+                },
                 &store,
                 &CountingNonces::default(),
             ),
@@ -989,8 +1048,11 @@ fn mcp_registry_converge_bounds_agents_and_refuses_duplicates() {
                 selection(AGENT_A, McpConfigPlacement::Unsupported, &["gh"]),
                 selection(AGENT_A, McpConfigPlacement::Unsupported, &[]),
             ],
-            LAUNCHER,
-            SERVICE,
+            &GenerationInputs {
+                launcher: LAUNCHER,
+                keychain_service: SERVICE,
+                pending: &BTreeMap::new(),
+            },
             &store,
             &CountingNonces::default(),
         ),
@@ -1011,8 +1073,11 @@ fn mcp_registry_converge_bounds_agents_and_refuses_duplicates() {
             &paths,
             &registry,
             &many,
-            LAUNCHER,
-            SERVICE,
+            &GenerationInputs {
+                launcher: LAUNCHER,
+                keychain_service: SERVICE,
+                pending: &BTreeMap::new(),
+            },
             &store,
             &CountingNonces::default(),
         ),
@@ -1032,8 +1097,11 @@ fn mcp_registry_no_generated_file_carries_a_secret() {
         &paths,
         &registry(&stdio("gh", "github")),
         &[selection(AGENT_A, placement, &["gh"])],
-        LAUNCHER,
-        SERVICE,
+        &GenerationInputs {
+            launcher: LAUNCHER,
+            keychain_service: SERVICE,
+            pending: &BTreeMap::new(),
+        },
         &store,
         &CountingNonces::default(),
     )
@@ -1102,8 +1170,11 @@ fn mcp_registry_the_spawn_seam_strips_before_it_sets() {
         &paths,
         &registry(&stdio("gh", "github")),
         &[selection(AGENT_A, McpConfigPlacement::Unsupported, &["gh"])],
-        LAUNCHER,
-        SERVICE,
+        &GenerationInputs {
+            launcher: LAUNCHER,
+            keychain_service: SERVICE,
+            pending: &BTreeMap::new(),
+        },
         &store,
         &CountingNonces::default(),
     )

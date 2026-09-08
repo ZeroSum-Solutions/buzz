@@ -31,7 +31,7 @@ import {
   personaBehaviorDraftValid,
 } from "./personaBehaviorDraft";
 import {
-  ADVANCED_FIELDS_MOTION_TRANSITION,
+  advancedFieldsMotion,
   AUTO_MODEL_DROPDOWN_VALUE,
   AUTO_PROVIDER_DROPDOWN_VALUE,
   BLOCK_BUILD_HIDDEN_PROVIDER_IDS,
@@ -646,9 +646,7 @@ export function AgentDefinitionDialog({
       {runtimeWarningText} Visit Settings &gt; Agents to set it up.
     </p>
   ) : null;
-  const advancedFieldsTransition = shouldReduceMotion
-    ? { duration: 0 }
-    : ADVANCED_FIELDS_MOTION_TRANSITION;
+  const advancedFieldsTransition = advancedFieldsMotion(shouldReduceMotion);
 
   React.useEffect(() => {
     if (

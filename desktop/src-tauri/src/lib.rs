@@ -324,6 +324,23 @@ pub fn run() {
                 eprintln!("buzz-desktop: persona-snapshot backfill failed: {e}");
             }
 
+            // Finish whatever the last MCP registry change left owed, before
+            // any agent is restored. A crash mid-change leaves either a
+            // half-staged generation the pointer never adopted, or an adopted
+            // one whose keychain deletions did not all succeed — a credential
+            // the operator already revoked, still in the store, with nothing
+            // left to retry it. Best-effort and loud: a start must not be
+            // blocked by configuration debt, and the next Settings action
+            // retries the same work.
+            match managed_agents::mcp_registry::apply::reconcile_at_start(&app_handle) {
+                Ok(managed_agents::mcp_registry::generation::Reconciled::Nothing) => {}
+                Ok(outcome) => {
+                    eprintln!("buzz-desktop: mcp registry reconcile at start: {outcome:?}");
+                }
+                Err(e) => {
+                    eprintln!("buzz-desktop: mcp registry reconcile at start failed: {e}");
+                }
+            }
             // Rust sync trigger once after launch restore in lib.rs setup
             agent_health::sync_for_agent(&app_handle, "");
 
@@ -538,6 +555,11 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            list_mcp_registry_servers,
+            save_mcp_registry_server,
+            delete_mcp_registry_server,
+            set_agent_mcp_servers,
+            get_agent_mcp_servers,
             terminal_runtime::terminal_attach,
             terminal_runtime::terminal_detach,
             terminal_runtime::terminal_close,

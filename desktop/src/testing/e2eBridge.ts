@@ -381,6 +381,8 @@ type E2eConfig = {
     deepHistoryMessageCount?: number;
     feedReadError?: string;
     canvasReadError?: string;
+    /** Seeds every channel's canvas body until a `set_canvas` overwrites it. */
+    canvasContent?: string;
     /** Delay (ms) for `apply_workspace` so e2e tests can observe the
      *  community-switch gate. 0/undefined = instant. */
     applyCommunityDelayMs?: number;
@@ -3582,6 +3584,18 @@ function mockObservedUnreadProjections(
 
 function resetMockObservedUnread() {
   mockObservedUnreadScopes.clear();
+}
+
+// Mock canvas bodies, keyed by channel id. `mock.canvasContent` seeds every
+// channel; `set_canvas` overwrites one, exactly as the relay-backed command
+// would, so a spec can drive the write-then-read path an immutable stub
+// cannot represent.
+let mockCanvasByChannel = new Map<string, string>();
+let mockCanvasSeed: string | null = null;
+
+function resetMockCanvas(config: E2eConfig | undefined) {
+  mockCanvasByChannel = new Map();
+  mockCanvasSeed = config?.mock?.canvasContent ?? null;
 }
 
 function resetMockSaveSubscriptions(config: E2eConfig | undefined) {
@@ -8571,6 +8585,158 @@ let runtimeCatalogDiscoveryCount = 0;
 let mockInstallCompleted = false;
 let mockConnectCompleted = false;
 
+// -- MCP registry (T7c) ------------------------------------------------------
+//
+// The registry document, each agent's selection, and the artefacts a
+// convergence stages. The generation number and the artefact shape mirror the
+// Rust side (`managed_agents::mcp_registry`) closely enough for a spec to
+// assert "the agent's generated config names the launcher and this server, and
+// the next generation drops it"; the byte-level guarantee is bound in Rust by
+// `mcp_registry_a_toggle_change_adopts_a_new_generation`, which reads the file
+// the shipped generator wrote.
+
+/** Absolute path of the bundled launcher, as a real generated config names it. */
+const MOCK_MCP_LAUNCHER =
+  "/Applications/Buzz.app/Contents/MacOS/buzz-mcp-launch";
+
+type MockMcpEnvEntry = {
+  name: string;
+  reference: string | null;
+  literal: string | null;
+};
+
+type MockMcpEntry = {
+  id: string;
+  name: string;
+  transport: "stdio" | "http";
+  command: string | null;
+  args: string[];
+  url: string | null;
+  auth_scheme: string | null;
+  env: MockMcpEnvEntry[];
+  rejection: string | null;
+};
+
+let mockMcpServers: MockMcpEntry[] = [];
+const mockMcpSelections = new Map<string, string[]>();
+/** Reference ids the panel has stored a value for. The values are not kept. */
+const mockMcpStoredReferences = new Set<string>();
+let mockMcpGeneration = 0;
+/** Generated artefacts by agent pubkey, as of the adopted generation. */
+let mockMcpArtefacts = new Map<string, unknown>();
+
+/** Stage and adopt one generation from the document plus every selection. */
+function convergeMockMcpRegistry() {
+  mockMcpGeneration += 1;
+  mockMcpArtefacts = new Map();
+  for (const [pubkey, enabled] of mockMcpSelections) {
+    const servers = mockMcpServers
+      .filter((entry) => enabled.includes(entry.id) && entry.rejection === null)
+      .map((entry) => ({
+        name: entry.name,
+        command: MOCK_MCP_LAUNCHER,
+        args:
+          entry.transport === "stdio"
+            ? [
+                "--service",
+                "buzz-desktop-dev",
+                "launch",
+                "--server",
+                entry.name,
+                ...entry.env.flatMap((variable) => [
+                  variable.reference === null ? "--set" : "--secret",
+                  `${variable.name}=${variable.reference ?? variable.literal ?? ""}`,
+                ]),
+                "--",
+                entry.command ?? "",
+                ...entry.args,
+              ]
+            : [
+                "--service",
+                "buzz-desktop-dev",
+                "proxy",
+                "--url",
+                entry.url ?? "",
+              ],
+      }));
+    if (servers.length === 0) continue;
+    mockMcpArtefacts.set(pubkey, { version: 1, servers });
+  }
+}
+
+function mockMcpRegistryView() {
+  return {
+    servers: mockMcpServers,
+    document_path: "/mock/app-data/agents/mcp_servers.json",
+    refused: [],
+  };
+}
+
+function handleSaveMcpRegistryServer(payload: {
+  entry?: {
+    id?: string;
+    name?: string;
+    transport?: "stdio" | "http";
+    command?: string;
+    args?: string[];
+    url?: string;
+    auth?: { scheme?: string; secret?: string };
+    env?: Record<string, string>;
+  };
+  secrets?: Record<string, string>;
+}) {
+  const entry = payload.entry ?? {};
+  const next: MockMcpEntry = {
+    id: entry.id ?? "",
+    name: entry.name ?? "",
+    transport: entry.transport ?? "stdio",
+    command: entry.transport === "http" ? null : (entry.command ?? ""),
+    args: entry.transport === "http" ? [] : (entry.args ?? []),
+    url: entry.transport === "http" ? (entry.url ?? "") : null,
+    auth_scheme: entry.auth?.scheme ?? null,
+    env: Object.entries(entry.env ?? {}).map(([name, value]) => ({
+      name,
+      reference: value.startsWith("mcp:") ? value : null,
+      literal: value.startsWith("mcp:") ? null : value,
+    })),
+    rejection: null,
+  };
+  // The value is consumed here and never kept: the mock records only that a
+  // credential exists, exactly as the keychain write side does.
+  for (const reference of Object.keys(payload.secrets ?? {})) {
+    mockMcpStoredReferences.add(reference);
+  }
+  const index = mockMcpServers.findIndex((each) => each.id === next.id);
+  if (index >= 0) {
+    mockMcpServers[index] = next;
+  } else {
+    mockMcpServers.push(next);
+  }
+  convergeMockMcpRegistry();
+  return mockMcpRegistryView();
+}
+
+function handleDeleteMcpRegistryServer(payload: { id?: string }) {
+  mockMcpServers = mockMcpServers.filter((entry) => entry.id !== payload.id);
+  for (const [pubkey, enabled] of mockMcpSelections) {
+    mockMcpSelections.set(
+      pubkey,
+      enabled.filter((each) => each !== payload.id),
+    );
+  }
+  convergeMockMcpRegistry();
+  return mockMcpRegistryView();
+}
+
+function handleSetAgentMcpServers(payload: {
+  pubkey?: string;
+  enabled?: string[];
+}) {
+  mockMcpSelections.set(payload.pubkey ?? "", payload.enabled ?? []);
+  convergeMockMcpRegistry();
+  return mockMcpRegistryView();
+}
+
 async function handleDiscoverAcpRuntimes(
   config: E2eConfig | undefined,
 ): Promise<RawAcpRuntimeCatalogEntry[]> {
@@ -11531,6 +11697,7 @@ export function maybeInstallE2eTauriMocks() {
   resetMockObservedUnread();
   resetMockTeamCatalogEvents(config);
   resetMockSaveSubscriptions(config);
+  resetMockCanvas(config);
   resetMockPendingCommunityDeepLinks(config);
   resetMockPendingNavigationDeepLinks(config);
   resetMockPendingEntityDeepLinks(config);
@@ -13605,6 +13772,36 @@ export function maybeInstallE2eTauriMocks() {
         return activeConfig?.mock?.relayRequiresMembership ?? false;
       case "discover_acp_providers":
         return handleDiscoverAcpRuntimes(activeConfig);
+      case "list_mcp_registry_servers":
+        return mockMcpRegistryView();
+      case "save_mcp_registry_server":
+        return handleSaveMcpRegistryServer(
+          payload as Parameters<typeof handleSaveMcpRegistryServer>[0],
+        );
+      case "delete_mcp_registry_server":
+        return handleDeleteMcpRegistryServer(payload as { id?: string });
+      case "get_agent_mcp_servers":
+        return (
+          mockMcpSelections.get(
+            (payload as { pubkey?: string }).pubkey ?? "",
+          ) ?? null
+        );
+      case "set_agent_mcp_servers":
+        return handleSetAgentMcpServers(
+          payload as Parameters<typeof handleSetAgentMcpServers>[0],
+        );
+      case "__buzz_e2e_mcp_generation__":
+        // Test-only seam: what a spawn of this agent would read from the
+        // adopted generation, plus the generation number, so a spec can assert
+        // that a toggle moved the pointer and changed the artefact.
+        return {
+          generation: mockMcpGeneration,
+          artefact:
+            mockMcpArtefacts.get(
+              (payload as { pubkey?: string }).pubkey ?? "",
+            ) ?? null,
+          storedReferences: [...mockMcpStoredReferences].sort(),
+        };
       case "save_custom_harness":
         return handleSaveCustomHarness(
           payload as Parameters<typeof handleSaveCustomHarness>[0],
@@ -14975,15 +15172,31 @@ export function maybeInstallE2eTauriMocks() {
         // The spec only verifies UI state, not the submitted request shape;
         // returning null mirrors the Rust submit_event success path.
         return null;
-      case "set_canvas":
+      case "set_canvas": {
+        const input = payload as { channelId?: string; content?: string };
+        // Write before reporting success: a spec that reads the canvas back
+        // after `set_canvas` resolves must never see the pre-write body.
+        mockCanvasByChannel.set(
+          input?.channelId ?? "",
+          typeof input?.content === "string" ? input.content : "",
+        );
         return { ok: true, event_id: mockEventId() };
+      }
       case "get_canvas": {
         const canvasReadError = activeConfig?.mock?.canvasReadError;
         if (canvasReadError) {
           throw new Error(canvasReadError);
         }
-        // Return the no-canvas success shape — content null means no canvas set.
-        return { content: null, updated_at: null, author: null };
+        const input = payload as { channelId?: string };
+        // A body written by `set_canvas` wins over the seed; with neither,
+        // content null is the no-canvas success shape.
+        const content =
+          mockCanvasByChannel.get(input?.channelId ?? "") ?? mockCanvasSeed;
+        return {
+          content: content ?? null,
+          updated_at: null,
+          author: null,
+        };
       }
       // ── Local-save archive ──────────────────────────────────────────────
       // These stubs drive the LocalArchiveSettingsCard in screenshot / UI tests

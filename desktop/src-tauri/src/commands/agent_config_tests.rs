@@ -74,6 +74,7 @@ fn goose_runtime() -> &'static KnownAcpRuntime {
 
 fn agent_record() -> ManagedAgentRecord {
     ManagedAgentRecord {
+        mcp_servers: None,
         description: None,
         pubkey: "agent".to_string(),
         name: "Agent".to_string(),

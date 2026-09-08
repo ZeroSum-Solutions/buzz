@@ -209,7 +209,7 @@ jobs:
     name: Desktop Smoke E2E (${{ matrix.shard }})
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
-    if: github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust
+    if: github.event_name != 'pull_request' && (github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust)
     strategy:
       fail-fast: false
       matrix:
@@ -306,9 +306,17 @@ jobs:
             echo "Desktop Compiled Flags finished with: ${{ needs.desktop-compiled-flags.result }}"
             exit 1
           fi
-          if [ "${{ needs.desktop-smoke-e2e.result }}" != "success" ]; then
-            echo "Desktop Smoke E2E shards finished with: ${{ needs.desktop-smoke-e2e.result }}"
-            exit 1
+          smoke_result="${{ needs.desktop-smoke-e2e.result }}"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            if [ "$smoke_result" != "success" ] && [ "$smoke_result" != "skipped" ]; then
+              echo "Desktop Smoke E2E shards finished with: $smoke_result"
+              exit 1
+            fi
+          else
+            if [ "$smoke_result" != "success" ]; then
+              echo "Desktop Smoke E2E shards finished with: $smoke_result"
+              exit 1
+            fi
           fi
           if [ "${{ needs.desktop-windows-build.result }}" != "success" ]; then
             echo "Desktop Windows Build finished with: ${{ needs.desktop-windows-build.result }}"

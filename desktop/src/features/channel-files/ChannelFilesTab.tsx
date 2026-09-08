@@ -7,6 +7,7 @@ import {
   Folder,
   ChevronRight,
   ChevronDown,
+  BookOpenText,
   Trash2,
   X,
   Undo2,
@@ -22,13 +23,14 @@ import {
   flattenFolders,
   hasSiblingNamed,
 } from "./folderStore";
+import type { ChannelFile } from "./useChannelFiles";
 import {
-  categorizeFile,
-  sortFiles,
-  type ChannelFile,
-  type FileCategory,
-  type FileSort,
-} from "./useChannelFiles";
+  MAX_SEARCH_QUERY_LENGTH,
+  applyFileFacets,
+  countFacets,
+  type FileFacet,
+  type FileSortKey,
+} from "./fileFacets";
 import {
   MAX_BULK_DROP_FILES,
   resolveBulkDropKeys,
@@ -37,7 +39,7 @@ import {
 } from "./bulkDropPreference";
 import { Button } from "@/shared/ui/button";
 
-const CATEGORY_TABS: { value: FileCategory; label: string }[] = [
+const FACET_TABS: { value: FileFacet; label: string }[] = [
   { value: "all", label: "All" },
   { value: "image", label: "Images" },
   { value: "video", label: "Videos" },
@@ -45,15 +47,42 @@ const CATEGORY_TABS: { value: FileCategory; label: string }[] = [
   { value: "other", label: "Other" },
 ];
 
-const SORT_OPTIONS: { value: FileSort; label: string }[] = [
+const SORT_OPTIONS: { value: FileSortKey; label: string }[] = [
   { value: "newest", label: "Newest" },
   { value: "oldest", label: "Oldest" },
   { value: "name", label: "Name" },
   { value: "size", label: "Size" },
+  { value: "author", label: "Author" },
 ];
+
+/**
+ * Characters of the canvas preview the pinned row shows. The canvas body is
+ * relay-sourced, so the row caps what it renders rather than trusting its
+ * length.
+ */
+export const MAX_CANVAS_PREVIEW_LENGTH = 140;
+
+/**
+ * The channel's canvas, as the Files tab pins it.
+ *
+ * A canvas is not an attachment: the row opens {@link ChannelFilesCanvas.surface},
+ * the channel's own Canvas editor, so editing keeps working. It never opens the
+ * attachment viewer.
+ */
+export type ChannelFilesCanvas = {
+  /** One-line preview of the canvas body. Empty when the body has no text. */
+  preview: string;
+  /** The Canvas surface revealed when the row is opened. */
+  surface: React.ReactNode;
+};
 
 export type ChannelFilesTabProps = {
   files: ChannelFile[];
+  /**
+   * The channel's canvas. Present only when the channel has one; the tab pins
+   * a row for it above the file list.
+   */
+  canvas?: ChannelFilesCanvas;
   /**
    * True when a row cap or one of the index retention caps dropped an older
    * entry — an attachment, or the edit or deletion that describes one — so
@@ -108,6 +137,7 @@ const VIRTUALIZE_ROW_THRESHOLD = 60;
 
 export function ChannelFilesTab({
   files,
+  canvas,
   truncated = false,
   isLoading,
   isError = false,
@@ -130,9 +160,12 @@ export function ChannelFilesTab({
   onMoveFolder,
   onAssignFiles,
 }: ChannelFilesTabProps) {
-  const [category, setCategory] = useState<FileCategory>("all");
+  // Facet and sort state live here, in the tab, not in the index: changing a
+  // facet re-orders what is already loaded and never re-reads the channel.
+  const [facet, setFacet] = useState<FileFacet>("all");
   const [searchQuery, setSearchQuery] = useState("");
-  const [sort, setSort] = useState<FileSort>("newest");
+  const [sort, setSort] = useState<FileSortKey>("newest");
+  const [isCanvasOpen, setIsCanvasOpen] = useState(false);
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
     () => new Set(),
   );
@@ -175,33 +208,18 @@ export function ChannelFilesTab({
     [pending],
   );
 
-  const filtered = useMemo(() => {
-    let result = files;
-    if (category !== "all") {
-      result = result.filter((f) => categorizeFile(f.mimeType) === category);
-    }
-    if (searchQuery.trim()) {
-      const q = searchQuery.toLowerCase().trim();
-      result = result.filter(
-        (f) =>
-          (f.filename ?? "").toLowerCase().includes(q) ||
-          (f.caption ?? "").toLowerCase().includes(q),
-      );
-    }
-    return sortFiles(result, sort);
-  }, [files, category, searchQuery, sort]);
+  const filtered = useMemo(
+    () =>
+      applyFileFacets(files, {
+        authorNames: senderNames,
+        facet,
+        query: searchQuery,
+        sort,
+      }),
+    [files, facet, searchQuery, senderNames, sort],
+  );
 
-  const counts = useMemo(() => {
-    const c: Record<FileCategory, number> = {
-      all: files.length,
-      image: 0,
-      video: 0,
-      document: 0,
-      other: 0,
-    };
-    for (const f of files) c[categorizeFile(f.mimeType)]++;
-    return c;
-  }, [files]);
+  const counts = useMemo(() => countFacets(files), [files]);
 
   const filesByFolder = useMemo(() => {
     const map = new Map<string, ChannelFile[]>();
@@ -559,14 +577,15 @@ export function ChannelFilesTab({
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="shrink-0 space-y-2 border-b border-border px-4 pb-3 pt-3">
         <div className="flex items-center gap-1 overflow-x-auto [scrollbar-width:none]">
-          {CATEGORY_TABS.map((tab) => (
+          {FACET_TABS.map((tab) => (
             <Button
+              aria-pressed={facet === tab.value}
               className="h-7 shrink-0 rounded-full px-3 text-xs"
-              data-active={category === tab.value}
+              data-active={facet === tab.value}
               key={tab.value}
-              onClick={() => setCategory(tab.value)}
+              onClick={() => setFacet(tab.value)}
               size="sm"
-              variant={category === tab.value ? "secondary" : "ghost"}
+              variant={facet === tab.value ? "secondary" : "ghost"}
             >
               {tab.label}
               {counts[tab.value] > 0 ? (
@@ -582,7 +601,9 @@ export function ChannelFilesTab({
           <div className="relative flex-1">
             <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
             <input
+              aria-label="Search files"
               className="h-8 w-full rounded-md border border-border bg-background pl-8 pr-3 text-xs placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+              maxLength={MAX_SEARCH_QUERY_LENGTH}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="Search files..."
               type="text"
@@ -604,7 +625,7 @@ export function ChannelFilesTab({
             <select
               aria-label="Sort files"
               className="h-8 appearance-none rounded-md border border-border bg-background px-7 py-0 pr-6 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-              onChange={(e) => setSort(e.target.value as FileSort)}
+              onChange={(e) => setSort(e.target.value as FileSortKey)}
               value={sort}
             >
               {SORT_OPTIONS.map((opt) => (
@@ -751,6 +772,48 @@ export function ChannelFilesTab({
           entries are dropped: some older attachments, or the latest change to
           one, may be missing here.
         </p>
+      ) : null}
+
+      {canvas ? (
+        <div className="shrink-0 border-b border-border">
+          <button
+            aria-expanded={isCanvasOpen}
+            className="flex w-full items-center gap-2 px-4 py-2 text-left hover:bg-muted/50"
+            data-testid="channel-files-canvas-row"
+            onClick={() => setIsCanvasOpen((open) => !open)}
+            type="button"
+          >
+            {isCanvasOpen ? (
+              <ChevronDown
+                aria-hidden="true"
+                className="h-4 w-4 shrink-0 text-muted-foreground"
+              />
+            ) : (
+              <ChevronRight
+                aria-hidden="true"
+                className="h-4 w-4 shrink-0 text-muted-foreground"
+              />
+            )}
+            <BookOpenText
+              aria-hidden="true"
+              className="h-4 w-4 shrink-0 text-muted-foreground"
+            />
+            <span className="text-sm font-medium">Canvas</span>
+            {canvas.preview ? (
+              <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+                {canvas.preview.slice(0, MAX_CANVAS_PREVIEW_LENGTH)}
+              </span>
+            ) : null}
+          </button>
+          {isCanvasOpen ? (
+            <div
+              className="border-t border-border px-4 py-3"
+              data-testid="channel-files-canvas-surface"
+            >
+              {canvas.surface}
+            </div>
+          ) : null}
+        </div>
       ) : null}
 
       {selectedCount > 0 ? (

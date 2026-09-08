@@ -91,6 +91,7 @@ pub(super) fn preset_catalog_entry(
         mcp_config_placement: crate::managed_agents::McpConfigPlacement::Unsupported,
         mcp_transports: Vec::new(),
         mcp_native_transports: Vec::new(),
+        mcp_registry_available: false,
     }
 }
 

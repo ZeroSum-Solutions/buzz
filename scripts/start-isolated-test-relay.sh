@@ -28,6 +28,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
+export CARGO_TARGET_DIR="$("${REPO_ROOT}/scripts/zs/cargo-target-dir.sh" root)"
 
 CARGO_PROFILE="${CARGO_PROFILE:-ci}"
 while [[ $# -gt 0 ]]; do
@@ -125,6 +126,7 @@ fi
 log "Building relay (profile=${CARGO_BUILD_PROFILE}, cargo=$(command -v cargo), $(cargo --version))..."
 cargo build --profile "${CARGO_BUILD_PROFILE}" -p buzz-relay
 ok "Relay built"
+TARGET_DIR="$(cargo metadata --format-version 1 --no-deps | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).target_directory")"
 
 # ── Run relay (detached tmux session) ────────────────────────────────────────
 # Run inside tmux, NOT the foreground: this script is invoked from ephemeral
@@ -155,7 +157,7 @@ tmux new-session -d -s "${TMUX_SESSION}" "cd '${REPO_ROOT}' && env \
   BUZZ_RELAY_PRIVATE_KEY=${RELAY_PRIVATE_KEY} \
   BUZZ_REQUIRE_AUTH_TOKEN=false \
   BUZZ_RECONCILE_CHANNELS=true \
-  './target/${CARGO_TARGET_PROFILE}/buzz-relay' > '${RELAY_LOG}' 2>&1"
+  '${TARGET_DIR}/${CARGO_TARGET_PROFILE}/buzz-relay' > '${RELAY_LOG}' 2>&1"
 
 # Wait for the main port to accept connections.
 for _ in $(seq 1 30); do
