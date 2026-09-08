@@ -33,7 +33,11 @@ cd "${REPO_ROOT}"
 
 # ---- Load .env if present ---------------------------------------------------
 
-if [[ -f ".env" ]]; then
+if [[ "$MODE" == "unit" ]]; then
+  # Infrastructure-free fixtures must not execute local configuration or
+  # inherit database defaults from this runner.
+  :
+elif [[ -f ".env" ]]; then
   log "Loading .env..."
   set -o allexport
   # shellcheck disable=SC1091
@@ -120,7 +124,14 @@ run_unit_tests() {
   # corpus as pure in-process tests (no infra). Mirrors the nextest path in
   # `just test-unit` — the two lists must stay in step.
   run_test_step "buzz-agent unit tests" \
-    cargo test -p buzz-agent --lib -- --nocapture
+    cargo test -p buzz-agent -- --nocapture
+
+  # Match the nextest admin selection, using the current module names.
+  # These two read-route tests wait for a database and do not belong here.
+  run_test_step "buzz-relay admin unit tests" \
+    cargo test -p buzz-relay --lib api::admin:: -- --nocapture \
+      --skip api::admin::postgres_tests::disabled_mode_allows_unauthenticated_requests_on_the_admin_host \
+      --skip api::admin::postgres_tests::nip98_mode_unrostered_signer_does_not_consume_a_replay_slot
 
   # ACP author-gate and queue tests are pure unit tests. Keep this fallback in
   # step with `just test-unit`; ignored lifecycle tests run elsewhere.

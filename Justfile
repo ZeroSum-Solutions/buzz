@@ -223,7 +223,12 @@ desktop-tauri-test: _ensure-sidecar-stubs
     #!/usr/bin/env bash
     set -euo pipefail
     export CARGO_TARGET_DIR="$(scripts/zs/cargo-target-dir.sh desktop)"
-    cd desktop/src-tauri && cargo test --workspace
+    cd desktop/src-tauri
+    # Full unit coverage uses synthetic/file storage, never the developer keychain.
+    cargo test --workspace --no-default-features
+    # Preserve all eight feature-gated cache/lock/pure secret-store regressions.
+    # Real OS-keychain integration tests remain explicitly #[ignore]d.
+    cargo test -p buzz-desktop --lib secret_store::tests::
 
 # Run the native terminal latency gate explicitly on a known-idle host.
 # This is intentionally excluded from shared CI: scheduler contention makes a

@@ -132,6 +132,29 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn("'Justfile'", rust_filter)
         self.assertIn("python3 scripts/test-cargo-target-lifecycle.py", workflow)
 
+    def test_unit_runner_avoids_infrastructure_and_preserves_selection(self):
+        shutil.copy2(SOURCE / "run-tests.sh", self.repo / "scripts/run-tests.sh")
+        tools = self.base / "tools"
+        tools.mkdir()
+        cargo = tools / "cargo"
+        cargo.write_text("#!/usr/bin/env python3\nimport json,os,sys\nwith open(os.environ['BUZZ_TEST_COMMAND_LOG'], 'a') as f: f.write(json.dumps({'args':sys.argv[1:],'database_configured':'DATABASE_URL' in os.environ})+'\\n')\n")
+        cargo.chmod(0o755)
+        command_log = self.base / "commands.jsonl"
+        result = subprocess.run(["bash", "scripts/run-tests.sh", "unit"], cwd=self.repo,
+            env=dict(self.environment, PATH=str(tools)+os.pathsep+self.environment["PATH"],
+                     CARGO_TARGET_DIR=str(self.base / "target"), BUZZ_TEST_COMMAND_LOG=str(command_log)),
+            capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        commands = [json.loads(line) for line in command_log.read_text().splitlines()]
+        self.assertTrue(all(not row["database_configured"] for row in commands),
+                        "unit runner must not initialize infrastructure configuration")
+        agent = next(row["args"] for row in commands if "buzz-agent" in row["args"])
+        self.assertNotIn("--lib", agent, "agent integration fixtures belong in the infra-free lane")
+        admin = next(row["args"] for row in commands if "buzz-relay" in row["args"])
+        self.assertIn("api::admin::", admin)
+        for name in ["disabled_mode_allows_unauthenticated_requests_on_the_admin_host", "nip98_mode_unrostered_signer_does_not_consume_a_replay_slot"]:
+            self.assertIn("api::admin::postgres_tests::" + name, admin)
+
     def test_root_symlink_fails_closed(self):
         root = self.home / ".cache/zs"
         root.mkdir(parents=True)
