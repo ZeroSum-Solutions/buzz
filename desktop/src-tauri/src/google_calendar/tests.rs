@@ -620,6 +620,40 @@ fn google_calendar_exchange_without_a_refresh_token_writes_no_binding() {
 }
 
 #[test]
+fn google_calendar_exchange_accepts_google_canonical_email_scope() {
+    let granted = vec![
+        "openid".to_string(),
+        "https://www.googleapis.com/auth/userinfo.email".to_string(),
+        "https://www.googleapis.com/auth/calendar.events".to_string(),
+    ];
+    assert_eq!(check_exchange(&granted, true, true), Ok(()));
+    for scope in [
+        "https://www.googleapis.com/auth/userinfo.profile",
+        "https://www.googleapis.com/auth/userinfo.email.extra",
+        "http://www.googleapis.com/auth/userinfo.email",
+    ] {
+        let mut wrong = granted.clone();
+        wrong[1] = scope.to_string();
+        assert!(matches!(
+            check_exchange(&wrong, true, true),
+            Err(ExchangeError::ScopeMissing(_))
+        ));
+    }
+    for missing in 0..granted.len() {
+        let partial: Vec<String> = granted
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != missing)
+            .map(|(_, scope)| scope.clone())
+            .collect();
+        assert!(matches!(
+            check_exchange(&partial, true, true),
+            Err(ExchangeError::ScopeMissing(_))
+        ));
+    }
+}
+
+#[test]
 fn google_calendar_credentials_never_render() {
     let secret = Redacted::new(SENTINEL.to_string());
     assert!(!format!("{secret:?}").contains(SENTINEL));

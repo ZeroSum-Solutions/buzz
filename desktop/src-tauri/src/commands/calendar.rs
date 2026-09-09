@@ -204,7 +204,10 @@ fn refresh(
     let outcome: Result<Binding, calendar::provider::TokenFailure> = (|| {
         if let Some(scopes) = &tokens.scope {
             for required in oauth::SCOPES {
-                if !scopes.split_whitespace().any(|s| s == *required) {
+                if !scopes
+                    .split_whitespace()
+                    .any(|s| oauth::scope_satisfies(s, required))
+                {
                     return Err(calendar::provider::TokenFailure {
                         state: calendar::failure::FailureState::Terminal(
                             calendar::failure::TerminalReason::ScopeWithdrawn,
