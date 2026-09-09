@@ -56,6 +56,7 @@ const settingsNavGroups: Array<{
     label: "Personal",
     sections: [
       "profile",
+      "calendar",
       "appearance",
       "notifications",
       "voice",

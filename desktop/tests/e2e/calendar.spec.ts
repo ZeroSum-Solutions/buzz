@@ -254,3 +254,18 @@ test("unconfirmed cleanup needs explicit action before reconnect", async ({
     }),
   ).not.toBeVisible();
 });
+
+test("calendar connection is reachable through personal settings navigation", async ({
+  page,
+}) => {
+  await installCalendar(page, { connected: false });
+  await page.getByRole("link", { name: "Calendar settings" }).click();
+  const personal = page.getByLabel("Personal settings sections", {
+    exact: true,
+  });
+  await personal.getByRole("button", { name: "Profile", exact: true }).click();
+  await personal.getByRole("button", { name: "Calendar", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "Connect Google Calendar", exact: true }),
+  ).toBeVisible();
+});
