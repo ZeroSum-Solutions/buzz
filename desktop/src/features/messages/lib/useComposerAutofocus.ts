@@ -10,6 +10,8 @@ import * as React from "react";
  * once that happens — so listing it as a dep recovers from the
  * editor-not-ready-yet case on first render. It must focus synchronously;
  * this hook owns the frame scheduling and rechecks ownership at execution.
+ * Return true only when focus succeeds, so initial navigation intent survives
+ * callbacks made before the editor is ready.
  *
  * The effect trigger deliberately excludes `disabled`: callers pass a
  * disabled flag that includes transient state like `isSending`, which would
@@ -26,7 +28,7 @@ import * as React from "react";
  *    may transfer focus from its navigation button to the composer.
  */
 export function useComposerAutofocus(
-  focus: () => void,
+  focus: () => boolean,
   draftKey: string | null | undefined,
   disabled: boolean,
 ) {
@@ -36,19 +38,26 @@ export function useComposerAutofocus(
   disabledRef.current = disabled;
 
   const previousDraftKey = React.useRef(draftKey);
+  const mounted = React.useRef(false);
+  const navigationIntent = React.useRef<Element | null>(null);
 
   React.useEffect(() => {
-    const navigated = previousDraftKey.current !== draftKey;
+    if (typeof document === "undefined") return;
+    if (!mounted.current || previousDraftKey.current !== draftKey) {
+      // Preserve the original navigation control while the editor mounts.
+      // Readiness callbacks must not reinterpret a later selection as intent.
+      navigationIntent.current = document.activeElement;
+    }
+    mounted.current = true;
     previousDraftKey.current = draftKey;
     if (disabledRef.current) return;
-    if (typeof document === "undefined") return;
-    const scheduledActive = document.activeElement;
     const frame = requestAnimationFrame(() => {
       if (disabledRef.current) return;
       const active = document.activeElement as HTMLElement | null;
+      if (active !== navigationIntent.current) navigationIntent.current = null;
       if (active && active !== document.body) {
         const tag = active.tagName;
-        const navigationHandoff = navigated && active === scheduledActive;
+        const navigationHandoff = active === navigationIntent.current;
         if (
           tag === "INPUT" ||
           tag === "TEXTAREA" ||
@@ -66,7 +75,7 @@ export function useComposerAutofocus(
       }
       // The callback must focus synchronously: a second deferred focus would
       // escape this ownership check and could dismiss a newly opened overlay.
-      focus();
+      if (focus()) navigationIntent.current = null;
     });
     return () => cancelAnimationFrame(frame);
   }, [draftKey, focus]);

@@ -52,7 +52,9 @@ async function harness() {
   function Harness({ ready, draftKey = "channel-a", disabled = false }) {
     const ref = React.useRef(null);
     const focus = React.useCallback(() => {
-      if (ready) ref.current?.focus();
+      if (!ready) return false;
+      ref.current?.focus();
+      return true;
     }, [ready]);
     useComposerAutofocus(focus, draftKey, disabled);
     return React.createElement(
@@ -212,4 +214,36 @@ test("navigation preserves the focused action in an alert dialog", async () => {
   await h.act(async () => action.focus());
   h.update({ ready: true, draftKey: "channel-b" });
   assert.ok(document.activeElement === action);
+});
+
+test("initial mount retains channel navigation intent through editor readiness", async () => {
+  const navigation = document.createElement("button");
+  document.body.append(navigation);
+  navigation.focus();
+  try {
+    const h = await harness();
+    h.update({ ready: true });
+    assert.ok(
+      document.activeElement === h.getByRole("textbox"),
+      "new composer must receive navigation focus",
+    );
+  } finally {
+    navigation.remove();
+  }
+});
+
+test("initial mount cannot take focus from an already open voice control", async () => {
+  const overlay = document.createElement("div");
+  overlay.setAttribute("data-slot", "popover-content");
+  const control = document.createElement("button");
+  overlay.append(control);
+  document.body.append(overlay);
+  control.focus();
+  try {
+    const h = await harness();
+    h.update({ ready: true });
+    assert.ok(document.activeElement === control);
+  } finally {
+    overlay.remove();
+  }
 });

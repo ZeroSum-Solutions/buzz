@@ -679,11 +679,12 @@ export function useRichTextEditor({
   // before calling this. Tiptap's focus command queues another frame, which
   // could otherwise steal focus from a control opened in between.
   const focusForAutofocus = React.useCallback(() => {
-    if (!editor || editor.isDestroyed) return;
+    if (!editor || editor.isDestroyed) return false;
     const tr = editor.state.tr;
     tr.setSelection(TextSelection.atEnd(tr.doc)).scrollIntoView();
     editor.view.dispatch(tr);
     editor.view.focus();
+    return true;
   }, [editor]);
 
   const focusEnd = React.useCallback(() => {
