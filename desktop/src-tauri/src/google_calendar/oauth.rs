@@ -290,6 +290,14 @@ impl std::fmt::Display for ExchangeError {
 
 impl std::error::Error for ExchangeError {}
 
+/// Whether a granted scope satisfies a requested Google permission.
+/// Google may return its canonical userinfo URL for the OIDC `email` alias.
+/// All other permissions require an exact match.
+pub fn scope_satisfies(granted: &str, required: &str) -> bool {
+    granted == required
+        || (required == "email" && granted == "https://www.googleapis.com/auth/userinfo.email")
+}
+
 /// Check that an exchange carried everything a binding needs.
 ///
 /// # Errors
@@ -307,7 +315,10 @@ pub fn check_exchange(
         return Err(ExchangeError::NoIdToken);
     }
     for scope in SCOPES {
-        if !granted_scopes.iter().any(|granted| granted == scope) {
+        if !granted_scopes
+            .iter()
+            .any(|granted| scope_satisfies(granted, scope))
+        {
             return Err(ExchangeError::ScopeMissing((*scope).to_string()));
         }
     }
