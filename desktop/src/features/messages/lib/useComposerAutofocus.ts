@@ -8,7 +8,10 @@ import * as React from "react";
  * accept typing without an explicit click. The `focus` callback is expected
  * to no-op until the underlying editor is mounted, and to change identity
  * once that happens — so listing it as a dep recovers from the
- * editor-not-ready-yet case on first render.
+ * editor-not-ready-yet case on first render. It must focus synchronously;
+ * this hook owns the frame scheduling and rechecks ownership at execution.
+ * Return true only when focus succeeds, so initial navigation intent survives
+ * callbacks made before the editor is ready.
  *
  * The effect trigger deliberately excludes `disabled`: callers pass a
  * disabled flag that includes transient state like `isSending`, which would
@@ -20,11 +23,12 @@ import * as React from "react";
  * Guards:
  *  - Skip if the composer is currently disabled (archived channel, no
  *    channel, or in-flight send at the moment of mount).
- *  - Skip if focus already lives in another text-entry surface (open
- *    dialog input, search box, etc.) so we don't yank focus from the user.
+ *  - Preserve text-entry and open-overlay focus. Editor readiness must also
+ *    preserve a selected interactive control; a real draft-key navigation
+ *    may transfer focus from its navigation button to the composer.
  */
 export function useComposerAutofocus(
-  focus: () => void,
+  focus: () => boolean,
   draftKey: string | null | undefined,
   disabled: boolean,
 ) {
@@ -33,22 +37,46 @@ export function useComposerAutofocus(
   const disabledRef = React.useRef(disabled);
   disabledRef.current = disabled;
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: draftKey is the trigger; disabled is read via ref
+  const previousDraftKey = React.useRef(draftKey);
+  const mounted = React.useRef(false);
+  const navigationIntent = React.useRef<Element | null>(null);
+
   React.useEffect(() => {
-    if (disabledRef.current) return;
     if (typeof document === "undefined") return;
-    const active = document.activeElement as HTMLElement | null;
-    if (active && active !== document.body) {
-      const tag = active.tagName;
-      if (
-        tag === "INPUT" ||
-        tag === "TEXTAREA" ||
-        tag === "SELECT" ||
-        active.isContentEditable
-      ) {
-        return;
-      }
+    if (!mounted.current || previousDraftKey.current !== draftKey) {
+      // Preserve the original navigation control while the editor mounts.
+      // Readiness callbacks must not reinterpret a later selection as intent.
+      navigationIntent.current = document.activeElement;
     }
-    focus();
+    mounted.current = true;
+    previousDraftKey.current = draftKey;
+    if (disabledRef.current) return;
+    const frame = requestAnimationFrame(() => {
+      if (disabledRef.current) return;
+      const active = document.activeElement as HTMLElement | null;
+      if (active !== navigationIntent.current) navigationIntent.current = null;
+      if (active && active !== document.body) {
+        const tag = active.tagName;
+        const navigationHandoff = active === navigationIntent.current;
+        if (
+          tag === "INPUT" ||
+          tag === "TEXTAREA" ||
+          tag === "SELECT" ||
+          active.isContentEditable ||
+          active.closest(
+            '[data-slot="popover-content"], [role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]',
+          ) ||
+          (!navigationHandoff &&
+            active.matches(
+              'button, a[href], [tabindex], [role="button"], [role="switch"]',
+            ))
+        )
+          return;
+      }
+      // The callback must focus synchronously: a second deferred focus would
+      // escape this ownership check and could dismiss a newly opened overlay.
+      if (focus()) navigationIntent.current = null;
+    });
+    return () => cancelAnimationFrame(frame);
   }, [draftKey, focus]);
 }
