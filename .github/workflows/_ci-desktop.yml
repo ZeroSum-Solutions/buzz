@@ -25,7 +25,7 @@ jobs:
     name: Desktop Core
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 45
-    if: github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust
+    if: github.event_name != 'merge_group' && (github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust)
     permissions:
       contents: read
     steps:
@@ -132,7 +132,7 @@ jobs:
     name: Desktop Compiled Flags
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 45
-    if: github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust
+    if: github.event_name != 'merge_group' && (github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust)
     permissions:
       contents: read
     steps:
@@ -298,11 +298,11 @@ jobs:
     steps:
       - name: Check desktop jobs
         run: |
-          if [ "${{ needs.desktop-core.result }}" != "success" ]; then
+          if [ "${{ needs.desktop-core.result }}" != "success" ] && ! { [ "${{ github.event_name }}" = "merge_group" ] && [ "${{ needs.desktop-core.result }}" = "skipped" ]; }; then
             echo "Desktop Core finished with: ${{ needs.desktop-core.result }}"
             exit 1
           fi
-          if [ "${{ needs.desktop-compiled-flags.result }}" != "success" ]; then
+          if [ "${{ needs.desktop-compiled-flags.result }}" != "success" ] && ! { [ "${{ github.event_name }}" = "merge_group" ] && [ "${{ needs.desktop-compiled-flags.result }}" = "skipped" ]; }; then
             echo "Desktop Compiled Flags finished with: ${{ needs.desktop-compiled-flags.result }}"
             exit 1
           fi
@@ -318,7 +318,7 @@ jobs:
               exit 1
             fi
           fi
-          if [ "${{ needs.desktop-windows-build.result }}" != "success" ]; then
+          if [ "${{ needs.desktop-windows-build.result }}" != "success" ] && ! { [ "${{ github.event_name }}" = "merge_group" ] && [ "${{ needs.desktop-windows-build.result }}" = "skipped" ]; }; then
             echo "Desktop Windows Build finished with: ${{ needs.desktop-windows-build.result }}"
             exit 1
           fi
@@ -328,7 +328,7 @@ jobs:
     name: Desktop Windows Build
     runs-on: blacksmith-8vcpu-windows-2025
     timeout-minutes: 20
-    if: github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust
+    if: github.event_name != 'merge_group' && (github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust)
     permissions:
       contents: read
     steps:

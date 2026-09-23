@@ -137,7 +137,7 @@ jobs:
     name: PostgreSQL Tests
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
-    if: inputs.lane == 'postgres' && (github.event_name == 'push' || inputs.rust)
+    if: github.event_name != 'merge_group' && (inputs.lane == 'postgres' && (github.event_name == 'push' || inputs.rust))
     permissions:
       contents: read
     services:
