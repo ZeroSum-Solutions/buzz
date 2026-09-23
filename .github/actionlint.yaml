@@ -1,0 +1,10 @@
+# Blacksmith runner labels used by this repo (GitHub app blacksmith-sh on the org).
+# GitHub-hosted runners are blocked on ZeroSum-Solutions by billing (2026-09-20+).
+self-hosted-runner:
+  labels:
+    - blacksmith-2vcpu-ubuntu-2404
+    - blacksmith-4vcpu-ubuntu-2404
+    - blacksmith-4vcpu-ubuntu-2404-arm
+    - blacksmith-8vcpu-ubuntu-2404
+    - blacksmith-6vcpu-macos-latest
+    - blacksmith-8vcpu-windows-2025

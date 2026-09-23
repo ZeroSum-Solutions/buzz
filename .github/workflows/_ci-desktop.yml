@@ -326,7 +326,7 @@ jobs:
 
   desktop-windows-build:
     name: Desktop Windows Build
-    runs-on: windows-latest
+    runs-on: blacksmith-8vcpu-windows-2025
     timeout-minutes: 20
     if: github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust
     permissions:
