@@ -29,7 +29,7 @@ jobs:
     name: Rust Lint
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
-    if: inputs.lane == 'required' && (github.event_name == 'push' || inputs.rust || inputs.desktop_rust)
+    if: github.event_name != 'merge_group' && (inputs.lane == 'required' && (github.event_name == 'push' || inputs.rust || inputs.desktop_rust))
     permissions:
       contents: read
     steps:
@@ -51,7 +51,7 @@ jobs:
     name: Unit Tests
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
-    if: inputs.lane == 'required' && (github.event_name == 'push' || inputs.rust)
+    if: github.event_name != 'merge_group' && (inputs.lane == 'required' && (github.event_name == 'push' || inputs.rust))
     permissions:
       contents: read
     steps:
@@ -75,7 +75,7 @@ jobs:
     name: Server Cross-Compile
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
-    if: inputs.lane == 'cross-compile' && (github.event_name == 'push' || inputs.rust)
+    if: github.event_name != 'merge_group' && (inputs.lane == 'cross-compile' && (github.event_name == 'push' || inputs.rust))
     permissions:
       contents: read
     strategy:
@@ -117,7 +117,7 @@ jobs:
     # Windows runners are slow and this compiles the workspace + Tauri crate
     # cold across four steps; budget generously.
     timeout-minutes: 45
-    if: inputs.lane == 'required' && (github.event_name == 'push' || inputs.rust || inputs.desktop_rust)
+    if: github.event_name != 'merge_group' && (inputs.lane == 'required' && (github.event_name == 'push' || inputs.rust || inputs.desktop_rust))
     permissions:
       contents: read
     env:
