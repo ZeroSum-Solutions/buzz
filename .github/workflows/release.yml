@@ -52,7 +52,7 @@ jobs:
   release:
     name: Release
     if: github.repository == 'block/buzz'
-    runs-on: macos-latest
+    runs-on: blacksmith-6vcpu-macos-latest
     needs: setup
     timeout-minutes: 60
     permissions:
@@ -265,7 +265,7 @@ jobs:
   release-macos-x64:
     name: Release macOS (Intel)
     if: github.repository == 'block/buzz'
-    runs-on: macos-latest
+    runs-on: blacksmith-6vcpu-macos-latest
     needs: setup
     timeout-minutes: 60
     permissions:
@@ -654,7 +654,7 @@ jobs:
 
   release-windows:
     name: Release Windows
-    runs-on: windows-latest
+    runs-on: blacksmith-8vcpu-windows-2025
     needs: setup
     timeout-minutes: 60
     permissions:

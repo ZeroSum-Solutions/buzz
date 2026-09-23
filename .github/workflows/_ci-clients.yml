@@ -121,7 +121,7 @@ jobs:
 
   mobile-swift:
     name: Mobile Swift
-    runs-on: macos-latest
+    runs-on: blacksmith-6vcpu-macos-latest
     timeout-minutes: 30
     if: inputs.lane == 'mobile-swift' && inputs.mobile
     steps:
