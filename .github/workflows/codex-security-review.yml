@@ -32,7 +32,7 @@ jobs:
           contains(fromJSON('["MEMBER", "OWNER"]'), github.event.comment.author_association)
         )
       )
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 5
     permissions:
       contents: read
@@ -67,7 +67,7 @@ jobs:
         github.event_name == 'push' ||
         github.event_name == 'repository_dispatch'
       )
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 5
     concurrency:
       group: codex-security-review-base-reconciliation-${{ github.event.client_payload.main_sha || github.sha }}
@@ -100,7 +100,7 @@ jobs:
   reconcile-base-reviews:
     name: Reconcile Review for PR ${{ matrix.pr_number }}
     needs: prepare-base-reconciliation
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 5
     strategy:
       fail-fast: false
@@ -148,7 +148,7 @@ jobs:
       always() &&
       needs.prepare-base-reconciliation.result == 'success' &&
       needs.prepare-base-reconciliation.outputs.should_continue == 'true'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
     permissions:
       contents: write
@@ -185,7 +185,7 @@ jobs:
     if: >-
       github.repository == 'block/buzz' &&
       github.event_name == 'pull_request_target'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 5
     concurrency:
       group: codex-security-review-post-${{ github.event.pull_request.number }}
@@ -212,7 +212,7 @@ jobs:
     name: Run Codex Security Review
     needs: prepare-review
     if: needs.prepare-review.outputs.authorized == 'true'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     environment: codex-review
     timeout-minutes: 40
     concurrency:
@@ -499,7 +499,7 @@ jobs:
     name: Post Codex Security Review
     needs: [prepare-review, security-review]
     if: ${{ needs.prepare-review.result == 'success' && needs.security-review.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
     concurrency:
       group: codex-security-review-post-${{ needs.prepare-review.outputs.pr_number }}
