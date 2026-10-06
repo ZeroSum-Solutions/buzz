@@ -25,7 +25,7 @@ env:
 jobs:
   web:
     name: Web
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     if: github.event_name != 'merge_group' && (inputs.lane == 'required' && (github.event_name == 'push' || inputs.web))
     permissions:
@@ -61,7 +61,7 @@ jobs:
 
   mobile:
     name: Mobile
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     if: github.event_name != 'merge_group' && (inputs.lane == 'required' && (github.event_name == 'push' || inputs.mobile))
     permissions:
@@ -121,7 +121,7 @@ jobs:
 
   mobile-swift:
     name: Mobile Swift
-    runs-on: blacksmith-6vcpu-macos-latest
+    runs-on: macos-latest
     timeout-minutes: 30
     if: github.event_name != 'merge_group' && (inputs.lane == 'mobile-swift' && inputs.mobile)
     steps:
@@ -144,7 +144,7 @@ jobs:
     name: Results
     if: ${{ always() }}
     needs: [web, mobile, mobile-swift]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}
     outputs:
