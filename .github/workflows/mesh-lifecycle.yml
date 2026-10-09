@@ -46,7 +46,7 @@ env:
 jobs:
   lifecycle-smoke:
     name: Relay-Driven Mesh Lifecycle Smoke
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
       contents: read

@@ -34,7 +34,7 @@ env:
 jobs:
   desktop-e2e-relay:
     name: Desktop E2E Relay
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 75  # zs fork: cold relay build with no cache exceeds 30 min
     if: inputs.lane == 'artifacts' && (github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust)
     permissions:
@@ -135,7 +135,7 @@ jobs:
 
   postgres-tests:
     name: PostgreSQL Tests
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     if: github.event_name != 'merge_group' && (inputs.lane == 'postgres' && (github.event_name == 'push' || inputs.rust))
     permissions:
@@ -212,7 +212,7 @@ jobs:
 
   desktop-e2e-integration-shard:
     name: Desktop E2E Integration (${{ matrix.shard }}/4)
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     if: inputs.lane == 'required' && github.event_name != 'pull_request' && (github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust)
     strategy:
@@ -264,7 +264,7 @@ jobs:
         run: cd desktop && pnpm exec playwright install chromium
       - name: Install Playwright system dependencies
         # zs fork: install-deps runs apt against Ubuntu mirrors that drop out
-        # from the Blacksmith network for minutes at a time; retry with a pause.
+        # from CI runners for minutes at a time; retry with a pause.
         run: |
           cd desktop
           for attempt in 1 2 3 4 5; do
@@ -404,7 +404,7 @@ jobs:
 
   desktop-e2e-integration:
     name: Desktop E2E Integration
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     needs: [desktop-e2e-integration-shard]
     if: always() && inputs.lane == 'required' && (github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust)
@@ -429,7 +429,7 @@ jobs:
 
   backend-integration:
     name: Backend Integration (relay e2e)
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     if: inputs.lane == 'required' && github.event_name != 'pull_request' && (github.event_name == 'push' || inputs.rust)
     permissions:
@@ -572,7 +572,7 @@ jobs:
 
   relay-e2e:
     name: Relay E2E
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     if: inputs.lane == 'required' && github.event_name != 'pull_request' && (github.event_name == 'push' || inputs.rust)
     permissions:
@@ -630,7 +630,7 @@ jobs:
     name: Results
     if: ${{ always() }}
     needs: [desktop-e2e-relay, postgres-tests, desktop-e2e-integration, backend-integration, relay-e2e]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}
     outputs:

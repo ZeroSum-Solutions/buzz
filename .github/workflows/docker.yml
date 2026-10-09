@@ -97,10 +97,10 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: blacksmith-4vcpu-ubuntu-2404
+            runner: ubuntu-latest
             arch: amd64
           - platform: linux/arm64
-            runner: blacksmith-4vcpu-ubuntu-2404-arm
+            runner: ubuntu-24.04-arm
             arch: arm64
 
     steps:
@@ -237,7 +237,7 @@ jobs:
   qualify:
     name: Qualify relay image source
     if: github.event_name != 'pull_request'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 70
     permissions:
       actions: read
@@ -312,7 +312,7 @@ jobs:
   merge:
     name: Merge ${{ matrix.variant }} multi-arch manifest
     if: github.event_name != 'pull_request'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     needs: [build, qualify]
     timeout-minutes: 15
     permissions:
@@ -504,10 +504,10 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: blacksmith-4vcpu-ubuntu-2404
+            runner: ubuntu-latest
             arch: amd64
           - platform: linux/arm64
-            runner: blacksmith-4vcpu-ubuntu-2404-arm
+            runner: ubuntu-24.04-arm
             arch: arm64
     steps:
       - name: Checkout
@@ -572,7 +572,7 @@ jobs:
   push-gateway-merge:
     name: Publish public push gateway image
     if: github.event_name != 'pull_request'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     needs: push-gateway-build
     timeout-minutes: 15
     permissions:
