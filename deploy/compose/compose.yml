@@ -84,9 +84,22 @@ services:
     networks:
       - buzz-net
 
+  # The Chainguard MinIO image runs as uid 65532; volumes written by the old
+  # root-run minio/minio image are root-owned. Hand them over once before start.
+  minio-perms:
+    image: cgr.dev/chainguard/minio:latest-dev@sha256:1f74aba71eff94011dbcb62947354f19d6e6efda5facd023fa3f4560d2a088d4
+    user: "0:0"
+    entrypoint: ["chown", "-R", "65532:65532", "/data"]
+    volumes:
+      - buzz-minio-data:/data
+    restart: "no"
+
   minio:
     image: cgr.dev/chainguard/minio:latest-dev@sha256:1f74aba71eff94011dbcb62947354f19d6e6efda5facd023fa3f4560d2a088d4  # minio/minio left Docker Hub; -dev adds sh and wget
     command: server /data --console-address ":9001"
+    depends_on:
+      minio-perms:
+        condition: service_completed_successfully
     environment:
       MINIO_ROOT_USER: ${BUZZ_S3_ACCESS_KEY:?set BUZZ_S3_ACCESS_KEY}
       MINIO_ROOT_PASSWORD: ${BUZZ_S3_SECRET_KEY:?set BUZZ_S3_SECRET_KEY}
