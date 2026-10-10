@@ -23,7 +23,7 @@ env:
 jobs:
   desktop-core:
     name: Desktop Core
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     if: github.event_name != 'merge_group' && (github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust)
     permissions:
@@ -45,7 +45,7 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          # zs fork: the Ubuntu mirrors drop out from the Blacksmith network for
+          # zs fork: the Ubuntu mirrors drop out from CI runners for
           # minutes at a time, longer than apt's own three retries cover, and
           # each dropout ejects a merge-queue entry. Re-run the whole
           # update+install up to five times with a pause between attempts.
@@ -130,7 +130,7 @@ jobs:
     # Desktop Core's 28 minutes, the longest job in every merge-queue run. It
     # shares nothing with the other steps, so it runs beside them.
     name: Desktop Compiled Flags
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     if: github.event_name != 'merge_group' && (github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust)
     permissions:
@@ -152,7 +152,7 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          # zs fork: the Ubuntu mirrors drop out from the Blacksmith network for
+          # zs fork: the Ubuntu mirrors drop out from CI runners for
           # minutes at a time, longer than apt's own three retries cover, and
           # each dropout ejects a merge-queue entry. Re-run the whole
           # update+install up to five times with a pause between attempts.
@@ -207,7 +207,7 @@ jobs:
 
   desktop-smoke-e2e:
     name: Desktop Smoke E2E (${{ matrix.shard }})
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     if: github.event_name != 'pull_request' && (github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust)
     strategy:
@@ -247,7 +247,7 @@ jobs:
         run: cd desktop && pnpm exec playwright install chromium
       - name: Install Playwright system dependencies
         # zs fork: install-deps runs apt against Ubuntu mirrors that drop out
-        # from the Blacksmith network for minutes at a time; retry with a pause.
+        # from CI runners for minutes at a time; retry with a pause.
         run: |
           cd desktop
           for attempt in 1 2 3 4 5; do
@@ -289,7 +289,7 @@ jobs:
 
   desktop:
     name: Desktop
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     needs: [desktop-core, desktop-compiled-flags, desktop-smoke-e2e, desktop-windows-build]
     if: always() && (github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust)
@@ -326,7 +326,7 @@ jobs:
 
   desktop-windows-build:
     name: Desktop Windows Build
-    runs-on: blacksmith-8vcpu-windows-2025
+    runs-on: windows-latest
     timeout-minutes: 20
     if: github.event_name != 'merge_group' && (github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust)
     permissions:
@@ -357,7 +357,7 @@ jobs:
     name: Results
     if: ${{ always() }}
     needs: [desktop]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}
     outputs:
