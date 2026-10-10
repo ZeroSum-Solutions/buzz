@@ -28,6 +28,8 @@ spec:
         {{- include "buzz.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: minio
     spec:
+      securityContext:
+        fsGroup: 65532  # the Chainguard MinIO image runs as nonroot (uid 65532)
       containers:
         - name: minio
           image: {{ .Values.minio.image | quote }}
