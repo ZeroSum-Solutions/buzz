@@ -88,3 +88,50 @@ tests:
           path: spec.selector["app.kubernetes.io/component"]
           value: relay
         template: templates/service.yaml
+
+  # The Chainguard image runs as uid 65532; volumes from the old root-run
+  # minio/minio image need a root ownership hand-over, which some storage
+  # (NFS root_squash) and namespaces (PSA restricted) refuse.
+  - it: hands a root-owned MinIO volume to uid 65532 by default
+    release:
+      name: rel
+    set:
+      relayUrl: wss://buzz.example.com
+      ownerPubkey: "0000000000000000000000000000000000000000000000000000000000000000"
+      postgresql.enabled: true
+      redis.enabled: true
+      minio.enabled: true
+    template: templates/quickstart-minio.yaml
+    documentIndex: 0
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext
+          value: { fsGroup: 65532, fsGroupChangePolicy: OnRootMismatch }
+      - equal:
+          path: spec.template.spec.initContainers[0].name
+          value: data-ownership
+      - equal:
+          path: spec.template.spec.initContainers[0].securityContext.runAsUser
+          value: 0
+      - matchRegex:
+          path: spec.template.spec.initContainers[0].command[2]
+          pattern: "chown -R 65532:65532 /data"
+
+  - it: drops the root init container when minio.fixDataOwnership=false
+    release:
+      name: rel
+    set:
+      relayUrl: wss://buzz.example.com
+      ownerPubkey: "0000000000000000000000000000000000000000000000000000000000000000"
+      postgresql.enabled: true
+      redis.enabled: true
+      minio.enabled: true
+      minio.fixDataOwnership: false
+      minio.podSecurityContext: null
+    template: templates/quickstart-minio.yaml
+    documentIndex: 0
+    asserts:
+      - notExists:
+          path: spec.template.spec.initContainers
+      - notExists:
+          path: spec.template.spec.securityContext
