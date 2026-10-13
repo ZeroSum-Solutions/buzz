@@ -6,6 +6,9 @@ ignore = [
     # paste 1.0.15 — unmaintained. Transitive dep: mesh-llm → iroh → netlink-* → paste.
     # No safe upgrade available; tracked for upstream (iroh/netlink) replacement.
     { id = "RUSTSEC-2024-0436", reason = "transitive dep via mesh-llm → iroh → netlink; no upstream fix available" },
+    # unsafe-libyaml 0.2.11 — unmaintained. Transitive dep: serde_yaml 0.9 (deprecated) → unsafe-libyaml.
+    # Tracked for a serde_yaml replacement (e.g. serde_yml / yaml-rust2) in buzz-agent and buzz-persona.
+    { id = "RUSTSEC-2024-0449", reason = "transitive dep via deprecated serde_yaml 0.9; replacement tracked" },
     # quick-xml < 0.41: quadratic runtime on duplicate-attribute check (0194) and
     # unbounded namespace-declaration allocation in NsReader (0195). Both DoS-class,
     # requiring attacker-controlled XML. Our two locked versions only parse trusted

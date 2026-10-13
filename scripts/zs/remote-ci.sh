@@ -5,8 +5,9 @@
 #
 # Starts the stopped EC2 instance provisioned by scripts/zs/remote-ci/provision.sh,
 # checks the branch out on it, refreshes its dependencies, runs `just <targets>`
-# (default: `ci`), streams the log to this terminal and to ~/Inbox/notes/, copies
-# desktop/playwright-report back to ~/Inbox/misc/, then stops the instance again.
+# (default: `ci`), streams the log to this terminal and to ~/Inbox/notes/buzz/<YYYY-MM>/,
+# copies desktop/playwright-report back to ~/Inbox/misc/buzz/<YYYY-MM>/, then stops the
+# instance again (both paths come from ~/bin/inbox-path).
 # The exit code is the gate's own.
 #
 # ── one box, one owner ───────────────────────────────────────────────────────
@@ -28,8 +29,10 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BOX_ENV="${REMOTE_CI_BOX_ENV:-${SCRIPT_DIR}/remote-ci/box.env}"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-INBOX_NOTES="${REMOTE_CI_NOTES_DIR:-$HOME/Inbox/notes}"
-INBOX_MISC="${REMOTE_CI_MISC_DIR:-$HOME/Inbox/misc}"
+# Unset means "allocate with ~/bin/inbox-path" (Inbox layout); set means "use that directory".
+INBOX_NOTES="${REMOTE_CI_NOTES_DIR:-}"
+INBOX_MISC="${REMOTE_CI_MISC_DIR:-}"
+INBOX_PATH="${INBOX_PATH:-$HOME/bin/inbox-path}"
 LEASE_FILE="${REMOTE_CI_LEASE:-${XDG_CACHE_HOME:-$HOME/.cache}/zs/buzz-remote-ci.lock}"
 LEASE_HOLDER="${LEASE_FILE}.holder"
 REMOTE_REPO=/home/ci/buzz
@@ -99,8 +102,10 @@ Environment:
                          the box's own 90-minute uptime limit).
   REMOTE_CI_LOG_CAP      Maximum local log bytes, tail kept (default 200 MB).
   REMOTE_CI_REPORT_CAP_KB  Largest report tree copied back (default 500 MB).
-  REMOTE_CI_NOTES_DIR    Log directory (default ~/Inbox/notes).
-  REMOTE_CI_MISC_DIR     Report directory (default ~/Inbox/misc).
+  REMOTE_CI_NOTES_DIR    Log directory (default: ~/bin/inbox-path buzz notes, that is
+                         ~/Inbox/notes/buzz/<YYYY-MM>/).
+  REMOTE_CI_MISC_DIR     Report directory (default: ~/bin/inbox-path buzz misc --bundle,
+                         that is ~/Inbox/misc/buzz/<YYYY-MM>/).
 
 box.env is written by scripts/zs/remote-ci/provision.sh and holds
 BUZZ_CI_INSTANCE_ID, BUZZ_CI_REGION, BUZZ_CI_KEY_PATH and BUZZ_CI_SSH_USER.
@@ -349,9 +354,32 @@ fi
 
 SAFE_BRANCH="$(printf '%s' "$BRANCH" | tr '/ ' '--')"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
-LOG_FILE="${INBOX_NOTES}/remote-ci-${SAFE_BRANCH}-${TS}.log"
-REPORT_DIR="${INBOX_MISC}/remote-ci-report-${SAFE_BRANCH}-${TS}"
-mkdir -p "$INBOX_NOTES" "$INBOX_MISC"
+# Allocate an Inbox path for buzz: inbox_alloc <type> <subject> <ext|bundle>. If the
+# helper fails, fall back to a valid _unassigned path in the same layout.
+inbox_alloc() {
+  local type="$1" subject="$2" kind="$3" out base
+  if [ "$kind" = bundle ]; then
+    out="$("$INBOX_PATH" buzz "$type" "$subject" --bundle 2>/dev/null)"
+  else
+    out="$("$INBOX_PATH" buzz "$type" "$subject" --ext "$kind" 2>/dev/null)"
+  fi
+  if [ -z "$out" ]; then
+    base="$HOME/Inbox/${type}/_unassigned/$(date +%Y-%m)/$(date +%F)-_unassigned-${subject}"
+    if [ "$kind" = bundle ]; then
+      out="$base"; mkdir -p "$out"
+    else
+      out="${base}.${kind}"; mkdir -p "$(dirname "$out")"
+    fi
+  fi
+  printf '%s\n' "$out"
+}
+if [ -n "$INBOX_NOTES" ]; then
+  mkdir -p "$INBOX_NOTES"
+  LOG_FILE="${INBOX_NOTES}/remote-ci-${SAFE_BRANCH}-${TS}.log"
+else
+  LOG_FILE="$(inbox_alloc notes "remote-ci-${SAFE_BRANCH}-${TS}" log)"
+fi
+REPORT_DIR=""
 
 WORKDIR="$(mktemp -d)" || die "mktemp failed"
 [ -d "$WORKDIR" ] || die "mktemp produced no directory"
@@ -569,7 +597,14 @@ case "$report_state" in
     :
     ;;
   present)
-    mkdir -p "$REPORT_DIR"
+    # The report directory is allocated only now, so a run without a report leaves
+    # no empty folder behind.
+    if [ -n "$INBOX_MISC" ]; then
+      REPORT_DIR="${INBOX_MISC}/remote-ci-report-${SAFE_BRANCH}-${TS}"
+      mkdir -p "$REPORT_DIR"
+    else
+      REPORT_DIR="$(inbox_alloc misc "remote-ci-report-${SAFE_BRANCH}-${TS}" bundle)"
+    fi
     # Bounded transfer, not a preflight size check: a gate that is still
     # writing could pass a `du` check and then overrun the cap during the copy.
     # tar streams a snapshot, `head -c` cuts it at the cap, and the whole thing
