@@ -28,19 +28,36 @@ spec:
         {{- include "buzz.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: minio
     spec:
+      {{- with .Values.minio.podSecurityContext }}
       securityContext:
-        fsGroup: 65532  # the Chainguard MinIO image runs as nonroot (uid 65532)
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.minio.fixDataOwnership }}
       initContainers:
         # Volumes written by the old root-run minio/minio image are root-owned,
-        # and fsGroup does not fix hostPath-backed PVCs. Hand them over once.
+        # and fsGroup does not fix hostPath-backed PVCs. Hand them over to the
+        # nonroot uid. The walk is skipped once nothing is left to change, so a
+        # reschedule costs one find; files that vanish mid-walk are tolerated
+        # and only ownership still wrong afterwards fails the pod.
         - name: data-ownership
           image: {{ .Values.minio.image | quote }}
-          command: ["chown", "-R", "65532:65532", "/data"]
+          command:
+            - /bin/sh
+            - -c
+            - |
+              stale() { find /data -xdev ! -user 65532 -print -quit 2>/dev/null; }
+              [ -z "$(stale)" ] && exit 0
+              chown -R 65532:65532 /data || true
+              left="$(stale)"
+              [ -z "$left" ] && exit 0
+              echo "data-ownership: $left is not owned by 65532 (set minio.fixDataOwnership=false if the storage rejects root chown)" >&2
+              exit 1
           securityContext:
             runAsUser: 0
             runAsNonRoot: false
           volumeMounts:
             - { name: data, mountPath: /data }
+      {{- end }}
       containers:
         - name: minio
           image: {{ .Values.minio.image | quote }}

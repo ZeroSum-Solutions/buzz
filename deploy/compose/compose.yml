@@ -85,13 +85,29 @@ services:
       - buzz-net
 
   # The Chainguard MinIO image runs as uid 65532; volumes written by the old
-  # root-run minio/minio image are root-owned. Hand them over once before start.
+  # root-run minio/minio image are root-owned. Hand them over before start.
+  # `up` reruns this while MinIO may be serving, so the walk is skipped once
+  # nothing is left to change, files that vanish mid-walk are tolerated, and
+  # only ownership still wrong afterwards fails the step.
   minio-perms:
     image: cgr.dev/chainguard/minio:latest-dev@sha256:1f74aba71eff94011dbcb62947354f19d6e6efda5facd023fa3f4560d2a088d4
     user: "0:0"
-    entrypoint: ["chown", "-R", "65532:65532", "/data"]
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        stale() { find /data -xdev ! -user 65532 -print -quit 2>/dev/null; }
+        [ -z "$$(stale)" ] && exit 0
+        chown -R 65532:65532 /data || true
+        left="$$(stale)"
+        [ -z "$$left" ] && exit 0
+        echo "minio-perms: $$left is not owned by 65532" >&2
+        exit 1
     volumes:
       - buzz-minio-data:/data
+    network_mode: none
+    labels:
+      com.buzz.role: minio-ownership-migration
     restart: "no"
 
   minio:

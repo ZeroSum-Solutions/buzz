@@ -47,6 +47,14 @@
       "allowedVersions": "<1.2.0"
     },
     {
+      "description": "MinIO runs from Chainguard's free latest-dev tags pinned by digest; superseded digests are not retained, so refresh them weekly. A digest bump can carry a new MinIO release with a one-way on-disk migration: never automerge. Digests carry no release timestamp, so the global timestamp-required release-age gate is lifted here.",
+      "matchPackageNames": ["cgr.dev/chainguard/**"],
+      "groupName": "chainguard minio images",
+      "schedule": ["before 6am on monday"],
+      "minimumReleaseAge": null,
+      "automerge": false
+    },
+    {
       "description": "tiptap 3.23.x breaks editor lifecycle under real relay latency — pin until upstream stabilizes.",
       "matchPackageNames": ["@tiptap/{/,}**"],
       "allowedVersions": "<3.23.0"
