@@ -96,10 +96,18 @@ services:
       - /bin/sh
       - -c
       - |
-        stale() { find /data -xdev ! -user 65532 -print -quit 2>/dev/null; }
-        [ -z "$$(stale)" ] && exit 0
+        # Vanished entries ("No such file") are expected while MinIO serves;
+        # any other find error means /data could not be checked.
+        scan() {
+          out="$$(find /data -xdev ! -user 65532 -print -quit 2>&1)"
+          bad="$$(printf '%s\n' "$$out" | grep '^find: ' | grep -v 'No such file or directory')"
+          [ -z "$$bad" ] || { echo "minio-perms: cannot scan /data: $$bad" >&2; exit 1; }
+          printf '%s\n' "$$out" | grep '^/' | head -n 1
+        }
+        first="$$(scan)" || exit 1
+        [ -z "$$first" ] && exit 0
         chown -R 65532:65532 /data || true
-        left="$$(stale)"
+        left="$$(scan)" || exit 1
         [ -z "$$left" ] && exit 0
         echo "minio-perms: $$left is not owned by 65532" >&2
         exit 1
