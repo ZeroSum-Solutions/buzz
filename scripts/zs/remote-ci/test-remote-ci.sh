@@ -719,6 +719,10 @@ check_contains "remote-ci copies the report through a bounded stream" "$REMOTE_C
   'head -c "$cap_bytes"'
 check_contains "remote-ci bounds the report transfer in time" "$REMOTE_CI" \
   "timeout 600 tar -C"
+check_contains "remote-ci allocates its default log path with inbox-path" "$REMOTE_CI" \
+  '--ext "$kind"'
+check_contains "remote-ci allocates its default report folder with inbox-path --bundle" "$REMOTE_CI" \
+  '"$subject" --bundle'
 check_contains "remote-ci tells a missing report from a failed probe" "$REMOTE_CI" \
   "could not tell whether a playwright report exists"
 check_contains "provision turns xtrace off before touching a credential" "$PROVISION" \
