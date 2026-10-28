@@ -55,7 +55,7 @@ spec:
               }
               first="$(scan)" || exit 1
               [ -z "$first" ] && exit 0
-              chown -R 65532:65532 /data || true
+              chown -Rh 65532:65532 /data || true
               left="$(scan)" || exit 1
               [ -z "$left" ] && exit 0
               echo "data-ownership: $left is not owned by 65532 (set minio.fixDataOwnership=false if the storage rejects root chown)" >&2

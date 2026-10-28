@@ -115,7 +115,7 @@ tests:
           value: 0
       - matchRegex:
           path: spec.template.spec.initContainers[0].command[2]
-          pattern: "chown -R 65532:65532 /data"
+          pattern: "chown -Rh 65532:65532 /data"
 
   - it: drops the root init container when minio.fixDataOwnership=false
     release:

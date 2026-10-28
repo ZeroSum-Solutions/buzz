@@ -89,6 +89,9 @@ services:
   # `up` reruns this while MinIO may be serving, so the walk is skipped once
   # nothing is left to change, files that vanish mid-walk are tolerated, and
   # only ownership still wrong afterwards fails the step.
+  # First move off the old root-run image: stop relay and minio BEFORE `up`
+  # (see README, "Moving off the Docker Hub MinIO image"), or the old container
+  # can write root-owned files after this step has finished.
   minio-perms:
     image: cgr.dev/chainguard/minio:latest-dev@sha256:1f74aba71eff94011dbcb62947354f19d6e6efda5facd023fa3f4560d2a088d4
     user: "0:0"
@@ -106,7 +109,7 @@ services:
         }
         first="$$(scan)" || exit 1
         [ -z "$$first" ] && exit 0
-        chown -R 65532:65532 /data || true
+        chown -Rh 65532:65532 /data || true
         left="$$(scan)" || exit 1
         [ -z "$$left" ] && exit 0
         echo "minio-perms: $$left is not owned by 65532" >&2
@@ -119,7 +122,9 @@ services:
     restart: "no"
 
   minio:
-    image: cgr.dev/chainguard/minio:latest-dev@sha256:1f74aba71eff94011dbcb62947354f19d6e6efda5facd023fa3f4560d2a088d4  # minio/minio left Docker Hub; -dev adds sh and wget
+    # minio/minio left Docker Hub; -dev adds sh and wget. This digest is minio
+    # RELEASE.2026-09-22T19-25-18Z (the old pin was RELEASE.2025-09-07T16-13-09Z).
+    image: cgr.dev/chainguard/minio:latest-dev@sha256:1f74aba71eff94011dbcb62947354f19d6e6efda5facd023fa3f4560d2a088d4
     command: server /data --console-address ":9001"
     depends_on:
       minio-perms:

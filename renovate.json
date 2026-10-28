@@ -10,6 +10,15 @@
   "recreateWhen": "always",
   "separateMinorPatch": true,
   "postUpdateOptions": ["cargo:updateLockfile"],
+  "customManagers": [
+    {
+      "description": "Renovate's helm-values manager only reads keys named image; minio.mcImage needs its own rule so its digest is refreshed with the minio image.",
+      "customType": "regex",
+      "managerFilePatterns": ["/^deploy/charts/buzz/values\\.yaml$/"],
+      "matchStrings": ["mcImage: (?<depName>[^:\\s]+):(?<currentValue>[^@\\s]+)@(?<currentDigest>sha256:[a-f0-9]{64})"],
+      "datasourceTemplate": "docker"
+    }
+  ],
   "packageRules": [
     {
       "description": "Major version bumps often require code changes — require human review.",

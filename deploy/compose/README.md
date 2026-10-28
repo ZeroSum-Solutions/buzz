@@ -46,6 +46,27 @@ keypair.
 
 Run `./run.sh backup-hint` for the backup checklist.
 
+### Moving off the Docker Hub MinIO image
+
+`minio/minio` and `minio/mc` are gone from Docker Hub. The stack now runs
+Chainguard's MinIO (uid 65532, a newer MinIO release, so the on-disk format may
+change one way). The `minio-perms` step hands an old root-owned `buzz-minio-data`
+volume to uid 65532, but it must not run while the old root-run container is
+still writing. Move over once, in this order:
+
+```bash
+cd deploy/compose
+docker compose stop relay minio          # quiesce writers first
+docker run --rm -v buzz-prod_buzz-minio-data:/data -v /var/backups:/backup alpine \
+  tar czf /backup/minio-data-$(date +%F).tgz -C /data .   # back up the volume
+./run.sh pull
+./run.sh start                           # runs minio-perms, then minio, then relay
+```
+
+Check the volume name with `docker volume ls | grep minio` (the project name is
+`buzz-prod`). To roll the data back, restore the archive into the volume; the old
+image is no longer pullable, so keep any local copy of it on the host.
+
 ## Validation
 
 Before sharing an install link publicly, verify a fresh install with:
