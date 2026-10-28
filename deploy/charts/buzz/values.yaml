@@ -367,8 +367,26 @@ s3:
 # this disabled and use s3.* (or secrets.existingSecret) against managed S3.
 minio:
   enabled: false                 # quickstart: set true for bundled in-cluster MinIO
-  image: minio/minio:RELEASE.2025-09-07T16-13-09Z
-  mcImage: minio/mc:RELEASE.2025-08-13T08-35-41Z
+  # minio/minio and minio/mc left Docker Hub and Quay. Chainguard's free images
+  # (latest tags only) are pinned by digest; -dev variants carry the /bin/sh the
+  # init job needs. They run as uid 65532 (see quickstart-minio fsGroup).
+  # These digests were minio RELEASE.2026-09-22T19-25-18Z (the old pin was
+  # RELEASE.2025-09-07T16-13-09Z); check `minio --version` when bumping them.
+  image: cgr.dev/chainguard/minio:latest-dev@sha256:1f74aba71eff94011dbcb62947354f19d6e6efda5facd023fa3f4560d2a088d4
+  mcImage: cgr.dev/chainguard/minio-client:latest-dev@sha256:2d11d09801b035510cb0c2ff0c64aa016fc94f0c4e7055a31ec17cf41dd154cb
+  # Root initContainer that hands a root-owned volume (written by the old
+  # minio/minio image) to uid 65532 before MinIO starts; it skips the chown
+  # (not the ownership scan) once ownership is right. Set false when the storage
+  # rejects root chown (NFS root_squash) or the namespace forbids root init
+  # containers; the volume must then already be writable by uid 65532. This
+  # quickstart sets no container securityContext, so false alone does not make
+  # it pass PSA restricted or OpenShift restricted-v2.
+  fixDataOwnership: true
+  # Pod securityContext for MinIO. OpenShift restricted-v2 assigns its own
+  # fsGroup range: set this to null there ({} merges with the defaults).
+  podSecurityContext:
+    fsGroup: 65532
+    fsGroupChangePolicy: OnRootMismatch
   persistence:
     enabled: true
     size: 10Gi

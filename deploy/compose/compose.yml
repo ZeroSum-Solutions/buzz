@@ -84,16 +84,58 @@ services:
     networks:
       - buzz-net
 
+  # The Chainguard MinIO image runs as uid 65532; volumes written by the old
+  # root-run minio/minio image are root-owned. Hand them over before start.
+  # `up` reruns this while MinIO may be serving, so the walk is skipped once
+  # nothing is left to change, files that vanish mid-walk are tolerated, and
+  # only ownership still wrong afterwards fails the step.
+  # First move off the old root-run image: stop relay and minio BEFORE `up`
+  # (see README, "Moving off the Docker Hub MinIO image"), or the old container
+  # can write root-owned files after this step has finished.
+  minio-perms:
+    image: cgr.dev/chainguard/minio:latest-dev@sha256:1f74aba71eff94011dbcb62947354f19d6e6efda5facd023fa3f4560d2a088d4
+    user: "0:0"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        # Vanished entries ("No such file") are expected while MinIO serves;
+        # any other find error means /data could not be checked.
+        scan() {
+          out="$$(find /data -xdev ! -user 65532 -print -quit 2>&1)"
+          bad="$$(printf '%s\n' "$$out" | grep '^find: ' | grep -v 'No such file or directory')"
+          [ -z "$$bad" ] || { echo "minio-perms: cannot scan /data: $$bad" >&2; exit 1; }
+          printf '%s\n' "$$out" | grep '^/' | head -n 1
+        }
+        first="$$(scan)" || exit 1
+        [ -z "$$first" ] && exit 0
+        chown -Rh 65532:65532 /data || true
+        left="$$(scan)" || exit 1
+        [ -z "$$left" ] && exit 0
+        echo "minio-perms: $$left is not owned by 65532" >&2
+        exit 1
+    volumes:
+      - buzz-minio-data:/data
+    network_mode: none
+    labels:
+      com.buzz.role: minio-ownership-migration
+    restart: "no"
+
   minio:
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    # minio/minio left Docker Hub; -dev adds sh and wget. This digest is minio
+    # RELEASE.2026-09-22T19-25-18Z (the old pin was RELEASE.2025-09-07T16-13-09Z).
+    image: cgr.dev/chainguard/minio:latest-dev@sha256:1f74aba71eff94011dbcb62947354f19d6e6efda5facd023fa3f4560d2a088d4
     command: server /data --console-address ":9001"
+    depends_on:
+      minio-perms:
+        condition: service_completed_successfully
     environment:
       MINIO_ROOT_USER: ${BUZZ_S3_ACCESS_KEY:?set BUZZ_S3_ACCESS_KEY}
       MINIO_ROOT_PASSWORD: ${BUZZ_S3_SECRET_KEY:?set BUZZ_S3_SECRET_KEY}
     volumes:
       - buzz-minio-data:/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9000/minio/health/live"]
       interval: 5s
       timeout: 5s
       retries: 12
@@ -103,7 +145,7 @@ services:
       - buzz-net
 
   minio-init:
-    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    image: cgr.dev/chainguard/minio-client:latest-dev@sha256:2d11d09801b035510cb0c2ff0c64aa016fc94f0c4e7055a31ec17cf41dd154cb
     depends_on:
       minio:
         condition: service_healthy

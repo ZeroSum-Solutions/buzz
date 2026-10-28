@@ -10,6 +10,15 @@
   "recreateWhen": "always",
   "separateMinorPatch": true,
   "postUpdateOptions": ["cargo:updateLockfile"],
+  "customManagers": [
+    {
+      "description": "Renovate's helm-values manager only reads keys named image; minio.mcImage needs its own rule so its digest is refreshed with the minio image.",
+      "customType": "regex",
+      "managerFilePatterns": ["/^deploy/charts/buzz/values\\.yaml$/"],
+      "matchStrings": ["mcImage: (?<depName>[^:\\s]+):(?<currentValue>[^@\\s]+)@(?<currentDigest>sha256:[a-f0-9]{64})"],
+      "datasourceTemplate": "docker"
+    }
+  ],
   "packageRules": [
     {
       "description": "Major version bumps often require code changes — require human review.",
@@ -45,6 +54,14 @@
       "matchPackageNames": ["earshot"],
       "matchManagers": ["cargo"],
       "allowedVersions": "<1.2.0"
+    },
+    {
+      "description": "MinIO runs from Chainguard's free latest-dev tags pinned by digest; superseded digests are not retained, so refresh them weekly. A digest bump can carry a new MinIO release with a one-way on-disk migration: never automerge. Digests carry no release timestamp, so the global timestamp-required release-age gate is lifted here.",
+      "matchPackageNames": ["cgr.dev/chainguard/**"],
+      "groupName": "chainguard minio images",
+      "schedule": ["before 6am on monday"],
+      "minimumReleaseAge": null,
+      "automerge": false
     },
     {
       "description": "tiptap 3.23.x breaks editor lifecycle under real relay latency — pin until upstream stabilizes.",
